@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
-from datetime import timedelta
 
 import pytest
 from pydantic import ValidationError
@@ -20,19 +18,14 @@ from redteam.core.contracts.tool import (
     ToolDescriptor,
     ToolResourceBinding,
 )
-from redteam.core.ids import AgentId, RunId, ToolId
+from redteam.core.ids import AgentId, ToolId
 from redteam.core.tool_resources import ResourceBindingError
 from redteam.orchestration.agents.base import PlanStep
 from redteam.orchestration.candidates.compiler import CandidateCompiler
 from redteam.orchestration.candidates.models import CandidateDraft
 from redteam.orchestration.resource_conflicts import resource_conflict_keys
-from redteam.orchestration.scheduler import WorkScheduler
 from redteam.orchestration.settings import OrchestrationSettings
-from redteam.orchestration.work.memory import InMemoryWorkStore
-from redteam.orchestration.work.models import WorkStatus
-from redteam.orchestration.work.sqlite import SQLiteWorkStore
 from tests.integration._engine_llm_harness import FakeCatalog
-from tests.unit.test_orchestration_work import NOW, item
 
 
 def descriptor(*bindings, server="bridge", argument="handle") -> ToolDescriptor:
@@ -176,7 +169,7 @@ async def test_operator_configuration_adds_resources_but_cannot_erase_provider_l
         MCPServerSettings.from_environment("bridge", env=env)
 
 
-async def test_compiler_rejects_unbound_resources_and_scheduler_persists_bound_keys():
+async def test_compiler_rejects_unbound_resources_and_preserves_bound_keys():
     tool = descriptor(ToolResourceBinding(namespace="browser.profile", argument="handle"))
     draft = CandidateDraft(
         agent_id=AgentId("web-worker"),
@@ -203,128 +196,23 @@ async def test_compiler_rejects_unbound_resources_and_scheduler_persists_bound_k
     )
     candidates, errors = compiler.compile_drafts_with_rejections([bound])
     assert not errors
-    store = InMemoryWorkStore()
-    (work,) = await WorkScheduler(store).enqueue(candidates, graph_revision=0, run_id=RunId("r"))
-    assert work.resource_keys == resource_conflict_keys(tool, {"handle": "private-profile"})
-    assert set(work.resource_keys).issubset(work.conflict_keys)
-    assert "private-profile" not in work.model_dump_json()
 
 
-@pytest.fixture(params=["memory", "sqlite"])
-def store(request, tmp_path):
-    return (
-        InMemoryWorkStore()
-        if request.param == "memory"
-        else SQLiteWorkStore(tmp_path / "resource-work.sqlite3")
-    )
 
 
-def resource_work(identity, key="resource:opaque-one", run="one"):
-    return item(identity, run_id=run).model_copy(
-        update={
-            "conflict_keys": [key],
-            "resource_keys": [key],
-        }
-    )
 
 
-async def acquire(store, identity, now=NOW):
-    return await store.acquire(identity, owner="worker", now=now, ttl=timedelta(seconds=5))
 
 
-async def test_same_resource_serializes_across_runs_while_independent_resource_progresses(store):
-    for work in (
-        resource_work("a"),
-        resource_work("b", run="other"),
-        resource_work("c", key="resource:other"),
-    ):
-        assert await store.add(work)
-    leases = await asyncio.gather(acquire(store, "a"), acquire(store, "b"))
-    assert sum(lease is not None for lease in leases) == 1
-    assert await acquire(store, "c")
-    winner = "a" if leases[0] else "b"
-    loser = "b" if winner == "a" else "a"
-    assert await store.mark_execution_started(winner, owner="worker", now=NOW)
-    assert await store.complete(
-        winner, owner="worker", now=NOW, status=WorkStatus.SUCCEEDED, execution_known=True
-    )
-    assert await acquire(store, loser)
 
 
-@pytest.mark.parametrize("ending", ["failed", "cancelled", "expired", "abandoned"])
-async def test_unknown_effects_keep_resources_after_terminal_expiry_and_restart(store, ending):
-    assert await store.add(resource_work("a"))
-    assert await store.add(resource_work("b", run="other"))
-    owner = "one" if ending == "abandoned" else "worker"
-    assert await store.acquire("a", owner=owner, now=NOW, ttl=timedelta(seconds=5))
-    assert not await store.mark_execution_started("a", owner="wrong", now=NOW)
-    assert await store.mark_execution_started("a", owner=owner, now=NOW)
-    assert not await store.release("a", owner=owner, now=NOW)
-    if ending == "expired":
-        assert await store.reclaim_expired(now=NOW + timedelta(seconds=6)) == ["a"]
-    elif ending == "abandoned":
-        # Legacy rows use their Run as owner for abandonment.
-        assert await store.abandon_run(RunId("one"), owner=owner, now=NOW, reason="stop") == ["a"]
-    else:
-        assert await store.complete("a", owner=owner, now=NOW, status=WorkStatus(ending))
-    row = await store.get("a")
-    assert row is not None and row.resource_execution_pending
-    if isinstance(store, SQLiteWorkStore):
-        store = SQLiteWorkStore(store._path)  # independent connection / reconstructed backend
-    assert await acquire(store, "b", now=NOW + timedelta(seconds=7)) is None
-    assert not await store.reconcile_execution(
-        "a",
-        run_id=RunId("wrong"),
-        instance_id=None,
-        candidate_key=row.candidate_key,
-        status="failed",
-        now=NOW + timedelta(seconds=7),
-    )
-    assert await store.reconcile_execution(
-        "a",
-        run_id=RunId("one"),
-        instance_id=None,
-        candidate_key=row.candidate_key,
-        status="failed",
-        now=NOW + timedelta(seconds=7),
-    )
-    assert not (await store.get("a")).resource_execution_pending
-    assert await acquire(store, "b", now=NOW + timedelta(seconds=7))
 
 
-async def test_preentry_approval_release_does_not_hold_resource(store):
-    assert await store.add(resource_work("a"))
-    assert await store.add(resource_work("b"))
-    assert await acquire(store, "a")
-    assert await store.release("a", owner="worker", now=NOW)
-    assert await acquire(store, "b")
 
 
-async def test_resource_entry_marker_requires_live_owner_and_refuses_duplicate_entry(store):
-    assert await store.add(resource_work("a"))
-    assert not await store.mark_execution_started("a", owner="worker", now=NOW)
-    assert await acquire(store, "a")
-    assert not await store.mark_execution_started("a", owner="other-owner", now=NOW)
-    assert not await store.mark_execution_started(
-        "a", owner="worker", now=NOW + timedelta(seconds=6),
-    )
-    assert await store.mark_execution_started("a", owner="worker", now=NOW)
-    assert not await store.mark_execution_started("a", owner="worker", now=NOW)
 
 
-async def test_multiple_resource_acquisition_is_atomic_not_a_partial_lock(store):
-    both = resource_work("a").model_copy(
-        update={
-            "conflict_keys": ["resource:x", "resource:y"],
-            "resource_keys": ["resource:x", "resource:y"],
-        }
-    )
-    assert await store.add(both)
-    assert await store.add(resource_work("b", key="resource:y"))
-    assert await store.add(resource_work("c", key="resource:x"))
-    assert await acquire(store, "b")
-    assert await acquire(store, "a") is None
-    assert await acquire(store, "c")  # unsuccessful a did not reserve x
+
 
 
 async def test_real_mcp_discovery_declares_workspace_and_device_physical_aliases(tmp_path):

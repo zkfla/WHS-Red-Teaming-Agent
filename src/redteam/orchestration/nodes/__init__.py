@@ -18,24 +18,18 @@ binds ``deps`` with ``functools.partial`` and nothing else needs to
 change when a node's internals do.
 """
 
-from redteam.orchestration.nodes.aggregate import aggregate_node
 from redteam.orchestration.nodes.execute import execute_node
 from redteam.orchestration.nodes.observe import observe_node
-from redteam.orchestration.nodes.plan import plan_node
 from redteam.orchestration.nodes.policy import policy_node
 from redteam.orchestration.nodes.replan import replan_node
 from redteam.orchestration.nodes.update import update_node
 from redteam.orchestration.nodes.verify import verify_node
-from redteam.orchestration.nodes.worker import worker_node
 
 __all__ = [
     "observe_node",
-    "plan_node",
     "policy_node",
     "execute_node",
-    "aggregate_node",
     "verify_node",
-    "worker_node",
     "update_node",
     "replan_node",
 ]

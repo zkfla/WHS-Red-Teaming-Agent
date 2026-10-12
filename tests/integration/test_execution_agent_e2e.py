@@ -5,15 +5,12 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import pytest
 from mcp import Client
 
-from redteam.app.bootstrap import run_engagement
 from redteam.capability.adapters.mcp.execution import ExecutionMCPAdapter
 from redteam.capability.adapters.mcp.transport import (
     RemoteCallResult,
@@ -45,7 +42,7 @@ from redteam.core.contracts.engagement import (
 from redteam.core.contracts.policy import ControlContext
 from redteam.core.contracts.target import AssetTarget
 from redteam.core.contracts.tool import ExecutionContext, ToolInvocation
-from redteam.core.enums import EvidenceSourceType, PolicyVerdict, RiskLevel, ToolHealthStatus
+from redteam.core.enums import PolicyVerdict, RiskLevel, ToolHealthStatus
 from redteam.core.ids import (
     ActionId,
     AgentId,
@@ -57,9 +54,6 @@ from redteam.core.ids import (
 )
 from redteam.core.ports.llm import NativeCompletion, NativeToolCall
 from redteam.orchestration.native_binding import exposed_tool_name
-from redteam.orchestration.settings import OrchestrationSettings
-from redteam.orchestration.state import TerminationReason
-from tests.fakes import build_test_application
 from tests.integration import _engine_llm_harness as h
 
 ASSET = "workspace-test"
@@ -196,78 +190,8 @@ def engagement(*, allowed_operation: str = "analysis.command_run") -> Engagement
     )
 
 
-def draft_path() -> dict[str, Any]:
-    return {
-        "path_id": "path-execution-agent",
-        "run_id": str(RUN_ID),
-        "mission_id": None,
-        "version": 1,
-        "parent_version": None,
-        "status": "draft",
-        "reason": "process an approved workspace input",
-        "goal": "count lines in the approved input",
-        "steps": [
-            {
-                "step_id": PATH_STEP,
-                "objective": "count lines in the approved workspace input",
-                "agent_id": "analysis-agent",
-                "target_node_ids": [ASSET_NODE],
-                "principal_refs": [],
-                "allowed_operations": ["analysis.command_run"],
-                "depends_on": [],
-                "required_fact_refs": [],
-                "unknowns": [],
-                "completion_criteria": [
-                    {
-                        "kind": "evidence",
-                        "description": "command output evidence recorded",
-                        "min_evidence": 1,
-                    }
-                ],
-                "required": True,
-                "status": "pending",
-                "outcome": None,
-                "evidence_ids": [],
-            }
-        ],
-        "hypothesis_ids": [],
-        "evidence_ids": [],
-        "changed_step_ids": [],
-        "review_records": {},
-    }
 
 
-def turn_action() -> dict[str, Any]:
-    return {
-        "mode": "actions",
-        "reason": "use the offered fixed execution option",
-        "actions": [
-            {
-                "path_step_id": PATH_STEP,
-                "agent_id": "analysis-agent",
-                "target_node_id": ASSET_NODE,
-                "principal_ref": None,
-                "capability": "analysis",
-                "operation": "command_run",
-                "tool_id": "analysis.run_command",
-                # Direct selection supplies the valid registered input; legacy
-                # recipe replacement and executable denial have separate tests.
-                "arguments": {"executable": "wc", "args": ["-l", "input.txt"]},
-                "reason": "process the configured graph-bound input",
-                "expected_observation": "bounded line count output",
-                "hypothesis": None,
-                "existing_hypothesis_id": None,
-                "expectation": None,
-                "authentication_check": None,
-                "availability_impact": False,
-            }
-        ],
-        "path": None,
-        "path_step_id": None,
-        "completion": {},
-        "evidence_request": {},
-        "hypothesis_update": {},
-    }
 
 
 class ExecutionNativeLLM:
@@ -383,56 +307,8 @@ def scripted_llm() -> ExecutionNativeLLM:
     return ExecutionNativeLLM()
 
 
-async def run_agent_loop(
-    configured: Engagement,
-    gateway: MCPToolGateway,
-) -> tuple[Any, Any, ExecutionNativeLLM]:
-    llm = scripted_llm()
-    deps = build_test_application(
-        control_plane=DefaultControlPlane(
-            {configured.engagement_id: configured},
-            risk_resolver=RegistryRiskResolver(gateway),
-            outbound_descriptor_resolver=gateway.get,
-        ),
-        tool_gateway=gateway,
-        tool_catalog=gateway,
-        llm_client=llm,
-        settings=OrchestrationSettings(max_steps=12, checkpointing=False),
-    )
-    deps = replace(deps, engagement=configured)
-    final = await run_engagement(configured, deps=deps, run_id=RUN_ID)
-    return final, deps, llm
 
 
-async def test_agent_loop_reaches_execution_mcp_and_records_evidence(
-    tmp_path: Path,
-) -> None:
-    starts: list[tuple[str, ...]] = []
-
-    async def spawn(*args: str, **_: Any) -> CompletedProcess:
-        starts.append(args)
-        return CompletedProcess()
-
-    (tmp_path / "input.txt").write_text("one\ntwo\nthree\n", encoding="utf-8")
-    gateway = await gateway_for(policy(tmp_path), process_factory=spawn)
-
-    final, deps, llm = await run_agent_loop(engagement(), gateway)
-
-    assert final.termination_reason == TerminationReason.INVESTIGATION_HELD
-    assert final.actions_executed == 1
-    assert len(starts) == 1
-    docker_argv = starts[0]
-    assert "/usr/bin/wc" in docker_argv
-    assert docker_argv[-2:] == ("-l", "input.txt")
-    assert "python" not in docker_argv
-    evidence = await deps.evidence_store.list_for_run(RUN_ID)
-    tool_evidence = [item for item in evidence if item.source_type is EvidenceSourceType.TOOL]
-    assert len(tool_evidence) == 1
-    assert tool_evidence[0].metadata["success"] is True
-    assert llm.calls[0]["tool"] == exposed_tool_name(
-        "analysis.execution.run_command"
-    )
-    assert llm.turns >= 2, "native model holds the investigation after the execution evidence"
 
 
 async def test_roe_exclusion_is_denied_by_control_before_execution(tmp_path: Path) -> None:
@@ -501,27 +377,3 @@ async def test_server_rejects_unallowlisted_executable_without_starting_docker(
     assert result.error is not None
     assert result.error.code == "execution_executable_not_allowed"
     assert starts == 0
-
-
-@pytest.mark.skipif(
-    os.environ.get("REDTEAM_TEST_EXECUTION_DOCKER") != "1",
-    reason="set REDTEAM_TEST_EXECUTION_DOCKER=1 under WSL2/Linux with Docker",
-)
-async def test_agent_loop_executes_real_docker_and_records_evidence(tmp_path: Path) -> None:
-    workspace = tmp_path / "workspace"
-    workspace.mkdir(mode=0o700)
-    (workspace / "input.txt").write_text("one\ntwo\nthree\n", encoding="utf-8")
-    gateway = await gateway_for(
-        policy(workspace, image=os.environ["REDTEAM_TEST_EXECUTION_IMAGE"])
-    )
-
-    final, deps, _ = await run_agent_loop(engagement(), gateway)
-
-    assert final.actions_executed == 1
-    evidence = await deps.evidence_store.list_for_run(RUN_ID)
-    tool_evidence = [item for item in evidence if item.source_type is EvidenceSourceType.TOOL]
-    assert len(tool_evidence) == 1
-    result = tool_evidence[0].metadata["tool_result"]
-    assert result["success"] is True
-    assert result["output"]["exit_code"] == 0
-    assert result["output"]["stdout"].lstrip().startswith("3 ")

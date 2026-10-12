@@ -1,0 +1,211 @@
+"""Structured planner/task/worker view built only from stored originals.
+
+Pure function of what ``graph_read`` loaded: no I/O, no model, no inference. A value the
+stores do not hold is ``None`` (shown as unknown), never a guess. Layout is the client's job.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+
+from redteam.app.cli.display import safe_text
+from redteam.core.contracts.execution import ExecutionState, TaskExecution
+from redteam.core.contracts.mission import MissionPlan, MissionTask
+
+PLANNER_OWNER = "specialist_planning"
+REVIEW_OWNERS = frozenset({"task_completion_review", "goal_completion"})
+_LIVE_REQUEST = frozenset({"reserved", "dispatched"})
+_OPEN_EXECUTION = frozenset({ExecutionState.PENDING, ExecutionState.RUNNING})
+_EVENT_KEYS = ("action_id", "mission_task_id", "task_id", "tool_id", "operation", "verdict",
+               "approval_id", "evidence_id", "finding_id", "success", "error_code")
+EVENT_LIMIT = 40
+EVIDENCE_REF_LIMIT = 5
+
+
+@dataclass
+class GraphRaw:
+    run_id: str
+    mission: MissionPlan | None
+    tasks: list[MissionTask]
+    executions: list[TaskExecution]
+    activations: list[dict[str, Any]]
+    llm_requests: list[dict[str, Any]]
+    planner_judgment: dict[str, Any] | None
+    evidence_count: int
+    event_counts: dict[str, int]
+    events: list[dict[str, Any]] = field(default_factory=list)  # newest first
+    budget_remaining: int | None = None
+
+
+def _text(value: Any, limit: int) -> str | None:
+    return safe_text(value, limit=limit) if value not in (None, "") else None
+
+
+def _live(requests: list[dict[str, Any]], owner: str) -> bool:
+    return any(r.get("owner") == owner and r.get("state") in _LIVE_REQUEST for r in requests)
+
+
+def _usage(requests: list[dict[str, Any]]) -> dict[str, Any]:
+    spent = [r for r in requests if r.get("state") in {"settled", "unknown"}]
+    return {
+        "requests": len(spent),
+        "in_flight": sum(r.get("state") in _LIVE_REQUEST for r in requests),
+        "known_tokens": sum(r.get("total_tokens") or 0 for r in spent),
+        "unknown_usage": sum(r.get("total_tokens") is None for r in spent),
+        "unknown_outcome": sum(r.get("state") == "unknown" for r in spent),
+    }
+
+
+def _planner(raw: GraphRaw) -> dict[str, Any]:
+    finished = bool(raw.mission and (
+        raw.mission.termination_reason
+        or raw.mission.status.value in {"completed", "cancelled", "failed"}
+    ))
+    if _live(raw.llm_requests, PLANNER_OWNER):
+        state = "deciding"
+    elif finished:
+        state = "finished"
+    else:
+        state = "waiting"
+    judgment = raw.planner_judgment
+    by_status: dict[str, int] = {}
+    for task in raw.tasks:
+        by_status[task.status.value] = by_status.get(task.status.value, 0) + 1
+    planner_requests = [r for r in raw.llm_requests if r.get("owner") == PLANNER_OWNER]
+    return {
+        "state": state,
+        # Stage (question proposal vs. task split) and the waking event are not stored.
+        "stage": None,
+        "trigger": None,
+        "inputs": {
+            "goal": _text(raw.mission.objective if raw.mission else None, 300),
+            "evidence": raw.evidence_count,
+            "tasks": len(raw.tasks),
+            "tasks_by_status": by_status,
+            "open_questions": None,
+        },
+        "last_judgment": None if judgment is None else {
+            "termination": _text(judgment.get("termination"), 40),
+            "reason": _text(judgment.get("reason"), 300),
+        },
+        "tasks_registered": raw.event_counts.get("TaskCreated"),
+        # Checked against the planner's input assembly (see the guard test), not assumed.
+        "guidance_in_input": False,
+        "usage": _usage(planner_requests),
+    }
+
+
+def _wait(execution: TaskExecution) -> dict[str, Any] | None:
+    if execution.wait_reason is None:
+        return None
+    return {"reason": execution.wait_reason, "approval_ref": execution.approval_ref}
+
+
+def _worker(activation: dict[str, Any], raw: GraphRaw) -> dict[str, Any]:
+    instance, owner, task_id = (
+        activation["instance_id"], activation["owner"], activation["task_id"],
+    )
+    mine = [e for e in raw.executions if str(e.instance_id) == instance]
+    open_runs = [e for e in mine if e.state in _OPEN_EXECUTION]
+    unknown = [e for e in mine if e.state == ExecutionState.UNKNOWN]
+    waiting = next((e for e in open_runs if e.wait_reason), None)
+    stage = activation["launch_stage"]
+    if waiting is not None:
+        phase = f"waiting_{waiting.wait_reason}"
+    elif open_runs:
+        phase = "tool"
+    elif _live(raw.llm_requests, owner):
+        phase = "model"
+    elif unknown:
+        phase = "outcome_unknown"
+    elif stage == "returned":
+        phase = "returned"
+    elif stage == "reserved":
+        phase = "reserved"
+    else:
+        phase = "between"  # settle/hand-off: neither a model request nor a tool is open
+    requests = [r for r in raw.llm_requests if r.get("owner") == owner]
+    refs = [str(e.result_evidence_id) for e in mine if e.result_evidence_id]
+    return {
+        "instance_id": instance,
+        "task_id": task_id,
+        "launch_stage": stage,
+        "phase": phase,
+        "model_requests": len(requests),
+        "tool_calls": len(mine),
+        "tool_states": {s.value: sum(e.state == s for e in mine)
+                        for s in ExecutionState if any(e.state == s for e in mine)},
+        "current_tool": str(open_runs[0].tool_id) if open_runs else None,
+        "wait": _wait(waiting) if waiting else None,
+        # Returned while an execution still waits: the slot was given back, the request is kept.
+        "slot_released": stage == "returned" and bool(open_runs),
+        "evidence_refs": refs[-EVIDENCE_REF_LIMIT:],
+    }
+
+
+def _task(task: MissionTask, workers: list[dict[str, Any]], raw: GraphRaw) -> dict[str, Any]:
+    holder = next((w for w in workers if w["task_id"] == str(task.task_id)
+                   and w["launch_stage"] != "returned"), None)
+    waits = [e for e in raw.executions if str(e.task_id) == str(task.task_id)
+             and e.state in _OPEN_EXECUTION and e.wait_reason]
+    criteria = [safe_text(c.description, limit=160) for c in task.completion_criteria[:2]
+                if c.description]
+    return {
+        "task_id": str(task.task_id),
+        "title": safe_text(task.title, limit=160),
+        "status": task.status.value,
+        "role": str(task.assigned_agent) if task.assigned_agent else None,
+        "worker": holder["instance_id"] if holder else None,
+        "completion": criteria or [safe_text(task.objective, limit=160)],
+        "blocking_reason": _text(task.blocking_reason, 200),
+        "wait": _wait(waits[0]) if waits else None,
+        "required": task.required,
+        "evidence": len(task.evidence_ids),
+        "has_result": task.result is not None,
+    }
+
+
+def _event(row: dict[str, Any]) -> dict[str, Any]:
+    from redteam.app.web.events import public_payload
+
+    envelope = row["envelope"]
+    public = public_payload(envelope["event_type"], envelope.get("payload") or {})
+    kept = {k: public[k] for k in _EVENT_KEYS if k in public}
+    return {"seq": row["sequence"], "type": envelope["event_type"],
+            "ts": str(envelope["timestamp"]), "data": kept}
+
+
+def build_graph(raw: GraphRaw) -> dict[str, Any]:
+    workers = [_worker(a, raw) for a in raw.activations]
+    tasks = [_task(t, workers, raw) for t in raw.tasks]
+    edges = [{"from": "planner", "to": f"task:{t['task_id']}", "kind": "registered"}
+             for t in tasks]
+    edges += [{"from": f"task:{w['task_id']}", "to": f"worker:{w['instance_id']}",
+               "kind": "held_by" if w["launch_stage"] != "returned" else "returned"}
+              for w in workers]
+    edges += [{"from": f"worker:{w['instance_id']}", "to": "origin", "kind": "stored"}
+              for w in workers if w["evidence_refs"]]
+    edges.append({"from": "origin", "to": "planner", "kind": "wakes"})
+    return {
+        "available": True,
+        "run_id": raw.run_id,
+        "mission": None if raw.mission is None else {
+            "status": raw.mission.status.value,
+            "termination_reason": _text(raw.mission.termination_reason, 80),
+        },
+        "planner": _planner(raw),
+        "tasks": tasks,
+        "workers": workers,
+        "origin": {
+            "evidence": raw.evidence_count,
+            "graph_updates": raw.event_counts.get("GraphUpdated", 0),
+            "findings": raw.event_counts.get("FindingCreated", 0),
+            "verified_findings": raw.event_counts.get("FindingVerified", 0),
+            # Hypotheses live in the graph store, which this read does not open.
+            "hypotheses": None,
+        },
+        "usage": {**_usage(raw.llm_requests), "budget_remaining": raw.budget_remaining},
+        "edges": edges,
+        "events": [_event(r) for r in raw.events[:EVENT_LIMIT]],
+    }

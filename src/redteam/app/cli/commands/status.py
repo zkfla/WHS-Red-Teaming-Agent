@@ -1,24 +1,24 @@
-"""``redteam status <run-id>`` — read what's durably known about a Run.
+"""Read current central Run state, including active and suspended investigations.
 
-By default the persisted terminal report (``app.report_store``, written once by
-the canonical bootstrap when a run reaches a terminal phase) plus the
-Approval store are queried here. A Run still executing in another,
-still-live process has no durable status row anywhere in this codebase
-today (``RuntimeState`` is in-memory, checkpointed only if the caller
-opted into SQLite checkpointing) — this command says so explicitly
-rather than guessing. Explicit --activation-db inspects canonical specialist
-launch/request records only. It does not open checkpoints/transports, mutate
-claims/accounting or grant replay; it is not a live whole-Run status API.
---work-db/--evidence-dir add independently read original-execution snapshots,
-not provider reconciliation or an atomic recovery proof.
+The default reader inspects the central database and preserved originals without
+starting actors, replaying checkpoints or creating/upgrading a database. Explicit
+legacy selection reads a derived terminal report. --activation-db and its optional
+original Work/Evidence snapshots remain read-only compatibility diagnostics;
+they do not authorize reconciliation, resource release or budget reset.
 """
 
 from __future__ import annotations
 
 import argparse
 
-from redteam.app.cli._shared import EXIT_CONFIG_ERROR, EXIT_FAILURE, EXIT_OK, eprint, print_json
-from redteam.app.report_store import load_terminal_report
+from redteam.app.cli._shared import (
+    EXIT_CONFIG_ERROR,
+    EXIT_FAILURE,
+    EXIT_OK,
+    eprint,
+    print_json,
+    read_run_report,
+)
 from redteam.control.approval import ApprovalService
 from redteam.control.stores.filesystem import FilesystemApprovalStore
 
@@ -28,6 +28,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument("run_id")
     parser.add_argument("--approval-dir", default="data/approvals")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--state-db", default=None)
     parser.add_argument(
         "--activation-db", default=None,
         help="Read-only specialist activation snapshot from an existing coordination SQLite DB",
@@ -53,7 +54,11 @@ async def run(args: argparse.Namespace) -> int:
         return EXIT_CONFIG_ERROR
     if getattr(args, "activation_db", None) is not None:
         return await _activation_diagnostics(args)
-    report = load_terminal_report(args.run_id)
+    try:
+        report = await read_run_report(args)
+    except (ValueError, OSError, RuntimeError) as exc:
+        eprint(f"ERROR: central status unavailable: {exc}")
+        return EXIT_FAILURE
     if report is None:
         if args.json:
             print_json({"run_id": args.run_id, "status": "unknown"})
@@ -75,11 +80,20 @@ async def run(args: argparse.Namespace) -> int:
     print(f"Status: {report.phase.value.upper()}")
     if report.termination_reason:
         print(f"Termination reason: {report.termination_reason}")
+    if report.previous_termination_reason:
+        print(f"Previous termination reason: {report.previous_termination_reason}")
     print(f"\nActions executed: {report.actions_executed}")
     if report.work_status_counts:
         print("Work items by status:")
         for status, count in report.work_status_counts.items():
             print(f"  {status}: {count}")
+    if report.effective_limits:
+        print(f"Applied limits: {report.effective_limits}")
+    for execution in report.executions:
+        if execution.get("wait_reason") or execution["state"] == "unknown":
+            print(f"  {execution['task_id']} / {execution['invocation_id']}: "
+                  f"{execution['state']}, wait={execution.get('wait_reason')}, "
+                  f"approval={execution.get('approval_ref')}, job={execution.get('job_ref')}")
     print(f"Evidence recorded: {report.evidence_count}")
     print(f"Findings: {report.finding_count}")
     if report.pending_approval_id:

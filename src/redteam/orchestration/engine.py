@@ -14,40 +14,34 @@ from jsonschema import validate as validate_json_schema
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from redteam.attack_graph.identity import node_id_for_target, target_for_node
-from redteam.attack_graph.predicates import Confidence, Provenance, facts_of
+from redteam.attack_graph.predicates import facts_of
+from redteam.core.contracts.completion import completion_contract_hash
 from redteam.core.contracts.evidence import EvidenceRecord
-from redteam.core.contracts.graph import Hypothesis
 from redteam.core.contracts.mission import redact_secret_material
-from redteam.core.enums import EvidenceSourceType, TaskStatus, ToolHealthStatus
-from redteam.core.ids import EventId, GraphNodeId, new_id
+from redteam.core.enums import EvidenceSourceType, MissionStatus, TaskStatus, ToolHealthStatus
+from redteam.core.ids import EventId, new_id
 from redteam.core.ports.control_plane import PolicyExplanationControl
 from redteam.core.redaction import redact_sensitive_text
 from redteam.event_bus.publisher import EventPublisher
 from redteam.orchestration.agents.base import HypothesisDraft, PlanStep
-from redteam.orchestration.agents.providers import CandidateBatch, GraphCandidateContext
 from redteam.orchestration.agents.role_view import role_tool_visible, tools_for_role
 from redteam.orchestration.authentication import AuthenticationCheck
 from redteam.orchestration.candidates.catalog import bound_operations
 from redteam.orchestration.candidates.compiler import CandidateCompiler
-from redteam.orchestration.candidates.models import CandidateDraft
 from redteam.orchestration.cognition import (
     DecisionBudget,
     DecisionFailure,
     StructuredDecisionClient,
 )
-from redteam.orchestration.completion import validate_completion
 from redteam.orchestration.completion_proposal import (
     CompletionProposal,
-    record_unresolved,
-    validate_unresolved,
 )
 from redteam.orchestration.context_projection import (
     completion_review_context,
     project_run_processing,
-    review_path_reference,
 )
 from redteam.orchestration.coordination import (
-    ChangeSet,
+    CoordinationError,
     StateConflict,
     content_hash,
     coordinator_for,
@@ -65,15 +59,11 @@ from redteam.orchestration.diagnostics import (
 from redteam.orchestration.eligibility import EligibilityContext
 from redteam.orchestration.events import AGENT_CONTEXT_PREPARED, AGENT_TURN_DECIDED
 from redteam.orchestration.evidence_access import (
-    EvidenceReader,
     EvidenceReadRequest,
-    raw_from_metadata,
-    read_for_runtime,
     restore_reads,
 )
 from redteam.orchestration.execution_bridge import (
     EXECUTION_OPERATIONS,
-    agent_tool_visible,
     bind_execution_arguments,
     execution_agent_options,
 )
@@ -88,20 +78,11 @@ from redteam.orchestration.knowledge_validation import (
     assessment_blocked,
     check_principal_arguments,
     check_ready_step,
-    known_principals,
     known_target_ids,
 )
 from redteam.orchestration.local_tools import LocalToolCall, LocalToolContext
-from redteam.orchestration.paths import PathError, PathPlan, is_active_status, is_known_criterion
-from redteam.orchestration.paths.models import (
-    ALLOWED_CRITERION_KINDS,
-    changed_steps_and_descendants,
-    step_definition_equal,
-    validate_path_structure,
-)
+from redteam.orchestration.paths import PathError, PathPlan
 from redteam.orchestration.paths.writing import (
-    CriterionWritingError,
-    normalize_path_proposals,
     validate_written_criteria,
     writing_schema,
 )
@@ -113,7 +94,7 @@ from redteam.orchestration.tool_discovery import (
     card_view_for,
     discovery_cards_for_context,
 )
-from redteam.orchestration.work.models import WorkStatus, is_unexecuted_stale
+from redteam.orchestration.work.models import WorkStatus
 
 
 class ActionIntent(BaseModel):
@@ -512,7 +493,6 @@ class InvestigationEngine:
             await self._ensure_reasoning_allowed()
             if budget.token_halt_required(self.decision_token_limit):
                 from redteam.orchestration.cognition import ReasoningHalted
-
                 raise ReasoningHalted("requester_token_limit_or_unknown_usage")
 
         outcomes = []
@@ -607,29 +587,23 @@ class InvestigationEngine:
             budget.record(stage, "context", **decision_context(payload))
         # Raw writing validation occurs before permissive storage models can
         # normalize unknown kinds or fill omitted fields.
-        kwargs["system"] = (
-            kwargs.get("system", "")
-            + " Supported completion kinds: "
-            + ", ".join(sorted(ALLOWED_CRITERION_KINDS))
-            + ". New conditions require a nonblank description; kind defaults to semantic "
-            "and min_evidence to 1. "
-            "hypothesis kinds require hypothesis_id."
-        )
         runtime = self._event_runtime
         if runtime is not None and runtime.mission_id is not None:
             await self._review_token(runtime)
         if runtime is None:
             result = await self._propose(stage=stage, payload=payload, **kwargs)
-            validate_written_criteria(result)
-            return normalize_path_proposals(result)
+            return result
         publisher = EventPublisher(
             self.deps.event_bus,
             run_id=runtime.run_id,
             engagement_id=runtime.engagement_id,
             source="orchestration.engine",
         )
-        active = payload.get("draft_path") or payload.get("active_path") or {}
-        refs = {"path_id": active.get("path_id"), "path_version": active.get("version")}
+        payload.get("draft_path") or payload.get("active_path") or {}
+        refs = (
+            {"mission_task_id": str(runtime.active_task_id) if runtime.active_task_id else None,
+             "mission_id": str(runtime.mission_id) if runtime.mission_id else None}
+        )
         prepared = await publisher.publish(
             AGENT_CONTEXT_PREPARED,
             {
@@ -652,7 +626,6 @@ class InvestigationEngine:
             raise
         if budget is not None:
             budget.record(stage, "proposal", **decision_context(payload, result))
-        validate_written_criteria(result)
         public = {
             "stage": stage,
             **refs,
@@ -669,21 +642,7 @@ class InvestigationEngine:
             causation_id=self.last_event_id,
         )
         self.last_event_id = decided.event_id
-        active_path = await self.deps.path_store.get_active(str(runtime.run_id))
-        defaults = {
-            "run_id": str(runtime.run_id),
-            "mission_id": str(runtime.mission_id) if runtime.mission_id else None,
-            "mission_task_id": str(runtime.active_task_id) if runtime.active_task_id else None,
-            "path_id": active_path.path_id if active_path else new_id("path"),
-            "version": active_path.version + 1 if active_path else 1,
-            "parent_version": active_path.version if active_path else None,
-            "status": "candidate",
-            "goal": payload.get("goal", ""),
-            "review_records": {},
-            "changed_step_ids": [],
-            "evidence_ids": [],
-        }
-        return normalize_path_proposals(result, defaults=defaults)
+        return result
 
     async def _propose(self, *, stage, payload, response_schema, system="", budget=None):
         """Apply the same output boundary to builtin and delegated inference."""
@@ -759,6 +718,18 @@ class InvestigationEngine:
         if runtime.is_terminal:
             raise DecisionRuleError("the run is terminal; no new model request is allowed")
         if runtime.mission_id is not None:
+            from redteam.orchestration.central_runtime import process_controls
+            await process_controls(self.deps)
+            mission = await self.deps.central_state.get_mission(runtime.mission_id)
+            from redteam.orchestration.cognition import ReasoningHalted
+            from redteam.orchestration.state import TerminationReason
+
+            if mission.status in {MissionStatus.PAUSED, MissionStatus.CANCELLED}:
+                reason = (TerminationReason.OPERATOR_PAUSED
+                          if mission.status is MissionStatus.PAUSED
+                          else TerminationReason.OPERATOR_STOPPED)
+                runtime.termination_reason = reason
+                raise ReasoningHalted(reason)
             await self._review_token(runtime)
         from redteam.orchestration.cognition import ReasoningHalted
         from redteam.orchestration.reasoning_time import reasoning_time_failure
@@ -841,35 +812,18 @@ class InvestigationEngine:
             engagement_id=str(runtime.engagement_id),
         )
         mission = (
-            await self.deps.task_graph_store.get_mission(runtime.mission_id)
+            await self.deps.investigations.get_mission(runtime.mission_id)
             if runtime.mission_id
             else None
         )
-        active = await self.deps.path_store.get_active(str(runtime.run_id))
         active_task = (
-            await self.deps.task_graph_store.get_task(runtime.active_task_id)
+            await self.deps.investigations.get_task(runtime.active_task_id)
             if runtime.active_task_id
             else None
         )
-        completed_task_paths = []
         tasks = []
         if runtime.mission_id:
-            tasks = await self.deps.task_graph_store.list_tasks(mission_id=runtime.mission_id)
-            completed_ids = {
-                str(task.task_id) for task in tasks if task.status is TaskStatus.COMPLETED
-            }
-            latest: dict[str, PathPlan] = {}
-            for saved in await self.deps.path_store.list_paths(str(runtime.run_id)):
-                if (
-                    saved.mission_id != str(runtime.mission_id)
-                    or saved.mission_task_id not in completed_ids
-                    or not is_active_status(saved.status)
-                ):
-                    continue
-                previous = latest.get(saved.mission_task_id)
-                if previous is None or previous.version < saved.version:
-                    latest[saved.mission_task_id] = saved
-            completed_task_paths = [item.model_dump(mode="json") for item in latest.values()]
+            tasks = await self.deps.investigations.list_tasks(mission_id=runtime.mission_id)
         tools = {}
         execution_options = await execution_agent_options(
             service, self.deps.engagement, runtime.run_id, recipes=self.deps.execution_recipes
@@ -976,12 +930,15 @@ class InvestigationEngine:
             }
             for item in records[-20:]
         ]
-        work_history = await self.deps.work_store.list_items(run_id=runtime.run_id)
+        work_history = (await self.deps.central_state.list_executions())
         history = [
             redact_secret_material(item.model_dump(mode="json")) for item in work_history[-20:]
         ]
         instructions = []
-        if runtime.mission_id:
+        if runtime.mission_id and getattr(self.deps, "central_state", None) is not None:
+            instructions = [r.model_dump(mode="json") for r in
+                            await self.deps.central_state.list_for_mission(runtime.mission_id)]
+        elif runtime.mission_id:
             coordinator = self.deps.coordinator or coordinator_for(
                 self.deps.task_graph_store, self.deps.path_store
             )
@@ -1012,6 +969,14 @@ class InvestigationEngine:
         validity = await project_validity(
             self.deps.evidence_store, service, str(runtime.run_id), records=records,
         )
+        remaining_budget = runtime.remaining_budget
+        # Worker counters stay local; prompt capacity comes from the
+        # original shared Control decisions, never a sibling's Runtime.
+        shared_remaining = await self.deps.central_state.transaction(
+            lambda tx: tx.policy_budget_remaining(), write=False,
+        )
+        if shared_remaining is not None:
+            remaining_budget = shared_remaining
         return {
             "evidence_validity": [item.model_dump(mode="json") for item in validity],
             **reference_context,
@@ -1041,6 +1006,7 @@ class InvestigationEngine:
             "success_criteria": mission.success_criteria if mission else [runtime.current_goal],
             "mission": mission.model_dump(mode="json") if mission else None,
             "active_task": (active_task.model_dump(mode="json") if active_task else None),
+            "investigation_tasks": [task.model_dump(mode="json") for task in tasks],
             "operator_instructions": instructions,
             "engagement_constraints": {
                 "description": redact_sensitive_text(self.deps.engagement.description),
@@ -1060,8 +1026,7 @@ class InvestigationEngine:
             if self.deps.engagement
             else None,
             "knowledge": knowledge,
-            "active_path": active.model_dump(mode="json") if active else None,
-            "completed_task_paths": completed_task_paths,
+            **({}),
             "roles": [
                 {"agent_id": str(agent.agent_id), "capabilities": agent.capabilities}
                 for agent in visible_agents
@@ -1105,569 +1070,28 @@ class InvestigationEngine:
             "execution_history": history[-20:],
             "execution_history_count": len(work_history),
             "execution_history_omitted_count": max(len(work_history) - len(history), 0),
-            "delegations": [item.model_dump(mode="json") for item in runtime.delegations.values()],
-            "remaining_budget": runtime.remaining_budget,
+            **({}),
+            "remaining_budget": remaining_budget,
             "feedback": redact_secret_material(runtime.planning_feedback),
             "runtime_observations": observations_for_prompt(runtime.recent_observations),
         }
 
-    async def reference_paths(self, observation, service, runtime) -> list[dict]:
-        from redteam.attack_graph.view import AttackGraphView
-        from redteam.orchestration.context_projection import ContextProjector
 
-        references: list[dict] = []
-        diagnostics: list[DecisionDiagnostic] = []
-        self.last_reference_diagnostics = diagnostics
-        # Reference drafts never enter the executable pool, and provider
-        # order is preserved exactly.
-        view = AttackGraphView(self.deps.graph_store)
-        projector = ContextProjector(service, self.deps.context_cache)
-        task_context = await self._reference_task_context(runtime)
-        task_targets = task_context["task_target_node_ids"]
-        mission_objective = task_context["mission_objective"]
-        task_id = task_context["task_id"]
-        eligibility_context = EligibilityContext(service, self.deps.tool_catalog)
-        for agent in self.deps.agents.all():
-            if not (await self.deps.eligibility.role(agent, eligibility_context)).eligible:
-                continue
-            definition = self.deps.agents.definition(agent.agent_id)
-            if definition is None:
-                diagnostics.append(
-                    self._reference_diagnostic(
-                        "The role has no registered definition; no reference candidates were built."
-                    )
-                )
-                continue
-            provider = self.deps.candidate_providers.get(definition.provider_id)
-            if provider is None:
-                diagnostics.append(
-                    self._reference_diagnostic(
-                        "The role candidate provider is not registered; no reference "
-                        "candidates were built."
-                    )
-                )
-                continue
-            try:
-                role_observation = await projector.project(
-                    definition.context_profile,
-                    step=int(getattr(runtime, "step_count", 0) or 0),
-                    target_node_ids=list(task_targets),
-                    fallback=observation,
-                    cache_namespace=str(getattr(runtime, "run_id", "")),
-                )
-                candidate_context = self._reference_candidate_context(
-                    agent,
-                    view,
-                    role_observation,
-                    runtime,
-                    task_id,
-                    mission_objective,
-                    task_context,
-                )
-                propose_graph = getattr(provider, "propose_graph", None)
-                if callable(propose_graph):
-                    result = await propose_graph(agent, candidate_context)
-                else:
-                    legacy_propose = getattr(provider, "propose", None)
-                    if not callable(legacy_propose):
-                        raise KeyError("candidate provider has no propose entrypoint")
-                    result = await legacy_propose(
-                        agent,
-                        view,
-                        role_observation,
-                        step=int(getattr(runtime, "step_count", 0) or 0),
-                    )
-            except Exception:
-                diagnostics.append(
-                    self._reference_diagnostic(
-                        "The role candidate provider failed; no reference candidates were built."
-                    )
-                )
-                continue
-            if isinstance(result, CandidateBatch):
-                drafts = list(result.candidates)
-            elif isinstance(result, (list, tuple)):
-                drafts = list(result)
-            else:
-                diagnostics.append(
-                    self._reference_diagnostic(
-                        "The role candidate provider returned an unusable shape; no "
-                        "reference candidates were kept."
-                    )
-                )
-                continue
-            kept = [draft for draft in drafts if self._reference_draft_shape(draft)]
-            if len(kept) != len(drafts):
-                diagnostics.append(
-                    self._reference_diagnostic(
-                        "The role candidate provider returned an unusable shape; no "
-                        "reference candidates were kept."
-                    )
-                )
-            drafts = kept
-            for draft in drafts:
-                references.append(
-                    {
-                        "operation": draft.plan_step.operation_key,
-                        "purpose": draft.plan_step.reason,
-                        "targets": list(map(str, draft.target_node_ids)),
-                        "prerequisites": draft.prerequisite_ids,
-                    }
-                )
-        self.last_reference_diagnostics = diagnostics
-        return references
 
-    @staticmethod
-    def _reference_diagnostic(summary: str) -> DecisionDiagnostic:
-        """Reference-absence note; code-owned text only, never provider output."""
-        return DecisionDiagnostic(
-            code="reference_unavailable",
-            stage="reference_paths",
-            kind="reference",
-            location=known_location(("agent_id",)),
-            summary=summary,
-            retryable=False,
-        )
 
-    async def _reference_task_targets(self, runtime) -> list[str]:
-        """Fallback targets from the accepted path when the task names none."""
-        try:
-            active = await self.deps.path_store.get_active(str(runtime.run_id))
-        except Exception:
-            return []
-        if active is None:
-            return []
-        try:
-            return [
-                GraphNodeId(node_id)
-                for node_id in sorted(
-                    {str(item) for step in active.steps for item in step.target_node_ids}
-                )
-            ]
-        except Exception:
-            return []
 
-    async def _reference_task_context(self, runtime) -> dict:
-        """Live task/mission scope; path targets are fallback only.
 
-        Task objective, source, and target ids come from the task store and
-        the mission record, not from model-held runtime text.
-        """
-        task_id = getattr(runtime, "active_task_id", None)
-        task = None
-        try:
-            if task_id is not None:
-                task = await self.deps.task_graph_store.get_task(task_id)
-        except Exception:
-            task = None
-        mission = None
-        try:
-            if getattr(runtime, "mission_id", None) is not None:
-                mission = await self.deps.task_graph_store.get_mission(runtime.mission_id)
-        except Exception:
-            mission = None
-        source = getattr(getattr(task, "provenance", None), "source", None)
-        targets = list(getattr(task, "related_attack_graph_node_ids", None) or ())
-        if not targets:
-            targets = await self._reference_task_targets(runtime)
-        objective = getattr(mission, "objective", None) or getattr(runtime, "current_goal", None)
-        return {
-            "task_id": task_id,
-            "task_source": str(source) if source else None,
-            "task_objective": getattr(task, "objective", None),
-            "mission_objective": str(objective) if objective else None,
-            "task_target_node_ids": tuple(targets),
-        }
 
-    @staticmethod
-    def _reference_draft_shape(draft) -> bool:
-        """Whether a provider draft has the reference shape; no raw copying."""
-        plan_step = getattr(draft, "plan_step", None)
-        targets = getattr(draft, "target_node_ids", None)
-        prerequisites = getattr(draft, "prerequisite_ids", None)
-        if plan_step is None or targets is None or prerequisites is None:
-            return False
-        try:
-            _ = plan_step.operation_key
-            str(plan_step.reason)
-            list(map(str, targets))
-            list(prerequisites)
-        except Exception:
-            return False
-        return True
 
-    def _reference_candidate_context(
-        self, agent, view, role_observation, runtime, task_id, mission_objective, task_context
-    ):
-        """Graph context from the live run: role view, task targets, real tools.
-
-        Pairs come from every capability the agent owns, not its playbook:
-        each pair is usable only when the live catalog binds a healthy tool
-        to it. An unknown catalog or a failed catalog lookup leaves the
-        pairs unknown, never empty.
-        """
-        task_targets = task_context["task_target_node_ids"]
-        verified, operations, tool_docs = self._reference_live_operations(agent, task_context)
-        hypotheses = getattr(role_observation, "open_hypotheses", None)
-        open_hypotheses = (
-            tuple(str(item) for item in hypotheses[:20])
-            if isinstance(hypotheses, (list, tuple))
-            else ()
-        )
-        return GraphCandidateContext(
-            view=view,
-            observation=role_observation,
-            step=int(getattr(runtime, "step_count", 0) or 0),
-            task_id=str(task_id) if task_id is not None else None,
-            task_source=task_context.get("task_source"),
-            task_objective=task_context.get("task_objective"),
-            mission_objective=str(mission_objective) if mission_objective is not None else None,
-            task_target_node_ids=tuple(task_targets),
-            available_capabilities=tuple(getattr(agent, "capabilities", None) or ()),
-            open_hypotheses=open_hypotheses,
-            available_operations=tuple(operations),
-            available_tools=tuple(tool_docs),
-            operations_verified=verified,
-        )
-
-    def _reference_live_operations(self, agent, task_context):
-        """Catalog pairs across all agent capabilities; failures stay unknown."""
-        if self.deps.tool_catalog is None:
-            return False, [], []
-        catalog_failed = False
-        operations: list[tuple[str, str]] = []
-        tool_docs: list[dict] = []
-        seen: set[tuple[str, str]] = set()
-        for capability in getattr(agent, "capabilities", None) or ():
-            cap = str(capability)
-            try:
-                tools = self.deps.tool_catalog.list_by_capability(cap) or []
-            except Exception:
-                catalog_failed = True
-                continue
-            for tool in tools:
-                if tool.health_status is ToolHealthStatus.UNHEALTHY or not agent_tool_visible(
-                    tool, execution_ready=False, recipes=self.deps.execution_recipes
-                ):
-                    continue
-                try:
-                    live_operations = bound_operations(self.deps.tool_catalog, tool, cap)
-                except Exception:
-                    catalog_failed = True
-                    continue
-                for operation in live_operations:
-                    pair = (cap, str(operation))
-                    if pair in seen:
-                        continue
-                    seen.add(pair)
-                    try:
-                        usable = self.deps.tool_catalog.list_tools_for_action(pair[0], pair[1])
-                    except Exception:
-                        catalog_failed = True
-                        continue
-                    healthy = [
-                        item
-                        for item in usable or []
-                        if item.health_status is not ToolHealthStatus.UNHEALTHY
-                    ]
-                    if not healthy:
-                        continue
-                    operations.append(pair)
-                    if len(tool_docs) < 20:
-                        tool_docs.append(
-                            redact_secret_material(
-                                healthy[0].model_dump(mode="json"), drop_secret_keys=False
-                            )
-                        )
-        if catalog_failed:
-            self.last_reference_diagnostics.append(
-                self._reference_diagnostic(
-                    "The tool catalog lookup failed; executable operations are unknown."
-                )
-            )
-            return False, [], []
-        return True, operations, tool_docs
-
-    async def repair_references(self, observation, service, runtime, attempted_intents):
-        targets = {intent.target_node_id for intent in attempted_intents}
-        operations = {f"{intent.capability}.{intent.operation}" for intent in attempted_intents}
-        references = await self.reference_paths(observation, service, runtime)
-        relevant = [
-            item
-            for item in references
-            if targets.intersection(map(str, item.get("targets", [])))
-            or item.get("operation") in operations
-        ]
-        return {
-            "items": [
-                redact_secret_material(
-                    {
-                        "operation": item["operation"],
-                        "purpose": str(item["purpose"])[:300],
-                        "targets": item["targets"][:4],
-                        "prerequisites": item["prerequisites"][:4],
-                    }
-                )
-                for item in relevant[:8]
-            ],
-            "omitted_count": max(len(relevant) - 8, 0),
-        }
 
     async def _review_token(self, runtime):
-        coordinator = self.deps.coordinator or coordinator_for(
-            self.deps.task_graph_store, self.deps.path_store
-        )
+        from redteam.orchestration.central_runtime import runtime_token
+        return await runtime_token(self.deps, runtime,
+                                   require_task=runtime.active_task_id is not None)
 
-        async def capture(change):
-            if runtime.mission_id is not None:
-                change.admit(str(runtime.run_id), str(runtime.mission_id))
-            else:
-                change.legacy_scope(str(runtime.run_id))
-            return change.token(str(runtime.run_id), str(runtime.mission_id or ""))
 
-        return await coordinator.change(capture)
 
-    async def _check_review_path(self, runtime, path):
-        if path is None:
-            await self._review_token(runtime)
-            return
-        current = await self.deps.path_store.get_active(str(runtime.run_id))
-        if current is None or content_hash(current) != content_hash(path):
-            raise StateConflict("completion_path_snapshot_changed")
 
-    async def _commit_review(self, runtime, token, mutation):
-        coordinator = self.deps.coordinator or coordinator_for(
-            self.deps.task_graph_store, self.deps.path_store
-        )
-
-        async def commit(change: ChangeSet):
-            if runtime.mission_id is not None:
-                change.admit(str(runtime.run_id), str(runtime.mission_id), token=token)
-            elif change.token(str(runtime.run_id), "") != token:
-                raise StateConflict("reviewed_path_changed")
-            return await mutation(change)
-
-        return await coordinator.change(commit)
-
-    async def register_path(
-        self, proposed, runtime, context, observation, *, switch: bool = False, budget=None
-    ):
-        from redteam.attack_graph.service import AttackGraphService
-
-        budget = budget or self._decision_budget()
-        token = await self._review_token(runtime)
-        validate_written_criteria(proposed.model_dump(mode="json"))
-        active = await self.deps.path_store.get_active(str(runtime.run_id))
-        switch = switch or bool(
-            active
-            and active.mission_task_id
-            and runtime.active_task_id
-            and active.mission_task_id != str(runtime.active_task_id)
-        )
-        candidate = proposed.model_dump(mode="json")
-        candidate.update(
-            run_id=str(runtime.run_id),
-            mission_id=str(runtime.mission_id) if runtime.mission_id else None,
-            mission_task_id=str(runtime.active_task_id) if runtime.active_task_id else None,
-            path_id=active.path_id if active and not switch else new_id("path"),
-            version=active.version + 1 if active else 1,
-            parent_version=active.version if active and not switch else None,
-            status="candidate",
-            goal=context["goal"],
-        )
-        path = PathPlan.model_validate(candidate)
-        validate_path_structure(path.steps)
-        service = AttackGraphService(self.deps.graph_store)
-        for identity in path.hypothesis_ids:
-            if await service.get_hypothesis(identity) is None:
-                raise DecisionRuleError("path references a missing hypothesis")
-        for identity in path.evidence_ids:
-            evidence = await self.deps.evidence_store.get(identity)
-            if evidence is None or str(evidence.run_id) != str(runtime.run_id):
-                raise DecisionRuleError("path cites evidence from another run or missing evidence")
-        # Progress and receipts are code-owned, never accepted from a model draft.
-        for step in path.steps:
-            step.status, step.outcome, step.evidence_ids = "pending", None, []
-        # Registration judges references against fresh internal material, never
-        # the capped LLM display. A failed read admits nothing.
-        assessment = await _collect_check_assessment(self.deps, runtime, service=service)
-        blocked = assessment_blocked(assessment)
-        if blocked is not None:
-            raise DecisionRuleError(blocked)
-        known = known_target_ids(assessment)
-        registered_principals = known_principals(assessment)
-        for step in path.steps:
-            if set(step.target_node_ids) - known:
-                raise DecisionRuleError(
-                    "path references unknown target(s)",
-                    code="unresolved_target",
-                    location=known_location(("steps", "target_node_ids")),
-                )
-            if set(step.principal_refs) - registered_principals:
-                raise DecisionRuleError(
-                    "path references unregistered principal(s)",
-                    code="invalid_arguments",
-                    location=known_location(("steps", "principal_refs")),
-                )
-            if step.agent_id and self.deps.agents.get(step.agent_id) is None:
-                raise DecisionRuleError("path references unknown role")
-            if not step.completion_criteria or any(
-                not is_known_criterion(item) for item in step.completion_criteria
-            ):
-                raise DecisionRuleError("new paths require typed completion criteria")
-        references = await self.reference_paths(
-            observation,
-            AttackGraphService(self.deps.graph_store),
-            runtime,
-        )
-        reference_notes = [
-            item.model_dump(mode="json") for item in self.last_reference_diagnostics[:10]
-        ]
-        review = ReviewDecision.model_validate(
-            await self._ask(
-                stage="path_review",
-                payload={
-                    **context,
-                    "draft_path": path.model_dump(mode="json"),
-                    "code_references": references,
-                    "code_checks": (
-                        "structure passed; references unavailable: "
-                        + "; ".join(
-                            f"{item['code']}: {item['summary']}" for item in reference_notes
-                        )
-                        if reference_notes
-                        else "structure and references passed"
-                    ),
-                    "reference_diagnostics": reference_notes,
-                },
-                response_schema=self._writing_schema(ReviewDecision),
-                system=SYSTEM,
-                budget=budget,
-            )
-        )
-        if review.decision == "revise":
-            if review.path is None:
-                raise DecisionRuleError("revision review requires a replacement path")
-            assessment = await _collect_check_assessment(self.deps, runtime, service=service)
-            blocked = assessment_blocked(assessment)
-            if blocked is not None:
-                raise DecisionRuleError(blocked)
-            known = known_target_ids(assessment)
-            registered_principals = known_principals(assessment)
-            replacement = review.path.model_dump(mode="json")
-            replacement.update(
-                {
-                    key: candidate[key]
-                    for key in (
-                        "run_id",
-                        "mission_id",
-                        "mission_task_id",
-                        "path_id",
-                        "version",
-                        "parent_version",
-                        "status",
-                        "goal",
-                    )
-                }
-            )
-            path = PathPlan.model_validate(replacement)
-            validate_path_structure(path.steps)
-            for identity in path.hypothesis_ids:
-                if await service.get_hypothesis(identity) is None:
-                    raise DecisionRuleError("reviewed path references a missing hypothesis")
-            for identity in path.evidence_ids:
-                evidence = await self.deps.evidence_store.get(identity)
-                if evidence is None or str(evidence.run_id) != str(runtime.run_id):
-                    raise DecisionRuleError("reviewed path cites unrelated evidence")
-            for step in path.steps:
-                step.status, step.outcome, step.evidence_ids = "pending", None, []
-                if (
-                    set(step.target_node_ids) - known
-                    or set(step.principal_refs) - registered_principals
-                    or (step.agent_id and self.deps.agents.get(step.agent_id) is None)
-                    or not step.completion_criteria
-                    or any(not is_known_criterion(item) for item in step.completion_criteria)
-                ):
-                    raise DecisionRuleError("reviewed path has invalid references or criteria")
-        if review.decision == "revise":
-            # The review supplied a replacement, which has not itself passed a
-            # semantic review. Re-enter using the same shared call budget.
-            return await self.register_path(
-                path, runtime, context, observation, switch=switch, budget=budget
-            )
-        if review.decision in {"reject", "hold"}:
-            history = path.model_dump(mode="json")
-            history.update(
-                path_id=new_id("path_review"),
-                version=1,
-                parent_version=None,
-                status="rejected" if review.decision == "reject" else "candidate",
-                reason=review.reason,
-            )
-
-            async def save_history(change):
-                return await change.paths.register(PathPlan.model_validate(history))
-
-            await self._commit_review(runtime, token, save_history)
-            return None
-        accepted = path.model_dump(mode="json")
-        latest = await _collect_check_assessment(self.deps, runtime, service=service)
-        blocked = assessment_blocked(latest)
-        if blocked is not None:
-            raise DecisionRuleError(blocked)
-        if any(
-            set(step.target_node_ids) - known_target_ids(latest)
-            or set(step.principal_refs) - known_principals(latest)
-            for step in path.steps
-        ):
-            raise DecisionRuleError("path references changed during review")
-        accepted.update(status="accepted", reason=review.reason)
-        if active:
-            accepted["changed_step_ids"] = changed_steps_and_descendants(
-                active.steps,
-                path.steps,
-                [],
-            )
-        if "review_records" in PathPlan.model_fields:
-            accepted["review_records"] = {"decision": review.decision, "reason": review.reason}
-
-        async def save_path(change):
-            return await change.paths.register(
-                PathPlan.model_validate(accepted),
-                expected_version=active.version if active else None,
-                expected_path_id=active.path_id if active else None,
-            )
-
-        registered = await self._commit_review(runtime, token, save_path)
-        if active:
-            await self.invalidate_pending(active, registered, runtime)
-        return registered
-
-    async def invalidate_pending(self, previous, current, runtime):
-        previous_steps = {item.step_id: item for item in previous.steps}
-        current_steps = {item.step_id: item for item in current.steps}
-        changed = set(current.changed_step_ids) | (set(previous_steps) - set(current_steps))
-        for identity, old in previous_steps.items():
-            new = current_steps.get(identity)
-            if new is not None:
-                if not step_definition_equal(old, new):
-                    changed.add(identity)
-        while True:
-            descendants = {
-                item.step_id for item in previous.steps if set(item.depends_on) & changed
-            }
-            if descendants <= changed:
-                break
-            changed.update(descendants)
-        if previous.path_id != current.path_id:
-            changed = set(previous_steps)
-        now = datetime.now(timezone.utc)
-        await self.deps.work_store.invalidate_pending(
-            run_id=runtime.run_id,
-            path_id=previous.path_id,
-            step_ids=changed,
-            now=now,
-        )
         # LEASED is checked again on admission; RUNNING keeps its real result.
 
     @staticmethod
@@ -1728,936 +1152,9 @@ class InvestigationEngine:
             ),
         )
 
-    async def decide(self, runtime, observation, *, last_event_id=None):
-        self._event_runtime = runtime
-        self.updated_runtime = runtime
-        self.last_event_id = last_event_id
-        await self._review_token(runtime)
-        context = await self.context(runtime, observation)
-        path = await self.deps.path_store.get_active(str(runtime.run_id))
-        if (
-            path
-            and path.mission_task_id
-            and runtime.active_task_id
-            and path.mission_task_id != str(runtime.active_task_id)
-        ):
-            path = None
-        if path is None:
-            drafting_budget = self._decision_budget()
-            while drafting_budget.permits():
-                try:
-                    draft = PathPlan.model_validate(
-                        await self._ask(
-                            stage="path_draft",
-                            payload=context,
-                            response_schema=self._writing_schema(PathPlan),
-                            system=SYSTEM,
-                            budget=drafting_budget,
-                        )
-                    )
-                    path = await self.register_path(
-                        draft, runtime, context, observation, budget=drafting_budget
-                    )
-                    break
-                except (ValueError, TypeError, PathError) as exc:
-                    diagnostic = diagnostic_for_exception(exc, stage="path_draft")
-                    if isinstance(exc, CriterionWritingError):
-                        diagnostic = DecisionDiagnostic(
-                            code=exc.code,
-                            stage="path_draft",
-                            kind="format",
-                            location=exc.location,
-                            summary=exc.description,
-                            retryable=True,
-                        )
-                    drafting_budget.last_failure = diagnostic
-                    self._record_rejection(drafting_budget, "path_draft", diagnostic)
-                    context["feedback"] = (
-                        [exc.correction()]
-                        if isinstance(exc, CriterionWritingError)
-                        else [diagnostic.feedback()]
-                    )
-            else:
-                raise self._budget_failure("path_draft", drafting_budget)
-            if path is None:
-                return None, [], "path held or rejected"
-        from redteam.orchestration.delegated_runtime import decide_delegations
 
-        delegated, advanced = await decide_delegations(self, path, runtime, context)
-        runtime = self.updated_runtime or runtime
-        if delegated:
-            return path, delegated, None
-        if advanced:
-            return path, [], "continue_planning"
-        extra = []
-        last_control_succeeded = False
-        budget = self._decision_budget()
-        while budget.permits():
-            context["active_path"] = path.model_dump(mode="json")
-            try:
-                decision = TurnDecision.model_validate(
-                    await self._ask(
-                        stage="next_action",
-                        payload={**context, "additional_evidence": extra},
-                        response_schema=self._writing_schema(TurnDecision),
-                        system=SYSTEM,
-                        budget=budget,
-                    )
-                )
-            except (ValueError, TypeError, PathError) as exc:
-                diagnostic = diagnostic_for_exception(exc, stage="next_action")
-                if isinstance(exc, CriterionWritingError):
-                    diagnostic = DecisionDiagnostic(
-                        code=exc.code,
-                        stage="next_action",
-                        kind="format",
-                        location=exc.location,
-                        summary=exc.description,
-                        retryable=True,
-                    )
-                    context["feedback"] = [exc.correction()]
-                else:
-                    context["feedback"] = [diagnostic.feedback()]
-                budget.last_failure = diagnostic.model_copy(update={"attempts": budget.used})
-                self._record_rejection(budget, "next_action", diagnostic)
-                continue
-            try:
-                last_control_succeeded = False
-                if decision.tool_calls:
-                    extra.extend(await self.execute_local_calls(
-                        [call.model_dump(mode="json") for call in decision.tool_calls],
-                        runtime=runtime, path=path, budget=budget,
-                    ))
-                    context = await self.context(runtime, observation)
-                    last_control_succeeded = True
-                    if decision.mode == "tool_calls":
-                        continue
-                elif decision.mode == "tool_calls":
-                    raise DecisionRuleError("local tool decision needs tool_calls")
-                if decision.mode == "delegate":
-                    from redteam.orchestration.delegated_runtime import accept_delegations
 
-                    if not decision.delegations:
-                        raise DecisionRuleError(
-                            "delegation decision needs an investigation purpose"
-                        )
-                    await accept_delegations(self, path, decision.delegations, runtime)
-                    return path, [], "continue_planning"
-                if decision.mode == "read_evidence":
-                    request = decision.evidence_request
-                    if request.get("target_references"):
-                        from redteam.orchestration.target_references import register_references
 
-                        accepted = await register_references(
-                            self.deps.evidence_store, runtime, request["target_references"]
-                        )
-                        extra.append({"referenced_targets": accepted, "presence": "unconfirmed"})
-                    extra.append(
-                        await read_for_runtime(
-                            self.deps.evidence_store, runtime,
-                            EvidenceReadRequest.model_validate(request),
-                        )
-                    )
-                    # The narrowed completion review reads requested windows
-                    # from this same context. Refresh them here so a later
-                    # complete_* in this round sees what was just read,
-                    # reusing the existing restore path; no new store/cache.
-                    context["requested_evidence"] = await restore_reads(
-                        self.deps.evidence_store, runtime
-                    )
-                    last_control_succeeded = True
-                    continue
-                if decision.mode == "update_hypothesis":
-                    from redteam.attack_graph.service import AttackGraphService
-
-                    service = AttackGraphService(self.deps.graph_store)
-                    suggestion = decision.hypothesis_update
-                    target_id = str(suggestion.get("target_node_id", ""))
-                    hypothesis_assessment = await _collect_check_assessment(
-                        self.deps, runtime, service=service
-                    )
-                    hypothesis_blocked = assessment_blocked(hypothesis_assessment)
-                    if hypothesis_blocked is not None:
-                        raise DecisionRuleError(hypothesis_blocked)
-                    if target_id not in known_target_ids(hypothesis_assessment):
-                        raise DecisionRuleError(
-                            "hypothesis target is unknown",
-                            code="unresolved_target",
-                            location=known_location(("target_node_id",)),
-                        )
-                    description = suggestion.get("description")
-                    if not isinstance(description, str) or not description.strip():
-                        raise DecisionRuleError("hypothesis needs a claim")
-                    hypothesis_id = str(suggestion.get("hypothesis_id") or new_id("hyp"))
-                    existing = await service.get_hypothesis(hypothesis_id)
-                    if existing and existing.metadata.get("target_node_id") != target_id:
-                        raise DecisionRuleError(
-                            "a hypothesis revision cannot change its target identity"
-                        )
-                    evidence_ids = list(map(str, suggestion.get("evidence_ids", [])))
-                    for identity in evidence_ids:
-                        evidence = await self.deps.evidence_store.get(identity)
-                        if (
-                            evidence is None
-                            or str(evidence.run_id) != str(runtime.run_id)
-                            or evidence.metadata.get("target_node_id") != target_id
-                        ):
-                            raise DecisionRuleError("hypothesis cites unrelated evidence")
-                    revision_history = (
-                        list(existing.metadata.get("revisions", [])) if existing else []
-                    )
-                    if existing:
-                        revision_history.append(
-                            {
-                                "claim": existing.description,
-                                "status": _text(existing.status),
-                                "evidence_ids": existing.metadata.get("evidence_ids", []),
-                            }
-                        )
-                    hypothesis = Hypothesis(
-                        hypothesis_id=hypothesis_id,
-                        description=description,
-                        confidence=float(suggestion.get("confidence", 0.3)),
-                        status="open",
-                        metadata={
-                            **(existing.metadata if existing else {}),
-                            "target_node_id": target_id,
-                            "evidence_ids": evidence_ids,
-                            "needs": suggestion.get("needs", []),
-                            "previous_claim": existing.description if existing else None,
-                            "revisions": revision_history,
-                            "neutral_evidence_ids": evidence_ids,
-                            "supporting_evidence_ids": [],
-                            "refuting_evidence_ids": [],
-                            "path_id": path.path_id,
-                            "path_version": path.version,
-                        },
-                    )
-                    await service.record_hypothesis(
-                        hypothesis,
-                        about=GraphNodeId(target_id),
-                        step=runtime.step_count,
-                        provenance=Provenance(
-                            source="llm:hypothesis",
-                            run_id=str(runtime.run_id),
-                            step=runtime.step_count,
-                            confidence=Confidence.INFERRED,
-                        ),
-                    )
-                    context = await self.context(runtime, observation)
-                    last_control_succeeded = True
-                    continue
-                if decision.mode == "recover_evidence":
-                    from redteam.attack_graph.service import AttackGraphService
-                    from redteam.orchestration.recovery import reprocess_evidence
-
-                    evidence_id = str(decision.evidence_request.get("evidence_id", ""))
-                    model_budget = budget
-                    before_usage = (budget.used, budget.tokens_used, budget.unknown_usage_count)
-                    try:
-                        recovered = await reprocess_evidence(
-                            evidence_id=evidence_id,
-                            run_id=str(runtime.run_id),
-                            evidence_store=self.deps.evidence_store,
-                            graph_service=AttackGraphService(self.deps.graph_store),
-                            verifier=self.deps.verifier,
-                            result_mappers=self.deps.result_mappers,
-                            budget=model_budget,
-                            before_call=self._ensure_reasoning_allowed,
-                        )
-                    except Exception as exc:
-                        recovered = {
-                            "status": "failed",
-                            "evidence_id": evidence_id,
-                            "reason": type(exc).__name__,
-                        }
-                    finally:
-                        runtime.model_requests_used += budget.used - before_usage[0]
-                        runtime.model_tokens_used += budget.tokens_used - before_usage[1]
-                        runtime.model_usage_unknown += budget.unknown_usage_count - before_usage[2]
-                    extra.append(recovered)
-                    context = await self.context(runtime, observation)
-                    last_control_succeeded = True
-                    continue
-                if decision.mode == "reconcile_job":
-                    extra.append(await self.reconcile_job(
-                        decision.evidence_request, runtime, budget=budget
-                    ))
-                    context = await self.context(runtime, observation)
-                    last_control_succeeded = True
-                    continue
-                if decision.mode in {"revise_path", "switch_path"}:
-                    if decision.path is None:
-                        raise DecisionRuleError("path change needs a structured path")
-                    if not budget.permits():
-                        return path, [], "continue_planning"
-                    try:
-                        updated = await self.register_path(
-                            decision.path,
-                            runtime,
-                            context,
-                            observation,
-                            switch=decision.mode == "switch_path",
-                            budget=budget,
-                        )
-                    except DecisionFailure as exc:
-                        if exc.diagnostic.code != "decision_normal_budget_exhausted":
-                            raise
-                        self.planning_diagnostic = exc.diagnostic
-                        return path, [], "continue_planning"
-                    if updated is None:
-                        return path, [], "path revision held"
-                    path = updated
-                    last_control_succeeded = True
-                    continue
-                if decision.mode == "complete_step":
-                    # Unresolved settlement needs no further model call, so the
-                    # structured unresolved proposal bypasses the review gate.
-                    if not budget.permits() and not _structured_completion_unresolved(decision):
-                        self.planning_diagnostic = self._budget_failure(
-                            "completion_review", budget
-                        ).diagnostic
-                        return path, [], "continue_planning"
-                    path, errors = await self.complete_step(
-                        path, decision, runtime, context, budget=budget
-                    )
-                    if errors:
-                        budget.last_failure = DecisionDiagnostic(
-                            code="completion_or_action_not_admitted",
-                            stage="next_action",
-                            kind="semantic",
-                            attempts=budget.used,
-                            summary="Evidence, path or execution checks rejected this decision.",
-                            retryable=True,
-                        )
-                    context["feedback"] = self._safe_errors(errors, budget)
-                    last_control_succeeded = not errors
-                    continue
-                if decision.mode == "complete_goal":
-                    if not budget.permits() and not _structured_completion_unresolved(decision):
-                        self.planning_diagnostic = self._budget_failure(
-                            "completion_review", budget
-                        ).diagnostic
-                        return path, [], "continue_planning"
-                    errors = await self.complete_goal(
-                        path, decision, runtime, context, budget=budget
-                    )
-                    if not errors:
-                        unresolved = (
-                            CompletionProposal.model_validate(
-                                decision.completion
-                            ).unresolved
-                            if decision.completion
-                            else False
-                        )
-                        return path, [], "investigation_finished" if unresolved else "goal_achieved"
-                    budget.last_failure = DecisionDiagnostic(
-                        code="completion_or_action_not_admitted",
-                        stage="next_action",
-                        kind="semantic",
-                        attempts=budget.used,
-                        summary="Evidence, path or execution checks rejected this decision.",
-                        retryable=True,
-                    )
-                    context["feedback"] = self._safe_errors(errors, budget)
-                    continue
-                if decision.mode == "complete_task":
-                    if not budget.permits() and not _structured_completion_unresolved(decision):
-                        self.planning_diagnostic = self._budget_failure(
-                            "completion_review", budget
-                        ).diagnostic
-                        return path, [], "continue_planning"
-                    errors = await self.complete_task(
-                        path, decision, runtime, context, budget=budget
-                    )
-                    if not errors:
-                        unresolved = (
-                            CompletionProposal.model_validate(
-                                decision.completion
-                            ).unresolved
-                            if decision.completion
-                            else False
-                        )
-                        return path, [], "task_blocked" if unresolved else "task_completed"
-                    budget.last_failure = DecisionDiagnostic(
-                        code="completion_or_action_not_admitted",
-                        stage="next_action",
-                        kind="semantic",
-                        attempts=budget.used,
-                        summary="Evidence, path or execution checks rejected this decision.",
-                        retryable=True,
-                    )
-                    context["feedback"] = self._safe_errors(errors, budget)
-                    continue
-                if decision.mode == "hold":
-                    return path, [], decision.reason
-                if not decision.actions:
-                    raise DecisionRuleError("actions decision contained no actions")
-                compiled, errors = await self.compile_actions(
-                    path, decision.actions, runtime, context
-                )
-                if errors and not compiled:
-                    budget.last_failure = DecisionDiagnostic(
-                        code="completion_or_action_not_admitted",
-                        stage="next_action",
-                        kind="semantic",
-                        attempts=budget.used,
-                        summary="Evidence, path or execution checks rejected this decision.",
-                        retryable=True,
-                    )
-                    context["feedback"] = self._safe_errors(errors, budget)
-                    from redteam.attack_graph.service import AttackGraphService
-
-                    context["repair_references"] = await self.repair_references(
-                        observation,
-                        AttackGraphService(self.deps.graph_store),
-                        runtime,
-                        decision.actions,
-                    )
-                    continue
-                if errors:
-                    self.updated_runtime = runtime.model_copy(
-                        update={"planning_feedback": self._safe_errors(errors, budget)}
-                    )
-                    await EventPublisher(
-                        self.deps.event_bus,
-                        run_id=runtime.run_id,
-                        engagement_id=runtime.engagement_id,
-                        source="orchestration.engine",
-                    ).publish(
-                        "ActionProposalsRejected",
-                        {"diagnostics": self._safe_errors(errors, budget)},
-                        causation_id=self.last_event_id,
-                    )
-                return path, compiled, None
-            except (ValueError, TypeError, KeyError, PathError) as exc:
-                diagnostic = diagnostic_for_exception(exc, stage="next_action")
-                budget.last_failure = diagnostic
-                self._record_rejection(budget, "next_action", diagnostic)
-                context["feedback"] = [diagnostic.feedback()]
-                continue
-        if last_control_succeeded:
-            return path, [], "continue_planning"
-        raise self._budget_failure("next_action", budget)
-
-    async def compile_actions(self, path, intents, runtime, context):
-        await self._review_token(runtime)
-        from redteam.attack_graph.service import AttackGraphService
-
-        service = AttackGraphService(self.deps.graph_store)
-        # One fresh read shared by every candidate in this batch; the
-        # plan-time display is never used for execution judgment.
-        assessment = await _collect_check_assessment(self.deps, runtime, service=service)
-        blocked = assessment_blocked(assessment)
-        if blocked is not None:
-            return [], [blocked]
-        eligibility_context = EligibilityContext(service, self.deps.tool_catalog)
-        steps = {step.step_id: step for step in path.steps}
-        drafts = []
-        errors = []
-        for intent_index, intent in enumerate(intents):
-            try:
-                step = steps.get(intent.path_step_id)
-                if step is None:
-                    raise DecisionRuleError("action is outside accepted path")
-                checks = check_ready_step(path, step, assessment)
-                if checks:
-                    raise DecisionRuleError(
-                        "accepted step prerequisites are not satisfied: " + "; ".join(checks),
-                        code="step_prerequisites_unmet",
-                        location=_action_location(intent_index, "path_step_id"),
-                    )
-                if intent.target_node_id not in known_target_ids(assessment):
-                    raise DecisionRuleError(
-                        "action target is not supplied or observed",
-                        code="unresolved_target",
-                        location=_action_location(intent_index, "target_node_id"),
-                    )
-                agent = self.deps.agents.get(intent.agent_id)
-                if agent is None:
-                    raise DecisionRuleError("action role is unavailable")
-                tool_for_eligibility = (
-                    self.deps.tool_catalog.get(intent.tool_id) if self.deps.tool_catalog else None
-                )
-                if tool_for_eligibility is not None:
-                    definition = self.deps.agents.definition(agent.agent_id)
-                    if not role_tool_visible(definition, tool_for_eligibility):
-                        raise DecisionRuleError(
-                            "tool is not registered in the delegated role's catalog"
-                        )
-                    eligible = await self.deps.eligibility.action(
-                        agent, tool_for_eligibility, intent.target_node_id, eligibility_context
-                    )
-                    if not eligible.eligible:
-                        raise DecisionRuleError("role_or_tool_inactive:" + eligible.reason)
-                execution_node = None
-                execution_tool = None
-                if intent.binding_mode == "legacy_action" and (
-                    intent.operation in EXECUTION_OPERATIONS
-                    or any(
-                        recipe.operation == intent.operation
-                        for recipe in self.deps.execution_recipes.values()
-                    )
-                ):
-                    execution_node = await service.get_node(GraphNodeId(intent.target_node_id))
-                    if execution_node is None:
-                        raise DecisionRuleError("execution Agent target disappeared")
-                    if self.deps.tool_catalog is None:
-                        raise DecisionRuleError("a real tool catalog is required for execution")
-                    execution_tool = self.deps.tool_catalog.get(intent.tool_id)
-                    if execution_tool is None:
-                        raise DecisionRuleError(
-                            "No live tool binding serves the requested operation.",
-                            code="no_tool_for_operation",
-                            location=_action_location(intent_index, "operation"),
-                        )
-                    intent = intent.model_copy(
-                        update={
-                            "arguments": bind_execution_arguments(
-                                engagement=self.deps.engagement,
-                                run_id=runtime.run_id,
-                                node=execution_node,
-                                tool=execution_tool,
-                                capability=intent.capability,
-                                operation=intent.operation,
-                                arguments=intent.arguments,
-                                recipes=self.deps.execution_recipes,
-                            )
-                        }
-                    )
-                operation = (
-                    str(intent.tool_id)
-                    if intent.binding_mode == "selected_tool"
-                    else f"{intent.capability}.{intent.operation}"
-                )
-                exclusions = await operator_exclusions(
-                    self.deps,
-                    runtime,
-                    GraphNodeId(intent.target_node_id),
-                    operation,
-                    arguments=intent.arguments,
-                    assessment_text=step.objective,
-                )
-                if exclusions:
-                    raise DecisionRuleError("; ".join(exclusions))
-                _principal_check(
-                    step,
-                    intent.principal_ref,
-                    intent.arguments,
-                    assessment,
-                    _action_location(intent_index, "arguments"),
-                )
-                node = execution_node or await service.get_node(GraphNodeId(intent.target_node_id))
-                reference = assessment.targets.get(intent.target_node_id)
-                reference_target = reference.execution_target if reference is not None else None
-                if node is None and reference_target is None:
-                    raise DecisionRuleError(
-                        "referenced action target disappeared",
-                        code="unresolved_target",
-                        location=_action_location(intent_index, "target_node_id"),
-                    )
-                if reference_target is not None:
-                    target = reference_target
-                else:
-                    node_facts = facts_of(node.properties)
-                    target = target_for_node(
-                        node.id,
-                        node.type,
-                        observed=node_facts.get("observed_target"),
-                        device_serial=node_facts.get("device_serial"),
-                        device_ref=node_facts.get("device_ref"),
-                        package_name=node_facts.get("package_name"),
-                    )
-                if self.deps.tool_catalog is None:
-                    raise DecisionRuleError(
-                        "a real tool catalog is required for action compilation"
-                    )
-                if self.deps.tool_catalog.get(intent.tool_id) is None:
-                    raise DecisionRuleError(
-                        "No live tool binding serves the requested operation.",
-                        code="no_tool_for_operation",
-                        location=_action_location(intent_index, "operation"),
-                    )
-                asset_bindings = asset_argument_bindings(self.deps, target)
-                aliases = target_aliases(self.deps, target)
-                argument_defaults = dict(asset_bindings)
-                if (
-                    len(aliases) == 1
-                    and self.deps.tool_catalog.get(
-                        intent.tool_id
-                    ).target_binding.binds_target_arguments
-                ):
-                    argument_defaults["target_ref"] = aliases
-                intent = intent.model_copy(
-                    update={
-                        "arguments": bind_asset_arguments(
-                            intent.arguments,
-                            self.deps.tool_catalog.get(intent.tool_id),
-                            argument_defaults,
-                        )
-                    }
-                )
-                validate_argument_target(
-                    target,
-                    intent.arguments,
-                    aliases,
-                    operation=intent.operation,
-                    asset_bindings=asset_bindings,
-                    operation_bindings=self.deps.operation_bindings,
-                    argument_bindings=self.deps.tool_catalog.get(intent.tool_id).argument_bindings,
-                    target_binding=self.deps.tool_catalog.get(intent.tool_id).target_binding,
-                )
-                tool = execution_tool or self.deps.tool_catalog.get(intent.tool_id)
-                if tool is None:
-                    raise DecisionRuleError(
-                        "No live tool binding serves the requested operation.",
-                        code="no_tool_for_operation",
-                        location=_action_location(intent_index, "operation"),
-                    )
-                from redteam.core.outbound_text import check_outbound_arguments
-
-                outbound = check_outbound_arguments(
-                    intent.arguments,
-                    tool.outbound_text_fields,
-                    self.deps.engagement.external_text_policy.prohibited_patterns
-                    if self.deps.engagement
-                    else (),
-                )
-                if outbound.blocked:
-                    # Reject before work, dispatch and checkpoints retain the
-                    # selected text. The actual Control gate owns the verdict.
-                    from redteam.core.contracts.action import ActionProposal
-                    from redteam.core.contracts.policy import ControlContext
-                    from redteam.core.enums import PolicyVerdict
-
-                    proposal = ActionProposal(
-                        action_id=new_id("action"),
-                        run_id=runtime.run_id,
-                        engagement_id=runtime.engagement_id,
-                        agent_id=intent.agent_id,
-                        instance_id=runtime.instance_id,
-                        capability=intent.capability,
-                        operation=intent.operation,
-                        tool_id=intent.tool_id,
-                        binding_mode=intent.binding_mode,
-                        target=target,
-                        arguments=intent.arguments,
-                        reason=intent.reason,
-                        availability_impact=intent.availability_impact,
-                        created_at=datetime.now(timezone.utc),
-                    )
-                    async with self.deps.policy_lock:
-                        decision = await self.deps.control_plane.evaluate(
-                            proposal,
-                            ControlContext(
-                                engagement_id=runtime.engagement_id,
-                                agent_id=intent.agent_id,
-                                selected_tool_id=tool.tool_id,
-                                correlation_id=str(proposal.action_id),
-                            ),
-                        )
-                    if decision.verdict is not PolicyVerdict.DENY:
-                        raise DecisionRuleError(
-                            "outbound text rejection was not enforced by Control"
-                        )
-                    await self.deps.evidence_store.append(
-                        EvidenceRecord(
-                            evidence_id=new_id("evidence"),
-                            run_id=runtime.run_id,
-                            engagement_id=runtime.engagement_id,
-                            source_type=EvidenceSourceType.SYSTEM,
-                            source_id="orchestration.policy_preflight",
-                            content_type="application/json",
-                            digest=content_hash({"reason": outbound.reason_code}),
-                            summary="External text rejected before persistent action storage",
-                            created_at=datetime.now(timezone.utc),
-                            metadata={
-                                "record_kind": "policy_rejection",
-                                "action_id": str(proposal.action_id),
-                                "reason_code": outbound.reason_code,
-                                "verdict": decision.verdict.value,
-                            },
-                        )
-                    )
-                    raise DecisionRuleError("outbound_text_blocked:" + str(outbound.reason_code))
-                if await self.has_ambiguous_execution(intent, runtime):
-                    raise DecisionRuleError(
-                        "matching execution is uncertain; reconcile its stored result/job"
-                    )
-                if (
-                    intent.expectation
-                    and intent.expectation.violation_if_met
-                    and (
-                        intent.expectation.kind == "tool_succeeded"
-                        or intent.expectation.field in {"status", "status_code", "success"}
-                    )
-                ):
-                    raise DecisionRuleError("tool success or status alone cannot prove a violation")
-                if intent.existing_hypothesis_id:
-                    if intent.hypothesis is not None:
-                        raise DecisionRuleError(
-                            "choose an existing hypothesis or a new claim, not both"
-                        )
-                    hypothesis = await service.get_hypothesis(intent.existing_hypothesis_id)
-                    if hypothesis is None:
-                        raise DecisionRuleError("action references a missing hypothesis")
-                    if hypothesis.metadata.get("target_node_id") != intent.target_node_id:
-                        raise DecisionRuleError(
-                            "existing hypothesis has no matching target binding"
-                        )
-                plan = PlanStep(
-                    step_id=step.step_id,
-                    path_id=path.path_id,
-                    path_version=path.version,
-                    path_step_id=step.step_id,
-                    principal_ref=intent.principal_ref,
-                    operator_intent_id=await operator_epoch(self.deps, runtime),
-                    intent_index=intent_index,
-                    availability_impact=intent.availability_impact,
-                    capability=intent.capability,
-                    operation=intent.operation,
-                    binding_mode=intent.binding_mode,
-                    tool_id=intent.tool_id,
-                    compatible_tool_ids=[intent.tool_id],
-                    target=target,
-                    arguments=intent.arguments,
-                    reason=intent.reason,
-                    expected_observation=intent.expected_observation,
-                    hypothesis=intent.hypothesis,
-                    existing_hypothesis_id=intent.existing_hypothesis_id,
-                    expectation=intent.expectation,
-                    authentication_check=intent.authentication_check,
-                    assessment_kind="security_check"
-                    if intent.hypothesis or intent.existing_hypothesis_id
-                    else "observation",
-                )
-                drafts.append(
-                    CandidateDraft(
-                        agent_id=intent.agent_id,
-                        plan_step=plan,
-                        target_node_ids=[node_id_for_target(target)],
-                        prerequisite_fingerprint=assessment.fact_fingerprint,
-                        execution_identity_version=2,
-                        conflict_keys=[f"target:{node_id_for_target(target)}"],
-                    )
-                )
-            except (ValueError, TypeError, KeyError) as exc:
-                errors.append(
-                    exc.diagnostic.feedback()
-                    if isinstance(exc, DecisionRuleError)
-                    else diagnostic_for_exception(exc, stage="action_compilation").feedback()
-                )
-        compiled, rejected = CandidateCompiler(
-            self.deps.tool_catalog, operation_bindings=self.deps.operation_bindings
-        ).compile_drafts_with_rejections(
-            drafts,
-        )
-        # Canonical compiler verdicts stay distinct: unsupported operations,
-        # unresolvable targets, and bad arguments each keep their own code.
-        errors.extend(_rejection_feedback(item.reason, item.field) for item in rejected)
-        # Scores are telemetry. Preserve the LLM's order exactly.
-        compiled.sort(key=lambda item: item.plan_step.intent_index)
-        # Execution identity does not change when a claim, role or path is renamed.
-        # A different tool or grounded investigation state is a different attempt.
-        for item in compiled:
-            identity = {
-                "tool_id": str(item.tool.tool_id),
-                "arguments": item.plan_step.arguments,
-                "targets": list(map(str, item.draft.target_node_ids)),
-                "principal_ref": item.plan_step.principal_ref,
-                "knowledge": item.draft.prerequisite_fingerprint,
-            }
-            if item.plan_step.binding_mode == "legacy_action":
-                identity["operation"] = item.plan_step.operation_key
-            item.candidate_key = (
-                "cand_"
-                + hashlib.sha256(
-                    json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
-                ).hexdigest()[:24]
-            )
-        admitted = []
-        for item in compiled:
-            errors_before = len(errors)
-            try:
-                validate_argument_target(
-                    item.plan_step.resolved_target(),
-                    item.plan_step.arguments,
-                    target_aliases(self.deps, item.plan_step.resolved_target()),
-                    operation=item.plan_step.operation,
-                    asset_bindings=asset_argument_bindings(
-                        self.deps, item.plan_step.resolved_target()
-                    ),
-                    operation_bindings=self.deps.operation_bindings,
-                    argument_bindings=item.tool.argument_bindings,
-                    target_binding=item.tool.target_binding,
-                )
-                _principal_check(
-                    steps[item.plan_step.path_step_id],
-                    item.plan_step.principal_ref,
-                    item.plan_step.arguments,
-                    assessment,
-                    known_location(("arguments",)),
-                )
-            except (ValueError, TypeError) as exc:
-                errors.append(
-                    exc.diagnostic.feedback()
-                    if isinstance(exc, DecisionRuleError)
-                    else diagnostic_for_exception(exc, stage="action_compilation").feedback()
-                )
-            history = await self.deps.work_store.list_items(run_id=runtime.run_id)
-            if any(
-                work.candidate_key == item.candidate_key
-                and work.status is not WorkStatus.PENDING
-                and not is_unexecuted_stale(work)
-                for work in history
-            ):
-                errors.append("identical action already recorded; choose an evidenced new action")
-            elif await self._legacy_identity_conflict(item, history, runtime):
-                # A legacy hash cannot reveal its original inputs. Do not
-                # silently repeat work on upgrade or infer novelty from a
-                # different hash; require reconciliation of the old execution.
-                errors.append("legacy execution identity requires reconciliation before retry")
-            if len(errors) == errors_before:
-                admitted.append(item)
-        return admitted, errors
-
-    async def _legacy_identity_conflict(self, candidate, history, runtime) -> bool:
-        legacy = [
-            work
-            for work in history
-            if work.execution_identity_version < 2
-            and work.candidate_key.startswith("cand_")
-            and set(work.target_node_ids) & set(candidate.draft.target_node_ids)
-            and not is_unexecuted_stale(work)
-        ]
-        if not legacy:
-            return False
-        try:
-            records = await self.deps.evidence_store.list_for_run(runtime.run_id)
-        except Exception:  # noqa: BLE001 - unknown execution is not permission to retry
-            return True
-        for work in legacy:
-            originals = [
-                record
-                for record in records
-                if record.run_id == runtime.run_id
-                and record.engagement_id == runtime.engagement_id
-                and record.metadata.get("candidate_key") == work.candidate_key
-                and (raw_from_metadata(record.metadata) is not None)
-            ]
-            if not originals:
-                return True
-            for original in originals:
-                try:
-                    previous = PlanStep.model_validate(original.metadata.get("plan_step"))
-                    previous_target = previous.resolved_target()
-                    if previous_target is None:
-                        return True
-                    target_id = node_id_for_target(previous_target)
-                except (ValueError, TypeError):
-                    return True
-                raw = raw_from_metadata(original.metadata)
-                if (
-                    target_id not in work.target_node_ids
-                    or not isinstance(raw, dict)
-                    or raw.get("tool_id") != previous.tool_id
-                ):
-                    return True
-                current = candidate.plan_step
-                if (
-                    previous.tool_id == current.tool_id
-                    and previous.operation_key == current.operation_key
-                    and previous.arguments == current.arguments
-                    and previous.principal_ref == current.principal_ref
-                ):
-                    return True
-        return False
-
-    async def has_ambiguous_execution(self, intent, runtime) -> bool:
-        from redteam.core.contracts.tool import execution_outcome_uncertain
-        from redteam.orchestration.execution_journal import (
-            checked_receipt,
-            execution_processed,
-            preserved_result,
-        )
-
-        records = await self.deps.evidence_store.list_for_run(runtime.run_id)
-        for record in records:
-            proposal = record.metadata.get("proposal", {})
-            if (
-                record.metadata.get("receipt_kind") != "execution_submission"
-                or record.metadata.get("instance_id") != runtime.instance_id
-                or record.metadata.get("target_node_id") != intent.target_node_id
-                or proposal.get("arguments") != intent.arguments
-                or not (
-                    proposal.get("tool_id") == intent.tool_id
-                    if intent.binding_mode == "selected_tool"
-                    else proposal.get("capability") == intent.capability
-                    and proposal.get("operation") == intent.operation
-                )
-            ):
-                continue
-            checked_receipt(record)
-            original = await preserved_result(
-                self.deps.evidence_store, run_id=runtime.run_id, action_id=record.action_id,
-                instance_id=runtime.instance_id, work_id=record.metadata.get("work_id"),
-            )
-            if original is None:
-                return True
-            result, original_id = original
-            if (result.metadata.get("execution_started") is False
-                and not execution_outcome_uncertain(result.metadata)):
-                continue
-            source = await self.deps.evidence_store.get(original_id)
-            if (source is None or execution_outcome_uncertain(result.metadata)
-                or not await execution_processed(self.deps.evidence_store, source)):
-                return True
-
-        for record in records:
-            raw = record.metadata.get("tool_result", {})
-            proposal = record.metadata.get("proposal", {})
-            metadata = raw.get("metadata", {}) if isinstance(raw, dict) else {}
-            if proposal.get("instance_id") != runtime.instance_id:
-                continue
-            if not execution_outcome_uncertain(metadata):
-                continue
-            error = raw.get("error") or {}
-            if isinstance(error, dict) and error.get("code") in {
-                "tool_binding_invalid",
-                "lease_lost_before_execution",
-                "policy_admission_denied",
-            }:
-                continue
-            if (
-                record.metadata.get("target_node_id") == intent.target_node_id
-                and (
-                    proposal.get("tool_id") == intent.tool_id
-                    if intent.binding_mode == "selected_tool"
-                    else proposal.get("capability") == intent.capability
-                    and proposal.get("operation") == intent.operation
-                )
-                and proposal.get("arguments") == intent.arguments
-            ):
-                siblings = await self.deps.evidence_store.list_for_action(record.action_id)
-                reconciled = False
-                for item in siblings:
-                    sibling_raw = item.metadata.get("tool_result")
-                    sibling_proposal = item.metadata.get("proposal")
-                    if (item.run_id != record.run_id
-                        or item.invocation_id != record.invocation_id
-                        or not isinstance(sibling_raw, dict)
-                        or not isinstance(sibling_proposal, dict)
-                        or sibling_proposal.get("instance_id") != runtime.instance_id):
-                        continue
-                    sibling_metadata = sibling_raw.get("metadata")
-                    if (isinstance(sibling_metadata, dict)
-                        and sibling_metadata.get("execution_reconciled")
-                        and not execution_outcome_uncertain(sibling_metadata)):
-                        reconciled = True
-                        break
-                if not reconciled:
-                    return True
-        return False
 
     async def reconcile_job(self, request, runtime, *, budget=None):
         from redteam.core.contracts.action import ActionProposal
@@ -2765,172 +1262,6 @@ class InvestigationEngine:
             "evidence_id": str(reviewed.get("result_evidence_id")),
         }
 
-    async def complete_step(self, path, decision, runtime, context, *, budget=None):
-        from redteam.attack_graph.service import AttackGraphService
-
-        token = await self._review_token(runtime)
-        step = next((item for item in path.steps if item.step_id == decision.path_step_id), None)
-        if step is None:
-            return path, ["completion refers to an unknown step"]
-        proposal = decision.completion
-        if isinstance(proposal, dict) and not str(proposal.get("reason", "")).strip():
-            # The model always states its rationale at the turn level
-            # (TurnDecision.reason); the step-completion proposal's reason
-            # defaults to it rather than being rejected as empty. outcome and
-            # evidence_ids are never backfilled -- an omitted outcome or
-            # missing evidence must still fail, never be invented as success.
-            proposal = {**proposal, "reason": decision.reason}
-        parsed = CompletionProposal.model_validate(proposal)
-        if budget is not None:
-            budget.record(
-                "completion_review", "step_completion_requested",
-                step_id=step.step_id,
-                previous_status=step.status,
-                previous_outcome=step.outcome,
-                proposed_outcome=parsed.outcome,
-                proposed_evidence_count=len(parsed.evidence_ids),
-                new_evidence_count=len(set(parsed.evidence_ids) - set(step.evidence_ids)),
-            )
-        if parsed.unresolved:
-            errors = await validate_unresolved(
-                parsed, evidence_store=self.deps.evidence_store, runtime=runtime,
-                target_node_ids=list(step.target_node_ids),
-            )
-            if errors:
-                return path, errors
-            await self._check_review_path(runtime, path)
-            identity = await record_unresolved(
-                evidence_store=self.deps.evidence_store, runtime=runtime,
-                proposal=parsed, path=path, step_id=step.step_id,
-                task_id=str(runtime.active_task_id) if runtime.active_task_id else None,
-            )
-
-            async def block(change):
-                return await change.paths.update_step(
-                    str(runtime.run_id), path.path_id, path.version, step.step_id,
-                    "blocked", outcome=parsed.outcome,
-                    evidence_ids=list(dict.fromkeys([*parsed.evidence_ids, identity])),
-                )
-
-            updated = await self._commit_review(runtime, token, block)
-            runtime.unresolved_evidence_ids = list(dict.fromkeys([
-                *runtime.unresolved_evidence_ids, identity,
-            ]))
-            if budget is not None:
-                budget.record(
-                    "completion_review", "step_updated",
-                    step_id=step.step_id, previous_status=step.status,
-                    status="blocked", updated_outcome=parsed.outcome,
-                    unresolved_evidence_id=identity,
-                )
-            return updated or path, []
-        from redteam.orchestration.evidence_validity import capture_validity
-
-        validity_read = await capture_validity(self.deps, runtime, parsed.evidence_ids)
-        errors = await validate_completion(
-            path=path,
-            step=step,
-            proposal=proposal,
-            evidence_store=self.deps.evidence_store,
-            graph_service=AttackGraphService(self.deps.graph_store),
-            run_id=str(runtime.run_id),
-            path_store=self.deps.path_store,
-        )
-        if errors:
-            return path, errors
-        # Receipt citations expand to their proven originals inside code
-        # validation; the review reads those originals, never just the
-        # receipt wrapper. Before the shared attribute lands, cited ids
-        # remain the compatible fallback.
-        proven_ids = [str(identity) for identity in proposal.get("evidence_ids", [])]
-        review_sources = list(getattr(errors, "verified_source_ids", None) or proven_ids)
-        source_results = [
-            await EvidenceReader(self.deps.evidence_store).read(
-                evidence_id=str(identity), run_id=str(runtime.run_id), limit=4000
-            )
-            for identity in review_sources
-        ]
-        dependency_states = [
-            {
-                "step_id": candidate.step_id,
-                "objective": candidate.objective,
-                "status": candidate.status,
-                "outcome": candidate.outcome,
-            }
-            for candidate in path.steps
-            if candidate.step_id in set(step.depends_on or [])
-        ]
-        await self._check_review_path(runtime, path)
-        review = await self._ask(
-            stage="completion_review",
-            payload={
-                # Narrowed review context: constraints, related read
-                # windows, mission limits, plus the snapshot reference.
-                # Tool lists, histories, and goal criteria stay out.
-                **await self.review_context(runtime, context, review_sources),
-                "active_path": review_path_reference(path),
-                "step": step.model_dump(mode="json"),
-                "step_dependencies": dependency_states,
-                "completion_proposal": proposal,
-                "source_evidence_ids": review_sources,
-                "source_results": source_results,
-            },
-            response_schema={
-                "type": "object",
-                "properties": {"accepted": {"type": "boolean"}, "reason": {"type": "string"}},
-                "required": ["accepted", "reason"],
-                "additionalProperties": False,
-            },
-            system=(
-                SYSTEM
-                + "\nReview completion of the supplied path step only: judge its objective "
-                "and completion criteria against the proposal and source results. "
-                "Other unfinished steps, a running mission task, or an unmet overall goal "
-                "do not reject this step unless required by this step's own criteria. "
-                "Accepting a step does not complete its task or the mission."
-            ),
-            budget=budget,
-        )
-        await self.record_completion_review(
-            "completion_review",
-            path,
-            runtime,
-            review,
-            proposal.get("evidence_ids", []),
-            step_id=step.step_id,
-        )
-        if not review["accepted"]:
-            return path, [
-                "semantic completion review rejected the evidence: "
-                + safe_feedback(review["reason"])
-            ]
-        outcome = proposal.get("outcome", "inconclusive")
-        status = "completed" if outcome in {"success", "refuted"} else "blocked"
-
-        async def complete(change):
-            if validity_read is not None:
-                validity_read.check(change)
-            return await change.paths.update_step(
-                str(runtime.run_id),
-                path.path_id,
-                path.version,
-                step.step_id,
-                status,
-                outcome=outcome,
-                evidence_ids=proposal.get("evidence_ids", []),
-            )
-
-        updated = await self._commit_review(runtime, token, complete)
-        if budget is not None:
-            budget.record(
-                "completion_review",
-                "step_updated",
-                step_id=step.step_id,
-                previous_status=_text(step.status),
-                status=status,
-                reason=review["reason"],
-            )
-        return updated or path, []
 
     async def complete_goal(self, path, decision, runtime, context, *, budget=None):
         from redteam.orchestration.semantic_completion import complete_goal
@@ -3089,99 +1420,20 @@ def validate_argument_target(
 async def operator_epoch(deps, runtime) -> str | None:
     if not runtime.mission_id:
         return None
-    coordinator = deps.coordinator or coordinator_for(deps.task_graph_store, deps.path_store)
-
-    async def epoch(change):
-        change.binding(str(runtime.run_id), str(runtime.mission_id), str(runtime.engagement_id))
-        generation = change.generation(str(runtime.run_id), str(runtime.mission_id))
-        return str(generation) if generation else None
-
-    return await coordinator.change(epoch)
+    mission = await deps.central_state.get_mission(runtime.mission_id)
+    return str(mission.revision) if mission else None
 
 
 async def claim_action_admission(deps, runtime, step, proposal) -> None:
     """Linearize a tool's start before releasing the lock for external I/O."""
     if runtime is None:
         return
-    coordinator = deps.coordinator or coordinator_for(deps.task_graph_store, deps.path_store)
-    if runtime.mission_id is None:
-
-        async def legacy(change):
-            change.legacy_scope(str(runtime.run_id))
-
-        await coordinator.change(legacy)
-        return
-
-    async def claim(change):
-        from redteam.orchestration.task_graph.claim import claim_mission_task
-
-        change.admit(str(runtime.run_id), str(runtime.mission_id))
-        generation = change.generation(str(runtime.run_id), str(runtime.mission_id))
-        epoch = str(generation) if generation else None
-        if epoch != step.operator_intent_id:
-            raise StateConflict("operator_generation_changed")
-        if getattr(step, "execution_origin_version", 0) == 1:
-            from redteam.orchestration.semantic_completion import purpose_hash
-
-            task = (
-                await change.tasks.get_task(runtime.active_task_id)
-                if runtime.active_task_id
-                else None
-            )
-            if (
-                task is None
-                or task.mission_id != runtime.mission_id
-                or task.status is not TaskStatus.RUNNING
-                or str(task.task_id) != step.mission_task_id
-                or purpose_hash(task.objective) != step.task_purpose_hash
-                or not step.model_tool_call_id
-            ):
-                raise StateConflict("native_call_task_changed")
-            task = await claim_mission_task(
-                change, task.task_id, owner=runtime.work_owner, now=datetime.now(timezone.utc)
-            )
-            change.records[("admission", str(proposal.action_id))] = {
-                "run_id": str(runtime.run_id),
-                "mission_id": str(runtime.mission_id),
-                "mission_task_id": str(task.task_id),
-                "task_purpose_hash": step.task_purpose_hash,
-                "model_tool_call_id": step.model_tool_call_id,
-                "execution_origin_version": 1,
-                "generation": generation,
-            }
-            return
-        path = await change.paths.get_active(str(runtime.run_id))
-        if path is None or path.path_id != step.path_id or path.version != step.path_version:
-            raise StateConflict("action_path_changed")
-        current = next((item for item in path.steps if item.step_id == step.path_step_id), None)
-        if current is None or current.status in {"completed", "blocked", "failed", "skipped"}:
-            raise StateConflict("action_step_no_longer_runnable")
-        parents = {item.step_id: item for item in path.steps}
-        if any(
-            identity not in parents or parents[identity].status != "completed"
-            for identity in current.depends_on
-        ):
-            raise StateConflict("action_prerequisite_changed")
-        if runtime.active_task_id:
-            task = await change.tasks.get_task(runtime.active_task_id)
-            if (
-                task is None
-                or task.mission_id != runtime.mission_id
-                or task.status is not TaskStatus.RUNNING
-            ):
-                raise StateConflict("action_task_no_longer_running")
-            await claim_mission_task(
-                change, task.task_id, owner=runtime.work_owner, now=datetime.now(timezone.utc)
-            )
-        change.records[("admission", str(proposal.action_id))] = {
-            "run_id": str(runtime.run_id),
-            "mission_id": str(runtime.mission_id),
-            "generation": generation,
-            "path_id": path.path_id,
-            "path_version": path.version,
-        }
-
-    await coordinator.change(claim)
+    from redteam.orchestration.central_runtime import runtime_token
+    await runtime_token(deps, runtime)
+    # Central admission revalidates current operator scope and commits
+    # its revision with the original intent. The original receipt's
+    # operator epoch stays immutable across a verified approval resume.
+    return
 
 
 async def operator_exclusions(
@@ -3194,7 +1446,7 @@ async def operator_exclusions(
 
     if not runtime.mission_id:
         return []
-    mission = await deps.task_graph_store.get_mission(runtime.mission_id)
+    mission = await deps.investigations.get_mission(runtime.mission_id)
     if mission is None:
         return ["operator mission is missing"]
     preferences = mission.operator_preferences or {}
@@ -3252,7 +1504,7 @@ async def operator_exclusions(
     if action_areas & areas:
         problems.append("operator_excluded_area")
     if runtime.active_task_id:
-        task = await deps.task_graph_store.get_task(runtime.active_task_id)
+        task = await deps.investigations.get_task(runtime.active_task_id)
         if task is not None and _is_suppressed(task, mission):
             problems.append("operator_excluded_task")
     return list(dict.fromkeys(problems))
@@ -3267,7 +1519,13 @@ async def validate_current_action(deps, runtime, step, proposal=None) -> list[st
         not native and (not step.path_id or step.path_version is None or not step.path_step_id)
     ):
         return ["action needs an accepted investigation path"]
-    if runtime.mission_id:
+    if runtime.mission_id and getattr(deps, "central_state", None) is not None:
+        from redteam.orchestration.central_runtime import runtime_token
+        try:
+            await runtime_token(deps, runtime)
+        except (CoordinationError, StateConflict):
+            return ["operator mutation or current ownership blocks action admission"]
+    elif runtime.mission_id:
         try:
             await (
                 deps.coordinator or coordinator_for(deps.task_graph_store, deps.path_store)
@@ -3279,10 +1537,18 @@ async def validate_current_action(deps, runtime, step, proposal=None) -> list[st
         from redteam.orchestration.semantic_completion import purpose_hash
 
         task = (
-            await deps.task_graph_store.get_task(runtime.active_task_id)
+            await deps.investigations.get_task(runtime.active_task_id)
             if runtime.active_task_id
             else None
         )
+        held_original = False
+        if (getattr(deps, "central_state", None) is not None and task is not None
+                and task.status is TaskStatus.BLOCKED and proposal is not None):
+            from redteam.core.contracts.execution import ExecutionState
+            held_original = any(
+                item.action_id == proposal.action_id and item.state is ExecutionState.PENDING
+                for item in await deps.central_state.list_executions(task_id=str(task.task_id))
+            )
         if runtime.mission_id is None:
             if (step.mission_task_id is not None
                 or purpose_hash(str(runtime.current_goal or "")) != step.task_purpose_hash
@@ -3292,10 +1558,11 @@ async def validate_current_action(deps, runtime, step, proposal=None) -> list[st
         elif (
             task is None
             or task.mission_id != runtime.mission_id
-            or task.status is not TaskStatus.RUNNING
+            or (task.status is not TaskStatus.RUNNING
+                and not held_original)
             or task.occupant_owner not in (None, runtime.work_owner)
             or str(task.task_id) != step.mission_task_id
-            or purpose_hash(task.objective) != step.task_purpose_hash
+            or (completion_contract_hash(task)) != step.task_purpose_hash
             or not step.model_tool_call_id
         ):
             return ["native call no longer belongs to the current task purpose"]
@@ -3371,8 +1638,6 @@ async def validate_current_action(deps, runtime, step, proposal=None) -> list[st
     )
     if not target_known:
         problems.append("action target is not supplied or observed")
-    if await operator_epoch(deps, runtime) != step.operator_intent_id:
-        problems.append("operator instruction changed since action planning")
     if proposal is not None:
         if (
             proposal.run_id != runtime.run_id

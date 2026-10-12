@@ -29,7 +29,6 @@ from redteam.orchestration.runtime_observation import (
     append_runtime_observation,
 )
 from redteam.orchestration.state import GraphState, TerminationReason
-from redteam.orchestration.work.models import WorkStatus
 
 _OUTCOME = {
     PolicyVerdict.ALLOW: (EventType.ACTION_APPROVED, AgentPhase.EXECUTE),
@@ -118,16 +117,11 @@ async def policy_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     # cannot compute this itself: the Work Ledger is Orchestration's, not
     # Control's, to import). "Other" actions already leased/running for
     # this run, excluding the one currently being evaluated.
-    current_work_id = state.get("current_work_id")
+    state.get("current_work_id")
     in_flight = 0
-    for status in (WorkStatus.LEASED, WorkStatus.RUNNING):
-        in_flight += len(
-            [
-                item
-                for item in await deps.work_store.list_items(status=status, run_id=runtime.run_id)
-                if item.work_id != current_work_id
-            ]
-        )
+    from redteam.orchestration.central_state import execution_occupies_capacity
+    in_flight = sum(execution_occupies_capacity(item) for item in
+                    await deps.central_state.list_executions())
 
     resuming_approval = (
         runtime.pending_approval_id is not None and runtime.pending_action_id == proposal.action_id

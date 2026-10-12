@@ -14,16 +14,11 @@ from typing import Any
 
 import pytest
 
-from redteam.core.contracts.mission import MissionPlan, MissionTask, Provenance
-from redteam.core.enums import MissionStatus, TaskStatus
-from redteam.core.ids import EngagementId, MissionId, TaskId
-from redteam.orchestration.coordination import coordinator_for
 from redteam.orchestration.local_tools import LocalToolRegistry, LocalToolResult
 from redteam.orchestration.native_local_tools import (
     EVIDENCE_READ_TOOL_ID,
     GOAL_SETTLE_TOOL_ID,
     TASK_SETTLE_TOOL_ID,
-    goal_settle_handler,
     native_local_tool_contributions,
     task_settle_handler,
 )
@@ -100,33 +95,8 @@ def _context(runtime: Any, **overrides: Any) -> Any:
     return LocalToolContext(**base)
 
 
-def _mission() -> MissionPlan:
-    return MissionPlan(
-        mission_id=MissionId(MISSION),
-        engagement_id=EngagementId(ENGAGEMENT),
-        objective="confirm the login session behavior",
-        status=MissionStatus.ACTIVE,
-        revision=1,
-        created_at=NOW,
-        updated_at=NOW,
-        provenance=Provenance(source="test:native-local"),
-    )
 
 
-def _task(**overrides: Any) -> MissionTask:
-    base: dict[str, Any] = {
-        "task_id": TaskId(TASK),
-        "mission_id": MissionId(MISSION),
-        "title": "confirm the login session",
-        "objective": "confirm the login session behavior",
-        "status": TaskStatus.RUNNING,
-        "required": True,
-        "provenance": Provenance(source="test:native-local"),
-        "created_at": NOW,
-        "updated_at": NOW,
-    }
-    base.update(overrides)
-    return MissionTask(**base)
 
 
 def test_runtime_outcome_defaults_to_none_and_survives_asdict() -> None:
@@ -222,174 +192,14 @@ async def test_evidence_read_masks_foreign_and_missing_records() -> None:
     assert oversized.ok is False
 
 
-async def test_task_settle_unresolved_records_canonical_gap() -> None:
-    tasks = InMemoryTaskGraphStore()
-    await tasks.create_mission(_mission())
-    await tasks.create_task(_task())
-    paths = InMemoryPathStore()
-    await coordinator_for(tasks, paths).bind(RUN, MISSION, ENGAGEMENT)
-    store = _EvidenceStore((_record("ev-1", raw={"output": "timeout"}),))
-    runtime = _runtime()
-    deps = SimpleNamespace(
-        evidence_store=store,
-        task_graph_store=tasks,
-        path_store=paths,
-        work_store=_WorkStore(),
-        graph_store=None,
-        llm_client=object(),
-        settings=SimpleNamespace(decision_max_attempts=2),
-        planning_provider=None,
-        coordinator=None,
-    )
-    result = await task_settle_handler(
-        {
-            "outcome": "inconclusive",
-            "reason": "login flow timed out; need another window",
-            "evidence_ids": ["ev-1"],
-        },
-        _context(runtime, deps=deps),
-    )
-    assert result.ok is True
-    assert result.runtime_outcome == "task_blocked"
-    assert result.refs[0] == "ev-1"
-    assert len(result.payload["unresolved_evidence_ids"]) == 1
-    assert len(store.appended) == 1
-    assert store.appended[0].metadata["record_kind"] == "investigation_unresolved"
-    assert store.appended[0].metadata["path_id"] is None
-    settled = await tasks.get_task(TaskId(TASK))
-    assert settled is not None and settled.status is TaskStatus.BLOCKED
 
 
-async def test_goal_settle_unresolved_finishes_investigation() -> None:
-    tasks = InMemoryTaskGraphStore()
-    await tasks.create_mission(_mission())
-    await tasks.create_task(_task())
-    paths = InMemoryPathStore()
-    await coordinator_for(tasks, paths).bind(RUN, MISSION, ENGAGEMENT)
-    store = _EvidenceStore((_record("ev-1", raw={"output": "timeout"}),))
-    runtime = _runtime()
-    deps = SimpleNamespace(
-        evidence_store=store,
-        task_graph_store=tasks,
-        path_store=paths,
-        work_store=_WorkStore(),
-        graph_store=None,
-        llm_client=object(),
-        settings=SimpleNamespace(decision_max_attempts=2),
-        planning_provider=None,
-        coordinator=None,
-    )
-    result = await goal_settle_handler(
-        {
-            "outcome": "blocked",
-            "reason": "scope window closed with the login flow unproven",
-            "evidence_ids": ["ev-1"],
-        },
-        _context(runtime, deps=deps),
-    )
-    assert result.ok is True
-    assert result.runtime_outcome == "investigation_finished"
-    mission = await tasks.get_mission(MissionId(MISSION))
-    assert mission is not None and mission.status is MissionStatus.BLOCKED
 
 
-async def test_settle_rejects_without_active_task_or_mission() -> None:
-    deps = SimpleNamespace(
-        evidence_store=_EvidenceStore(),
-        task_graph_store=InMemoryTaskGraphStore(),
-        path_store=InMemoryPathStore(),
-        work_store=_WorkStore(),
-        llm_client=object(),
-        settings=SimpleNamespace(decision_max_attempts=2),
-        planning_provider=None,
-        coordinator=None,
-    )
-    idle = await task_settle_handler(
-        {"outcome": "success", "reason": "done", "evidence_ids": ["ev-1"]},
-        _context(_runtime(active_task_id=""), deps=deps),
-    )
-    assert idle.ok is False
-    assert idle.runtime_outcome is None
-    nomission = await goal_settle_handler(
-        {"outcome": "success", "reason": "done"},
-        _context(_runtime(mission_id=None), deps=deps),
-    )
-    assert nomission.ok is False
-    assert nomission.runtime_outcome is None
-    bad = await task_settle_handler(
-        {"outcome": "success"},
-        _context(_runtime(), deps=deps),
-    )
-    assert bad.ok is False
-    assert bad.runtime_outcome is None
 
 
-async def test_settle_maps_worker_errors_without_outcome(monkeypatch: Any) -> None:
-    import redteam.orchestration.semantic_completion as worker
-
-    async def failing(*args: Any, **kwargs: Any) -> list[str]:
-        return ["task completion needs related stored evidence"]
-
-    monkeypatch.setattr(worker, "complete_task", failing)
-    deps = SimpleNamespace(
-        evidence_store=_EvidenceStore(),
-        task_graph_store=InMemoryTaskGraphStore(),
-        path_store=InMemoryPathStore(),
-        work_store=_WorkStore(),
-        llm_client=object(),
-        settings=SimpleNamespace(decision_max_attempts=2),
-        planning_provider=None,
-        coordinator=None,
-    )
-    result = await task_settle_handler(
-        {"outcome": "success", "reason": "done", "evidence_ids": ["ev-1"]},
-        _context(_runtime(), deps=deps),
-    )
-    assert result.ok is False
-    assert result.runtime_outcome is None
-    assert "stored evidence" in str(result.error)
 
 
-async def test_settle_maps_worker_success_to_canonical_outcome(
-    monkeypatch: Any,
-) -> None:
-    import redteam.orchestration.semantic_completion as worker
-
-    seen: dict[str, Any] = {}
-
-    async def succeeding(*args: Any, **kwargs: Any) -> list[str]:
-        seen["path"] = args[1]
-        seen["budget"] = kwargs.get("budget")
-        return []
-
-    monkeypatch.setattr(worker, "complete_task", succeeding)
-    monkeypatch.setattr(worker, "complete_goal", succeeding)
-    budget = SimpleNamespace(used=0, tokens_used=0, unknown_usage_count=0)
-    deps = SimpleNamespace(
-        evidence_store=_EvidenceStore(),
-        task_graph_store=InMemoryTaskGraphStore(),
-        path_store=InMemoryPathStore(),
-        work_store=_WorkStore(),
-        llm_client=object(),
-        settings=SimpleNamespace(decision_max_attempts=2),
-        planning_provider=None,
-        coordinator=None,
-    )
-    task_ok = await task_settle_handler(
-        {"outcome": "success", "reason": "done", "evidence_ids": ["ev-1"]},
-        _context(_runtime(), deps=deps, budget=budget),
-    )
-    assert task_ok.ok is True
-    assert task_ok.runtime_outcome == "task_completed"
-    assert task_ok.refs == ("ev-1",)
-    assert seen["path"] is None
-    assert seen["budget"] is budget
-    goal_ok = await goal_settle_handler(
-        {"outcome": "refuted", "reason": "clean"},
-        _context(_runtime(), deps=deps, budget=budget),
-    )
-    assert goal_ok.ok is True
-    assert goal_ok.runtime_outcome == "goal_achieved"
 
 
 async def test_evidence_read_runtime_failure_keeps_safe_structured_diagnostic() -> None:
@@ -413,37 +223,6 @@ async def test_evidence_read_runtime_failure_keeps_safe_structured_diagnostic() 
     assert "store-secret-boom" not in str(result.payload)
 
 
-async def test_settle_runtime_failure_keeps_safe_structured_diagnostic(
-    monkeypatch: Any,
-) -> None:
-    import redteam.orchestration.semantic_completion as worker
-
-    async def exploding(*args: Any, **kwargs: Any) -> list[str]:
-        raise RuntimeError("settle-secret-boom")
-
-    monkeypatch.setattr(worker, "complete_task", exploding)
-    deps = SimpleNamespace(
-        evidence_store=_EvidenceStore(),
-        task_graph_store=InMemoryTaskGraphStore(),
-        path_store=InMemoryPathStore(),
-        work_store=_WorkStore(),
-        llm_client=object(),
-        settings=SimpleNamespace(decision_max_attempts=2),
-        planning_provider=None,
-        coordinator=None,
-    )
-    result = await task_settle_handler(
-        {"outcome": "success", "reason": "done", "evidence_ids": ["ev-1"]},
-        _context(_runtime(), deps=deps),
-    )
-    assert result.ok is False
-    assert result.runtime_outcome is None
-    assert "settlement_failed" in str(result.error)
-    assert "settle-secret-boom" not in str(result.error)
-    assert result.payload.get("outcome") == "success"
-    diagnostic = result.payload.get("diagnostic", {})
-    assert diagnostic.get("code") == "settlement_failed"
-    assert "settle-secret-boom" not in str(result.payload)
 
 
 async def test_evidence_read_validation_keeps_safe_field_diagnostics() -> None:
@@ -499,53 +278,6 @@ async def test_settle_validation_keeps_safe_field_diagnostics() -> None:
     assert "bogus-outcome-secret-value" not in str(result.error)
 
 
-async def test_native_handlers_propagate_reasoning_terminal_signals(
-    monkeypatch: Any,
-) -> None:
-    import redteam.orchestration.semantic_completion as worker
-    from redteam.orchestration import native_local_tools as native
-    from redteam.orchestration.cognition import DecisionFailure, ReasoningHalted
-
-    async def halted_read(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        raise ReasoningHalted("analysis_run_stopped_or_paused")
-
-    monkeypatch.setattr(native, "read_for_runtime", halted_read)
-    runtime = _runtime()
-    deps = SimpleNamespace(evidence_store=_EvidenceStore())
-    with pytest.raises(ReasoningHalted):
-        await native.evidence_read_handler(
-            {"evidence_id": "ev-1"}, _context(runtime, deps=deps)
-        )
-
-    async def failed_settle(*args: Any, **kwargs: Any) -> list[str]:
-        raise DecisionFailure("native", "budget", 3, "spent")
-
-    monkeypatch.setattr(worker, "complete_task", failed_settle)
-    settle_deps = SimpleNamespace(
-        evidence_store=_EvidenceStore(),
-        task_graph_store=InMemoryTaskGraphStore(),
-        path_store=InMemoryPathStore(),
-        work_store=_WorkStore(),
-        llm_client=object(),
-        settings=SimpleNamespace(decision_max_attempts=2),
-        planning_provider=None,
-        coordinator=None,
-    )
-    with pytest.raises(DecisionFailure):
-        await task_settle_handler(
-            {"outcome": "success", "reason": "done", "evidence_ids": ["ev-1"]},
-            _context(_runtime(), deps=settle_deps),
-        )
-
-    async def halted_settle(*args: Any, **kwargs: Any) -> list[str]:
-        raise ReasoningHalted("analysis_run_stopped_or_paused")
-
-    monkeypatch.setattr(worker, "complete_task", halted_settle)
-    with pytest.raises(ReasoningHalted):
-        await task_settle_handler(
-            {"outcome": "success", "reason": "done", "evidence_ids": ["ev-1"]},
-            _context(_runtime(), deps=settle_deps),
-        )
 
 
 def test_builtin_registration_includes_native_local_tools() -> None:

@@ -33,9 +33,10 @@ from redteam.core.ids import ActionId, ApprovalId, RunId
 
 
 class FilesystemAuditStore:
-    def __init__(self, root_dir: str | Path) -> None:
+    def __init__(self, root_dir: str | Path, *, create: bool = True) -> None:
         self._root = Path(root_dir)
-        self._root.mkdir(parents=True, exist_ok=True)
+        if create:
+            self._root.mkdir(parents=True, exist_ok=True)
 
     def _path_for_run(self, run_id: RunId) -> Path:
         return self._root / f"{run_id}.jsonl"
@@ -68,9 +69,10 @@ class FilesystemAuditStore:
 
 
 class FilesystemApprovalStore:
-    def __init__(self, root_dir: str | Path) -> None:
+    def __init__(self, root_dir: str | Path, *, create: bool = True) -> None:
         self._root = Path(root_dir)
-        self._root.mkdir(parents=True, exist_ok=True)
+        if create:
+            self._root.mkdir(parents=True, exist_ok=True)
 
     def _path_for(self, approval_id: ApprovalId) -> Path:
         return self._root / f"{approval_id}.json"

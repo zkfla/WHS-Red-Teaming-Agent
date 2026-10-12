@@ -74,6 +74,38 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     expire_parser.add_argument("--ttl-seconds", required=True, type=float)
     expire_parser.add_argument("--dir", default="data/approvals", dest="approval_dir")
     expire_parser.set_defaults(handler=run_expire)
+    for command in (list_parser, approve_parser, deny_parser, resolve_parser, expire_parser):
+        command.add_argument("--state-db", default=None)
+        if command is not list_parser:
+            command.add_argument("--run", dest="run_id", default=None)
+
+
+async def _central_approvals(args):
+    """Resolve original Control stores and bind approval IDs to this central Run."""
+    from redteam.app.cli._shared import central_reader_state_path
+    path = (central_reader_state_path(args) if getattr(args, "run_id", None)
+            or getattr(args, "state_db", None) is not None else None)
+    if path is None:
+        return None
+    if not getattr(args, "run_id", None):
+        raise ValueError("central_approvals_require_original_run_id")
+    import sqlite3
+
+    from redteam.app.central_views import inspect_central_run
+    from redteam.orchestration.coordination import CoordinationError, StateConflict
+    try:
+        state, config, _ = await inspect_central_run(path, args.run_id)
+    except (CoordinationError, StateConflict, sqlite3.Error):
+        raise ValueError("central_original_approval_run_unavailable") from None
+    args.approval_dir = config["storage_refs"]["approvals"]
+    args.audit_dir = config["storage_refs"]["audit"]
+    executions = await state.list_executions()
+    expected = {str(item.approval_ref): str(item.action_id) for item in executions
+                if item.approval_ref}
+    identity = getattr(args, "approval_id", None)
+    if identity is not None and identity not in expected:
+        raise ValueError("approval_not_bound_to_original_central_execution")
+    return expected
 
 
 def _default_resolved_by() -> str:
@@ -81,9 +113,16 @@ def _default_resolved_by() -> str:
 
 
 async def run_list(args: argparse.Namespace) -> int:
-    service = ApprovalService(FilesystemApprovalStore(args.approval_dir))
-    audit = AuditLog(FilesystemAuditStore(args.audit_dir)) if args.run_id else None
+    try:
+        expected = await _central_approvals(args)
+    except (ValueError, OSError, RuntimeError) as exc:
+        eprint(f"ERROR: {exc}")
+        return EXIT_CONFIG_ERROR
+    service = ApprovalService(FilesystemApprovalStore(args.approval_dir, create=False))
+    audit = AuditLog(FilesystemAuditStore(args.audit_dir, create=False)) if args.run_id else None
     pending = await service.list_pending()
+    if expected is not None:
+        pending = [a for a in pending if expected.get(str(a.approval_id)) == str(a.action_id)]
     if args.run_id and audit is not None:
         pending = [a for a in pending if await _belongs_to_run(audit, a, args.run_id)]
 
@@ -107,6 +146,11 @@ async def _belongs_to_run(audit: AuditLog, approval, run_id: str) -> bool:  # no
 
 
 async def _show_and_resolve(args: argparse.Namespace, status: ApprovalStatus) -> int:
+    try:
+        expected = await _central_approvals(args)
+    except (ValueError, OSError, RuntimeError) as exc:
+        eprint(f"ERROR: {exc}")
+        return EXIT_CONFIG_ERROR
     approvals = ApprovalService(FilesystemApprovalStore(args.approval_dir))
     audit = AuditLog(FilesystemAuditStore(args.audit_dir))
 
@@ -119,6 +163,10 @@ async def _show_and_resolve(args: argparse.Namespace, status: ApprovalStatus) ->
         return EXIT_CONFIG_ERROR
 
     request = await audit.find_approval_request(approval.action_id, approval.approval_id)
+    if expected is not None and (expected.get(str(approval.approval_id)) != str(approval.action_id)
+                                or request is None or str(request.run_id) != args.run_id):
+        eprint("ERROR: approval_original_run_action_mismatched")
+        return EXIT_FAILURE
     if request is None:
         eprint(
             f"ERROR: no policy-decision audit entry for approval {args.approval_id} -- "
@@ -166,6 +214,11 @@ async def run_deny(args: argparse.Namespace) -> int:
 
 
 async def run_resolve(args: argparse.Namespace) -> int:
+    try:
+        expected = await _central_approvals(args)
+    except (ValueError, OSError, RuntimeError) as exc:
+        eprint(f"ERROR: {exc}")
+        return EXIT_CONFIG_ERROR
     approvals = ApprovalService(FilesystemApprovalStore(args.approval_dir))
     audit = AuditLog(FilesystemAuditStore(args.audit_dir))
     approval = await approvals.get(ApprovalId(args.approval_id))
@@ -173,6 +226,10 @@ async def run_resolve(args: argparse.Namespace) -> int:
         eprint(f"ERROR: no such approval: {args.approval_id}")
         return EXIT_CONFIG_ERROR
     request = await audit.find_approval_request(approval.action_id, approval.approval_id)
+    if expected is not None and (expected.get(str(approval.approval_id)) != str(approval.action_id)
+                                or request is None or str(request.run_id) != args.run_id):
+        eprint("ERROR: approval_original_run_action_mismatched")
+        return EXIT_FAILURE
     if request is None:
         eprint(f"ERROR: no policy decision audit entry for approval: {args.approval_id}")
         return EXIT_FAILURE
@@ -192,8 +249,15 @@ async def run_expire(args: argparse.Namespace) -> int:
     if not math.isfinite(args.ttl_seconds) or args.ttl_seconds < 0:
         eprint("ERROR: --ttl-seconds must be finite and non-negative")
         return EXIT_CONFIG_ERROR
+    try:
+        expected = await _central_approvals(args)
+    except (ValueError, OSError, RuntimeError) as exc:
+        eprint(f"ERROR: {exc}")
+        return EXIT_CONFIG_ERROR
     service = ApprovalService(FilesystemApprovalStore(args.approval_dir))
-    expired = await service.sweep_expired(args.ttl_seconds)
+    expired = await service.sweep_expired(
+        args.ttl_seconds, approval_ids=set(expected) if expected is not None else None,
+    )
     print(f"Expired {len(expired)} approval(s).")
     for approval in expired:
         print(f"  {approval.approval_id}  action={approval.action_id}")

@@ -113,7 +113,7 @@ class LoadedSpecialists:
             }),
         )
 
-    def assemble(self, components):
+    def assemble(self, components, *, include_code_artifacts: bool = True):
         from redteam.orchestration.evidence_validity import register_validity
 
         registry = AgentRegistry()
@@ -130,10 +130,6 @@ class LoadedSpecialists:
         from redteam.orchestration.agents.tool_access import register_role_readiness
 
         register_role_readiness(components.local_tools)
-        if self.code_artifacts_enabled:
-            from redteam.orchestration.code_artifacts import register_code_artifacts
-
-            register_code_artifacts(components.local_tools)
         return replace(components, agents=registry)
 
 

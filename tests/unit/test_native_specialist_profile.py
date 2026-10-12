@@ -110,32 +110,3 @@ def test_optional_code_feature_requires_two_independent_explicit_bindings(tmp_pa
     else:
         with pytest.raises(ValueError, match="specialist_profile_invalid"):
             load_specialist_profile(path)
-
-
-async def test_changed_prompt_binding_cannot_resume_same_run(tmp_path):
-    from dataclasses import replace
-
-    from redteam.orchestration.component_binding import builtin_component_binding
-    from redteam.orchestration.runner import AgentLoopRunner
-    from redteam.orchestration.state import RuntimeState
-    from tests.integration.test_native_react_loop import (
-        ScriptedNativeLLM,
-        _engagement,
-        _native_deps,
-    )
-
-    original = load_specialist_profile(PROFILE)
-    engagement = _engagement()
-    binding = builtin_component_binding().model_copy(update={
-        "specialist_fingerprint": original.fingerprint,
-    })
-    deps = replace(_native_deps(engagement, ScriptedNativeLLM([])), component_binding=binding)
-    runtime = RuntimeState(run_id="run-binding", engagement_id=engagement.engagement_id,
-                           component_binding=binding)
-    async with AgentLoopRunner(deps) as runner:
-        assert await runner._binding_for(runtime)
-    changed = replace(deps, component_binding=binding.model_copy(update={
-        "specialist_fingerprint": "f" * 64,
-    }))
-    async with AgentLoopRunner(changed) as runner:
-        assert not await runner._binding_for(runtime)

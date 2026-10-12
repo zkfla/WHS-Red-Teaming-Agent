@@ -837,6 +837,9 @@ def _evidence_metadata(proposal, result, step, runtime, *, work_id=None) -> dict
     bypass is keyed on origin.
     """
     metadata: dict = {}
+    if runtime.task_ownership_version:
+        metadata["central_execution_version"] = 1
+        metadata["task_ownership_version"] = runtime.task_ownership_version
     if proposal.expected_observation is not None:
         metadata["expected_observation"] = proposal.expected_observation
     metadata["tool_result"] = result.model_dump(mode="json")

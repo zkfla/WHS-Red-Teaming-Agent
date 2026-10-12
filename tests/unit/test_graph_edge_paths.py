@@ -25,7 +25,6 @@ from redteam.attack_graph.predicates import (
 )
 from redteam.attack_graph.service import AttackGraphService
 from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
-from redteam.attack_graph.visualize import render_svg
 from redteam.core.contracts.graph import GraphNode
 from redteam.core.contracts.target import (
     GraphNodeTarget,
@@ -169,26 +168,8 @@ def test_a_graph_node_target_without_a_type_reads_as_a_resource() -> None:
 # -- rendering the cleanup state ------------------------------------------
 
 
-async def test_an_outstanding_resource_is_outlined_as_a_warning() -> None:
-    svc = service()
-    node = await svc.upsert_node(GraphNodeType.ASSET, key="tmp-file")
-    await svc.register_created_resource(node.id, resource_type="file")
-
-    svg, _ = render_svg(await svc.list_nodes(), await svc.list_edges())
-
-    assert '#ffd166' in svg
-    assert "cleanup:" in svg  # and the tooltip explains it
 
 
-async def test_a_cleaned_resource_is_not_outlined() -> None:
-    svc = service()
-    node = await svc.upsert_node(GraphNodeType.ASSET, key="tmp-file")
-    await svc.register_created_resource(node.id, resource_type="file")
-    await svc.mark_cleaned(node.id, evidence_id="ev_1")
-
-    svg, _ = render_svg(await svc.list_nodes(), await svc.list_edges())
-
-    assert "#ffd166" not in svg
 
 
 # -- the read-only view, called directly ----------------------------------
@@ -205,11 +186,9 @@ async def test_every_view_method_works_without_going_through_the_service() -> No
     assert await view.get_edge(edge.id) is not None
     assert len(await view.neighbors(host_node.id)) == 1
     assert len(await view.query(node_type=GraphNodeType.HOST)) == 1
-    assert await view.shortest_path(host_node.id, service_node.id) is not None
     assert len((await view.subgraph_around(host_node.id))[0]) == 2
     assert (await view.cleanup_report()).is_clear
     assert (await view.resolve([NodePattern(type=GraphNodeType.HOST, bind="h")])).ok
-    assert await view.evidence_chain("nope") is None
     assert (await view.observe()).node_counts == {"host": 1, "service": 1}
     assert (await view.integrity_report()) is not None
 

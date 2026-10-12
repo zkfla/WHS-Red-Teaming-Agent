@@ -19,7 +19,6 @@ test of unrelated code shouldn't have to set up.
 from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore as FakeAttackGraphStore
 from redteam.event_bus.memory import InMemoryEventBus as FakeEventBus
 from redteam.llm.fake import FakeLLMClient
-from tests.fakes.bootstrap import build_test_application
 from tests.fakes.control_plane import FakeControlPlane
 from tests.fakes.evidence_store import FakeEvidenceStore
 from tests.fakes.tool_gateway import DummyToolGateway
@@ -31,5 +30,4 @@ __all__ = [
     "FakeEventBus",
     "FakeAttackGraphStore",
     "FakeLLMClient",
-    "build_test_application",
 ]

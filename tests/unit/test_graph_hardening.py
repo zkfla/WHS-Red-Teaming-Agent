@@ -27,6 +27,7 @@ from redteam.core.contracts.graph import GraphNode
 from redteam.core.contracts.target import EndpointTarget
 from redteam.core.enums import GraphEdgeType, GraphNodeType
 from redteam.core.ids import GraphNodeId
+from tests.fakes.graph_records import records_for, seed_records
 
 NOW = datetime.now(timezone.utc)
 
@@ -228,18 +229,18 @@ async def test_upserting_an_existing_node_as_another_type_is_refused() -> None:
 async def test_import_replaces_by_default_and_merges_on_request() -> None:
     source = service()
     await source.upsert_node(GraphNodeType.HOST, key="a", attrs={"x": True}, step=5)
-    records = await source.export_snapshot()
+    records = await records_for(source)
 
     replaced = service()
     await replaced.upsert_node(GraphNodeType.HOST, key="a", attrs={"y": True}, step=9)
-    await replaced.import_snapshot(records)
+    await seed_records(replaced, records)
     restored = await replaced.get_node(GraphNodeId("host:a"))
     assert restored is not None
     assert "y" not in restored.properties["attrs"]
 
     merged = service()
     await merged.upsert_node(GraphNodeType.HOST, key="a", attrs={"y": True}, step=9)
-    await merged.import_snapshot(records, merge=True)
+    await seed_records(merged, records, merge=True)
     combined = await merged.get_node(GraphNodeId("host:a"))
     assert combined is not None
     assert combined.properties["attrs"] == {"x": True, "y": True}

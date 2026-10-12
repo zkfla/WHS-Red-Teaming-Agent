@@ -23,7 +23,7 @@ class SQLiteTaskGraphStore:
 
     def _connect(self) -> sqlite3.Connection:
         """Connection helper for the coordinator; call and close in its worker thread."""
-        return connect(self._path)
+        return connect(self._path, write=True)
 
     async def setup(self) -> None:
         if self._ready:

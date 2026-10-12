@@ -1,4 +1,4 @@
-"""Exercise the default Agent loop through real MCP servers in the isolated lab.
+"""Exercise the retained native compatibility loop over isolated lab MCP servers.
 
 First retain the shipped approval policy and assert Web waits. Then run an
 explicit synthetic-only read test with auto-approval of its high-risk Web tool.
@@ -21,14 +21,14 @@ from typing import Any
 from redteam.app.bootstrap import build_application, run_engagement
 from redteam.attack_graph.predicates import attrs_of, facts_of
 from redteam.attack_graph.service import AttackGraphService
-from redteam.core.config import load_app_config
+from redteam.core.config import OrchestrationConfig, load_app_config
 from redteam.core.contracts.events import EventEnvelope, EventType
+from redteam.core.contracts.llm_policy import LLMRequestPolicy
 from redteam.core.enums import RiskLevel
 from redteam.core.ids import ToolId
 from redteam.core.ports.llm import NativeCompletion, NativeToolCall
 from redteam.orchestration.native_binding import exposed_tool_name
 from redteam.orchestration.native_local_tools import (
-    GOAL_SETTLE_TOOL_ID,
     TASK_SETTLE_TOOL_ID,
 )
 from redteam.orchestration.settings import OrchestrationSettings
@@ -127,6 +127,8 @@ class _ScriptedLabModel:
         self._listed = False
         self._details_requested = False
         self._remote_sequence: list[tuple[str, dict[str, Any]]] = []
+        self._planned = False
+        self._question = None
         self._issued_remote: list[str] = []
         self._settlement_evidence: list[str] = []
         self._task_call: str | None = None
@@ -152,6 +154,10 @@ class _ScriptedLabModel:
     @staticmethod
     def _route_key(schema: dict[str, Any]) -> str:
         props = schema.get("properties", {})
+        if "questions" in props:
+            return "attack_path_proposal"
+        if "tasks" in props:
+            return "task_atomization"
         if "criteria" in props:
             return "goal_completion_review"
         if "claims" in props:
@@ -170,6 +176,43 @@ class _ScriptedLabModel:
     ) -> dict[str, Any]:
         route = self._route_key(response_schema)
         self.calls.append({"route": route, "messages": messages, "system": system})
+        if route == "attack_path_proposal":
+            payload = json.loads(messages[0]["content"])
+            if self._planned:
+                return {
+                    "questions": [],
+                    "reason": "Await the current lab investigation",
+                    "termination": "held",
+                }
+            self._planned = True
+            targets = payload["known_target_ids"]
+            assert targets, "lab planning needs an original scoped target"
+            self._question = {
+                "question_id": "lab-response",
+                "objective": "Inspect scoped lab responses",
+                "target_node_ids": [
+                    next(target for target in targets if target.startswith("host:"))
+                ],
+                "completion_criteria": [
+                    {"kind": "semantic", "description": "Inspect scoped lab responses"},
+                ],
+            }
+            return {"questions": [self._question], "reason": "Read the configured lab endpoints"}
+        if route == "task_atomization":
+            payload = json.loads(messages[0]["content"])
+            role = next(
+                row["role_id"] for row in payload["role_readiness"] if row["activation_eligible"]
+            )
+            return {
+                "tasks": [
+                    {
+                        **self._question,
+                        "task_key": "lab-response",
+                        "title": "Read the lab",
+                        "role_id": role,
+                    }
+                ]
+            }
         if route == "analysis_verify":
             return {
                 "meaning": "scripted",
@@ -185,10 +228,19 @@ class _ScriptedLabModel:
             return {
                 "accepted": True,
                 "reason": "lab task done",
+                "criterion_results": [
+                    {
+                        "criterion_id": row["criterion_id"],
+                        "met": True,
+                        "reason": "Actual responses inspected",
+                        "evidence_ids": receipts,
+                    }
+                    for row in review_payload.get("completion_criteria", [])
+                ],
                 "claims": [
                     {
                         "description": "actual lab task result observed in stored evidence",
-                        "kind": "observation",
+                        "kind": "semantic",
                         "evidence_ids": receipts,
                         "target_node_ids": [],
                         "principal_refs": [],
@@ -220,9 +272,7 @@ class _ScriptedLabModel:
                     for criterion in payload["mission"]["success_criteria"]
                 ],
             }
-        raise AssertionError(
-            f"legacy strategy route is not part of the native loop: {route!r}"
-        )
+        raise AssertionError(f"unsupported lab decision route: {route!r}")
 
     async def complete_native(
         self,
@@ -257,9 +307,7 @@ class _ScriptedLabModel:
             )
         if not self._details_requested:
             advertised = {
-                tool_id
-                for ids in _harvest_lab_cards(messages).values()
-                for tool_id in ids
+                tool_id for ids in _harvest_lab_cards(messages).values() for tool_id in ids
             }
             for tool_id, _ in sequence:
                 assert tool_id in advertised, (
@@ -282,7 +330,6 @@ class _ScriptedLabModel:
         for index, (tool_id, _) in enumerate(sequence):
             assert remote[index] in names, f"native model needs the registered lab tool: {tool_id}"
         task_tool = exposed_tool_name(TASK_SETTLE_TOOL_ID)
-        goal_tool = exposed_tool_name(GOAL_SETTLE_TOOL_ID)
         # Settlement helpers are local tools: bindings resolve them by
         # registered name even when lazy discovery has not advertised their
         # schemas, so no advertisement assert here (unlike the remote MCP
@@ -342,25 +389,7 @@ class _ScriptedLabModel:
         if seen is None or seen.get("ok") is not True:
             self.calls.append({"turn": self.turns, "tool_calls": []})
             return NativeCompletion(tool_calls=(), text="")
-        if self._goal_call is None:
-            self._goal_call = "call-lab-goal"
-            self.calls.append({"turn": self.turns, "tool_calls": [goal_tool]})
-            return NativeCompletion(
-                tool_calls=(
-                    NativeToolCall(
-                        call_id=self._goal_call,
-                        name=goal_tool,
-                        arguments={
-                            "outcome": "success",
-                            "reason": "lab goal evidence ready",
-                            "evidence_ids": list(self._settlement_evidence),
-                        },
-                    ),
-                ),
-                text="",
-            )
-        self.calls.append({"turn": self.turns, "tool_calls": []})
-        return NativeCompletion(tool_calls=(), text="")
+        return NativeCompletion(tool_calls=(), text="Lab investigation result recorded")
 
     async def complete(
         self,
@@ -398,7 +427,21 @@ async def exercise(*, require_approval: bool) -> None:
                 evidence_dir=Path(directory) / "evidence",
                 audit_dir=Path(directory) / "audit",
                 approval_dir=Path(directory) / "approvals",
-                orchestration_settings=OrchestrationSettings(checkpointing=False, max_steps=20),
+                orchestration_settings=OrchestrationSettings(
+                    checkpointing=True,
+                    checkpoint_backend="sqlite",
+                    max_steps=20,
+                    checkpoint_path=str(Path(directory) / "checkpoints.sqlite3"),
+                    central_state_path=str(Path(directory) / "state.sqlite3"),
+                    specialist_profile_path=(
+                        OrchestrationConfig.from_environment().specialist_profile_path
+                        or str(
+                            Path(__file__).resolve().parents[1]
+                            / "config/agents/native-specialists-web.yaml"
+                        )
+                    ),
+                    llm_request_policy=LLMRequestPolicy(mode="bounded", max_requests=100),
+                ),
             )
             events: list[EventEnvelope] = []
 
@@ -443,14 +486,20 @@ async def exercise(*, require_approval: bool) -> None:
             assert expected_tools["recon.http_probe"] in started, started
             assert not [e for e in events if e.event_type == EventType.TOOL_EXECUTION_FAILED]
             if require_approval:
-                assert final.termination_reason == TerminationReason.APPROVAL_PENDING, (
+                assert any(
+                    item.wait_reason == "approval"
+                    for item in await deps.central_state.list_executions()
+                ), (
                     final.termination_reason,
                     lab_model.turns,
                     lab_model.error_summary(),
                 )
                 assert expected_tools["web.http_request"] not in started, started
             else:
-                assert final.termination_reason == TerminationReason.GOAL_ACHIEVED, (
+                assert final.termination_reason in {
+                    TerminationReason.GOAL_ACHIEVED,
+                    TerminationReason.INVESTIGATION_HELD,
+                }, (
                     final.termination_reason,
                     lab_model.turns,
                     lab_model.error_summary(),
@@ -469,8 +518,9 @@ async def exercise(*, require_approval: bool) -> None:
                     not in facts_of(node.properties).get("attempted_operations", [])
                     for node in disallowed
                 ), "Agent must not visit an explicitly unallowlisted endpoint"
-                assert final.actions_by_agent.get("web-api-agent", 0) >= 1
-                assert final.actions_by_agent.get("recon-agent", 0) >= 1
+                assert final.actions_executed >= 4
+                tasks = await deps.central_state.list_tasks()
+                assert tasks and all(task.status.value == "completed" for task in tasks), tasks
     print(f"PASS: real Agent -> Control -> MCP -> Graph -> Web; approval={require_approval}")
 
 

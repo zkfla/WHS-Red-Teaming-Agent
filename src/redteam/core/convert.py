@@ -40,6 +40,30 @@ class NonAllowDecisionError(ValueError):
     """Raised when trying to build a ToolInvocation from a non-ALLOW decision."""
 
 
+def prepare_tool_invocation(
+    proposal: ActionProposal, *, tool_id: ToolId, timeout_seconds: float,
+    correlation_id: str | None = None,
+) -> ToolInvocation:
+    """Bind an execution intent before approval; this supplies no permission.
+
+    Callers must still validate an ALLOW decision at actual provider entry.
+    Retaining this identity lets approval waits refer to the same proposal.
+    """
+    if is_direct(proposal.binding_mode, proposal.tool_id) and proposal.tool_id != tool_id:
+        raise ValueError("direct invocation tool_id must equal proposal.tool_id")
+    return ToolInvocation(
+        invocation_id=InvocationId(new_id("inv")), action_id=proposal.action_id,
+        run_id=proposal.run_id, tool_id=tool_id, binding_mode=proposal.binding_mode,
+        operation=proposal.operation, arguments=proposal.arguments,
+        timeout_seconds=timeout_seconds, created_at=datetime.now(timezone.utc),
+        execution_context=ExecutionContext(
+            engagement_id=proposal.engagement_id, run_id=proposal.run_id,
+            agent_id=proposal.agent_id, instance_id=proposal.instance_id,
+            approved_target=proposal.target, correlation_id=correlation_id,
+        ),
+    )
+
+
 def build_tool_invocation(
     proposal: ActionProposal,
     decision: PolicyDecision,

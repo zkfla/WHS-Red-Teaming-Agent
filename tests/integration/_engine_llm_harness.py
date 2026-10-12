@@ -272,6 +272,8 @@ def make_world(
         context_cache=ContextProjectionCache(),
         work_store=work,
         task_graph_store=tasks,
+        investigations=tasks,
+        central_state=None,
         engagement=None,
         operator_intent_store=None,
         verifier=None,

@@ -28,9 +28,10 @@ drop-in substitute anywhere a store is wired today.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 from redteam.attack_graph.stores.base import (
+    AtomicAttackGraphStore,
     StoreCapabilityError,
     require_listable,
     require_mutable,
@@ -42,6 +43,8 @@ from redteam.attack_graph.stores.mutations import (
     GraphMutationReceipt,
     checked_receipt,
 )
+from redteam.attack_graph.traversal import Direction, subgraph_around
+from redteam.attack_graph.writes import EdgeUpdate, NodeUpdate
 from redteam.core.contracts.graph import GraphEdge, GraphNode
 from redteam.core.ids import EngagementId, GraphEdgeId, GraphNodeId
 from redteam.core.ports.attack_graph import AttackGraphStore
@@ -67,6 +70,10 @@ class EngagementScopedAttackGraphStore:
 
     def _namespaced(self, node_id: GraphNodeId) -> GraphNodeId:
         return GraphNodeId(f"{self._ns}{_NS_SEPARATOR}{node_id}")
+
+    @property
+    def cacheable(self) -> bool:
+        return bool(getattr(self._inner, "cacheable", True))
 
     def _stripped(self, namespaced_id: GraphNodeId) -> GraphNodeId:
         prefix = f"{self._ns}{_NS_SEPARATOR}"
@@ -196,6 +203,35 @@ class EngagementScopedAttackGraphStore:
         node = await self._inner.get_node(self._namespaced(node_id))
         return None if node is None else self._translate_node(node)
 
+    def __getattr__(self, name: str) -> Any:
+        # Forward an optional atomic capability only when the owning backend
+        # implements it. Legacy service fallback keeps get_edge's ID handling.
+        if name in {"mutate_node", "mutate_edge"} and callable(getattr(self._inner, name, None)):
+            return getattr(self, f"_{name}")
+        raise AttributeError(name)
+
+    async def _mutate_node(self, node_id: GraphNodeId, update: NodeUpdate) -> GraphNode | None:
+        def translated(current: GraphNode | None) -> GraphNode | None:
+            result = update(self._translate_node(current) if current else None)
+            return result.model_copy(update={"id": self._namespaced(result.id)}) if result else None
+        result = await cast(AtomicAttackGraphStore, self._inner).mutate_node(
+            self._namespaced(node_id), translated,
+        )
+        return self._translate_node(result) if result else None
+
+    async def _mutate_edge(self, edge_id: GraphEdgeId, update: EdgeUpdate) -> GraphEdge | None:
+        def translated(current: GraphEdge | None) -> GraphEdge | None:
+            result = update(self._translate_edge(current) if current else None)
+            return result.model_copy(update={
+                "id": self._namespaced_edge(result.id),
+                "source_id": self._namespaced(result.source_id),
+                "target_id": self._namespaced(result.target_id),
+            }) if result else None
+        result = await cast(AtomicAttackGraphStore, self._inner).mutate_edge(
+            self._namespaced_edge(edge_id), translated,
+        )
+        return self._translate_edge(result) if result else None
+
     async def get_edge(self, edge_id: GraphEdgeId) -> GraphEdge | None:
         namespaced_id = self._namespaced_edge(edge_id)
         edge = await self._inner.get_edge(namespaced_id)
@@ -211,6 +247,34 @@ class EngagementScopedAttackGraphStore:
     async def neighbors(self, node_id: GraphNodeId) -> list[GraphNode]:
         nodes = await self._inner.neighbors(self._namespaced(node_id))
         return [self._translate_node(n) for n in nodes if self._owns(str(n.id))]
+
+    async def incident_edges(
+        self, node_id: GraphNodeId, *, direction: Direction = "any",
+    ) -> list[GraphEdge]:
+        method = getattr(self._inner, "incident_edges", None)
+        if callable(method):
+            edges = await method(self._namespaced(node_id), direction=direction)
+            return [self._translate_edge(edge) for edge in edges if self._owns_edge(edge)]
+        return [edge for edge in await self.list_edges() if
+                (direction in ("out", "any") and edge.source_id == node_id) or
+                (direction in ("in", "any") and edge.target_id == node_id)]
+
+    async def subgraph_around(
+        self, node_id: GraphNodeId, *, radius: int = 1, direction: Direction = "any",
+    ) -> tuple[list[GraphNode], list[GraphEdge]]:
+        method = getattr(self._inner, "subgraph_around", None)
+        if callable(method):
+            nodes, edges = await method(
+                self._namespaced(node_id), radius=radius, direction=direction,
+            )
+            return (
+                [self._translate_node(n) for n in nodes if self._owns(str(n.id))],
+                [self._translate_edge(e) for e in edges if self._owns_edge(e)],
+            )
+        return subgraph_around(
+            node_id, nodes=await self.list_nodes(), edges=await self.list_edges(),
+            radius=radius, direction=direction,
+        )
 
     async def query(self, **filters: Any) -> list[GraphNode]:
         nodes = await self._inner.query(**filters)

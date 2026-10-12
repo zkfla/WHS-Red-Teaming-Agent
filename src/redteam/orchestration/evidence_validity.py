@@ -5,26 +5,27 @@ projection, not a second authoritative evidence store or a success verdict.
 No guessed expiry, source rewrite, Task resurrection or automatic target call.
 """
 
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from redteam.attack_graph.predicates import attrs_of, claim_provenance_of, facts_of, retractions_of
 from redteam.attack_graph.service import AttackGraphService
-from redteam.core.contracts.events import EventEnvelope, EventType
 from redteam.core.contracts.evidence import EvidenceRecord
-from redteam.core.enums import EvidenceSourceType, MissionStatus
-from redteam.core.ids import EvidenceId, new_id
-from redteam.orchestration.coordination import StateConflict, content_hash, coordinator_for
+from redteam.core.enums import EvidenceSourceType
+from redteam.core.ids import EvidenceId, GraphNodeId
+from redteam.orchestration.central_state import check_evidence
+from redteam.orchestration.coordination import StateConflict, content_hash
 from redteam.orchestration.evidence_access import raw_from_metadata
 from redteam.orchestration.knowledge import collect_measured_values
 from redteam.orchestration.local_tools import LocalToolContext, LocalToolDescriptor, LocalToolResult
-from redteam.orchestration.outbox import deliver_pending
-from redteam.orchestration.planning_admission import PlanningAdmission
 
 BINDING_KIND = "evidence_validity_binding_v1"
 SOURCE_ID = "orchestration.evidence_validity"
+BINDING_INDEX_KIND = "evidence_reuse_binding"
 ValidityStatus = Literal["unbound", "valid", "stale", "invalid", "inconclusive"]
 
 
@@ -175,133 +176,124 @@ async def validity_errors(store, graph, run_id: str, evidence_ids) -> list[str]:
     return []
 
 
+def _binding_index(tx, evidence_ids):
+    return {identity: json.loads(payload) for identity, payload in tx.db.execute(
+        "SELECT identity,payload FROM state_requests WHERE run_id=? AND kind=?",
+        (tx.run_id, BINDING_INDEX_KIND),
+    ) if json.loads(payload).get("claim_evidence_id") in evidence_ids}
+
+
+def _condition_state(node, condition):
+    if node is None:
+        return content_hash(None)
+    props = node.properties
+    values = attrs_of(props) if condition.container == "attr" else facts_of(props)
+    key = f"{condition.container}s:{condition.key}"
+    return content_hash([
+        values.get(condition.key), claim_provenance_of(props).get(key),
+        [item for item in retractions_of(props) if item.get("key") == condition.key],
+    ])
+
+
 @dataclass(frozen=True)
 class ValidityRead:
-    run_id: str
-    versions: tuple[tuple[str, int], ...]
+    """Request-local proof; never a second validity store or global graph fence."""
+
+    evidence_ids: tuple[str, ...]
+    binding_hashes: dict[str, str]
+    indexed_bindings: dict
+    conditions: dict[str, ReuseCondition]
+    condition_hashes: dict[str, str]
     valid_until: datetime | None
+    checked: tuple
 
-    def check(self, tx) -> None:
-        PlanningAdmission.check_references(tx, self.run_id, self.versions)
+    async def refresh(self, deps):
+        current, errors = await capture_validity(deps, self.evidence_ids)
+        if errors:
+            return None, errors
+        if (current.binding_hashes != self.binding_hashes
+                or current.condition_hashes != self.condition_hashes
+                or {str(item.record.evidence_id): item.content_hash for item in current.checked}
+                != {str(item.record.evidence_id): item.content_hash for item in self.checked}):
+            raise StateConflict("evidence_reuse_changed_reassessment_required")
+        return current, []
+
+    def check(self, tx):
+        if _binding_index(tx, self.evidence_ids) != self.indexed_bindings:
+            raise StateConflict("evidence_reuse_binding_changed_reassessment_required")
         if self.valid_until is not None and self.valid_until <= datetime.now(timezone.utc):
-            raise StateConflict("completion_evidence_expired")
+            raise StateConflict("evidence_reuse_expired_reassessment_required")
+        for ref, condition in self.conditions.items():
+            node = tx.graph.get_local_node(GraphNodeId(condition.node_id))
+            if _condition_state(node, condition) != self.condition_hashes[ref]:
+                raise StateConflict("evidence_reuse_condition_changed_reassessment_required")
+        tx.add_evidence_refs(self.checked)
 
 
-async def capture_validity(deps, runtime, evidence_ids) -> ValidityRead | None:
-    """Code-owned relevant read set; called before validation/model review."""
-    if getattr(deps, "specialist_policy", None) is None:
-        return None
-    coordinator = deps.coordinator or coordinator_for(deps.task_graph_store, deps.path_store)
-    admission = PlanningAdmission(coordinator)
-    run_id = str(runtime.run_id)
-    # Include receipt origins, not just the mutable wrapper citation.
-    identities = set(map(str, evidence_ids))
-    for identity in tuple(identities):
-        record = await deps.evidence_store.get(identity)
-        if record is not None and str(record.run_id) == run_id:
-            identities.update(map(str, record.metadata.get("source_evidence_ids", [])))
-    versions = await admission.capture_references(run_id, [f"validity:{i}" for i in identities])
+async def capture_validity(deps, evidence_ids, *, graph_service=None):
+    """Inspect only selected originals/conditions outside the central SQL lock."""
+    selected = tuple(sorted(set(map(str, evidence_ids))))
+    graph = graph_service or AttackGraphService(deps.graph_store)
+    run_id, engagement_id = deps.central_state.run_id, deps.central_state.engagement_id
     records = await deps.evidence_store.list_for_run(run_id)
-    nodes: set[str] = set()
-    for record in records:
-        if is_binding(record) and record.metadata.get("claim_evidence_id") in identities:
-            try:
-                binding = ReuseBinding.model_validate(record.metadata)
-                nodes.update(f"node:{c.node_id}" for c in binding.conditions)
-            except ValueError:
-                pass  # original validation will reject this binding, not erase it
-    node_versions = await admission.capture_references(run_id, nodes)
-    current = [await current_validity(
-        deps.evidence_store, AttackGraphService(deps.graph_store), run_id, identity,
-        records=records,
-    ) for identity in identities]
-    read = ValidityRead(run_id, tuple(sorted((*versions, *node_versions))), min(
-        (item.valid_until for item in current if item.valid_until is not None), default=None,
-    ))
-    async def verify(tx):
-        # Expiry already observed by validation is a normal evidence gap.
-        # The final settlement still checks wall-clock expiry atomically.
-        admission.check_references(tx, run_id, read.versions)
-    await coordinator.change(verify)
-    return read
+    bindings = [record for record in records if is_binding(record)
+                and record.metadata.get("claim_evidence_id") in selected]
+    for identity in selected:
+        projection = await current_validity(
+            deps.evidence_store, graph, run_id, identity, records=records,
+        )
+        if projection.status not in {"unbound", "valid"}:
+            return None, [f"evidence reuse conditions are {projection.status}; "
+                          "current support is unproven"]
+    conditions, hashes, deadlines, sources = {}, {}, [], set(selected)
+    for record in bindings:
+        sources.add(str(record.evidence_id))
+        binding = ReuseBinding.model_validate(record.metadata)
+        for condition in binding.conditions:
+            node = await graph.get_node(GraphNodeId(condition.node_id))
+            conditions[condition.ref] = condition
+            hashes[condition.ref] = _condition_state(node, condition)
+            if node is not None:
+                provenance = claim_provenance_of(node.properties).get(
+                    f"{condition.container}s:{condition.key}", {},
+                )
+                identity = provenance.get("evidence_id") or provenance.get("evidence")
+                if identity:
+                    sources.add(str(identity))
+        values, deadline = await _conditions(
+            deps.evidence_store, graph, run_id, engagement_id, binding.conditions,
+        )
+        if values != binding.values:
+            raise StateConflict("evidence_reuse_condition_changed_reassessment_required")
+        if deadline is not None:
+            deadlines.append(deadline)
+    checked = await check_evidence(deps.evidence_store, run_id=run_id,
+                                   engagement_id=engagement_id, evidence_ids=sorted(sources))
+    indexed = await deps.central_state.transaction(
+        lambda tx: _binding_index(tx, selected), write=False,
+    )
+    binding_hashes = {str(record.evidence_id): content_hash(record) for record in bindings}
+    if any(binding_hashes.get(identity) != payload.get("binding_hash")
+           for identity, payload in indexed.items()):
+        raise StateConflict("evidence_reuse_binding_original_unavailable")
+    return ValidityRead(selected, binding_hashes, indexed, conditions, hashes,
+                        min(deadlines) if deadlines else None, checked), []
+
+
+
+
 
 
 async def refresh_validity(deps, runtime) -> list[ValidityProjection]:
     """Deduplicate grounded status changes on the existing Coordinator/outbox."""
     run_id = str(runtime.run_id)
-    coordinator = deps.coordinator or coordinator_for(deps.task_graph_store, deps.path_store)
-    admission = PlanningAdmission(coordinator)
-    # This projection scans the entire binding query, so include absence too.
-    versions = await admission.capture_references(run_id, ("graph", "evidence"))
-    current = await project_validity(
+    return await project_validity(
         deps.evidence_store, AttackGraphService(deps.graph_store), run_id,
     )
 
-    async def record(tx):
-        tx.admit(run_id, str(runtime.mission_id))
-        admission.check_references(tx, run_id, versions)
-        for item in current:
-            if (item.status == "valid" and item.valid_until is not None
-                    and item.valid_until <= datetime.now(timezone.utc)):
-                raise StateConflict("validity_projection_expired")
-            key = ("evidence_validity_projection", f"{run_id}:{item.evidence_id}")
-            payload = item.model_dump(mode="json")
-            if tx.records.get(key) == payload:
-                continue
-            tx.records[key] = payload
-            tx.queue(EventEnvelope(
-                event_id=new_id("event"), event_type=EventType.EVIDENCE_VALIDITY_CHANGED,
-                run_id=runtime.run_id, engagement_id=runtime.engagement_id, source=SOURCE_ID,
-                timestamp=datetime.now(timezone.utc), payload={"schema_version": "1", **payload},
-            ))
-    await coordinator.change(record)
-    await deliver_pending(coordinator, run_id=run_id, engagement_id=str(runtime.engagement_id),
-                          event_bus=deps.event_bus)
-    return current
 
 
-@dataclass(frozen=True)
-class ValiditySchedule:
-    """Notification hint only; expiry always requires fresh original reads."""
 
-    digest: str
-    next_expiry: datetime | None
-
-
-async def validity_schedule(deps, runtime) -> ValiditySchedule | None:
-    """Read observed deadlines in the existing records, never invent a TTL.
-
-    Only an active specialist lifecycle may observe a wakeup. Held, paused,
-    closed and pending operator mutations cannot start followup judgments.
-    This is not a durable timer queue or evidence/permission authority.
-    """
-    coordinator = deps.coordinator or coordinator_for(deps.task_graph_store, deps.path_store)
-    run_id, mission_id = str(runtime.run_id), str(runtime.mission_id)
-
-    async def read(tx):
-        bound = tx.binding(run_id, mission_id, str(runtime.engagement_id))
-        mission = tx.tasks.peek_mission(runtime.mission_id)
-        if (bound["closed"] or mission is None or mission.status is not MissionStatus.ACTIVE
-                or tx.pending(run_id, mission_id)
-                or tx.records.get(("specialist_lifecycle", run_id), {}).get("state") != "active"):
-            return None
-        projections = []
-        for (kind, key), value in tx.records.items():
-            if kind != "evidence_validity_projection" or not key.startswith(f"{run_id}:"):
-                continue
-            item = ValidityProjection.model_validate(value)
-            if (key != f"{run_id}:{item.evidence_id}"
-                    or (item.valid_until is not None and item.valid_until.tzinfo is None)):
-                raise ValueError("validity_schedule_invalid")
-            projections.append(item)
-        projections.sort(key=lambda item: item.evidence_id)
-        return ValiditySchedule(
-            content_hash([item.model_dump(mode="json") for item in projections]),
-            min((item.valid_until for item in projections
-                 if item.status == "valid" and item.valid_until is not None), default=None),
-        )
-
-    return await coordinator.change(read)
 
 
 async def assess(tool_input: dict, context: LocalToolContext) -> LocalToolResult:
@@ -320,8 +312,9 @@ async def assess(tool_input: dict, context: LocalToolContext) -> LocalToolResult
                 conditions=request.conditions, values=values,
             ).model_dump(mode="json")
             identity = EvidenceId("validity_" + content_hash({"run": run_id, "binding": metadata}))
-            if await deps.evidence_store.get(identity) is None:
-                await deps.evidence_store.append(EvidenceRecord(
+            record = await deps.evidence_store.get(identity)
+            if record is None:
+                record = EvidenceRecord(
                     evidence_id=identity, run_id=runtime.run_id,
                     engagement_id=runtime.engagement_id,
                     source_type=EvidenceSourceType.SYSTEM, source_id=SOURCE_ID,
@@ -329,7 +322,24 @@ async def assess(tool_input: dict, context: LocalToolContext) -> LocalToolResult
                     metadata=metadata,
                     summary="Explicit reuse conditions, not a success verdict",
                     created_at=datetime.now(timezone.utc),
-                ))
+                )
+            if deps.central_state is not None:
+                # Publish the reference before file I/O. Missing/lost-ack
+                # originals remain detectable; conditions are never copied.
+                payload = {"claim_evidence_id": request.evidence_id,
+                           "binding_hash": content_hash(record)}
+
+                def register(tx):
+                    tx.admit(settlement=True)
+                    existing = _binding_index(tx, [request.evidence_id]).get(str(identity))
+                    if existing is not None and existing != payload:
+                        raise StateConflict("immutable_validity_binding_changed")
+                    tx.db.execute("INSERT OR IGNORE INTO state_requests VALUES(?,?,?,?)",
+                                  (tx.run_id, BINDING_INDEX_KIND, str(identity),
+                                   json.dumps(payload)))
+
+                await deps.central_state.transaction(register)
+            await deps.evidence_store.append(record)
         projection = await refresh_validity(deps, runtime)
         result = next((p for p in projection if p.evidence_id == request.evidence_id),
                       ValidityProjection(evidence_id=request.evidence_id, status="unbound"))

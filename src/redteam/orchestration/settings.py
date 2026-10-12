@@ -7,28 +7,84 @@ can widen what the Control Plane allows.
 
 from __future__ import annotations
 
-import math
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, model_validator
 
 from redteam.core.config import OrchestrationConfig
 from redteam.core.contracts.llm_policy import LLMRequestPolicy
 
-#: Sequential path has 7 nodes; fan-out adds WORKER + AGGREGATE.
-NODES_PER_TURN = 9
+#: The native graph has three nodes per model turn.
+NODES_PER_TURN = 3
 
 #: Head-room for the non-looping edges around the loop itself.
 RECURSION_SLACK = 10
 
+# Historical settings serialized into the first central binding. They never
+# influenced execution. Keep their original defaults only in durable identity
+# payloads so removing the selectable knobs does not invalidate saved runs.
+_RETIRED_IDENTITY_DEFAULTS = {
+    "branch_prune_failure_threshold": 2,
+    "branch_prune_difficulty_threshold": 0.65,
+    "branch_prune_objective_override": 0.8,
+    "planner_score_margin": 0.15,
+    "planner_rerank_top_k": 3,
+}
+
+_RETIRED_STATE_DEFAULTS = {
+    "max_no_progress_turns": 3,
+    "work_backend": "memory",
+    "work_path": "data/orchestration/work.sqlite3",
+    "task_graph_backend": "memory",
+    "task_graph_path": "data/orchestration/task_graph.sqlite3",
+    "attack_graph_backend": "memory",
+    "attack_graph_path": "data/orchestration/attack_graph.sqlite3",
+    "operator_intent_backend": "memory",
+    "operator_intent_path": "data/orchestration/operator_intents.sqlite3",
+    "path_backend": "memory",
+    "max_actions_per_turn": 1,
+    "verification_reserve_ratio": 0.2,
+    "enforce_verification_reserve": False,
+}
+
+_LEGACY_ONLY_SETTINGS = frozenset(
+    {
+        "work_backend",
+        "work_path",
+        "task_graph_backend",
+        "task_graph_path",
+        "path_backend",
+        "attack_graph_backend",
+        "attack_graph_path",
+        "operator_intent_backend",
+        "operator_intent_path",
+    }
+)
+
 
 class OrchestrationSettings(BaseModel):
-    """How a single ``AgentLoopRunner`` behaves."""
+    """Run limits shared by the planner, instance driver and native continuations."""
 
-    #: Hard ceiling on OBSERVE->REPLAN turns, independent of the
+    _retired_identity: dict = PrivateAttr(default_factory=dict)
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def retain_snapshot_identity(cls, value, handler):
+        # Retired fields are passive input decoding for original SDK bindings.
+        # They are absent from the public schema and never select a store/rule.
+        if not isinstance(value, dict):
+            return handler(value)
+        originals = {key: value[key] for key in _RETIRED_STATE_DEFAULTS if key in value}
+        result = handler({key: item for key, item in value.items() if key not in originals})
+        result._retired_identity.update(originals)
+        return result
+
+    #: Hard ceiling on native model turns, independent of the
     #: Control Plane's ``ExecutionBudget``. Both must hold.
     max_steps: int = Field(default=8, ge=1)
-    # None preserves legacy mode, never an implicit unlimited specialist policy.
+    central_state_path: str = Field(default="data/orchestration/state.sqlite3", min_length=1)
+    max_workers: int | None = Field(default=None, ge=1)
+    # Production assembly requires an explicit request policy.
     llm_request_policy: LLMRequestPolicy | None = None
     specialist_profile_path: str | None = Field(default=None, min_length=1, max_length=4096)
     code_fixture_policy_path: str | None = Field(default=None, min_length=1, max_length=4096)
@@ -44,7 +100,6 @@ class OrchestrationSettings(BaseModel):
     #: that keeps erroring should not be hammered for the whole budget.
     max_consecutive_failures: int = Field(default=3, ge=1)
     #: Stop repeatable or cycling plans that produce no meaningful graph delta.
-    max_no_progress_turns: int = Field(default=3, ge=1)
 
     observation_max_per_type: int = Field(default=20, ge=1)
     observation_max_total: int = Field(default=80, ge=1)
@@ -56,20 +111,10 @@ class OrchestrationSettings(BaseModel):
     checkpoint_path: str = "data/orchestration/checkpoints.sqlite3"
     thread_id: str | None = None
 
-    work_backend: Literal["memory", "sqlite"] = "memory"
-    work_path: str = "data/orchestration/work.sqlite3"
-    task_graph_backend: Literal["memory", "sqlite"] = "memory"
-    task_graph_path: str = "data/orchestration/task_graph.sqlite3"
-    attack_graph_backend: Literal["memory", "sqlite"] = "memory"
-    attack_graph_path: str = "data/orchestration/attack_graph.sqlite3"
-    operator_intent_backend: Literal["memory", "sqlite"] = "memory"
-    operator_intent_path: str = "data/orchestration/operator_intents.sqlite3"
-
     global_concurrency: int = Field(default=4, ge=1)
     #: Number of independent candidates admitted from one planning frontier.
     #: One preserves the original sequential graph; values above one enable
     #: the LangGraph ``Send`` map/reduce path.
-    max_actions_per_turn: int = Field(default=1, ge=1)
     per_target_concurrency: int = Field(default=1, ge=1)
     lease_ttl_seconds: float = Field(default=60.0, gt=0)
     resource_wait_timeout_seconds: float = Field(default=30.0, gt=0, le=600)
@@ -78,23 +123,11 @@ class OrchestrationSettings(BaseModel):
     #: verification/replanning with headroom. Only enforced when
     #: ``enforce_verification_reserve`` is on; otherwise the historical
     #: placeholder behaviour (the ratio is carried but inert) is preserved.
-    verification_reserve_ratio: float = Field(default=0.2, ge=0.0, le=0.9)
-    enforce_verification_reserve: bool = Field(default=False)
-    branch_prune_failure_threshold: int = Field(default=2, ge=1)
-    branch_prune_difficulty_threshold: float = Field(default=0.65, ge=0.0, le=1.0)
-    branch_prune_objective_override: float = Field(default=0.8, ge=0.0, le=1.0)
-
-    #: Legacy compatibility; the LLM-led runtime ignores ranking knobs.
-    planner_score_margin: float = Field(default=0.15, ge=0.0, le=10.0)
-    #: Retained for older settings; never limits LLM-generated actions.
-    planner_rerank_top_k: int = Field(default=3, ge=2, le=20)
-
     #: One runtime mode; frozen legacy core flags do not select it.
     llm_candidate_generation: Literal[True] = True
     decision_max_attempts: int = Field(default=3, ge=1, le=6)
     # Normal plan/review decisions are not malformed-response retries.
     decision_normal_limit: int = Field(default=8, ge=1, le=32)
-    path_backend: Literal["memory", "sqlite"] = "memory"
 
     #: Overrides the value derived from ``max_steps`` when set.
     recursion_limit: int | None = Field(default=None, ge=1)
@@ -103,33 +136,18 @@ class OrchestrationSettings(BaseModel):
     def _checkpoint_path_is_safe(self) -> OrchestrationSettings:
         if self.checkpoint_backend == "sqlite" and not self.checkpoint_path.strip():
             raise ValueError("sqlite checkpointing needs a non-blank checkpoint_path")
-        if self.work_backend == "sqlite" and not self.work_path.strip():
-            raise ValueError("sqlite work backend needs a non-blank work_path")
-        if self.task_graph_backend == "sqlite" and not self.task_graph_path.strip():
-            raise ValueError("sqlite task graph backend needs a non-blank task_graph_path")
-        if self.attack_graph_backend == "sqlite" and not self.attack_graph_path.strip():
-            raise ValueError("sqlite attack graph backend needs a non-blank attack_graph_path")
-        if self.operator_intent_backend == "sqlite" and not self.operator_intent_path.strip():
-            raise ValueError(
-                "sqlite operator intent backend needs a non-blank operator_intent_path"
-            )
         return self
 
     @classmethod
     def for_durable_run(
         cls, config: OrchestrationConfig | None = None, *, max_steps: int | None = None
     ) -> OrchestrationSettings:
-        """Use durable, independent domain stores for a CLI run and its resume."""
+        """Persist central execution checkpoints; domain state has one owner."""
         return cls.from_config(
             config,
             max_steps=max_steps,
             checkpointing=True,
             checkpoint_backend="sqlite",
-            work_backend="sqlite",
-            task_graph_backend="sqlite",
-            path_backend="sqlite",
-            attack_graph_backend="sqlite",
-            operator_intent_backend="sqlite",
             enforce_verification_reserve=True,
         )
 
@@ -139,18 +157,25 @@ class OrchestrationSettings(BaseModel):
             return self.recursion_limit
         return self.max_steps * NODES_PER_TURN + RECURSION_SLACK
 
-    def verification_reserve(self, total_budget: int) -> int:
-        """Actions held back from normal execution for verification.
+    def durable_payload(self) -> dict:
+        """Preserve the original settings identity, including retired defaults."""
+        return {
+            **_RETIRED_IDENTITY_DEFAULTS,
+            **_RETIRED_STATE_DEFAULTS,
+            **self._retired_identity,
+            **self.model_dump(mode="json"),
+        }
 
-        Clamped to ``[0, max(total_budget - 1, 0)]`` so at least one action
-        can always run; a run with a single action reserves nothing. This is
-        the scheduling primitive EXECUTE uses when
-        ``enforce_verification_reserve`` is on.
-        """
-        if total_budget <= 0:
-            return 0
-        reserved = math.ceil(total_budget * self.verification_reserve_ratio)
-        return min(reserved, max(total_budget - 1, 0))
+    def central_payload(self) -> dict:
+        """Operative settings and historical identity fields, without legacy DB path copies."""
+        historical = {key: self._retired_identity.get(key, value)
+                      for key, value in _RETIRED_STATE_DEFAULTS.items()
+                      if key not in _LEGACY_ONLY_SETTINGS}
+        return {**historical, **self.model_dump(mode="json")}
+
+    def with_overrides(self, **overrides) -> OrchestrationSettings:
+        """Validate selected changes without discarding original passive identity."""
+        return type(self).model_validate({**self.durable_payload(), **overrides})
 
     @classmethod
     def from_config(
@@ -160,6 +185,8 @@ class OrchestrationSettings(BaseModel):
         base: dict[str, object] = {}
         if config is not None:
             base["max_steps"] = config.max_steps
+            base["central_state_path"] = config.central_state_path
+            base["max_workers"] = config.max_workers
             base["max_retries"] = config.max_retries
             base["tool_timeout_seconds"] = config.tool_timeout_seconds
             base["resource_wait_timeout_seconds"] = config.resource_wait_timeout_seconds

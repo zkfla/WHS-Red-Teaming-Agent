@@ -74,8 +74,16 @@ def _integrity_problems(
 class EvidenceReadSnapshot:
     """Detached port view of an inspected Run, not a second durable store."""
 
-    def __init__(self, records: list[EvidenceRecord]) -> None:
+    def __init__(
+        self, records: list[EvidenceRecord], *, verified_run_id: RunId | None = None,
+    ) -> None:
         self._records = tuple(record.model_copy(deep=True) for record in records)
+        self._verified_run_id = verified_run_id
+
+    async def verify_run_integrity(self, run_id: RunId) -> list[str]:
+        if run_id != self._verified_run_id:
+            raise ValueError("evidence_snapshot_integrity_not_inspected")
+        return []  # Detached immutable copies of the inspected index/body pair.
 
     async def append(self, evidence: EvidenceRecord) -> None:
         raise RuntimeError("evidence_snapshot_is_read_only")
@@ -121,7 +129,7 @@ class FilesystemEvidenceStore:
             raise ValueError("evidence_snapshot_changed")
         return EvidenceReadSnapshot([
             EvidenceRecord.model_validate_json(line) for line in text.splitlines() if line.strip()
-        ])
+        ], verified_run_id=run_id)
 
     def __init__(self, root_dir: str | Path) -> None:
         self._root = Path(root_dir)

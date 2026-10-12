@@ -23,7 +23,7 @@ from redteam.core.ports.evidence_store import EvidenceStore
 from redteam.core.ports.execution_recovery import ExecutionRecoveryProvider
 from redteam.core.ports.llm import LLMClient
 from redteam.core.ports.program_discovery import ShellProgramDiscovery
-from redteam.core.ports.task_graph import MissionTaskStore
+from redteam.core.ports.task_graph import InvestigationReader, MissionTaskStore
 from redteam.core.ports.tool_catalog import ToolCatalog
 from redteam.core.ports.tool_gateway import ToolGateway
 from redteam.core.provider_contracts import (
@@ -38,6 +38,7 @@ from redteam.orchestration.agents.providers import (
 )
 from redteam.orchestration.agents.registry import AgentRegistry, default_registry
 from redteam.orchestration.analysis import AnalysisVerifier, StructuredLLMAnalysisVerifier
+from redteam.orchestration.central_state import CentralStateStore
 from redteam.orchestration.checkpointing import StateCodecRegistry
 from redteam.orchestration.component_binding import RuntimeComponentBinding
 from redteam.orchestration.context_projection import ContextProjectionCache
@@ -48,11 +49,9 @@ from redteam.orchestration.long_jobs import LongJobAdapter
 from redteam.orchestration.methodology import ReferenceLibrary
 from redteam.orchestration.observations import ResultMapperRegistry, default_result_mapper_registry
 from redteam.orchestration.operator_intents.store import OperatorIntentStore
-from redteam.orchestration.paths import InMemoryPathStore, PathStore
+from redteam.orchestration.paths import PathStore
 from redteam.orchestration.planning import PlanningProvider
 from redteam.orchestration.settings import OrchestrationSettings
-from redteam.orchestration.task_graph.memory import InMemoryTaskGraphStore
-from redteam.orchestration.work.memory import InMemoryWorkStore
 from redteam.orchestration.work.store import WorkStore
 
 
@@ -65,7 +64,7 @@ class RuntimeDeps:
     evidence_store: EvidenceStore
     llm_client: LLMClient
     verifier: AnalysisVerifier | None = None
-    path_store: PathStore = field(default_factory=InMemoryPathStore)
+    path_store: PathStore | None = None
     long_job_adapter: LongJobAdapter | None = None
     execution_recovery: ExecutionRecoveryProvider | None = None
     engagement: Engagement | None = None
@@ -81,8 +80,8 @@ class RuntimeDeps:
     # Tool Result -> Attack Graph Mutation (SERVICE/ENDPOINT discovery from
     # a successful execution's real output) -- see `orchestration.observations`.
     result_mappers: ResultMapperRegistry = field(default_factory=default_result_mapper_registry)
-    work_store: WorkStore = field(default_factory=InMemoryWorkStore)
-    task_graph_store: MissionTaskStore = field(default_factory=InMemoryTaskGraphStore)
+    work_store: WorkStore | None = None
+    task_graph_store: MissionTaskStore | None = None
     operator_intent_store: OperatorIntentStore | None = None
     settings: OrchestrationSettings = field(default_factory=OrchestrationSettings)
     context_cache: ContextProjectionCache = field(
@@ -125,18 +124,30 @@ class RuntimeDeps:
     agent_prompts: AgentPrompts | None = field(default=None, compare=False)
     artifact_store: ArtifactStore | None = field(default=None, compare=False)
     code_fixture_runner: CodeFixtureRunner | None = field(default=None, compare=False)
+    # Execution has one domain owner. Historical stores are migration inputs.
+    central_state: CentralStateStore = field(kw_only=True, compare=False)
+
+    @property
+    def investigations(self) -> InvestigationReader:
+        return self.central_state
 
     def __post_init__(self) -> None:
+        if self.central_state is None:
+            raise ValueError("runtime_requires_central_state")
+        if any(store is not None for store in
+                 (self.path_store, self.work_store, self.task_graph_store, self.coordinator)):
+            raise ValueError("central_runtime_cannot_mix_legacy_state_owners")
         if self.settings.llm_request_policy is not None:
-            from redteam.orchestration.coordination import coordinator_for
-            from redteam.orchestration.metered_llm import configure_request_metering
+            from redteam.orchestration.metered_llm import RunMeteredLLM
 
-            coordinator = self.coordinator or coordinator_for(
-                self.task_graph_store, self.path_store,
-            )
-            object.__setattr__(self, "llm_client", configure_request_metering(
-                self.llm_client, self.settings, coordinator,
-            ))
+            client = self.llm_client
+            if isinstance(client, RunMeteredLLM):
+                if not self.central_state.owns_request_ledger(client.ledger):
+                    raise ValueError("llm_meter_central_store_mismatch")
+            else:
+                client = RunMeteredLLM(client, self.central_state.request_ledger(),
+                                       prompts=self.agent_prompts)
+            object.__setattr__(self, "llm_client", client)
         if self.verifier is None:
             object.__setattr__(
                 self,

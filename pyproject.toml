@@ -48,9 +48,20 @@ agent = [
     "langgraph-checkpoint-sqlite>=3.1,<4.0",
     "aiosqlite>=0.22,<1.0",
 ]
+# Local browser UI (`redteam web`). These packages are also installed
+# transitively by `mcp`; they are declared here because the web UI imports them
+# directly. FastAPI and a JavaScript build chain are intentionally not used.
+web = [
+    "starlette>=0.27",
+    "uvicorn>=0.31",
+    "sse-starlette>=3.0",
+]
 dev = [
     "langgraph-checkpoint-sqlite>=3.1,<4.0",
     "aiosqlite>=0.22,<1.0",
+    "starlette>=0.27",
+    "uvicorn>=0.31",
+    "sse-starlette>=3.0",
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "hypothesis>=6.168",
@@ -69,7 +80,7 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [tool.setuptools.package-data]
-redteam = ["capability/reference_data/*.json", "capability/reference_data/*.yaml", "capability/reference_data/templates/*.md"]
+redteam = ["capability/reference_data/*.json", "capability/reference_data/*.yaml", "capability/reference_data/templates/*.md", "app/web/static/*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

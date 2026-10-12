@@ -1,20 +1,47 @@
 # WHS Red Teaming Agent
 
-## Native specialist integration branch
+## Current runtime
 
-`dev-jm-native-specialists` ports specialist roles onto dev's native ReAct and
-independent-instance driver. It does not replace that driver with the older
-dev-jm execution pipeline. The original `dev-jm` branch is preserved.
+The default runtime uses one central SQLite database and a bounded planner with
+two independent workers. The planner proposes investigations; workers choose
+tools using native ReAct (`MODEL → TOOLS → SETTLE`). Results and intermediate
+evidence can trigger replanning before another worker finishes.
 
-See [the branch guide](docs/agent/native-specialists-branch-guide.md) for roles,
-explicit configuration, synthetic tests and known unfinished work. This is an
-implementation preview, not a completed PRD or a verified live penetration run.
+Select a specialist profile and a shared LLM request policy explicitly. The
+Web/API and Recon profile is `config/agents/native-specialists-web.yaml`.
+Roles describe available expertise; several workers can use the same role.
+Changing a profile or operative limit cannot force-resume an existing Run.
+See [the runtime guide](docs/agent/orchestration.md) and
+[central state contract](docs/contracts/central-state.md).
 
-The current forward scope is **Web/API and Recon, not Mobile**. Select
-`config/agents/native-specialists-web.yaml` explicitly for new specialist Runs.
-It shares the existing MD prompts and native engine; the full profile and old
-Mobile code remain for compatibility. Profile changes must not force-resume
-an existing Run. See the guide for cost controls and local verification.
+## Browser setup and automatic web policy
+
+Start `redteam web`, then create or edit an investigation in **조사 선택**.
+In the scope step, enter the target URL (including HTTPS and any explicit port)
+and choose **사이트 전체 — 정책 자동 생성** or **지정 경로만 — 정책 자동 생성**.
+Review the sites and paths, confirm the authorized scope, and save. Existing
+investigations keep their manual MCP selection until explicitly edited.
+
+Before the session becomes ready, the application generates and validates the
+local web/recon MCP deployment under `<engagement-name>.mcp/<fingerprint>/`
+beside the engagement file and connects the policy files automatically.
+The selected site remains bound to its scheme, hostname and port. Whole-site
+mode permits all literal paths on that origin; exact-path mode permits only the
+entered paths. Generated profiles provide anonymous GET/HEAD/OPTIONS requests.
+Query, credential, replay and write permissions, Control approval, ROE and
+shared budgets remain subject to their existing contracts.
+
+Explicit network CIDRs are retained. Otherwise target addresses are pinned as
+individual IPv4/IPv6 networks; a hostname needs a DNS lookup during preparation.
+No HTTP request or scan occurs during generation. Source/policy digests and
+declarations are saved in engagement metadata and reused on restart; missing
+or changed originals are refused. Scope/path changes create a new deployment
+and retain old artifacts for previous Runs. Generated MCP settings belong to
+that session and do not modify `.env` or the process environment.
+**기존 MCP 설정 사용** retains manual/remote selection.
+
+Restart the web server after updating this code; an already-running server
+does not reload Python modules automatically.
 
 ## Project Goal
 
@@ -44,14 +71,16 @@ Analysis) versus what's real and wired up (Web/API, Recon).
 
 ```text
 User/Operator -> Engagement Config (Scope/ROE/Limits)
-              -> Agent Orchestration Layer (native ReAct: MODEL->TOOLS->SETTLE)
-                 Optional specialist planning/atomization -> existing Task/outbox/InstanceDriver
+              -> Planner -> investigation Tasks -> bounded InstanceDriver workers
+                 Each worker: MODEL -> TOOLS -> SETTLE
               -> Engagement Control Plane (Scope/ROE/Policy/RateLimit/Budget/Approval/Audit) [mandatory gate]
               -> Capability Layer (ToolGateway -> MCPToolRegistry -> MCPAdapter)
               -> Execution Substrate (MCP Server containers)
               -> Target
 
-All results -> Evidence Store, Event Bus, Shared Attack Graph
+Original results -> Evidence Store
+Tasks/results/executions/graph/request accounting -> central state.sqlite3
+Committed outbox -> worker/planner notifications -> replan / criterion review
 ```
 
 `redteam.core` (contracts + ports) is the Source of Truth. Every other
@@ -197,16 +226,15 @@ Full rules: `instruction.md` section 20, `docs/architecture/dependency-rules.md`
 
 ## How to Add an Agent
 
-1. Add a node function `async def my_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState`
-   under `src/redteam/orchestration/nodes/`.
-2. Register it in `redteam.orchestration.graph.build_graph` and route to
-   it from `redteam.orchestration.router`.
-3. Only touch `state["runtime"]` (the `RuntimeState` contract) for
-   anything that must outlive the node; use `GraphState`'s other
-   (transient) keys for in-flight objects between adjacent nodes.
-4. To propose a tool call, build an `ActionProposal` and call
-   `deps.control_plane.evaluate(...)` — never `deps.tool_gateway`
-   directly.
+1. Provide the role's definition, prompt and output contract through the existing
+   agent package/registry and component assembly.
+2. Select the role in the specialist profile, with catalog-based tool selection
+   and explicit request/concurrency limits.
+3. Let `InstanceDriver` instantiate workers for registered investigation Tasks.
+   Shared state belongs to central transactions; each SDK thread holds only its
+   own continuation and original execution references.
+4. Keep tool execution in the existing admission/Control/gateway/result flow.
+   Registering a role or tool does not grant execution permission.
 
 ## How to Add a Policy
 
@@ -250,9 +278,47 @@ policy decision is made in this package. New investigations go through the canon
 `app.bootstrap.build_application(AppConfig)` path (real configured LLM
 provider, real configured MCP servers, real Control Plane) — never a
 CLI-only shortcut. Resume and approval operations use their existing public APIs;
-read-only commands read durable state directly
-(Approval/Audit/Evidence stores, or the persisted terminal report — see
-`redteam.app.report_store`).
+read-only commands read durable state directly. The default runtime uses the
+central Mission/investigation/execution/graph database with two workers.
+Evidence, Audit, Approval and SDK checkpoints remain separate original stores;
+report files are exports. `status`, `findings` and `report` query current central
+state even when a Run is suspended or still executing. The required specialist
+profile and shared request policy are operator selections; see
+[Central state](docs/contracts/central-state.md#plan2d-completion-cleanup-reports-and-default-cli).
+
+```bash
+export REDTEAM_SPECIALIST_PROFILE=config/agents/native-specialists-web.yaml
+export REDTEAM_LLM_REQUEST_POLICY_JSON='{"mode":"bounded","max_requests":50,"max_concurrent_requests":2}'
+redteam run engagement.yaml --workers 2 --state-db data/orchestration/state.sqlite3
+redteam resume <run-id> engagement.yaml --state-db data/orchestration/state.sqlite3
+```
+
+The request count above is an example operator budget. Tool, target, token and
+time limits still apply. Approval/job waits free worker and model capacity while
+retaining the original execution and any occupied resources. Stop closes new
+admission and drains within the configured timeout; uncertain calls retain their
+resources and are never silently replayed. Resume validates the original scope,
+profile, limits, checkpoints, approvals, evidence and usage.
+
+Resource waits automatically continue the original call when another actor
+releases its resource/capacity, preserving IDs and the original budget charge.
+Identical non-retry-safe UNKNOWN calls cannot be repeated with new Task/call IDs,
+even without a provider resource binding. `resume ... --instance <instance-id>`
+continues only that instance; it leaves READY siblings and goal planning alone.
+Completed selections return without opening SDK state. Live status separates
+the current `in_progress` outcome from the previous settlement reason.
+
+Execution uses central state only. The legacy runtime option, old loop and
+cohort resume have been removed. Original databases and explicit offline
+migration readers remain; an unsupported old Run is refused rather than run
+through another engine. New relation-graph and unified-context APIs remain
+follow-up work. Historical strategy/activation counters do not limit new work;
+actual budgets and concurrent worker/resource limits do.
+
+Providers declare resource effects (including an explicit empty declaration for
+read-only operations). Calls with unspecified effects remain visible as
+`cleanup_unmapped_tools` and prevent `goal_achieved` until cleanup can be verified.
+No resource identity is guessed from response text.
 
 ### Interactive setup (`redteam`, no subcommand)
 
@@ -419,15 +485,15 @@ redteam [--verbose]                               # interactive setup/Preflight/
 redteam init [--output engagement.yaml]          # write a starter Engagement config (from examples/engagement.yaml)
 redteam validate engagement.yaml [--json]
                                                    # schema/scope/ROE/capability checks -- never touches a target
-redteam run engagement.yaml [--non-interactive] [--max-steps N] [--json]
-redteam resume <run-id> engagement.yaml          # reconnect a safe durable checkpoint
-redteam status <run-id> [--json]                  # from the persisted terminal report; "unknown" if still running elsewhere
+redteam run engagement.yaml [--workers 2] [--state-db PATH] [--non-interactive] [--max-steps N] [--json]
+redteam resume <run-id> engagement.yaml [--state-db PATH]  # original IDs, checkpoints and accounting
+redteam status <run-id> [--state-db PATH] [--json]          # current central state and all waits
 redteam roe show engagement.yaml [--json]
 redteam tools list [--json]
 redteam tools health [--json]
-redteam approvals list [--run <run-id>] [--json]
-redteam approvals approve <approval-id> [--by <name>]
-redteam approvals deny <approval-id> [--by <name>]
+redteam approvals list [--run <run-id>] [--state-db PATH] [--json]
+redteam approvals approve <approval-id> [--run <run-id>] [--state-db PATH] [--by <name>]
+redteam approvals deny <approval-id> [--run <run-id>] [--state-db PATH] [--by <name>]
 redteam approvals resolve <approval-id> approved|rejected --by <name>   # lower-level; approve/deny wrap this
 redteam approvals expire --ttl-seconds <n>
 redteam findings list <run-id> [--json]

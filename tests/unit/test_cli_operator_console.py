@@ -131,6 +131,8 @@ async def _console(
     deps = SimpleNamespace(
         operator_intent_store=intent_store,
         task_graph_store=task_store,
+        investigations=task_store,
+        central_state=None,
         event_bus=InMemoryEventBus(),
         control_plane=control_plane,
         tool_gateway=gateway,

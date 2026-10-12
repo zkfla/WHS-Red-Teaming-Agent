@@ -46,15 +46,14 @@ Fields are `id`/`type` (not `node_id`/`node_type` or
 `edge_id`/`edge_type`) — matches instruction.md section 16 exactly.
 `Hypothesis` and `Finding` are separate lightweight models (also under
 `redteam.core.contracts.graph`). **Current status**: `Hypothesis` nodes
-are real and produced in every run that proposes a step with a
-`HypothesisDraft` (`AttackGraphService.record_hypothesis`, called from
-`orchestration.nodes.plan`) — every built-in playbook step does.
-`Finding` nodes are produced only when a step's `Expectation` reaches
-`Verdict.VIOLATION` (not configured on built-in playbook steps — see
-`docs/agent/orchestration-implementation-plan.md` section 16.1, finding
-1), an explicit `graph.record` finding passes posthoc review plus
-promotion (`orchestration.graph_recording`), or verification resolves a
-tested hypothesis (`orchestration.nodes.verify`, `orchestration.recovery`).
+are recorded from worker proposals grounded in preserved originals.
+`Finding` nodes require the existing verification/promotion contract:
+an explicit `graph.record` proposal passes origin and claim review, or a
+verification result supports the tested hypothesis. Tool success alone does
+not confirm a Finding or complete a Task/Mission. The default implementation
+stores graph nodes, edges and mutation receipts in central `state.sqlite3`.
+See [the current graph guide](../agent/attack-graph.md) for the retained APIs,
+internal storage format and migration boundary.
 
 ## Store Protocol
 
@@ -85,6 +84,15 @@ resolves it uniformly across every target kind — see
 `orchestration.nodes.update.update_node` for the pattern.
 
 ## Swapping the backend
+
+The optional central backend is selected by `build_central_graph(state)` after
+initializing and binding `CentralStateStore`. It stores nodes, edges and existing
+mutation receipts in `state.sqlite3`, reads SQL without a graph mirror, and
+supports store-owned atomic node/edge updates and SQL `subgraph_around`.
+Service/view/namespace wrappers forward these capabilities. See
+[the central storage contract](central-state.md) for schema 2, shared commit,
+cache policy and the snapshot/receipt format for later migration. Existing
+default backend selection remains unchanged.
 
 Neo4j or another graph DB is out of scope for this stage
 (instruction.md section 21) but can be added later by implementing

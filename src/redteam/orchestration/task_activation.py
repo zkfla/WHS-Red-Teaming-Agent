@@ -360,6 +360,29 @@ class TaskActivation:
         return runtime
 
     @classmethod
+    async def inspect_migration_originals(cls, tx: ChangeSet, run_id: str) -> None:
+        """Check source launch proofs without claiming, releasing or entering.
+
+        Reserved launches reuse the original zero-entry recovery rules. Entered
+        launches need the original identity/claim, with checkpoints and external
+        receipts checked separately by migration. Path history is irrelevant.
+        """
+        rows = cls._rows(tx, run_id)
+        if len({row["instance_id"] for row in rows}) != len(rows):
+            raise StateConflict("task_activation_identity_mismatch")
+        for row in rows:
+            if row.get("launch_stage") == "reserved":
+                await cls._check_reserved_state(tx, row)
+            else:
+                runtime = cls._collection_runtime(tx, row, run_id)
+                task = await tx.tasks.get_task(TaskId(row["task_id"]))
+                if (task is None or task.mission_id != runtime.mission_id
+                        or task.occupant_owner != runtime.work_owner
+                        or task.assigned_agent != runtime.current_agent
+                        or completion_contract_hash(task) != row["completion_contract_hash"]):
+                    raise StateConflict("activation_collection_claim_changed")
+
+    @classmethod
     async def bootstrap_identity(
         cls, tx: ChangeSet, run_id: str,
     ) -> ActivationRecoveryIdentity | None:

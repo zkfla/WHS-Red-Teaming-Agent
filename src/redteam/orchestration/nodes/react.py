@@ -6,22 +6,19 @@ plan, and a free-text answer is not a confirmed task or mission outcome.
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 from dataclasses import asdict
-from datetime import datetime, timedelta, timezone
-from types import SimpleNamespace
+from datetime import datetime, timezone
 from typing import Any
-
-from langgraph.types import Overwrite
 
 from redteam.attack_graph.identity import node_id_for_target
 from redteam.core.contracts.action import ActionProposal
+from redteam.core.contracts.completion import completion_contract_hash
 from redteam.core.contracts.events import EventType
 from redteam.core.contracts.evidence import EvidenceRecord
 from redteam.core.contracts.mission import redact_secret_material
-from redteam.core.enums import EvidenceSourceType, PolicyVerdict
+from redteam.core.enums import EvidenceSourceType
 from redteam.core.ids import ActionId, EvidenceId, ToolId, new_id
 from redteam.core.ports.llm import NativeToolSpec
 from redteam.orchestration.agents.base import PlanStep
@@ -30,7 +27,7 @@ from redteam.orchestration.candidates.models import CandidateDraft
 from redteam.orchestration.cognition import DecisionFailure, ReasoningHalted
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.coordination import content_hash
-from redteam.orchestration.diagnostics import DecisionDiagnostic, diagnostic_for_exception
+from redteam.orchestration.diagnostics import diagnostic_for_exception
 from redteam.orchestration.dispatch import DispatchItem
 from redteam.orchestration.engine import (
     DecisionRuleError,
@@ -42,14 +39,9 @@ from redteam.orchestration.knowledge_validation import registered_principal_for_
 from redteam.orchestration.local_tools import LocalToolContext
 from redteam.orchestration.native_binding import exposed_tool_name, resolve_native_target
 from redteam.orchestration.nodes._support import publisher_for
-from redteam.orchestration.nodes.aggregate import aggregate_node
 from redteam.orchestration.nodes.observe import observe_node
-from redteam.orchestration.nodes.plan import _verification_batch_capacity
 from redteam.orchestration.nodes.replan import _hard_stop, replan_node
-from redteam.orchestration.nodes.worker import worker_node
 from redteam.orchestration.progress import canonical_graph_changed
-from redteam.orchestration.scheduler import WorkScheduler
-from redteam.orchestration.semantic_completion import purpose_hash
 from redteam.orchestration.state import GraphState, NativeCallState, TerminationReason
 from redteam.orchestration.tool_discovery import (
     bootstrap_local_ids,
@@ -58,8 +50,6 @@ from redteam.orchestration.tool_discovery import (
     discovery_lookup_wired,
     select_advertised_tool_ids,
 )
-from redteam.orchestration.work.models import TERMINAL_STATUSES, WorkStatus
-from redteam.orchestration.work.rules import conflict_blockers
 
 SYSTEM = """You investigate the current authorized task using the supplied tools.
 Choose useful tool calls directly; no investigation path, numbered step, or
@@ -220,9 +210,11 @@ async def _bind_call(call: NativeCallState, *, deps: RuntimeDeps, runtime, conte
         else f"{runtime.run_id}:{runtime.instance_id}"
     )
     key = "cand_" + hashlib.sha256(f"{call_namespace}:{call.call_id}".encode()).hexdigest()[:24]
+    history: list[Any]
+    history = await deps.central_state.list_executions()
     if any(
         item.model_tool_call_id == call.call_id and item.instance_id == runtime.instance_id
-        for item in await deps.work_store.list_items(run_id=runtime.run_id)
+        for item in history
     ):
         raise DecisionRuleError(
             "This provider tool call ID was already submitted.",
@@ -245,7 +237,9 @@ async def _bind_call(call: NativeCallState, *, deps: RuntimeDeps, runtime, conte
         # to the stored task objective (no current_goal fallback), and a
         # goal-only run (no mission) binds to the run goal. Any other value
         # here would make admission reject every native call.
-        task_purpose_hash=purpose_hash(_native_purpose_text(runtime, task)),
+        task_purpose_hash=(
+            completion_contract_hash(await deps.central_state.get_task(str(runtime.active_task_id)))
+        ),
         operator_intent_id=await operator_epoch(deps, runtime),
         availability_impact=bool(getattr(tool, "availability_impact", False)),
         assessment_kind="observation",
@@ -270,30 +264,6 @@ async def _bind_call(call: NativeCallState, *, deps: RuntimeDeps, runtime, conte
         )
     candidate = candidates[0].model_copy(update={"candidate_key": key})
     step = candidate.plan_step.model_copy(update={"candidate_key": key})
-    if await InvestigationEngine(deps).has_ambiguous_execution(
-        SimpleNamespace(
-            target_node_id=str(node_id_for_target(target)) if target is not None else None,
-            tool_id=tool.tool_id, binding_mode="selected_tool", arguments=step.arguments,
-        ),
-        runtime,
-    ):
-        raise DecisionRuleError(
-            "An identical execution has an uncertain outcome; collect its result before retrying.",
-            code="execution_outcome_uncertain", location="arguments",
-        )
-    items = await WorkScheduler(deps.work_store).enqueue(
-        [candidate],
-        graph_revision=runtime.step_count,
-        run_id=runtime.run_id,
-        instance_id=runtime.instance_id,
-        mission_task_id=runtime.active_task_id,
-    )
-    if not items:
-        raise DecisionRuleError(
-            "This provider tool call ID was already submitted.",
-            code="duplicate_tool_call_id",
-            location="call_id",
-        )
     proposal = ActionProposal(
         action_id=ActionId(new_id("action")),
         run_id=runtime.run_id,
@@ -310,14 +280,20 @@ async def _bind_call(call: NativeCallState, *, deps: RuntimeDeps, runtime, conte
         availability_impact=step.availability_impact,
         created_at=datetime.now(timezone.utc),
     )
-    call.dispatch = DispatchItem(work_id=items[0].work_id, plan_step=step, proposal=proposal)
+    from redteam.core.convert import prepare_tool_invocation
+
+    invocation = prepare_tool_invocation(proposal, tool_id=step.tool_id,
+                                         timeout_seconds=deps.settings.tool_timeout_seconds,
+                                         correlation_id=str(proposal.action_id))
+    call.dispatch = DispatchItem(work_id="", plan_step=step, proposal=proposal,
+                                 invocation=invocation)
     event = await publisher_for({"runtime": runtime}, deps, "orchestration.model").publish(
         EventType.ACTION_PROPOSED,
         {
             "action_id": proposal.action_id,
             "agent_id": proposal.agent_id,
             "candidate_key": key,
-            "work_id": items[0].work_id,
+            "work_id": None,
             "model_tool_call_id": call.call_id,
             "mission_task_id": step.mission_task_id,
             "tool_id": str(step.tool_id),
@@ -510,7 +486,8 @@ async def model_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             -10:
         ]
         runtime.termination_reason = (
-            diagnostic.termination_reason or TerminationReason.PLANNING_ERROR
+            runtime.termination_reason or diagnostic.termination_reason
+            or TerminationReason.PLANNING_ERROR
         )
         runtime.planning_error = None if diagnostic.termination_reason else type(exc).__name__
         state["native_calls"] = []
@@ -600,276 +577,51 @@ async def _local_call(call: NativeCallState, state: GraphState, *, deps: Runtime
 
 async def tools_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     """Run admitted siblings in bounded batches; keep unexecuted calls durable."""
+    from redteam.orchestration.central_runtime import run_call
+
     calls = [call.model_copy(deep=True) for call in state.get("native_calls", [])]
     state = {**state, "native_calls": calls}
-    budget_blocked = False
-    resource_wait_started: float | None = None
-    while any(not call.completed for call in calls):
-        runtime = state["runtime"]
-        if runtime.termination_reason:
-            break
+    for call in calls:
+        if call.completed or state["runtime"].termination_reason:
+            continue
         engine = InvestigationEngine(deps)
-        engine.begin_native_turn(runtime)
+        engine.begin_native_turn(state["runtime"])
         try:
             await engine.guard_reasoning()
         except (ReasoningHalted, ValueError) as exc:
             diagnostic = diagnostic_for_exception(exc, stage="native_tools")
-            runtime.planning_diagnostic = diagnostic
-            runtime.termination_reason = (
-                diagnostic.termination_reason or TerminationReason.PLANNING_ERROR
+            state["runtime"].planning_diagnostic = diagnostic
+            state["runtime"].termination_reason = (
+                state["runtime"].termination_reason or diagnostic.termination_reason
+                or TerminationReason.PLANNING_ERROR
             )
             break
-        # Registry-owned local calls retain the provider's order. In
-        # particular, recording is not run before a sibling source exists.
-        first = next(call for call in calls if not call.completed)
-        if first.dispatch is None:
-            await _local_call(first, state, deps=deps)
-            continue
-        selected: list[NativeCallState] = []
-        target_counts: dict[str, int] = {}
-        role_counts: dict[str, int] = {}
-        capacity = min(deps.settings.max_actions_per_turn, deps.settings.global_concurrency)
-        capacity = min(capacity, _verification_batch_capacity(runtime, deps.settings))
-        if runtime.remaining_budget is not None:
-            capacity = min(capacity, runtime.remaining_budget)
-        if capacity < 1:
-            for call in calls:
-                if not call.completed and call.dispatch is not None:
-                    budget_blocked = True
-                    call.feedback = {
-                        "ok": False,
-                        "error": "execution budget exhausted",
-                        "executed": False,
-                    }
-                    call.completed = True
-                    await deps.work_store.acquire(
-                        call.dispatch.work_id,
-                        owner=runtime.work_owner,
-                        now=datetime.now(timezone.utc),
-                        ttl=timedelta(seconds=deps.settings.lease_ttl_seconds),
-                    )
-                    await deps.work_store.complete(
-                        call.dispatch.work_id,
-                        owner=runtime.work_owner,
-                        now=datetime.now(timezone.utc),
-                        status=WorkStatus.CANCELLED,
-                        reason="native_execution_budget_exhausted",
-                    )
-            continue
-        for call in calls:
-            if call.completed:
-                continue
-            if call.dispatch is None:
-                break
-            item = call.dispatch
-            target = (
-                str(node_id_for_target(item.proposal.target))
-                if item.proposal.target is not None else None
-            )
-            role = str(item.proposal.agent_id)
-            definition = deps.agents.definition(item.proposal.agent_id)
-            agent = deps.agents.get(item.proposal.agent_id)
-            if (
-                agent is not None
-                and agent.max_actions is not None
-                and runtime.actions_by_agent.get(role, 0) + role_counts.get(role, 0)
-                >= agent.max_actions
-            ):
-                # The role allowance is spent for this run; release the
-                # queued row as CANCELLED instead of leaving it pending.
-                await deps.work_store.acquire(
-                    item.work_id,
-                    owner=runtime.work_owner,
-                    now=datetime.now(timezone.utc),
-                    ttl=timedelta(seconds=deps.settings.lease_ttl_seconds),
-                )
-                await deps.work_store.complete(
-                    item.work_id,
-                    owner=runtime.work_owner,
-                    now=datetime.now(timezone.utc),
-                    status=WorkStatus.CANCELLED,
-                    reason="role_execution_allowance_exhausted",
-                )
-                call.feedback = {
-                    "ok": False,
-                    "executed": False,
-                    "error": "role execution allowance exhausted",
-                }
-                call.completed = True
-                continue
-            if (target is not None
-                    and target_counts.get(target, 0) >= deps.settings.per_target_concurrency):
-                continue
-            if definition and role_counts.get(role, 0) >= definition.max_concurrency:
-                continue
-            work = await deps.work_store.get(item.work_id)
-            if work is not None and work.status in TERMINAL_STATUSES:
-                # A crash can happen after the tool/ledger commit but before
-                # the graph checkpoint. Reconcile originals, never replay it.
-                records = await deps.evidence_store.list_for_run(runtime.run_id)
-                call.evidence_ids = [
-                    str(record.evidence_id)
-                    for record in records
-                    if record.metadata.get("work_id") == item.work_id
-                ]
-                # The stored work status, not evidence-row presence, decides
-                # whether the reconciled execution succeeded.
-                restored = work.status is WorkStatus.SUCCEEDED
-                call.feedback = {
-                    "ok": restored,
-                    "executed": True,
-                    "status": work.status.value,
-                    "evidence_ids": call.evidence_ids,
-                    "error": None if restored else "stored execution status: " + work.status.value,
-                }
-                call.completed = True
-                continue
-            lease = await deps.work_store.heartbeat(
-                item.work_id,
-                owner=runtime.work_owner,
-                now=datetime.now(timezone.utc),
-                ttl=timedelta(seconds=deps.settings.lease_ttl_seconds),
-            )
-            if lease is None:
-                lease = await deps.work_store.acquire(
-                    item.work_id,
-                    owner=runtime.work_owner,
-                    now=datetime.now(timezone.utc),
-                    ttl=timedelta(seconds=deps.settings.lease_ttl_seconds),
-                )
-            if lease is not None:
-                selected.append(call)
-                if target is not None:
-                    target_counts[target] = target_counts.get(target, 0) + 1
-                role_counts[role] = role_counts.get(role, 0) + 1
-            if len(selected) >= capacity:
-                break
-        if not selected:
-            pending = next((call for call in calls if not call.completed), None)
-            work = (await deps.work_store.get(pending.dispatch.work_id)
-                    if pending is not None and pending.dispatch is not None else None)
-            if (pending is not None and work is not None
-                    and work.status is WorkStatus.PENDING and work.resource_keys):
-                blockers = conflict_blockers(work, await deps.work_store.list_items())
-                if blockers:
-                    # Only explicit shared-resource contention is waited here.
-                    # Keep original call/Work/claim; no extra model turn or ID.
-                    # A terminal unknown original never releases on a timeout.
-                    unknown = any(other.resource_execution_pending
-                                  and other.status in TERMINAL_STATUSES for other in blockers)
-                    now = asyncio.get_running_loop().time()
-                    if resource_wait_started is None:
-                        resource_wait_started = now
-                    remaining = deps.settings.resource_wait_timeout_seconds - (
-                        now - resource_wait_started
-                    )
-                    if unknown or remaining <= 0:
-                        runtime.termination_reason = TerminationReason.RESOURCE_WAIT
-                        pending.feedback = {
-                            "ok": False, "executed": False,
-                            "error": ("shared resource has an unresolved original execution"
-                                      if unknown else "shared resource wait limit reached"),
-                        }
-                        runtime.planning_diagnostic = DecisionDiagnostic(
-                            code=("resource_execution_unresolved" if unknown
-                                  else "resource_wait_limit_reached"),
-                            stage="native_tools", kind="resource",
-                            summary=pending.feedback["error"],
-                        )
-                        # Not completed: the original pending dispatch survives
-                        # in the checkpoint for an explicit, guarded resume.
-                        break
-                    # Both WorkStore backends have one authoritative acquire.
-                    # Bounded polling also observes other SQLite connections;
-                    # event-only waiting would miss a different process writer.
-                    await asyncio.sleep(min(0.1, remaining))
-                    continue
-            if pending is not None:
-                pending.feedback = {
-                    "ok": False,
-                    "executed": False,
-                    "error": "work lease unavailable; reconcile stored execution",
-                }
-                pending.completed = True
-            continue
-        resource_wait_started = None
-        dispatch = [call.dispatch for call in selected if call.dispatch is not None]
-        results = await asyncio.gather(
-            *[
-                worker_node({"runtime": runtime, "dispatch_item": item}, deps=deps)
-                for item in dispatch
-            ]
-        )
-        outcomes = {
-            key: value for result in results for key, value in result["worker_outcomes"].items()
-        }
-        state = await aggregate_node(
-            {
-                **state,
-                "dispatch_items": dispatch,
-                "worker_outcomes": outcomes,
-            },
-            deps=deps,
-        )
-        for call in selected:
-            assert call.dispatch is not None
-            outcome = outcomes[str(call.dispatch.proposal.action_id)]
-            if (
-                outcome.policy_verdict is PolicyVerdict.REQUIRE_APPROVAL
-                or outcome.error == "deferred_for_approval"
-            ):
-                continue
-            call.evidence_ids = list(outcome.evidence_ids)
-            call.feedback = _safe(
-                {
-                    "ok": outcome.succeeded is True,
-                    "executed": outcome.executed,
-                    "evidence_ids": outcome.evidence_ids,
-                    "error": outcome.error
-                    or (outcome.policy_reason if not outcome.executed else None),
-                }
-            )
-            call.completed = True
-        # Reducer wrappers belong to a graph return, not to the local state
-        # passed to another aggregation inside this tools node.
-        state["worker_outcomes"] = {}
-    # Completed siblings need only their call identity and result for resume.
-    # Keep live envelopes exclusively for calls still awaiting execution.
+        if call.dispatch is None:
+            await _local_call(call, state, deps=deps)
+        else:
+            state = await run_call(call, state, deps)
     for call in calls:
         if call.completed:
-            call.arguments = None
-            call.dispatch = None
+            call.arguments, call.dispatch = None, None
     if all(call.completed for call in calls):
-        messages = list(state.get("native_messages", []))
-        messages.extend(
-            {
-                "role": "tool",
-                "tool_call_id": call.call_id,
-                "content": json.dumps(
-                    {**call.feedback, "evidence_ids": call.evidence_ids}, ensure_ascii=False
-                ),
-            }
-            for call in calls
-        )
-        state["native_messages"] = _message_history(messages)
+        state["native_messages"] = _message_history([
+            *state.get("native_messages", []),
+            *({"role": "tool", "tool_call_id": call.call_id,
+               "content": json.dumps({**call.feedback, "evidence_ids": call.evidence_ids})}
+              for call in calls),
+        ])
         state["native_calls"] = []
-    # Legacy PLAN mapped an unschedulable batch with no budget to
-    # BUDGET_EXHAUSTED; preserve that terminal so the native loop does not
-    # drift to STALLED when the action budget is spent.
-    if budget_blocked and not state["runtime"].termination_reason:
-        state["runtime"].termination_reason = TerminationReason.BUDGET_EXHAUSTED
-    # The reducer channel belongs to a graph return, never to the local
-    # state handed to an in-node aggregation: reset it explicitly so a
-    # future Send-based batch can never accumulate stale outcomes.
-    final: GraphState = {**state}
-    final["worker_outcomes"] = Overwrite(value={})  # type: ignore[typeddict-item]
-    return final
+    return state
 
 
 async def settle_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     """Only canonical settlement tools can set a successful final outcome."""
     runtime = state["runtime"]
     outcome = state.get("native_outcome")
+    if deps.central_state is not None and outcome == "goal_achieved":
+        outcome = "investigation_held"
+    if deps.central_state is not None and outcome == "task_completed":
+        outcome = "investigation_held"
     if outcome in {"goal_achieved", "investigation_finished", "investigation_held"}:
         runtime.termination_reason = {
             "goal_achieved": TerminationReason.GOAL_ACHIEVED,

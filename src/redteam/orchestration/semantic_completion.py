@@ -43,15 +43,12 @@ from redteam.core.contracts.completion import (
     completion_contract_hash,
     criterion_id,
 )
-from redteam.core.contracts.events import EventType
 from redteam.core.contracts.mission import (
-    MissionCriterionResult,
     MissionTask,
     redact_secret_material,
 )
-from redteam.core.contracts.tool import execution_outcome_uncertain
-from redteam.core.enums import EvidenceSourceType, MissionStatus, TaskStatus
-from redteam.core.ids import EvidenceId, TaskId, new_id
+from redteam.core.enums import EvidenceSourceType, TaskStatus
+from redteam.core.ids import EvidenceId, new_id
 from redteam.event_bus.publisher import EventPublisher
 from redteam.orchestration.completion import (
     check_record_linkage,
@@ -61,30 +58,22 @@ from redteam.orchestration.completion import (
 )
 from redteam.orchestration.completion_proposal import (
     CompletionProposal,
-    record_unresolved,
-    validate_unresolved,
 )
 from redteam.orchestration.context_projection import (
     review_path_reference,
 )
 from redteam.orchestration.coordination import content_hash
 from redteam.orchestration.evidence_access import raw_from_metadata
-from redteam.orchestration.execution_journal import (
-    ExecutionReceiptError,
-    unsettled_execution_receipts,
-)
 from redteam.orchestration.result_claims import (
     RESULT_REVIEW_INSTRUCTION,
     CriterionReview,
     ResultClaim,
     ResultReview,
     TaskContractReview,
+    capture_result_graph,
     check_result_review,
-    mission_result_purpose,
 )
 from redteam.orchestration.task_completion_contract import check_task_conditions
-from redteam.orchestration.task_graph.claim import release_mission_task_claim
-from redteam.orchestration.work.models import WorkStatus, work_owner_for
 
 #: Evidence metadata marker for an accepted task completion receipt.
 TASK_RECEIPT_KIND = "task_completion_receipt"
@@ -203,6 +192,7 @@ def verify_task_receipt(
     *,
     run_id: str | None = None,
     mission_id: str | None = None,
+    accepted_outcomes: tuple[str, ...] = ("success",),
 ) -> list[str]:
     """Check a stored receipt against the task current purpose.
 
@@ -220,7 +210,7 @@ def verify_task_receipt(
         return ["task receipt belongs to another run"]
     if mission_id is not None and str(receipt.get("mission_id", "")) != str(mission_id):
         return ["task receipt belongs to another mission"]
-    if receipt.get("outcome") != "success":
+    if receipt.get("outcome") not in accepted_outcomes:
         return ["task receipt does not prove successful completion"]
     expected = purpose_hash(task.objective or "")
     if str(receipt.get("purpose_hash", "")) != expected:
@@ -314,7 +304,9 @@ async def verify_single_origin(
         return None, ["task origin '" + str(evidence_id) + "' " + origin_errors[0]]
     if task is not None:
         expected_hash = _record_text(meta.get("task_purpose_hash", "") or "").strip()
-        current_hash = purpose_hash(_record_text(getattr(task, "objective", "")))
+        current_hash = (completion_contract_hash(task)
+                        if meta.get("central_execution_version") == 1
+                        else purpose_hash(_record_text(getattr(task, "objective", ""))))
         if expected_hash and expected_hash != current_hash:
             message = "task origin '" + str(evidence_id) + "' purpose changed since the evidence"
             return None, [message]
@@ -498,7 +490,10 @@ async def _verify_task_origin(
         return None, ["evidence '" + str(evidence_id) + "' " + origin_errors[0]]
     task_hash = _record_text(meta.get("task_purpose_hash", "") or "").strip()
     if task_hash and task is not None:
-        if task_hash != purpose_hash(_record_text(getattr(task, "objective", ""))):
+        expected_hash = (completion_contract_hash(task)
+                         if meta.get("central_execution_version") == 1
+                         else purpose_hash(_record_text(getattr(task, "objective", ""))))
+        if task_hash != expected_hash:
             return None, ["evidence '" + str(evidence_id) + "' purpose changed since the evidence"]
     target_ref = _record_text(meta.get("target_node_id", "")).strip()
     if not target_ref and not preserved_target_is_absent(meta):
@@ -697,121 +692,16 @@ async def _pending_execution_errors(
         active = getattr(runtime, "active_task_id", None)
         if active is not None and str(active).strip():
             resolved_task_id = str(active)
-    try:
-        history = await engine.deps.work_store.list_items(run_id=runtime.run_id)
-    except Exception:
-        return ["execution history lookup failed; treating as unproven"]
+    from redteam.core.contracts.execution import ExecutionState
 
-    def _active(item: Any) -> bool:
-        status = getattr(item, "status", None)
-        return status in {WorkStatus.LEASED, WorkStatus.RUNNING} or (
-            status is WorkStatus.PENDING and getattr(item, "job_id", None) is not None
-        )
-
-    if goal_scope:
-        if any(_active(item) for item in (history or [])):
-            return ["unfinished execution records remain"]
-    else:
-        runtime_instance = getattr(runtime, "instance_id", None)
-        for item in history or []:
-            if not _active(item):
-                continue
-            if getattr(item, "instance_id", None) != runtime_instance:
-                continue
-            item_task = getattr(item, "mission_task_id", None)
-            if (
-                resolved_task_id is not None
-                and item_task is not None
-                and str(item_task) != resolved_task_id
-            ):
-                continue
-            return ["unfinished execution records remain"]
-    if getattr(runtime, "pending_approval_id", None):
-        return ["an approval is still pending"]
-    try:
-        if goal_scope:
-            pending_ids = await unsettled_execution_receipts(
-                engine.deps.evidence_store, run_id=runtime.run_id, all_instances=True,
-            )
-        else:
-            pending_ids = await unsettled_execution_receipts(
-                engine.deps.evidence_store,
-                run_id=runtime.run_id,
-                instance_id=getattr(runtime, "instance_id", None),
-                all_instances=False,
-                mission_task_id=resolved_task_id,
-            )
-    except ExecutionReceiptError as exc:
-        return [exc.reason_code]
-    except Exception:
-        return ["execution history lookup failed; treating as unproven"]
-    if pending_ids:
+    history = await engine.deps.central_state.list_executions(
+        task_id=None if goal_scope else resolved_task_id,
+    )
+    if any(
+        item.state in {ExecutionState.PENDING, ExecutionState.RUNNING, ExecutionState.UNKNOWN}
+        or item.wait_reason or item.resource_execution_pending for item in history
+    ):
         return ["unfinished execution records remain"]
-    try:
-        records = await engine.deps.evidence_store.list_for_run(runtime.run_id)
-    except Exception:
-        return ["task evidence lookup failed; treating as unproven"]
-    settled: set[tuple[str, Any, Any]] = set()
-    for record in records or []:
-        meta = getattr(record, "metadata", None)
-        if not isinstance(meta, dict):
-            continue
-        raw = meta.get("tool_result")
-        if not isinstance(raw, dict):
-            continue
-        inner = raw.get("metadata", {})
-        if not isinstance(inner, dict):
-            continue
-        if not inner.get("execution_reconciled"):
-            continue
-        if execution_outcome_uncertain(inner):
-            continue
-        proposal = meta.get("proposal", {})
-        instance = proposal.get("instance_id") if isinstance(proposal, dict) else None
-        settled.add((
-            _record_text(getattr(record, "action_id", None)),
-            _record_text(getattr(record, "invocation_id", None) or meta.get("invocation_id", "")),
-            instance,
-        ))
-    benign = {"tool_binding_invalid", "lease_lost_before_execution", "policy_admission_denied"}
-    runtime_instance = getattr(runtime, "instance_id", None)
-    for record in records or []:
-        meta = getattr(record, "metadata", None)
-        if not isinstance(meta, dict):
-            continue
-        raw = meta.get("tool_result")
-        if not isinstance(raw, dict):
-            continue
-        inner = raw.get("metadata", {})
-        if not isinstance(inner, dict):
-            continue
-        if not goal_scope:
-            proposal = meta.get("proposal", {})
-            proposal_instance = proposal.get("instance_id") if isinstance(proposal, dict) else None
-            if proposal_instance != runtime_instance:
-                continue
-            record_task = meta.get("mission_task_id")
-            if (
-                resolved_task_id is not None
-                and record_task is not None
-                and str(record_task) != resolved_task_id
-            ):
-                continue
-        if not execution_outcome_uncertain(inner):
-            continue
-        error = raw.get("error") or {}
-        if isinstance(error, dict) and error.get("code") in benign:
-            continue
-        proposal = meta.get("proposal", {})
-        instance = proposal.get("instance_id") if isinstance(proposal, dict) else None
-        key = (
-            _record_text(getattr(record, "action_id", None)),
-            _record_text(getattr(record, "invocation_id", None) or meta.get("invocation_id", "")),
-            instance,
-        )
-        if key in settled:
-            continue
-        return ["an execution outcome is uncertain; collect its actual result or hold"]
     return []
 
 
@@ -845,7 +735,8 @@ async def complete_task(
         or getattr(runtime, "active_task_id", None) is None
     ):
         return ["task completion requires an active mission task"]
-    task = await engine.deps.task_graph_store.get_task(runtime.active_task_id)
+    investigations = getattr(engine.deps, "investigations", engine.deps.task_graph_store)
+    task = await investigations.get_task(runtime.active_task_id)
     if (
         task is None
         or getattr(task, "mission_id", None) != runtime.mission_id
@@ -855,6 +746,8 @@ async def complete_task(
     if path is not None:
         if _record_text(getattr(path, "mission_task_id", "")) != str(task.task_id):
             return ["task completion path is not bound to this mission task"]
+    # The public API must bind the same reasoning guard/audit usage as native settlement.
+    engine._event_runtime = runtime
     raw_proposal = getattr(decision, "completion", {})
     if raw_proposal:
         proposal = CompletionProposal.model_validate({
@@ -867,13 +760,9 @@ async def complete_task(
     evidence_ids = select_task_evidence_ids(decision, path)
     if not evidence_ids:
         return ["task completion needs related stored evidence"]
-    from redteam.attack_graph.service import AttackGraphService
-    from redteam.orchestration.evidence_validity import capture_validity, validity_errors
+    from redteam.orchestration.evidence_validity import capture_validity
 
-    validity_read = await capture_validity(engine.deps, runtime, evidence_ids)
-    errors = await validity_errors(engine.deps.evidence_store,
-                                   AttackGraphService(engine.deps.graph_store),
-                                   str(runtime.run_id), evidence_ids)
+    validity_read, errors = await capture_validity(engine.deps, evidence_ids)
     if errors:
         return errors
     verified: list[Any] = []
@@ -888,7 +777,7 @@ async def complete_task(
             task=task,
             mission_id=getattr(runtime, "mission_id", None),
             step_principal_scope=None,
-            task_graph_store=getattr(getattr(engine, "deps", None), "task_graph_store", None),
+            task_graph_store=getattr(engine.deps, "investigations", engine.deps.task_graph_store),
             work_store=getattr(getattr(engine, "deps", None), "work_store", None),
         )
         if errors:
@@ -903,25 +792,30 @@ async def complete_task(
     )
     if contract_errors:
         return contract_errors
+    service = AttackGraphService(engine.deps.graph_store)
+    graph_proof = await capture_result_graph(service, conditions=task.completion_criteria)
     pending = await _pending_execution_errors(engine, runtime, scope="task", task=task)
     if pending:
         return pending
-    await engine._check_review_path(runtime, path)
-    review = await engine._ask(
-        stage="task_completion_review",
-        payload=_task_review_payload(
-            task=task,
-            path=path,
-            context=await engine.review_context(runtime, context, evidence_ids),
-            evidence_ids=evidence_ids,
-            excerpts=excerpt_notes,
-        ),
-        response_schema=(
-            TaskContractReview if task.completion_contract_version == 2 else ResultReview
-        ).model_json_schema(),
-        system=_engine_system(engine) + RESULT_REVIEW_INSTRUCTION,
-        budget=budget,
-    )
+    await engine._review_token(runtime)
+    from redteam.orchestration.metered_llm import llm_request_scope
+
+    with llm_request_scope(str(runtime.run_id), "task_completion_review"):
+        review = await engine._ask(
+            stage="task_completion_review",
+            payload=_task_review_payload(
+                task=task,
+                path=path,
+                context=await engine.review_context(runtime, context, evidence_ids),
+                evidence_ids=evidence_ids,
+                excerpts=excerpt_notes,
+            ),
+            response_schema=(
+                TaskContractReview if task.completion_contract_version == 2 else ResultReview
+            ).model_json_schema(),
+            system=_engine_system(engine) + RESULT_REVIEW_INSTRUCTION,
+            budget=budget,
+        )
     await engine.record_completion_review(
         "task_completion_review",
         path,
@@ -936,10 +830,13 @@ async def complete_task(
     )
     if contract_errors:
         return contract_errors
-    from redteam.attack_graph.service import AttackGraphService
 
     claims = list(review.get("claims", []))
     service = AttackGraphService(engine.deps.graph_store)
+    for identity, expected in (await capture_result_graph(service, claims)).items():
+        if identity in graph_proof and graph_proof[identity] != expected:
+            return ["completion_graph_proof_changed_reassessment_required"]
+        graph_proof[identity] = expected
     errors = await check_result_review(
         claims=claims,
         evidence_ids=evidence_ids,
@@ -950,12 +847,15 @@ async def complete_task(
         mission_id=str(runtime.mission_id),
         target_node_ids=list(task.related_attack_graph_node_ids),
         task=task,
-        task_graph_store=getattr(getattr(engine, "deps", None), "task_graph_store", None),
+        task_graph_store=getattr(engine.deps, "investigations", engine.deps.task_graph_store),
         work_store=getattr(getattr(engine, "deps", None), "work_store", None),
     )
     if errors:
         return errors
-    mission = await engine.deps.task_graph_store.get_mission(runtime.mission_id)
+    mission = await investigations.get_mission(runtime.mission_id)
+    validity_read, errors = await validity_read.refresh(engine.deps)
+    if errors:
+        return errors
     revision = int(getattr(mission, "revision", 1) or 1)
     receipt_payload = build_task_receipt(
         task_id=str(task.task_id),
@@ -983,49 +883,15 @@ async def complete_task(
         summary=str(review.get("reason", "")),
     )
 
-    async def complete(change: Any) -> None:
-        if validity_read is not None:
-            validity_read.check(change)
-        staged = await change.tasks.get_task(task.task_id)
-        if staged is None:
-            raise ValueError("completion_task_missing")
-        if completion_contract_hash(staged) != completion_contract_hash(task):
-            raise ValueError("completion_task_contract_changed")
-        owner = work_owner_for(runtime.run_id, getattr(runtime, "instance_id", None))
-        occupant = getattr(staged, "occupant_owner", None)
-        if occupant is None:
-            # Claim-before-admission: adopt the unowned task inside this same
-            # atomic commit, so no sibling can slip between check and close.
-            await change.tasks.update_task(
-                staged.model_copy(
-                    update={"occupant_owner": owner, "updated_at": datetime.now(timezone.utc)}
-                )
-            )
-        elif occupant != owner:
-            raise ValueError("completion_task_claimed_by_other")
-        updated = staged.model_copy(
-            update={
-                "completion_evidence_id": receipt_record.evidence_id,
-                # The adopt above is settled here: no live claim survives a
-                # terminal task, so the occupant clears with the receipt.
-                "occupant_owner": None,
-                "updated_at": datetime.now(timezone.utc),
-            }
-        )
-        await change.tasks.update_task(updated)
-        await change.tasks.transition_task(
-            task.task_id, TaskStatus.COMPLETED, now=datetime.now(timezone.utc)
-        )
-
     # The receipt is immutable evidence; authority still comes only from
     # the atomic task transition below, never from the receipt alone.
     await engine.deps.evidence_store.append(receipt_record)
-    await engine._commit_review(runtime, token, complete)
-    await _publish_settlement(
-        engine,
-        runtime,
-        EventType.TASK_COMPLETED,
-        {"mission_id": runtime.mission_id, "task_id": task.task_id},
+    from redteam.orchestration.central_results import complete_reviewed_result
+
+    await complete_reviewed_result(
+        engine.deps, runtime, task, token, receipt_record,
+        CompletionProposal.model_validate(raw_proposal), validity_read=validity_read,
+        graph_proof=graph_proof,
     )
     return []
 
@@ -1034,160 +900,17 @@ async def settle_unresolved(
     engine: Any, path: Any, proposal: CompletionProposal, runtime: Any, *,
     token: Any, task: Any = None, finish_investigation: bool = False,
 ) -> list[str]:
-    """End an investigation unit without granting a success/refutation receipt.
+    """Reuse the central unresolved result without a legacy global mutation."""
+    if path is not None or task is None or finish_investigation:
+        return ["unresolved settlement requires the current central investigation task"]
+    from redteam.orchestration.central_results import complete_unresolved_result
 
-    Instance isolation: a task-local unresolved blocks only its own
-    exactly-claimed task (occupant-owned, adopted when unowned inside the
-    same commit). A goal unresolved (finish_investigation, task None) with
-    a real instance derives the current active task when it is valid and
-    same-mission, adopts when unowned inside the same coordinator guarded
-    commit, and blocks OWN only, leaving foreign tasks and the global
-    mission untouched. Global settlement stays with the authoritative
-    mission criteria and operator stop via finalize_mission.
+    errors = await complete_unresolved_result(engine.deps, runtime, task, token, proposal)
+    if not errors:
+        engine.updated_runtime = engine._event_runtime = runtime
+    return errors
 
-    Legacy compat: the pre-instance central loop (runtime.instance_id None)
-    carries no per-instance identity, so task occupants are legacy
-    run-only owners or unclaimed and offer no isolation boundary; that
-    loop owns the whole mission, so finishing the investigation settles
-    all unfinished tasks and marks the mission BLOCKED. Instance goals
-    never convert to all-tasks.
-    """
-    if task is not None:
-        pending = await _pending_execution_errors(engine, runtime, scope="task", task=task)
-    elif finish_investigation and getattr(runtime, "instance_id", None) is not None:
-        active_for_gate = getattr(runtime, "active_task_id", None)
-        pending = await _pending_execution_errors(
-            engine, runtime, scope="task", mission_task_id=active_for_gate,
-        )
-    else:
-        pending = await _pending_execution_errors(
-            engine, runtime, scope="goal", all_instances=True,
-        )
-    if pending:
-        return pending
-    if task is not None:
-        targets = list(task.related_attack_graph_node_ids)
-    elif path is not None:
-        steps = getattr(path, "steps", []) or []
-        targets = list(dict.fromkeys(target for step in steps for target in step.target_node_ids))
-    else:
-        targets = []
-    errors = await validate_unresolved(
-        proposal, evidence_store=engine.deps.evidence_store, runtime=runtime,
-        target_node_ids=targets,
-    )
-    if errors:
-        return errors
-    await engine._check_review_path(runtime, path)
-    identity = await record_unresolved(
-        evidence_store=engine.deps.evidence_store, runtime=runtime, proposal=proposal,
-        path=path, task_id=str(task.task_id) if task is not None else None,
-    )
-    now = datetime.now(timezone.utc)
 
-    async def block(change: Any) -> None:
-        if task is not None:
-            staged = await change.tasks.get_task(task.task_id)
-            if staged is None:
-                raise ValueError("completion_task_missing")
-            owner = work_owner_for(runtime.run_id, getattr(runtime, "instance_id", None))
-            occupant = getattr(staged, "occupant_owner", None)
-            if occupant is None:
-                # Same claim-before-admission as completion: adopt inside
-                # this commit so the BLOCKED transition has a verified owner.
-                await change.tasks.update_task(
-                    staged.model_copy(
-                        update={"occupant_owner": owner, "updated_at": now}
-                    )
-                )
-            elif occupant != owner:
-                raise ValueError("completion_task_claimed_by_other")
-            await change.tasks.transition_task(
-                task.task_id, TaskStatus.BLOCKED, now=now,
-                reason=proposal.reason,
-            )
-            # BLOCKED tasks re-enter the pool via unblock (BLOCKED -> READY /
-            # PENDING), so the claim clears here and the next driver claims
-            # explicitly. No silent handoff, no TTL.
-            await release_mission_task_claim(
-                change, task.task_id, owner=owner, now=now
-            )
-        elif finish_investigation and getattr(runtime, "instance_id", None) is not None:
-            # Instance goal: block OWN active task only, inside this same
-            # coordinator guarded commit. Foreign tasks stay untouched.
-            active_id = getattr(runtime, "active_task_id", None)
-            if active_id is not None:
-                candidate = await change.tasks.get_task(active_id)
-                if (
-                    candidate is not None
-                    and str(getattr(candidate, "mission_id", "")) == str(runtime.mission_id)
-                    and getattr(candidate, "status", None)
-                    in {TaskStatus.PENDING, TaskStatus.READY, TaskStatus.RUNNING}
-                ):
-                    owner = work_owner_for(runtime.run_id, getattr(runtime, "instance_id", None))
-                    occupant = getattr(candidate, "occupant_owner", None)
-                    if occupant is None:
-                        await change.tasks.update_task(
-                            candidate.model_copy(
-                                update={"occupant_owner": owner, "updated_at": now}
-                            )
-                        )
-                    if occupant is None or occupant == owner:
-                        await change.tasks.transition_task(
-                            candidate.task_id, TaskStatus.BLOCKED, now=now,
-                            reason=proposal.reason,
-                        )
-                        await release_mission_task_claim(
-                            change, candidate.task_id, owner=owner, now=now
-                        )
-                    # Foreign-owned active tasks stay untouched.
-        elif finish_investigation:
-            # Legacy central loop (instance_id None): preserve the previous
-            # full-goal behaviour. Documented compat; instance goals above
-            # never take this path.
-            mission = await change.tasks.get_mission(runtime.mission_id)
-            if mission is None:
-                raise ValueError("unresolved_mission_missing")
-            for unfinished in await change.tasks.list_tasks(mission_id=runtime.mission_id):
-                if unfinished.status in {TaskStatus.PENDING, TaskStatus.READY, TaskStatus.RUNNING}:
-                    await change.tasks.transition_task(
-                        unfinished.task_id, TaskStatus.BLOCKED, now=now,
-                        reason=proposal.reason,
-                    )
-            await change.tasks.update_mission(mission.model_copy(update={
-                "status": MissionStatus.BLOCKED,
-                "updated_at": now,
-                "revision": int(getattr(mission, "revision", 1) or 1) + 1,
-            }))
-        for step in (getattr(path, "steps", []) or []):
-            if step.status in {"pending", "running"}:
-                await change.paths.update_step(
-                    str(runtime.run_id), path.path_id, path.version, step.step_id,
-                    "blocked", outcome=proposal.outcome,
-                    evidence_ids=list(dict.fromkeys([*step.evidence_ids, identity])),
-                )
-        # Instance goals do not close the global mission here; only the
-        # legacy central loop above updates the mission status globally.
-
-    await engine._commit_review(runtime, token, block)
-    runtime.unresolved_evidence_ids = list(dict.fromkeys([
-        *runtime.unresolved_evidence_ids, identity,
-    ]))
-    from redteam.orchestration.delegation_decision import mark_finished
-
-    if path is not None:
-        runtime.delegations = {
-            key: mark_finished(value, reason="investigation_unresolved")
-            if value.path_id == path.path_id and value.path_version == path.version
-            else value
-            for key, value in runtime.delegations.items()
-        }
-    if finish_investigation and getattr(runtime, "instance_id", None) is None:
-        # Legacy central loop only; instance goals leave the global mission
-        # status to finalize_mission so foreign RUNNING work continues.
-        runtime.mission_status = MissionStatus.BLOCKED
-    engine.updated_runtime = engine._event_runtime = runtime
-    return []
 async def verify_legacy_task_origins(
     *,
     evidence_store: Any,
@@ -1377,191 +1100,9 @@ async def complete_goal(
     engine: Any, path: Any, decision: Any, runtime: Any, context: Any, *, budget: Any = None
 ) -> list[str]:
     """Settle the original mission on its own criteria and required tasks."""
-    if getattr(engine.deps, "specialist_policy", None) is not None:
-        from redteam.orchestration.coordination import StateConflict, coordinator_for
-        from redteam.orchestration.outbox import pending_count
-        from redteam.orchestration.task_activation import TaskActivation
+    from redteam.orchestration.central_completion import complete_goal as central_goal
 
-        def check_quiescent(change):
-            run_id = str(runtime.run_id)
-            if (change.records.get(("specialist_lifecycle", run_id), {}).get("state")
-                    != "quiescent" or TaskActivation.has_pending(change, run_id)
-                    or pending_count(change, run_id)):
-                raise StateConflict("specialist_followup_review_pending")
-
-        async def loop_state(change):
-            try:
-                check_quiescent(change)
-            except StateConflict:
-                return False
-            return True
-
-        coordinator = engine.deps.coordinator or coordinator_for(
-            engine.deps.task_graph_store, engine.deps.path_store,
-        )
-        if not await coordinator.change(loop_state):
-            return ["specialist_followup_review_pending"]
-    token = await engine._review_token(runtime)
-    if getattr(runtime, "mission_id", None) is None:
-        return ["goal completion requires an operator mission"]
-    mission = await engine.deps.task_graph_store.get_mission(runtime.mission_id)
-    if mission is None:
-        return ["goal completion requires an operator mission"]
-    raw_proposal = getattr(decision, "completion", {})
-    if raw_proposal:
-        proposal = CompletionProposal.model_validate({
-            **raw_proposal, "reason": raw_proposal.get("reason") or decision.reason,
-        })
-        if proposal.unresolved:
-            return await settle_unresolved(
-                engine, path, proposal, runtime, token=token, finish_investigation=True,
-            )
-    criteria = list(getattr(mission, "success_criteria", []) or [])
-    if not criteria:
-        return ["goal has no original operator criteria"]
-    pending = await _pending_execution_errors(engine, runtime, scope="goal", all_instances=True)
-    if pending:
-        return pending
-    tasks = await engine.deps.task_graph_store.list_tasks(mission_id=runtime.mission_id)
-    from redteam.orchestration.evidence_validity import capture_validity, validity_errors
-
-    errors, task_evidence, excerpts = await _goal_task_coverage(
-        engine, runtime=runtime, tasks=tasks
-    )
-    if errors:
-        return errors
-    from redteam.attack_graph.service import AttackGraphService
-
-    # Legacy completed tasks can ground through original path results instead
-    # of a receipt. Include these verified origins in the same relevant fence.
-    validity_read = await capture_validity(engine.deps, runtime, [
-        *[task.completion_evidence_id for task in tasks if task.completion_evidence_id is not None],
-        *[i for origins in task_evidence.values() for i in origins],
-    ])
-    errors = await validity_errors(engine.deps.evidence_store,
-                                   AttackGraphService(engine.deps.graph_store),
-                                   str(runtime.run_id),
-                                   [i for origins in task_evidence.values() for i in origins])
-    if errors:
-        return errors
-    try:
-        from redteam.attack_graph.service import AttackGraphService
-
-        cleanup = await AttackGraphService(engine.deps.graph_store).cleanup_report()
-        if getattr(cleanup, "outstanding", None):
-            return ["required cleanup is still outstanding"]
-    except Exception:
-        return ["cleanup state lookup failed; treating as unproven"]
-    await engine._check_review_path(runtime, path)
-    review = await engine._ask(
-        stage="goal_completion_review",
-        payload=_goal_review_payload(
-            mission=mission,
-            criteria=criteria,
-            path=path,
-            context=await engine.review_context(
-                runtime, context,
-                [identity for origins in task_evidence.values() for identity in origins],
-            ),
-            task_evidence=task_evidence,
-            excerpts=excerpts,
-        ),
-        response_schema=_GoalReview.model_json_schema(),
-        system=_engine_system(engine) + RESULT_REVIEW_INSTRUCTION,
-        budget=budget,
-    )
-    await engine.record_completion_review(
-        "goal_completion_review",
-        path,
-        runtime,
-        review,
-        [identity for origins in task_evidence.values() for identity in origins],
-    )
-    if not review.get("accepted"):
-        return ["semantic completion review rejected the evidence"]
-    # No new goal prefix cases: the review must cover the original
-    # operator criteria exactly.
-    items = review.get("criteria", [])
-    table = {item.get("criterion"): item for item in items if isinstance(item, dict)}
-    if len(items) != len(criteria) or set(table) != set(criteria):
-        return ["goal review must cover the original operator criteria exactly"]
-    bound_tasks: dict[str, list[str]] = {}
-    for criterion_index, item in enumerate(items):
-        if not item.get("met") or not item.get("evidence_ids"):
-            return ["goal criterion lacks evidence"]
-        owners: set[str] = set()
-        for identity in item.get("evidence_ids", []):
-            owner = next(
-                (str(task_id) for task_id, origins in task_evidence.items() if identity in origins),
-                "",
-            )
-            if not owner:
-                return ["goal criterion cites unrelated evidence"]
-            owners.add(owner)
-        if not owners:
-            return ["goal criterion evidence lacks validated task ownership"]
-        errors = await check_result_review(
-            claims=item.get("claims", []),
-            claims_location=("criteria", criterion_index, "claims"),
-            evidence_ids=item["evidence_ids"],
-            evidence_store=engine.deps.evidence_store,
-            graph_service=AttackGraphService(engine.deps.graph_store),
-            path_store=engine.deps.path_store,
-            run_id=str(runtime.run_id),
-            mission_id=str(runtime.mission_id),
-            task_graph_store=getattr(getattr(engine, "deps", None), "task_graph_store", None),
-            work_store=getattr(getattr(engine, "deps", None), "work_store", None),
-        )
-        if errors:
-            return errors
-        bound_tasks[item.get("criterion")] = sorted(owners)
-    now = datetime.now(timezone.utc)
-
-    async def complete(change: Any) -> None:
-        if getattr(engine.deps, "specialist_policy", None) is not None:
-            check_quiescent(change)  # same transaction as Mission completion, not a stale hint
-        if validity_read is not None:
-            validity_read.check(change)
-        for task in tasks:
-            if (
-                getattr(task, "required", False)
-                and getattr(task, "status", None) is TaskStatus.RUNNING
-            ):
-                await change.tasks.transition_task(task.task_id, TaskStatus.COMPLETED, now=now)
-        await change.tasks.update_mission(
-            mission.model_copy(
-                update={
-                    "status": MissionStatus.COMPLETED,
-                    "updated_at": now,
-                    "revision": int(getattr(mission, "revision", 1) or 1) + 1,
-                    "criterion_results": [
-                        MissionCriterionResult(
-                            criterion=item.get("criterion"),
-                            met=True,
-                            evidence_ids=list(item.get("evidence_ids", [])),
-                            task_ids=[
-                                TaskId(identity)
-                                for identity in bound_tasks.get(item.get("criterion"), [])
-                            ],
-                            reason=str(review.get("reason", "")),
-                            result_claims=list(item.get("claims", [])),
-                            purpose_hash=mission_result_purpose(mission),
-                        )
-                        for item in items
-                    ],
-                }
-            )
-        )
-        change.binding(str(runtime.run_id), str(runtime.mission_id))["closed"] = True
-
-    await engine._commit_review(runtime, token, complete)
-    await _publish_settlement(
-        engine,
-        runtime,
-        EventType.MISSION_UPDATED,
-        {"mission_id": runtime.mission_id, "status": "completed"},
-    )
-    return []
+    return await central_goal(engine.deps, runtime, budget=budget)
 
 
 __all__ = [
@@ -1577,3 +1118,9 @@ __all__ = [
     "complete_task",
     "complete_goal",
 ]
+
+# Shared goal review contracts/payload, with the existing origin and claim
+# verifiers. SQL settlement is owned by the selected state implementation.
+GoalReview = _GoalReview
+goal_review_payload = _goal_review_payload
+origin_excerpt = _excerpt_of

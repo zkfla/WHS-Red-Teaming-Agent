@@ -10,7 +10,14 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 HTTPMethod = Literal["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"]
 
@@ -44,7 +51,8 @@ class TargetProfile(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     origin: str
-    allowed_paths: list[str] = Field(min_length=1)
+    allowed_paths: list[str] = Field(default_factory=list)
+    allow_all_paths: bool = False
     allowed_methods: list[HTTPMethod] = Field(default_factory=read_methods)
     allowed_path_methods: dict[str, list[HTTPMethod]] = Field(default_factory=dict)
     replayable_paths: list[str] = Field(default_factory=list)
@@ -94,6 +102,8 @@ class TargetProfile(BaseModel):
 
     @model_validator(mode="after")
     def proxy_paths_are_explicitly_scoped(self) -> TargetProfile:
+        if not self.allow_all_paths and not self.allowed_paths:
+            raise ValueError("allowed_paths must be non-empty unless allow_all_paths is explicit")
         allowed = set(self.allowed_paths)
         if set(self.allowed_query_keys) - allowed:
             raise ValueError("query rules must reference allowed paths")
@@ -119,6 +129,23 @@ class TargetProfile(BaseModel):
             ):
                 raise ValueError("mutable JSON field lists must be non-empty and unique")
         return self
+
+    def allows_path(self, path: str) -> bool:
+        """Whole-origin permission still accepts only literal local URL paths."""
+        try:
+            self.valid_paths([path])
+        except ValueError:
+            return False
+        return self.allow_all_paths or path in self.allowed_paths
+
+    @model_serializer(mode="wrap")
+    def original_path_payload(self, handler):
+        # Keep existing generated policy bytes/digests stable for exact-path
+        # profiles. Whole-origin permission is a new explicit serialized value.
+        payload = handler(self)
+        if not self.allow_all_paths:
+            payload.pop("allow_all_paths", None)
+        return payload
 
 
 class SessionProfile(BaseModel):
@@ -175,7 +202,8 @@ class ServerPolicy(BaseModel):
         for session in self.sessions.values():
             if session.allowed_paths is not None and (
                 len(set(session.allowed_paths)) != len(session.allowed_paths)
-                or set(session.allowed_paths) - set(self.targets[session.target_ref].allowed_paths)
+                or any(not self.targets[session.target_ref].allows_path(path)
+                       for path in session.allowed_paths)
             ):
                 raise ValueError("session paths must be unique allowed target paths")
         return self

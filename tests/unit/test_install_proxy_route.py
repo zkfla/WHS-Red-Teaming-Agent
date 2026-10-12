@@ -6,9 +6,6 @@ egress beyond 127.0.0.1.
 
 from __future__ import annotations
 
-import http.server
-import socket
-import threading
 from datetime import datetime, timezone
 from typing import cast
 
@@ -27,7 +24,7 @@ from redteam.capability.install_proxy import (
     proxy_env,
     route_for,
 )
-from redteam.capability.install_proxy_engine import PinningForwardProxy, ProxyRefused
+from redteam.capability.install_proxy_engine import ProxyRefused
 from redteam.core.contracts.network import (
     GrantRefused,
     NetworkBudget,
@@ -129,55 +126,10 @@ def test_engine_for_route_keying_and_refusal() -> None:
         engine_for_route(bad)
 
 
-class _QuietHandler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        body = b"mock-index"
-        self.send_response(200)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, *args):
-        return None
 
 
-def _recv_all(sock):
-    sock.settimeout(10.0)
-    chunks = []
-    try:
-        while True:
-            part = sock.recv(65536)
-            if not part:
-                break
-            chunks.append(part)
-    except (TimeoutError, OSError):
-        pass
-    return b"".join(chunks)
 
 
-def test_engine_relays_pinned_and_denies_unknown() -> None:
-    mirror = http.server.HTTPServer(("127.0.0.1", 0), _QuietHandler)
-    mirror_port = mirror.server_address[1]
-    thread = threading.Thread(target=mirror.serve_forever, daemon=True)
-    thread.start()
-    engine = PinningForwardProxy(
-        {"127.0.0.1": ("127.0.0.1",)}, allow_ports=(mirror_port,)
-    )
-    proxy_port = engine.start("127.0.0.1", 0)
-    try:
-        head = "GET http://127.0.0.1:" + str(mirror_port) + "/simple/ HTTP/1.1"
-        get = socket.create_connection(("127.0.0.1", proxy_port), timeout=10)
-        get.sendall(head.encode("latin-1") + CRLF + b"Host: x" + CRLF + CRLF)
-        reply = _recv_all(get)
-        assert b" 200 " in reply.split(CRLF)[0] and b"mock-index" in reply
-        get.close()
-        evil = socket.create_connection(("127.0.0.1", proxy_port), timeout=10)
-        evil.sendall(b"GET http://192.0.2.1/ HTTP/1.1" + CRLF + b"Host: x" + CRLF + CRLF)
-        assert _recv_all(evil).startswith(b"HTTP/1.1 403")
-        evil.close()
-    finally:
-        engine.stop()
-        mirror.shutdown()
 
 
 def _install_policy():

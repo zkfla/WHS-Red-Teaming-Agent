@@ -12,6 +12,7 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 from redteam.core.contracts.action import ActionProposal
+from redteam.core.contracts.tool import ToolInvocation
 from redteam.core.enums import PolicyVerdict, Verdict
 from redteam.core.ids import ApprovalId, EventId
 from redteam.orchestration.agents.base import PlanStep
@@ -25,6 +26,8 @@ class DispatchItem(BaseModel):
     plan_step: PlanStep
     proposal: ActionProposal
     last_event_id: EventId | None = None
+    # Central native selection: original intent, with no Work queue row.
+    invocation: ToolInvocation | None = None
 
 
 class WorkerOutcome(BaseModel):

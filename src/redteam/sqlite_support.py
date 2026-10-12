@@ -4,12 +4,82 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import json
+import os
 import sqlite3
+import stat
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import TypeVar
 
 T = TypeVar("T")
+
+
+class StorageRetiredError(RuntimeError):
+    """An explicitly migrated source may still be inspected, but not executed."""
+
+
+def retirement_path(path: str | Path) -> Path:
+    source = Path(path).resolve()
+    return source.with_name(f".{source.name}.central-migration.json")
+
+
+def read_storage_retirement(path: str | Path) -> dict | None:
+    marker = retirement_path(path)
+    try:
+        fd = os.open(marker, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None
+    with os.fdopen(fd, "r") as handle:
+        info = os.fstat(handle.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_nlink != 1 or info.st_mode & 0o077 or info.st_size > 4096):
+            raise StorageRetiredError("migration_retirement_marker_unsafe")
+        value = json.load(handle)
+    if (not isinstance(value, dict) or value.get("version") != 1
+            or any(not isinstance(value.get(key), str) or not value[key]
+                   for key in ("target", "migration_id", "source_hash"))):
+        raise StorageRetiredError("migration_retirement_marker_unreadable")
+    return value
+
+
+def check_storage_writable(path: str | Path) -> None:
+    if read_storage_retirement(path) is not None:
+        raise StorageRetiredError("storage_retired_by_explicit_migration")
+
+
+def retire_storage(path: str | Path, identity: dict) -> None:
+    """Persist a destination fence after import commit, without altering SQLite.
+
+    Caller holds original cohort ownership and has stopped shared writers.
+    Incomplete fences refuse target resume until an idempotent retry completes
+    them. Exact replays succeed; another destination cannot reset usage.
+    """
+    previous = read_storage_retirement(path)
+    if previous is not None:
+        if previous != identity:
+            raise StorageRetiredError("migration_source_already_retired_elsewhere")
+        return
+    marker = retirement_path(path)
+    with tempfile.NamedTemporaryFile(mode="w", dir=marker.parent, delete=False) as handle:
+        temporary = Path(handle.name)
+        json.dump(identity, handle)
+        handle.flush()
+        os.fsync(handle.fileno())
+    try:
+        try:
+            os.link(temporary, marker)
+        except FileExistsError:
+            if read_storage_retirement(path) != identity:
+                raise StorageRetiredError("migration_source_already_retired_elsewhere") from None
+    finally:
+        temporary.unlink()
+    directory = os.open(marker.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 def _lock_contention(exc: sqlite3.OperationalError) -> bool:
@@ -24,7 +94,9 @@ def _lock_contention(exc: sqlite3.OperationalError) -> bool:
     }
 
 
-def connect(path: str | Path) -> sqlite3.Connection:
+def connect(path: str | Path, *, write: bool = False) -> sqlite3.Connection:
+    if write:
+        check_storage_writable(path)
     db = sqlite3.connect(path, timeout=1.0)
     db.execute("PRAGMA busy_timeout=1000")
     db.execute("PRAGMA foreign_keys=ON")
@@ -36,7 +108,7 @@ def transaction(
 ) -> T:
     """Retry lock contention only; every failed transaction is rolled back."""
     for attempt in range(3):
-        db = connect(path)
+        db = connect(path, write=write)
         try:
             db.execute("BEGIN IMMEDIATE" if write else "BEGIN")
             result = operation(db)

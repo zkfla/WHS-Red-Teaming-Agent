@@ -49,13 +49,21 @@ class RunMeteredLLM:
     def __init__(
         self, client: Any, ledger: RunRequestLedger, *, sleep=asyncio.sleep,
         prompts: AgentPrompts | None = None,
+        request_semaphore: asyncio.Semaphore | None = None,
     ) -> None:
         self.client = client
         self.ledger = ledger
         self.sleep = sleep
         self.prompts = prompts
+        self.request_semaphore = request_semaphore
 
     async def _call(self, method: str, **kwargs: Any) -> Any:
+        if self.request_semaphore is None:
+            return await self._call_admitted(method, **kwargs)
+        async with self.request_semaphore:
+            return await self._call_admitted(method, **kwargs)
+
+    async def _call_admitted(self, method: str, **kwargs: Any) -> Any:
         scope = _scope.get()
         if scope is None:
             raise RequestAdmissionError("llm_request_run_scope_missing")
@@ -133,6 +141,7 @@ def configure_request_metering(
         if prompts is not None and client.prompts is not prompts:
             if client.prompts is not None:
                 raise ValueError("llm_prompt_snapshot_mismatch")
-            return RunMeteredLLM(client.client, client.ledger, sleep=client.sleep, prompts=prompts)
+            return RunMeteredLLM(client.client, client.ledger, sleep=client.sleep, prompts=prompts,
+                                 request_semaphore=client.request_semaphore)
         return client
     return RunMeteredLLM(client, RunRequestLedger(coordinator), prompts=prompts)

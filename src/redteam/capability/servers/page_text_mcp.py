@@ -20,6 +20,7 @@ from redteam.capability.servers.page_text import (
     PageTextRequest,
     PageTextResult,
 )
+from redteam.core.contracts.tool import PROVIDER_METADATA_RESOURCE_EFFECTS
 
 REMOTE_TOOL_NAME = "fetch_page_text"
 PROPOSED_OPERATION = "page_read"
@@ -70,7 +71,7 @@ def create_server(
     fetch_page_text.__annotations__["max_chars"] = Annotated[
         int | None, Field(ge=1, le=config.max_return_chars)
     ]
-    server.tool()(fetch_page_text)
+    server.tool(meta={PROVIDER_METADATA_RESOURCE_EFFECTS: []})(fetch_page_text)
     return server
 
 

@@ -43,6 +43,12 @@ llm:
   api_key_env_var: "LLM_API_KEY"
 
 orchestration:
+  runtime_backend: "central"
+  central_state_path: "data/orchestration/state.sqlite3"
+  max_workers: 2
+  # Central execution also requires an explicitly selected specialist profile
+  # and shared LLM request policy. The CLI reads those selections from REDTEAM_*
+  # environment variables; see README's central runtime example.
   max_retries: 3
   max_steps: 50
 

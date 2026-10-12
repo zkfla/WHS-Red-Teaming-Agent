@@ -92,6 +92,7 @@ async def reconcile_execution_receipts(
             reserved_retries = len(retry_admissions)
             charges[identity] = (1, reserved_retries, str(proposal.agent_id))
             work_id = data.get("work_id")
+            assert deps.work_store is not None
             work = await deps.work_store.get(work_id) if work_id is not None else None
             if work_id is not None and (
                 work is None or work.run_id != runtime.run_id

@@ -24,7 +24,10 @@ from typing import Annotated, Literal
 from mcp.server import MCPServer
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from redteam.core.contracts.tool import PROVIDER_METADATA_RESOURCE_BINDINGS
+from redteam.core.contracts.tool import (
+    PROVIDER_METADATA_RESOURCE_BINDINGS,
+    PROVIDER_METADATA_RESOURCE_EFFECTS,
+)
 
 _PRIVATE_PREFIX = ".redteam-"
 _IDENTITY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
@@ -695,7 +698,10 @@ def create_server(policy: WorkspacePolicy, mode: Literal["read", "write"] = "rea
                 function.__annotations__[name] = Annotated[
                     str, Field(max_length=policy.max_file_bytes)
                 ]
-        server.tool(meta=resource_meta)(function)
+        metadata = dict(resource_meta)
+        if mode == "read":
+            metadata[PROVIDER_METADATA_RESOURCE_EFFECTS] = []
+        server.tool(meta=metadata)(function)
     return server
 
 

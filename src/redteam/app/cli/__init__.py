@@ -39,7 +39,6 @@ from redteam.app.cli._shared import (
 )
 from redteam.app.cli.commands import (
     approvals,
-    collect_originals,
     evidence,
     findings,
     init,
@@ -50,6 +49,7 @@ from redteam.app.cli.commands import (
     status,
     tools,
     validate,
+    web,
 )
 from redteam.app.cli.commands import (
     run as run_command,
@@ -60,7 +60,6 @@ _COMMAND_MODULES = (
     validate,
     run_command,
     resume,
-    collect_originals,
     status,
     roe,
     tools,
@@ -68,6 +67,7 @@ _COMMAND_MODULES = (
     findings,
     report,
     evidence,
+    web,
 )
 
 

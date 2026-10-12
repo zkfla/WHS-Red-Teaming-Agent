@@ -2,15 +2,8 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 
-from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
-from redteam.orchestration.agents.providers import default_provider_registry
-from redteam.orchestration.agents.registry import default_registry
-from redteam.orchestration.context import ContextProjectionCache
-from redteam.orchestration.engine import InvestigationEngine
 from redteam.orchestration.paths import (
     CompletionCriterion,
     PathPlan,
@@ -19,8 +12,6 @@ from redteam.orchestration.paths import (
     PathVersionConflict,
     SQLitePathStore,
 )
-from redteam.orchestration.settings import OrchestrationSettings
-from redteam.orchestration.work.memory import InMemoryWorkStore
 
 RUN = "run-path-1"
 PATH = "path-1"
@@ -60,100 +51,18 @@ def _plan(version, steps, status="active", parent=None, changed=None, path_id=PA
     )
 
 
-class _AcceptLLM:
-    async def complete_structured(self, *, messages, response_schema, system="", num_retries=0):
-        return {"decision": "accept", "reason": "ok", "path": None}
 
 
-class _Agents:
-    def __init__(self):
-        self._definitions = default_registry().definitions()
-
-    def all(self):
-        return []
-
-    def get(self, agent_id):
-        return None
-
-    def definitions(self):
-        return self._definitions
 
 
-class _Evidence:
-    async def get(self, evidence_id):
-        return None
-
-    async def list_for_run(self, run_id):
-        return []
 
 
-def _engine_catalog():
-    from redteam.core.contracts.tool import ToolDescriptor
-    from redteam.core.ids import ToolId
-    from tests.fakes import DummyToolGateway
-
-    return DummyToolGateway(
-        tools=[
-            ToolDescriptor(
-                tool_id=ToolId("analysis.run_command"),
-                server_id="execution",
-                tool_name="run_command",
-                input_schema={"type": "object"},
-                output_schema={"type": "object"},
-                operations=["command_run"],
-                target_types=["asset"],
-                capability_tags=["analysis"],
-            )
-        ]
-    )
 
 
-def _engine_deps(path_store):
-    from redteam.orchestration.coordination import coordinator_for
-    from redteam.orchestration.task_graph.sqlite import SQLiteTaskGraphStore
-
-    task_graph_store = SQLiteTaskGraphStore(path_store._path)
-    return SimpleNamespace(
-        path_store=path_store,
-        task_graph_store=task_graph_store,
-        graph_store=InMemoryAttackGraphStore(),
-        evidence_store=_Evidence(),
-        agents=_Agents(),
-        candidate_providers=default_provider_registry(),
-        context_cache=ContextProjectionCache(),
-        llm_client=_AcceptLLM(),
-        settings=OrchestrationSettings(),
-        planning_provider=None,
-        coordinator=coordinator_for(task_graph_store, path_store),
-        engagement=None,
-        tool_catalog=_engine_catalog(),
-        work_store=InMemoryWorkStore(),
-    )
 
 
-def _engine_runtime(run_id="run-eng-1"):
-    return SimpleNamespace(
-        run_id=run_id,
-        engagement_id="eng-path-1",
-        mission_id=None,
-        active_task_id=None,
-        step_count=0,
-        current_goal="goal",
-        remaining_budget=None,
-        planning_feedback=[],
-    )
 
 
-def _engine_context():
-    return {
-        "goal": "goal",
-        "knowledge": {
-            "known_targets": [],
-            "fact_refs": [],
-            "facts": [],
-            "provided": {"claims": []},
-        },
-    }
 
 
 async def test_revision_preserves_identical_completed_step(tmp_path):
@@ -315,74 +224,3 @@ async def test_history_receipts_kept_after_revision(tmp_path):
     assert {s.step_id: s for s in first.steps}["s1"].status == "completed"
     assert {s.step_id: s for s in first.steps}["s1"].evidence_ids == ["ev-1"]
     assert {s.step_id: s for s in second.steps}["s1"].status == "pending"
-
-
-async def test_ancestor_propagation_via_engine(tmp_path):
-    store = SQLitePathStore(tmp_path / "paths.sqlite3")
-    engine = InvestigationEngine(_engine_deps(store))
-    runtime = _engine_runtime()
-    context = _engine_context()
-    v1_draft = PathPlan(
-        path_id="draft-1",
-        run_id="run-eng-1",
-        version=1,
-        status="candidate",
-        reason="draft",
-        goal="goal",
-        steps=[
-            _chain_step("s1"),
-            _chain_step("s2", depends=["s1"]),
-            _chain_step("s3", depends=["s2"]),
-            _chain_step("s-alone"),
-        ],
-    )
-    v1 = await engine.register_path(v1_draft, runtime, context, {})
-    assert v1 is not None and v1.version == 1
-    await store.update_step(
-        "run-eng-1", v1.path_id, 1, "s1", "completed", outcome="done", evidence_ids=["ev-1"]
-    )
-    await store.update_step(
-        "run-eng-1", v1.path_id, 1, "s2", "completed", outcome="done", evidence_ids=["ev-2"]
-    )
-    await store.update_step(
-        "run-eng-1", v1.path_id, 1, "s3", "completed", outcome="done", evidence_ids=["ev-3"]
-    )
-    await store.update_step(
-        "run-eng-1",
-        v1.path_id,
-        1,
-        "s-alone",
-        "completed",
-        outcome="done",
-        evidence_ids=["ev-alone"],
-    )
-    v2_draft = PathPlan(
-        path_id="draft-2",
-        run_id="run-eng-1",
-        version=99,
-        status="candidate",
-        reason="draft",
-        goal="goal",
-        steps=[
-            _chain_step("s1", objective="objective-s1-changed"),
-            _chain_step("s2", depends=["s1"]),
-            _chain_step("s3", depends=["s2"]),
-            _chain_step("s-alone"),
-        ],
-        changed_step_ids=["s1"],
-    )
-    v2 = await engine.register_path(v2_draft, runtime, context, {})
-    assert v2 is not None and v2.version == 2
-    assert v2.path_id == v1.path_id
-    assert set(["s1", "s2", "s3"]) <= set(v2.changed_step_ids)
-    assert "s-alone" not in set(v2.changed_step_ids)
-    by_id = {s.step_id: s for s in v2.steps}
-    assert by_id["s-alone"].status == "completed"
-    assert by_id["s-alone"].evidence_ids == ["ev-alone"]
-    assert by_id["s2"].status == "pending"
-    assert by_id["s2"].evidence_ids == []
-    assert by_id["s3"].status == "pending"
-    assert by_id["s3"].evidence_ids == []
-    versions = await store.list_paths("run-eng-1")
-    assert [p.version for p in versions] == [1, 2]
-    assert {s.step_id: s for s in versions[0].steps}["s1"].evidence_ids == ["ev-1"]

@@ -10,35 +10,15 @@ first, full schema only after a detail lookup.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
 
-from redteam.attack_graph.service import AttackGraphService
-from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
-from redteam.core.contracts.engagement import (
-    ApprovalPolicy,
-    Engagement,
-    EngagementScope,
-    ExecutionBudget,
-    RateLimitPolicy,
-)
 from redteam.core.contracts.tool import ToolDescriptor
 from redteam.core.enums import ToolHealthStatus
-from redteam.core.ids import EngagementId, RunId, ToolId
-from redteam.core.ports.llm import NativeCompletion
-from redteam.event_bus.memory import InMemoryEventBus
-from redteam.orchestration.agents.registry import default_registry
-from redteam.orchestration.context import RuntimeDeps
+from redteam.core.ids import ToolId
 from redteam.orchestration.local_tools import LocalToolContext, LocalToolRegistry
 from redteam.orchestration.methodology import ReferenceEntry, ReferenceLibrary
 from redteam.orchestration.native_binding import exposed_tool_name
-from redteam.orchestration.nodes.react import model_node
-from redteam.orchestration.paths import InMemoryPathStore
-from redteam.orchestration.seed import seed_from_engagement
-from redteam.orchestration.settings import OrchestrationSettings
-from redteam.orchestration.state import RuntimeState, initial_graph_state
-from redteam.orchestration.task_graph.memory import InMemoryTaskGraphStore
 from redteam.orchestration.tool_discovery import (
     PROGRAM_DESCRIBE_ID,
     PROGRAM_LIST_ID,
@@ -63,8 +43,7 @@ from redteam.orchestration.tool_discovery import (
     tool_get_detail_handler,
     tool_list_cards_handler,
 )
-from redteam.orchestration.work.memory import InMemoryWorkStore
-from tests.fakes import DummyToolGateway, FakeControlPlane, FakeEvidenceStore
+from tests.fakes import DummyToolGateway
 
 NEEDLE = "needle-xyz-discovery-probe"
 INVENTORY_TOOL = "recon.inventory"
@@ -503,114 +482,16 @@ def test_discovery_grants_nothing_and_hides_nothing_registered():
     assert select_advertised_tool_ids(eligible_ids=eligible, fetched_ids=[]) == []
 
 
-class ScriptedNativeLLM:
-    def __init__(self, responses):
-        self._responses = list(responses)
-        self.turns = []
-
-    async def complete_native(self, messages, tools, system=None, **_):
-        self.turns.append({"messages": messages, "tools": tools})
-        return self._responses.pop(0)
 
 
-def _engagement():
-    return Engagement(
-        engagement_id=EngagementId("eng_cards"),
-        name="cards",
-        scope=EngagementScope(allowed_hosts=["a.local"]),
-        execution_budget=ExecutionBudget(max_actions=5),
-        rate_limit_policy=RateLimitPolicy(max_actions_per_minute=60),
-        approval_policy=ApprovalPolicy(),
-        created_at=datetime.now(timezone.utc),
-    )
 
 
-async def _seeded_model_deps(engagement, llm, *, register_discovery=True, shell_programs=None):
-    gateway = DummyToolGateway(tools=[_inventory_descriptor()])
-    deps = RuntimeDeps(
-        control_plane=FakeControlPlane(),
-        tool_gateway=gateway,
-        event_bus=InMemoryEventBus(),
-        graph_store=InMemoryAttackGraphStore(),
-        evidence_store=FakeEvidenceStore(),
-        llm_client=llm,
-        engagement=engagement,
-        agents=default_registry(),
-        tool_catalog=gateway,
-        work_store=InMemoryWorkStore(),
-        task_graph_store=InMemoryTaskGraphStore(),
-        path_store=InMemoryPathStore(),
-        operator_intent_store=None,
-        settings=OrchestrationSettings(max_steps=4, checkpointing=False),
-        shell_programs=shell_programs,
-    )
-    if register_discovery:
-        for contribution in discovery_tool_contributions():
-            descriptor, handler = contribution.factory(object())
-            deps.local_tools.register(descriptor, handler)
-    return deps
 
 
-def _runtime(run_id):
-    return RuntimeState(
-        run_id=run_id,
-        engagement_id=EngagementId("eng_cards"),
-        current_goal="map the in-scope host",
-        remaining_budget=5,
-    )
 
 
-async def test_model_node_turn1_advertises_locals_only():
-    engagement = _engagement()
-    llm = ScriptedNativeLLM([NativeCompletion(tool_calls=(), text="nothing yet")])
-    deps = await _seeded_model_deps(engagement, llm)
-    run_id = RunId("run_cards_turn1")
-    await seed_from_engagement(AttackGraphService(deps.graph_store), engagement, run_id=run_id)
-    state = await model_node(initial_graph_state(_runtime(run_id)), deps=deps)
-    assert len(llm.turns) == 1
-    advertised = {spec.name for spec in llm.turns[0]["tools"]}
-    assert advertised == {
-        exposed_tool_name(TOOL_LIST_CARDS_ID),
-        exposed_tool_name(TOOL_GET_DETAIL_ID),
-    }
-    assert exposed_tool_name(INVENTORY_TOOL) not in advertised
-    assert exposed_tool_name(PROGRAM_DESCRIBE_ID) not in advertised
-    user_message = llm.turns[0]["messages"][-1]
-    context = json.loads(user_message["content"])
-    assert "tools" not in context
-    assert "tool_cards" in context
-    assert "program_manifest_status" in context
-    assert "workroom_status" in context
-    card_ids = {card["tool_id"] for card in context["tool_cards"]}
-    assert INVENTORY_TOOL in card_ids
-    assert state["native_calls"] == []
 
 
-async def test_model_node_turn2_exposes_fetched_schema():
-    engagement = _engagement()
-    llm = ScriptedNativeLLM([NativeCompletion(tool_calls=(), text="nothing yet")])
-    deps = await _seeded_model_deps(engagement, llm)
-    run_id = RunId("run_cards_turn2")
-    await seed_from_engagement(AttackGraphService(deps.graph_store), engagement, run_id=run_id)
-    detail_call = {
-        "id": "call_detail_1",
-        "type": "function",
-        "function": {
-            "name": exposed_tool_name(TOOL_GET_DETAIL_ID),
-            "arguments": json.dumps({"tool_id": INVENTORY_TOOL}),
-        },
-    }
-    history = [
-        {"role": "assistant", "content": None, "tool_calls": [detail_call]},
-        {"role": "tool", "tool_call_id": "call_detail_1", "content": json.dumps({"ok": True})},
-    ]
-    state = initial_graph_state(_runtime(run_id))
-    state["native_messages"] = history
-    await model_node(state, deps=deps)
-    assert len(llm.turns) == 1
-    advertised = {spec.name: spec for spec in llm.turns[0]["tools"]}
-    assert exposed_tool_name(INVENTORY_TOOL) in advertised
-    assert advertised[exposed_tool_name(INVENTORY_TOOL)].input_schema
 
 
 async def test_program_list_paginates_past_100_items():
@@ -675,55 +556,8 @@ def test_bootstrap_flag_lives_on_provider_declarations():
     assert LocalToolDescriptor(tool_id="x", description="y").bootstrap is False
 
 
-async def test_model_node_turn2_exposes_fetched_local_schema():
-    engagement = _engagement()
-    llm = ScriptedNativeLLM([NativeCompletion(tool_calls=(), text="nothing yet")])
-    deps = await _seeded_model_deps(engagement, llm)
-    run_id = RunId("run_cards_turn2local")
-    await seed_from_engagement(AttackGraphService(deps.graph_store), engagement, run_id=run_id)
-    history = [
-        {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [
-                {
-                    "id": "call_detail_local",
-                    "type": "function",
-                    "function": {
-                        "name": exposed_tool_name(TOOL_GET_DETAIL_ID),
-                        "arguments": json.dumps({"tool_id": PROGRAM_DESCRIBE_ID}),
-                    },
-                }
-            ],
-        },
-        {
-            "role": "tool",
-            "tool_call_id": "call_detail_local",
-            "content": json.dumps({"ok": True}),
-        },
-    ]
-    state = initial_graph_state(_runtime(run_id))
-    state["native_messages"] = history
-    await model_node(state, deps=deps)
-    assert len(llm.turns) == 1
-    advertised = {spec.name: spec for spec in llm.turns[0]["tools"]}
-    assert exposed_tool_name(PROGRAM_DESCRIBE_ID) in advertised
-    schema = advertised[exposed_tool_name(PROGRAM_DESCRIBE_ID)].input_schema
-    assert set(schema["properties"]) == {"tool_id", "name", "owner_scope"}
-    assert "required" not in schema
-    assert exposed_tool_name(INVENTORY_TOOL) not in advertised
 
 
-async def test_model_node_unwired_fallback_advertises_everything():
-    engagement = _engagement()
-    llm = ScriptedNativeLLM([NativeCompletion(tool_calls=(), text="nothing yet")])
-    deps = await _seeded_model_deps(engagement, llm, register_discovery=False)
-    run_id = RunId("run_cards_legacy")
-    await seed_from_engagement(AttackGraphService(deps.graph_store), engagement, run_id=run_id)
-    await model_node(initial_graph_state(_runtime(run_id)), deps=deps)
-    assert len(llm.turns) == 1
-    advertised = {spec.name for spec in llm.turns[0]["tools"]}
-    assert exposed_tool_name(INVENTORY_TOOL) in advertised
 
 
 async def test_shadowed_command_keeps_distinct_cards_and_effective_describe():
@@ -877,21 +711,6 @@ async def test_live_query_runs_only_on_explicit_program_tools():
     assert calls == ["image", "image", "instance"]
 
 
-async def test_model_node_passive_cards_capped_with_totals():
-    engagement = _engagement()
-    llm = ScriptedNativeLLM([NativeCompletion(tool_calls=(), text="nothing yet")])
-    rows = [_row(f"tool{i:04d}", executable=f"/usr/bin/tool{i:04d}") for i in range(1000)]
-    deps = await _seeded_model_deps(engagement, llm, shell_programs=StubPrograms(image=rows))
-    run_id = RunId("run_cards_cap")
-    await seed_from_engagement(AttackGraphService(deps.graph_store), engagement, run_id=run_id)
-    await model_node(initial_graph_state(_runtime(run_id)), deps=deps)
-    assert len(llm.turns) == 1
-    context = json.loads(llm.turns[0]["messages"][-1]["content"])
-    assert len(context["tool_cards"]) <= 100
-    assert context["tool_cards_total"] >= 1000
-    assert context["tool_cards_truncated"] is True
-    assert sum(context["tool_cards_counts"].values()) == context["tool_cards_total"]
-    assert "tool.list_cards" in context["tool_cards_guidance"]
 
 
 def test_error_code_ignores_unvalidated_text():

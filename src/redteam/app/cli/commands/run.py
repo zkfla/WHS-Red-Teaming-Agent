@@ -42,7 +42,7 @@ from pydantic import ValidationError
 if TYPE_CHECKING:
     from prompt_toolkit import PromptSession
 
-from redteam.app.bootstrap import build_application, run_engagement, settle_engagement
+from redteam.app.bootstrap import build_application
 from redteam.app.cli import renderer
 from redteam.app.cli._shared import (
     EXIT_CONFIG_ERROR,
@@ -83,7 +83,6 @@ from redteam.orchestration.events import (
     RESULT_MAPPER_FAILED,
 )
 from redteam.orchestration.operator_intents import OperatorIntentService, redact_text
-from redteam.orchestration.runner import AgentLoopRunner
 from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.state import RuntimeState, TerminationReason
 
@@ -146,6 +145,8 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument("--log-level", default=None)
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--objective", default=None, help="Natural-language Mission objective")
+    parser.add_argument("--state-db", default=None)
+    parser.add_argument("--workers", type=int, default=None)
     parser.set_defaults(handler=run)
 
 
@@ -762,6 +763,9 @@ async def build(
     mcp_stack: AsyncExitStack | None = None,
     component_profile: ComponentProfile | None = None,
     component_registry: ComponentRegistry | None = None,
+    central_state=None,
+    original_stores=None,
+    original_settings=None,
 ) -> tuple[Any, RuntimeDeps]:
     """Phase 1 of the shared core (section 17): config -> live
     ``(Engagement, RuntimeDeps)``, via the canonical
@@ -791,7 +795,7 @@ async def build(
             "server ids) and each server's REDTEAM_MCP_<ID>_* environment variables."
         )
 
-    orchestration_settings = OrchestrationSettings.for_durable_run(
+    orchestration_settings = original_settings or OrchestrationSettings.for_durable_run(
         config.orchestration, max_steps=max_steps
     )
 
@@ -810,6 +814,15 @@ async def build(
         # ONLY when the operator network policy is configured (absent means
         # closed): the composition root validates the same builtin adapter.
         component_options["gated_shell"] = (shell_runtime, gated_provider_config)
+    if central_state is not None:
+        from redteam.core.ids import EngagementId
+        identity = EngagementId(central_state.engagement_id)
+        component_options.update({"central_state": central_state, "engagement_id": identity})
+    if original_stores is not None:
+        component_options.update({
+            "evidence_dir": original_stores["evidence"], "audit_dir": original_stores["audit"],
+            "approval_dir": original_stores["approvals"],
+        })
     return await build_application(
         config,
         orchestration_settings=orchestration_settings,
@@ -912,22 +925,16 @@ async def execute(
         )
 
     try:
-        final = await run_engagement(
-            engagement,
-            deps=deps,
-            orchestration_config=config.orchestration,
-            objective=objective,
-        )
-
-        final = await wait_for_suspensions(
-            final,
-            deps,
-            operator_console=operator_console,
-            input_live=input_live,
-            echo=echo,
-            non_interactive=non_interactive,
-            wait_for_external_approval=wait_for_external_approval,
-            session_channel=session_channel,
+        from redteam.app.central_run import run_central_engagement
+        async def watch(session, current):
+            return await wait_for_central_suspensions(
+                session, current, input_live=input_live, echo=echo,
+                non_interactive=non_interactive,
+                wait_for_external_approval=wait_for_external_approval,
+                operator_console=operator_console, session_channel=session_channel,
+            )
+        final = await run_central_engagement(
+            engagement, deps=deps, objective=objective, watch=watch,
         )
     finally:
         if session_channel is not None:
@@ -939,57 +946,61 @@ async def execute(
     return final
 
 
-async def wait_for_suspensions(
-    final,
-    deps,
-    *,
-    operator_console,
-    input_live,
-    echo,
-    non_interactive=False,
-    wait_for_external_approval=False,
-    session_channel=None,
+async def wait_for_central_suspensions(
+    session, final, *, input_live, echo, non_interactive=False,
+    wait_for_external_approval=False, operator_console=None, session_channel=None,
+    instance_id=None,
 ):
-    """Shared CLI watch path for newly-started and durably resumed runs."""
+    """Watch original waits within the requested resume scope on the same driver."""
+    from redteam.core.enums import MissionStatus
+    from redteam.orchestration.central_runtime import process_controls
+    deps = session.deps
+    last_wait = None
     while final.termination_reason in {
-        TerminationReason.APPROVAL_PENDING,
-        TerminationReason.OPERATOR_PAUSED,
+        TerminationReason.INVESTIGATION_HELD, TerminationReason.OPERATOR_PAUSED,
     }:
-        if session_channel is not None:
-            session_channel.suspended(final)
-        if final.termination_reason == TerminationReason.OPERATOR_PAUSED:
-            live = input_live()
-            echo(renderer.operator_paused_text(str(final.run_id), live=live))
-            if not live:
-                # No in-session channel: never block waiting for a
-                # 'resume' that can never arrive. The Mission stays
-                # paused and resumable from a real interactive session.
-                break
-            final = await _wait_for_pause(deps, final, echo=echo)
-            if session_channel is not None:
-                session_channel.resumed()
-            continue
-        console = operator_console
-        live = input_live()
-        if non_interactive or (not live and not wait_for_external_approval):
-            # Without an explicit external-approval watch, a script/CI
-            # or JSON session returns its durable pending checkpoint.
-            echo(
-                renderer.operator_approval_pending_text(
-                    str(final.pending_approval_id), str(final.run_id)
-                )
-            )
+        history = await deps.central_state.list_executions()
+        waiting = [item for item in history if (item.wait_reason or item.job_ref)
+                   and (instance_id is None or str(item.instance_id) == str(instance_id))]
+        if not waiting and final.termination_reason != TerminationReason.OPERATOR_PAUSED:
             break
-        if live and console is not None:
-            console.set_pending_approval(final.pending_approval_id)
+        live = input_live()
+        if final.termination_reason == TerminationReason.OPERATOR_PAUSED and not live:
+            break
+        if non_interactive or (not live and not wait_for_external_approval):
+            break
+        approvals = [str(item.approval_ref) for item in waiting if item.approval_ref]
+        if session_channel is not None:
+            # Display one exact pending action at a time; status exposes every
+            # instance. Resolving it never resumes another approval's action.
+            session_channel.suspended(final.model_copy(update={
+                "pending_approval_id": approvals[0] if approvals else None,
+            }))
+        waits = (tuple(approvals), tuple(item.job_ref for item in waiting if item.job_ref))
+        if waits != last_wait:
+            echo(f"Run {final.run_id}: waiting for approvals={approvals}; jobs={list(waits[1])}")
+            last_wait = waits
+        if live and operator_console is not None and approvals:
+            operator_console.set_pending_approval(approvals[0])
         try:
-            final = await _wait_for_approval(deps, final, echo=echo, in_session=live)
+            await asyncio.sleep(0.5)
+            await process_controls(deps)
+            mission = await deps.central_state.get_mission(final.mission_id)
+            if mission.status is MissionStatus.CANCELLED:
+                return await session.settle(final)
+            if mission.status is MissionStatus.PAUSED:
+                continue
+            final = await session.resume(instance_id=instance_id, transfer_owner=False)
         finally:
-            if live and console is not None:
-                console.clear_pending_approval()
-            if session_channel is not None:
-                session_channel.resumed()
+            if operator_console is not None:
+                operator_console.clear_pending_approval()
+    if session_channel is not None and final.termination_reason not in {
+        TerminationReason.INVESTIGATION_HELD, TerminationReason.OPERATOR_PAUSED,
+    }:
+        session_channel.resumed()
     return final
+
+
 
 
 async def run(
@@ -1016,6 +1027,8 @@ async def _run(
 ) -> int:
     try:
         config = load_app_config_for_run(args.engagement_path)
+        from redteam.app.cli._shared import runtime_overrides
+        config = runtime_overrides(config, args)
     except (OSError, ValidationError, ValueError) as exc:
         eprint(f"ERROR: {exc}")
         return EXIT_CONFIG_ERROR
@@ -1092,97 +1105,8 @@ async def _run(
     return _exit_code_for(final)
 
 
-async def _wait_for_approval(
-    deps: RuntimeDeps, final: RuntimeState, *, echo: Echo, in_session: bool = False
-) -> RuntimeState:
-    approval_id = str(final.pending_approval_id)
-    echo(renderer.operator_approval_pending_text(approval_id, str(final.run_id)))
-    if in_session:
-        # The same-session operator console is live; approving here resolves
-        # the *exact* Approval this run is already suspended on (no replan).
-        echo(renderer.operator_approval_prompt_text(approval_id))
-    echo(
-        "승인 대기 중 · /stop 중단 요청 · /exit 세션 종료"
-        if in_session
-        else "Waiting for resolution (Ctrl+C stops watching; the Run stays pending)..."
-    )
-
-    if getattr(deps, "specialist_policy", None) is not None:
-        from redteam.app.cli.commands.resume import watch_specialist_approval
-
-        return await watch_specialist_approval(
-            deps, final, poll_seconds=(
-                _APPROVAL_POLL_SECONDS_IN_SESSION if in_session else _APPROVAL_POLL_SECONDS
-            ),
-        )
-
-    resume_settings = deps.settings.model_copy(update={"thread_id": str(final.run_id)})
-    resume_runner = AgentLoopRunner(deps, settings=resume_settings)
-    # deps.event_bus already has the subscriber `run()` registered before
-    # the first run_engagement() call -- it's the same bus for the whole
-    # process, subscribing again here would print every event twice.
-    current = final
-    poll_seconds = _APPROVAL_POLL_SECONDS_IN_SESSION if in_session else _APPROVAL_POLL_SECONDS
-    try:
-        while current.termination_reason == TerminationReason.APPROVAL_PENDING:
-            result = await resume_runner.reconcile_once(current, timeout_seconds=poll_seconds)
-            current = result.runtime
-            mission = (
-                await deps.task_graph_store.get_mission(current.mission_id)
-                if current.mission_id is not None
-                else None
-            )
-            if mission is not None and mission.status.value == "cancelled":
-                current = current.model_copy(
-                    update={
-                        "termination_reason": TerminationReason.OPERATOR_STOPPED,
-                        "pending_approval_id": None,
-                        "pending_action_id": None,
-                    }
-                )
-                break
-    except KeyboardInterrupt:
-        echo(
-            f"\nStopped watching. Run {current.run_id} is still pending approval "
-            f"{current.pending_approval_id} -- resume it later with "
-            f"`redteam resume {current.run_id} <engagement.yaml>`."
-        )
-        raise  # let main()'s top-level handler set the conventional SIGINT exit code
-    finally:
-        await resume_runner.aclose()
-    if current.termination_reason != TerminationReason.APPROVAL_PENDING:
-        current = await settle_engagement(current, deps, last_event_id=resume_runner.last_event_id)
-    return current
 
 
-async def _wait_for_pause(deps: RuntimeDeps, paused: RuntimeState, *, echo: Echo) -> RuntimeState:
-    settings = deps.settings.model_copy(update={"thread_id": str(paused.run_id)})
-    runner = AgentLoopRunner(deps, settings=settings)
-    current = paused
-    try:
-        while current.termination_reason == TerminationReason.OPERATOR_PAUSED:
-            result = await runner.reconcile_once(
-                current, timeout_seconds=_APPROVAL_POLL_SECONDS_IN_SESSION
-            )
-            current = result.runtime
-            mission = (
-                await deps.task_graph_store.get_mission(current.mission_id)
-                if current.mission_id is not None
-                else None
-            )
-            if mission is not None and mission.status.value == "cancelled":
-                current = current.model_copy(
-                    update={"termination_reason": TerminationReason.OPERATOR_STOPPED}
-                )
-                break
-    finally:
-        await runner.aclose()
-    if current.termination_reason not in {
-        TerminationReason.OPERATOR_PAUSED,
-        TerminationReason.APPROVAL_PENDING,
-    }:
-        return await settle_engagement(current, deps, last_event_id=runner.last_event_id)
-    return current
 
 
 def _print_summary(final: RuntimeState) -> None:

@@ -142,6 +142,7 @@ async def collect_execution_originals(
     proves that an actor did not run.
     """
     records = await deps.evidence_store.list_for_run(runtime.run_id)
+    assert deps.work_store is not None
     works = await deps.work_store.list_items(run_id=runtime.run_id)
     if (any(record.run_id != runtime.run_id for record in records)
             or len({record.evidence_id for record in records}) != len(records)

@@ -51,7 +51,7 @@ def _sort_key(record: IntentRecord) -> tuple[object, str]:
     return (record.intent.created_at, str(record.intent.intent_id))
 
 
-def _safe_record(record: IntentRecord | dict) -> IntentRecord:
+def sanitize_intent_record(record: IntentRecord | dict) -> IntentRecord:
     """Sanitize even model_copy-updated records before storing or returning."""
     payload = record.model_dump(mode="json") if isinstance(record, IntentRecord) else record
     return IntentRecord.model_validate(redact_secret_material(payload))
@@ -61,8 +61,8 @@ class IntentIdentityConflictError(ValueError):
     """An existing intent identifier cannot be reused with another instruction or run."""
 
 
-def _checked_update(old: IntentRecord, record: IntentRecord) -> IntentRecord:
-    record = _safe_record(record)
+def check_intent_update(old: IntentRecord, record: IntentRecord) -> IntentRecord:
+    record = sanitize_intent_record(record)
     if old.intent != record.intent or old.correlation_id != record.correlation_id:
         raise IntentIdentityConflictError("intent identity and content are immutable")
     if old.run_id is not None and old.run_id != record.run_id:
@@ -84,20 +84,20 @@ class InMemoryOperatorIntentStore:
         async with self._lock:
             if record.intent.intent_id in self._records:
                 raise DuplicateIntentError(f"intent exists: {record.intent.intent_id}")
-            self._records[record.intent.intent_id] = _safe_record(record)
+            self._records[record.intent.intent_id] = sanitize_intent_record(record)
 
     async def update(self, record: IntentRecord) -> None:
         async with self._lock:
             if record.intent.intent_id not in self._records:
                 raise IntentNotFoundError(f"intent not found: {record.intent.intent_id}")
-            self._records[record.intent.intent_id] = _checked_update(
+            self._records[record.intent.intent_id] = check_intent_update(
                 self._records[record.intent.intent_id], record
             )
 
     async def get(self, intent_id: OperatorIntentId) -> IntentRecord | None:
         async with self._lock:
             record = self._records.get(intent_id)
-            return _safe_record(record) if record is not None else None
+            return sanitize_intent_record(record) if record is not None else None
 
     async def list_for_mission(
         self,
@@ -108,7 +108,7 @@ class InMemoryOperatorIntentStore:
     ) -> list[IntentRecord]:
         async with self._lock:
             records = [
-                _safe_record(record)
+                sanitize_intent_record(record)
                 for record in self._records.values()
                 if record.intent.mission_id == mission_id
                 and (status is None or record.status is status)
@@ -172,11 +172,11 @@ class SQLiteOperatorIntentStore:
         row = db.execute(
             "SELECT payload FROM operator_intents WHERE intent_id=?", (str(intent_id),)
         ).fetchone()
-        return _safe_record(json.loads(row[0])) if row else None
+        return sanitize_intent_record(json.loads(row[0])) if row else None
 
     @staticmethod
     def _write(db: sqlite3.Connection, record: IntentRecord) -> None:
-        record = _safe_record(record)
+        record = sanitize_intent_record(record)
         db.execute(
             """INSERT INTO operator_intents(intent_id,mission_id,status,created_at,payload)
             VALUES(?,?,?,?,?) ON CONFLICT(intent_id) DO UPDATE SET
@@ -192,7 +192,7 @@ class SQLiteOperatorIntentStore:
 
     async def append(self, record: IntentRecord) -> None:
         await self.setup()
-        record = _safe_record(record)
+        record = sanitize_intent_record(record)
 
         def append(db: sqlite3.Connection) -> None:
             if self._get(db, record.intent.intent_id) is not None:
@@ -203,13 +203,13 @@ class SQLiteOperatorIntentStore:
 
     async def update(self, record: IntentRecord) -> None:
         await self.setup()
-        record = _safe_record(record)
+        record = sanitize_intent_record(record)
 
         def update(db: sqlite3.Connection) -> None:
             old = self._get(db, record.intent.intent_id)
             if old is None:
                 raise IntentNotFoundError(f"intent not found: {record.intent.intent_id}")
-            self._write(db, _checked_update(old, record))
+            self._write(db, check_intent_update(old, record))
 
         await run_transaction(self._path, update, write=True)
 
@@ -228,7 +228,7 @@ class SQLiteOperatorIntentStore:
 
         def read(db: sqlite3.Connection) -> list[IntentRecord]:
             records = [
-                _safe_record(json.loads(row[0]))
+                sanitize_intent_record(json.loads(row[0]))
                 for row in db.execute(
                     "SELECT payload FROM operator_intents WHERE mission_id=?",
                     (str(mission_id),),

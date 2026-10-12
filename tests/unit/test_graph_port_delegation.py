@@ -4,7 +4,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from redteam.attack_graph.service import AttackGraphService
 from redteam.attack_graph.stores.base import (
     StoreCapabilityError,
     require_listable,
@@ -12,9 +11,6 @@ from redteam.attack_graph.stores.base import (
     require_receipted,
 )
 from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
-from redteam.orchestration.planning_admission import PlanningAdmission
-from redteam.orchestration.planning_graph import PlanningGraphStore
-from tests.unit.test_orchestration_coordination import world
 
 
 class DelegatedStore:
@@ -50,13 +46,3 @@ def test_partial_or_noncallable_port_is_never_advertised(require, names, missing
         methods[names[-1]] = None
     with pytest.raises(StoreCapabilityError):
         require(DelegatedStore(SimpleNamespace(**methods)))
-
-
-async def test_planning_wrapper_can_be_observed_and_reported_without_bypassing_it(tmp_path):
-    w = await world(tmp_path, "memory")
-    inner = InMemoryAttackGraphStore()
-    wrapped = PlanningGraphStore(inner, PlanningAdmission(w.coordinator))
-    assert require_listable(wrapped, "report") is wrapped
-    service = AttackGraphService(wrapped)
-    assert await service.view().counts() == {"nodes": 0, "edges": 0}
-    assert (await service.integrity_report()).is_clean

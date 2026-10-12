@@ -12,7 +12,7 @@ import json
 import math
 import sqlite3
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from redteam.core.contracts.network import (
@@ -28,6 +28,138 @@ from redteam.core.contracts.network import (
 from redteam.sqlite_support import run_transaction
 
 _MAX_SQLITE_INTEGER = 2**63 - 1
+
+NETWORK_SCHEMA = (
+    """CREATE TABLE IF NOT EXISTS network_pools (
+                engagement TEXT NOT NULL, purpose TEXT NOT NULL,
+                max_deliveries INTEGER NOT NULL, max_bytes INTEGER NOT NULL,
+                available_deliveries INTEGER NOT NULL, available_bytes INTEGER NOT NULL,
+                last_delivery REAL, budget_json TEXT,
+                PRIMARY KEY(engagement,purpose))""",
+    """CREATE TABLE IF NOT EXISTS network_windows (
+                window_id TEXT PRIMARY KEY, engagement TEXT NOT NULL,
+                run_id TEXT NOT NULL, instance_id TEXT NOT NULL, epoch INTEGER NOT NULL,
+                purpose TEXT NOT NULL, state TEXT NOT NULL, grant_json TEXT NOT NULL,
+                caps_json TEXT NOT NULL, committed_deliveries INTEGER NOT NULL DEFAULT 0,
+                daemon_session TEXT, last_delivery REAL, settlement_json TEXT,
+                UNIQUE(engagement,run_id,instance_id,epoch))""",
+    """CREATE TABLE IF NOT EXISTS network_seq_log (
+                window_id TEXT NOT NULL REFERENCES network_windows(window_id),
+                seq INTEGER NOT NULL, daemon_session TEXT NOT NULL,
+                flow_key TEXT NOT NULL, decision_json TEXT NOT NULL,
+                PRIMARY KEY(window_id,seq))""",
+)
+
+
+def check_network_snapshot(rows: dict[str, list[dict]]) -> None:
+    """Validate the owner's current schema without settling or refunding it.
+
+    Migration must transfer complete engagement pools, including windows from
+    other Runs. A malformed source is retained and refused, never initialized
+    as an empty budget. Quarantine release can leave its original settlement
+    quarantined: that transition releases ownership without returning capacity.
+    """
+    # Reuse the exact owner DDL rather than maintain another column catalog.
+    expected = sqlite3.connect(":memory:")
+    try:
+        for statement in NETWORK_SCHEMA:
+            expected.execute(statement)
+        for table in ("network_pools", "network_windows", "network_seq_log"):
+            columns = {row[1] for row in expected.execute(f"PRAGMA table_info({table})")}
+            if any(set(row) != columns for row in rows[table]):
+                raise ValueError("network_snapshot_schema_unsupported")
+    finally:
+        expected.close()
+    pools = {(r["engagement"], r["purpose"]): r for r in rows["network_pools"]}
+    windows = {r["window_id"]: r for r in rows["network_windows"]}
+    consumed: dict[tuple[str, str], list[int]] = {key: [0, 0] for key in pools}
+    for engagement in {key[0] for key in pools}:
+        budget = NetworkBudget.model_validate_json(pools[(engagement, "global")]["budget_json"])
+        capacities = {"global": budget.global_capacity, "target": budget.target_capacity,
+                      "install": budget.install_capacity}
+        for purpose, capacity in capacities.items():
+            pool = pools[(engagement, purpose)]
+            if (pool["max_deliveries"], pool["max_bytes"]) != (
+                capacity.max_flow_init_deliveries, capacity.max_output_bytes,
+            ):
+                raise ValueError("network_snapshot_budget_mismatch")
+    charged = dict.fromkeys(windows, 0)
+    for row in rows["network_seq_log"]:
+        decision = AdmissionDecision.model_validate_json(row["decision_json"])
+        if row["window_id"] not in windows or decision.seq != row["seq"]:
+            raise ValueError("network_snapshot_sequence_mismatch")
+        charged[row["window_id"]] += int(decision.charged_delivery)
+    for row in windows.values():
+        grant = NetworkGrant.model_validate_json(row["grant_json"])
+        caps = WindowCaps.model_validate_json(row["caps_json"])
+        WindowState(row["state"])
+        if ((grant.window_id, grant.run_id, grant.instance_id, grant.epoch, grant.purpose.value)
+                != (row["window_id"], row["run_id"], row["instance_id"], row["epoch"],
+                    row["purpose"])
+                or (grant.reserved_deliveries, grant.reserved_bytes, grant.purpose)
+                != (caps.max_flow_init_deliveries, caps.max_output_bytes, caps.purpose)
+                or charged[row["window_id"]] != row["committed_deliveries"]
+                or not 0 <= row["committed_deliveries"] <= grant.reserved_deliveries):
+            raise ValueError("network_snapshot_window_mismatch")
+        deliveries, byte_count = grant.reserved_deliveries, grant.reserved_bytes
+        if row["settlement_json"] is not None:
+            settlement = WindowSettlement.model_validate_json(row["settlement_json"])
+            if (settlement.window_id != grant.window_id
+                    or settlement.committed_deliveries != row["committed_deliveries"]
+                    or settlement.charged_deliveries + settlement.released_deliveries
+                    != grant.reserved_deliveries
+                    or settlement.charged_bytes + settlement.released_bytes != grant.reserved_bytes
+                    or row["state"] == "open"):
+                raise ValueError("network_snapshot_settlement_mismatch")
+            deliveries, byte_count = settlement.charged_deliveries, settlement.charged_bytes
+        elif row["state"] == "released":
+            raise ValueError("network_snapshot_settlement_missing")
+        for purpose in ("global", grant.purpose.value):
+            amount = consumed[(row["engagement"], purpose)]
+            amount[0] += deliveries
+            amount[1] += byte_count
+    for key, row in pools.items():
+        if (row["available_deliveries"], row["available_bytes"]) != (
+            row["max_deliveries"] - consumed[key][0], row["max_bytes"] - consumed[key][1],
+        ) or min(row["available_deliveries"], row["available_bytes"]) < 0:
+            raise ValueError("network_snapshot_accounting_mismatch")
+
+
+def import_network_snapshot(db: sqlite3.Connection, rows: dict[str, list[dict]]) -> None:
+    """Borrow the migration transaction; preserve every original ledger column."""
+    check_network_snapshot(rows)
+    for statement in NETWORK_SCHEMA:
+        db.execute(statement)
+    for table in ("network_pools", "network_windows", "network_seq_log"):
+        for row in rows[table]:
+            columns = list(row)
+            actual = {item[1] for item in db.execute(f"PRAGMA table_info({table})")}
+            if set(columns) != actual:
+                raise ValueError("network_snapshot_schema_unsupported")
+            placeholders = ",".join("?" for _ in columns)
+            db.execute(f"INSERT INTO {table} ({','.join(columns)}) VALUES({placeholders})",
+                       tuple(row.values()))
+
+
+def network_activity_in_connection(
+    db: sqlite3.Connection, engagement_id: str, run_id: str,
+    instance_ids: Sequence[str], include_closed: bool,
+) -> bool:
+    """Control-owned recovery inventory on a caller-owned shared transaction.
+
+    Never changes quotas, settles a window, or grants execution. A released
+    window is activity too when checking a never-entered activation proof.
+    An unselected network feature has no windows and adds no restriction.
+    """
+    if not instance_ids or db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='network_windows'",
+    ).fetchone() is None:
+        return False
+    query = "SELECT 1 FROM network_windows WHERE engagement=? AND run_id=? AND instance_id=?"
+    if not include_closed:
+        query += " AND state!='released'"
+    return any(db.execute(query + " LIMIT 1", (engagement_id, run_id, instance)).fetchone()
+               is not None for instance in instance_ids)
 
 
 class SQLiteNetworkGrantLedger:
@@ -64,24 +196,8 @@ class SQLiteNetworkGrantLedger:
         def initialize(db: sqlite3.Connection) -> None:
             # execute individually: executescript would implicitly commit
             # the BEGIN IMMEDIATE that guards setup and budget identity.
-            db.execute("""CREATE TABLE IF NOT EXISTS network_pools (
-                engagement TEXT NOT NULL, purpose TEXT NOT NULL,
-                max_deliveries INTEGER NOT NULL, max_bytes INTEGER NOT NULL,
-                available_deliveries INTEGER NOT NULL, available_bytes INTEGER NOT NULL,
-                last_delivery REAL, budget_json TEXT,
-                PRIMARY KEY(engagement,purpose))""")
-            db.execute("""CREATE TABLE IF NOT EXISTS network_windows (
-                window_id TEXT PRIMARY KEY, engagement TEXT NOT NULL,
-                run_id TEXT NOT NULL, instance_id TEXT NOT NULL, epoch INTEGER NOT NULL,
-                purpose TEXT NOT NULL, state TEXT NOT NULL, grant_json TEXT NOT NULL,
-                caps_json TEXT NOT NULL, committed_deliveries INTEGER NOT NULL DEFAULT 0,
-                daemon_session TEXT, last_delivery REAL, settlement_json TEXT,
-                UNIQUE(engagement,run_id,instance_id,epoch))""")
-            db.execute("""CREATE TABLE IF NOT EXISTS network_seq_log (
-                window_id TEXT NOT NULL REFERENCES network_windows(window_id),
-                seq INTEGER NOT NULL, daemon_session TEXT NOT NULL,
-                flow_key TEXT NOT NULL, decision_json TEXT NOT NULL,
-                PRIMARY KEY(window_id,seq))""")
+            for statement in NETWORK_SCHEMA:
+                db.execute(statement)
             capacities = {
                 "global": self._budget.global_capacity,
                 "target": self._budget.target_capacity,

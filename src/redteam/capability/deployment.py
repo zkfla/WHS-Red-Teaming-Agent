@@ -97,8 +97,8 @@ class DeploymentSpec(BaseModel):
             profile = self.policy.targets[session.target_ref]
             if not _REF.fullmatch(ref) or not _REF.fullmatch(session.principal_ref):
                 raise ValueError("deployment_invalid_session_or_principal_ref")
-            if len(set(access.paths)) != len(access.paths) or set(access.paths) - set(
-                profile.allowed_paths
+            if len(set(access.paths)) != len(access.paths) or any(
+                not profile.allows_path(path) for path in access.paths
             ):
                 raise ValueError("deployment_session_paths_not_approved")
             if session.allowed_paths is not None and set(session.allowed_paths) != set(
@@ -127,6 +127,7 @@ class DeploymentSpec(BaseModel):
                 "host": host,
                 "origin": profile.origin,
                 "allowed_paths": profile.allowed_paths,
+                **({"allow_all_paths": True} if profile.allow_all_paths else {}),
                 "allowed_methods": profile.allowed_methods,
                 "allowed_path_methods": profile.allowed_path_methods,
                 "allowed_query_keys": profile.allowed_query_keys,
@@ -294,23 +295,28 @@ def deployment_metadata(spec: DeploymentSpec, scope: EngagementScope) -> dict:
 
 def check_deployment_scope(spec: DeploymentSpec, scope: EngagementScope) -> None:
     for target in spec.policy.targets.values():
-        proposal = ActionProposal(
-            action_id=ActionId("deployment-check"),
-            run_id=RunId("deployment-check"),
-            engagement_id=EngagementId("deployment-check"),
-            agent_id=AgentId("deployment-check"),
-            capability="web",
-            operation="http_request",
-            target=UrlTarget(url=target.origin),
-            arguments={},
-            reason="Operator deployment validation only; never executed",
-            created_at=datetime.now(timezone.utc),
-        )
-        allowed, _, _ = check_scope(proposal, scope)
-        if not allowed:
-            # Never strip ports to broaden scope; retain the current Control semantics.
-            raise ValueError("deployment_origin_outside_control_scope")
+        check_origin_scope(target.origin, scope)
     _declared_host_seeds(spec, scope)
+
+
+def check_origin_scope(origin: str, scope: EngagementScope) -> None:
+    """Validate a declared origin before provisioning or resolving its address."""
+    proposal = ActionProposal(
+        action_id=ActionId("deployment-check"),
+        run_id=RunId("deployment-check"),
+        engagement_id=EngagementId("deployment-check"),
+        agent_id=AgentId("deployment-check"),
+        capability="web",
+        operation="http_request",
+        target=UrlTarget(url=origin),
+        arguments={},
+        reason="Operator deployment validation only; never executed",
+        created_at=datetime.now(timezone.utc),
+    )
+    allowed, _, _ = check_scope(proposal, scope)
+    if not allowed:
+        # Never strip ports to broaden scope; retain the current Control semantics.
+        raise ValueError("deployment_origin_outside_control_scope")
 
 
 if __name__ == "__main__":

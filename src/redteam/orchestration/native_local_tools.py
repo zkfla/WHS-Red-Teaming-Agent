@@ -26,10 +26,8 @@ totals, or the review calls count twice.
 
 from __future__ import annotations
 
-from types import SimpleNamespace
 from typing import Any
 
-from redteam.core.contracts.mission import redact_secret_material
 from redteam.core.extensions import Contribution
 from redteam.orchestration.cognition import DecisionFailure, ReasoningHalted
 from redteam.orchestration.completion_proposal import CompletionProposal
@@ -166,86 +164,9 @@ async def _settle(
         return LocalToolResult(
             ok=False, error="goal settlement needs an operator mission"
         )
-    from redteam.orchestration.engine import InvestigationEngine
+    from redteam.orchestration.central_results import settle_central
 
-    if scope == "task":
-        from redteam.orchestration.semantic_completion import (
-            complete_task as settle,
-        )
-    else:
-        from redteam.orchestration.semantic_completion import (
-            complete_goal as settle,
-        )
-    engine = InvestigationEngine(deps)
-    engine._event_runtime = runtime
-    engine.last_event_id = context.last_event_id
-    decision = SimpleNamespace(
-        completion=proposal.model_dump(mode="json"), reason=proposal.reason
-    )
-    before_unresolved = list(getattr(runtime, "unresolved_evidence_ids", None) or [])
-    try:
-        errors = await settle(
-            engine,
-            None,
-            decision,
-            runtime,
-            {},
-            budget=getattr(context, "budget", None),
-        )
-    except (ReasoningHalted, DecisionFailure):
-        # The settlement review shares the caller reasoning budget; a
-        # spent budget or guard halt must reach _local_call so the run
-        # terminates instead of looking like a failed settlement.
-        raise
-    except Exception as exc:
-        diagnostic = operational_exception_diagnostic(
-            exc,
-            stage="native_local_tool",
-            code="settlement_failed",
-            summary="The settlement worker could not finish.",
-        )
-        return LocalToolResult(
-            ok=False,
-            payload={
-                "outcome": proposal.outcome,
-                "diagnostic": diagnostic.model_dump(mode="json"),
-            },
-            error=diagnostic.feedback(),
-            last_event_id=engine.last_event_id,
-        )
-    if errors:
-        safe = [str(redact_secret_material(str(item))) for item in errors]
-        return LocalToolResult(
-            ok=False,
-            payload={"outcome": proposal.outcome, "errors": safe},
-            error="; ".join(safe),
-            last_event_id=engine.last_event_id,
-        )
-    after_unresolved = [
-        str(item)
-        for item in (getattr(runtime, "unresolved_evidence_ids", None) or [])
-    ]
-    seen = set(map(str, before_unresolved))
-    new_ids = [item for item in after_unresolved if item not in seen]
-    refs = tuple(dict.fromkeys([*proposal.evidence_ids, *new_ids]))
-    if scope == "task":
-        outcome = "task_blocked" if proposal.unresolved else "task_completed"
-    else:
-        outcome = (
-            "investigation_finished" if proposal.unresolved else "goal_achieved"
-        )
-    return LocalToolResult(
-        ok=True,
-        payload={
-            "scope": scope,
-            "outcome": proposal.outcome,
-            "unresolved": proposal.unresolved,
-            "unresolved_evidence_ids": new_ids,
-        },
-        refs=refs,
-        runtime_outcome=outcome,
-        last_event_id=engine.last_event_id,
-    )
+    return await settle_central(scope, proposal, context)
 
 
 async def task_settle_handler(

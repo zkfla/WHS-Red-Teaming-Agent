@@ -17,7 +17,6 @@ from redteam.core.enums import AgentPhase, PolicyVerdict
 from redteam.core.tool_binding import execution_display_key
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.events import GRAPH_MUTATION_APPLIED, RESULT_MAPPER_FAILED
-from redteam.orchestration.execution_journal import mark_execution_processed
 from redteam.orchestration.nodes._support import advance, graph_service, publisher_for
 from redteam.orchestration.nodes.policy import denial_severity
 from redteam.orchestration.runtime_observation import (
@@ -109,11 +108,6 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         step=runtime.step_count,
     ) if proposal.target is not None else None
 
-    attempt_record_key = step.attempt_record_key if step is not None else operation_key
-    if node is not None:
-        await service.record_attempt(
-            node.id, attempt_record_key, step=runtime.step_count, provenance=provenance
-        )
 
     last_event = await publisher.publish(
         EventType.GRAPH_UPDATED,
@@ -344,7 +338,8 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 confirmed_edges += 1
 
             processing_stage = "edges"
-            if provenance.evidence_id:
+            if (provenance.evidence_id
+                    and not (result and result.metadata.get("development_double") is True)):
                 processing_failed_at = "findings"
                 for finding_mutation in findings_to_apply:
                     existing = await service.get_finding(finding_mutation.finding_id)
@@ -501,10 +496,12 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     work_id = state.get("current_work_id")
     approval_waiting = decision is not None and decision.verdict is PolicyVerdict.REQUIRE_APPROVAL
     if work_id is not None and approval_waiting:
+        assert deps.work_store is not None
         await deps.work_store.release(
             work_id, owner=runtime.work_owner, now=datetime.now(timezone.utc)
         )
     elif work_id is not None:
+        assert deps.work_store is not None
         error_code = result.error.code if result is not None and result.error else None
         invalidated = (
             blocked
@@ -537,13 +534,7 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         if not completed:
             raise RuntimeError("execution_work_settlement_failed")
 
-    result_evidence_id = state.get("result_evidence_id")
-    if result is not None and result_evidence_id is not None:
-        await mark_execution_processed(
-            deps.evidence_store, run_id=runtime.run_id, action_id=proposal.action_id,
-            instance_id=runtime.instance_id, work_id=work_id,
-            evidence_id=result_evidence_id,
-        )
+    state.get("result_evidence_id")
 
     # The graph summary follows measured application: verifier failures are
     # still FAILED for work accounting above, but an applied observation

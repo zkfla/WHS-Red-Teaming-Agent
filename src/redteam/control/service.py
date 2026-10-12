@@ -59,7 +59,7 @@ from redteam.core.contracts.engagement import Engagement
 from redteam.core.contracts.policy import Approval, ControlContext, PolicyDecision
 from redteam.core.contracts.tool import ToolDescriptor
 from redteam.core.enums import ApprovalStatus, PolicyVerdict, RiskLevel
-from redteam.core.ids import ApprovalId, EngagementId, ToolId
+from redteam.core.ids import ApprovalId, EngagementId, RunId, ToolId
 from redteam.core.tool_binding import execution_fingerprint as _binding_fingerprint
 from redteam.core.tool_binding import is_direct as _is_direct_binding
 from redteam.evidence.service import EvidenceService
@@ -685,6 +685,74 @@ class DefaultControlPlane:
         self._resolved_proposals[normalized_id] = proposal.model_copy(deep=True)
         self._resolved_outcomes[normalized_id] = decision
         return decision
+
+    async def inspect_approval(self, approval_id: ApprovalId | str) -> Approval | None:
+        """Read the original human resolution, without charging or admitting."""
+        return await self._approvals.get(ApprovalId(str(approval_id)))
+
+    async def recorded_decision(self, proposal: ActionProposal) -> PolicyDecision | None:
+        """Validate an exact durable proposal before reusing its paid admission.
+
+        This is no execution permission: admit_invocation must still recheck
+        current scope, ROE, operator state and approval at provider entry.
+        """
+        from redteam.control.audit import redact_arguments
+
+        found = None
+        for entry in await self._audit.list_for_run(proposal.run_id):
+            if entry.action_id != proposal.action_id or entry.decision is None:
+                continue
+            if "tool_call_reservation" in entry.metadata:
+                continue
+            if (entry.engagement_id != proposal.engagement_id
+                    or entry.action_summary != redact_arguments(proposal.model_dump(mode="json"))
+                    or entry.decision.execution_fingerprint != _proposal_fingerprint(proposal)):
+                raise ValueError("original_control_proposal_mismatch")
+            found = entry.decision
+        return found
+
+    async def rehydrate_run(self, engagement_id: EngagementId, run_id: RunId, *,
+                            started_at: datetime) -> RehydratedAccounting:
+        """Restore admitted charges from original audit, including interrupted intents.
+
+        Conservatively restores the current rate window. Audit gaps are not
+        authorization to enter a pending intent; recorded_decision rejects it.
+        No action/body is reconstructed from the redacted audit snapshot.
+        """
+        engagement = self._engagements[engagement_id]
+        entries = await self._audit.list_for_run(run_id)
+        if any(entry.engagement_id != engagement_id for entry in entries):
+            raise ValueError("original_control_scope_mismatch")
+        decisions = [entry.decision for entry in entries if entry.decision is not None]
+        admitted = {str(decision.action_id) for decision in decisions
+                    if decision.verdict is PolicyVerdict.ALLOW}
+        cap = engagement.execution_budget.max_tool_calls
+        cap = cap if cap is not None else engagement.execution_budget.max_actions
+        cap = min(cap, engagement.execution_budget.max_actions)
+        remaining = [decision.budget_remaining for decision in decisions
+                     if decision.budget_remaining is not None]
+        retries = set()
+        for entry in entries:
+            if "tool_call_reservation" not in entry.metadata:
+                continue
+            key = entry.metadata["tool_call_reservation"]
+            if (not isinstance(key, list) or len(key) != 4
+                    or key[0] != str(engagement_id) or key[1] != str(entry.action_id)
+                    or not isinstance(key[2], str) or not key[2]
+                    or type(key[3]) is not int or key[3] < 1
+                    or entry.decision is None or entry.decision.verdict is not PolicyVerdict.ALLOW):
+                raise ValueError("original_tool_call_reservation_invalid")
+            retries.add(tuple(key))
+        calls = len(admitted) + len(retries)
+        if remaining:
+            calls = max(calls, cap - min(remaining))
+        return await self.rehydrate(
+            engagement_id, actions_consumed=len(admitted), tool_calls_consumed=calls,
+            rate_actions_in_window=calls,
+            elapsed_duration_seconds=max(
+                0, (datetime.now(timezone.utc) - started_at).total_seconds(),
+            ),
+        )
 
     async def describe_policy(self, engagement_id: EngagementId | str) -> dict[str, Any]:
         normalized = EngagementId(str(engagement_id))
@@ -1391,6 +1459,9 @@ class DefaultControlPlane:
             severity=None,
             execution_fingerprint=decision.execution_fingerprint,
         )
+        await self._audit.record(proposal, allowed, metadata={
+            "tool_call_reservation": list(consumed_key),
+        })
         return allowed
 
     async def _finalize(

@@ -60,6 +60,10 @@ class EventWakeup:
             await bus.subscribe(event_type, self.notify)
         self._attached = True
 
+    @property
+    def pending(self) -> bool:
+        return self._signal.is_set()
+
     async def notify(self, event: EventEnvelope) -> None:
         if self._run_id is not None and event.run_id != self._run_id:
             return

@@ -8,15 +8,28 @@ dispatched request. A recovered unknown remains charged.
 from __future__ import annotations
 
 import time
-from typing import Any
+from collections.abc import Awaitable, Callable, Coroutine, MutableMapping
+from typing import Any, Protocol
 
 from redteam.core.contracts.llm_policy import LLMRequestPolicy
 from redteam.core.ids import new_id
 from redteam.core.ports.llm import LLMProviderFailure
 from redteam.orchestration.cognition import ReasoningHalted
-from redteam.orchestration.coordination import ChangeSet, CoordinationError, Coordinator
+from redteam.orchestration.coordination import CoordinationError, Coordinator
 
 _REQUEST_STATES = ("reserved", "dispatched", "settled", "unknown", "released")
+
+
+class RequestSession(Protocol):
+    """Only the existing request ledger's records and Run admission boundary."""
+
+    @property
+    def records(self) -> MutableMapping[tuple[str, str], Any]: ...
+
+    def admit(self, run_id: str, mission_id: str, *, token: str | None = None) -> None: ...
+
+
+RequestChange = Callable[[RequestSession], Coroutine[Any, Any, Any]]
 
 
 class RequestAdmissionError(ReasoningHalted):
@@ -31,11 +44,35 @@ class RequestAdmissionError(ReasoningHalted):
 
 
 class RunRequestLedger:
-    def __init__(self, coordinator: Coordinator, *, clock=time.time) -> None:
-        self.coordinator = coordinator
+    def __init__(
+        self, coordinator: Coordinator | None = None, *, clock=time.time,
+        change: Callable[[str, RequestChange], Awaitable[Any]] | None = None,
+    ) -> None:
+        if (coordinator is None) == (change is None):
+            raise ValueError("select one request accounting transaction boundary")
+        self._coordinator = coordinator
+        self._request_change = change
         self.clock = clock
 
-    def _cooldown(self, tx: ChangeSet, run_id: str, policy: LLMRequestPolicy) -> float:
+    def shares_boundary(self, change: Callable) -> bool:
+        return self._request_change == change
+
+    @property
+    def coordinator(self) -> Coordinator:
+        if self._coordinator is None:
+            raise RequestAdmissionError("central_request_ledger_requires_central_runtime")
+        return self._coordinator
+
+    async def _change(self, run_id: str, callback: RequestChange) -> Any:
+        if self._request_change is not None:
+            return await self._request_change(run_id, callback)
+
+        async def legacy(tx):
+            return await callback(tx)
+
+        return await self.coordinator.change(legacy)
+
+    def _cooldown(self, tx: RequestSession, run_id: str, policy: LLMRequestPolicy) -> float:
         saved = tx.records.get(("llm_provider_cooldown", run_id), {})
         if saved.get("held"):
             raise RequestAdmissionError("llm_rate_limit_requires_operator_review")
@@ -44,18 +81,18 @@ class RunRequestLedger:
         return max(0.0, saved.get("until", 0.0) - self.clock())
 
     async def wait_seconds(self, run_id: str) -> float:
-        async def read(tx: ChangeSet) -> float:
+        async def read(tx: RequestSession) -> float:
             self._admit(tx, run_id)
             saved = tx.records.get(("llm_request_policy", run_id))
             if saved is None:
                 raise RequestAdmissionError("llm_request_policy_not_bound")
             return self._cooldown(tx, run_id, LLMRequestPolicy.model_validate(saved))
-        return await self.coordinator.change(read)
+        return await self._change(run_id, read)
 
     async def record_provider_outcome(
         self, run_id: str, failure: LLMProviderFailure | None = None,
     ) -> None:
-        async def change(tx: ChangeSet) -> None:
+        async def change(tx: RequestSession) -> None:
             key = ("llm_provider_cooldown", run_id)
             if failure is None:
                 # Do not undo ANY exhausted Run-wide hold using an earlier
@@ -84,20 +121,20 @@ class RunRequestLedger:
                 "held": bool(previous.get("held")) or not failure.retryable
                         or delay > policy.max_rate_limit_wait_seconds,
             }
-        await self.coordinator.change(change)
+        await self._change(run_id, change)
 
     async def bind(self, run_id: str, policy: LLMRequestPolicy) -> None:
-        async def change(tx: ChangeSet) -> None:
+        async def change(tx: RequestSession) -> None:
             key = ("llm_request_policy", run_id)
             payload = policy.model_dump(mode="json")
             saved = tx.records.get(key)
             if saved is not None and saved != payload:
                 raise RequestAdmissionError("llm_request_policy_changed_new_run_required")
             tx.records[key] = payload
-        await self.coordinator.change(change)
+        await self._change(run_id, change)
 
     @staticmethod
-    def _checked_row(request_id: str, row: Any) -> dict[str, Any]:
+    def checked_record(request_id: str, row: Any) -> dict[str, Any]:
         """Validate the persisted identity/state before accounting or mutation.
 
         No row repair, inferred usage or refund: malformed history is held.
@@ -117,7 +154,7 @@ class RunRequestLedger:
         return row
 
     @classmethod
-    def _rows(cls, tx: ChangeSet, run_id: str) -> list[dict[str, Any]]:
+    def _rows(cls, tx: RequestSession, run_id: str) -> list[dict[str, Any]]:
         rows = []
         for (kind, request_id), row in tx.records.items():
             if kind != "llm_request":
@@ -128,11 +165,11 @@ class RunRequestLedger:
                     or not row["run_id"].strip()):
                 raise RequestAdmissionError("llm_request_record_invalid")
             if row["run_id"] == run_id:
-                rows.append(cls._checked_row(request_id, row))
+                rows.append(cls.checked_record(request_id, row))
         return rows
 
     @classmethod
-    def owner_has_activity(cls, tx: ChangeSet, run_id: str, owner: str) -> bool:
+    def owner_has_activity(cls, tx: RequestSession, run_id: str, owner: str) -> bool:
         """Even a released reservation contradicts a never-entered actor proof.
 
         Read-only: recovery never refunds requests or resets the shared policy.
@@ -141,7 +178,7 @@ class RunRequestLedger:
 
     @classmethod
     def request_states(
-        cls, tx: ChangeSet, run_id: str, *, owner: str | None = None,
+        cls, tx: RequestSession, run_id: str, *, owner: str | None = None,
     ) -> dict[str, int]:
         """Safe read-only projection, not refunds or unknown settlement.
 
@@ -155,7 +192,7 @@ class RunRequestLedger:
         return counts
 
     @staticmethod
-    def _admit(tx: ChangeSet, run_id: str) -> None:
+    def _admit(tx: RequestSession, run_id: str) -> None:
         binding = tx.records.get(("binding", run_id))
         if binding is not None:
             try:
@@ -168,7 +205,7 @@ class RunRequestLedger:
             raise RequestAdmissionError("llm_request_scope_invalid")
         request_id = new_id("llm_request")
 
-        async def change(tx: ChangeSet) -> str:
+        async def change(tx: RequestSession) -> str:
             self._admit(tx, run_id)
             saved = tx.records.get(("llm_request_policy", run_id))
             if saved is None:
@@ -188,9 +225,9 @@ class RunRequestLedger:
                 "kind": kind, "state": "reserved", "total_tokens": None,
             }
             return request_id
-        return await self.coordinator.change(change)
+        return await self._change(run_id, change)
 
-    def launch_blocked(self, tx: ChangeSet, run_id: str) -> str | None:
+    def launch_blocked(self, tx: RequestSession, run_id: str) -> str | None:
         """Non-reserving Run gate; a new instance cannot evade count/backoff."""
         saved = tx.records.get(("llm_request_policy", run_id))
         if saved is None:
@@ -206,7 +243,7 @@ class RunRequestLedger:
         return None
 
     async def dispatch(self, run_id: str, request_id: str) -> None:
-        async def change(tx: ChangeSet) -> None:
+        async def change(tx: RequestSession) -> None:
             self._admit(tx, run_id)
             row = self._get(tx, run_id, request_id)
             if row["state"] != "reserved":
@@ -215,14 +252,14 @@ class RunRequestLedger:
             if self._cooldown(tx, run_id, policy) > 0:
                 raise RequestAdmissionError("llm_provider_cooldown_active")
             row["state"] = "dispatched"
-        await self.coordinator.change(change)
+        await self._change(run_id, change)
 
     @classmethod
-    def _get(cls, tx: ChangeSet, run_id: str, request_id: str) -> dict[str, Any]:
+    def _get(cls, tx: RequestSession, run_id: str, request_id: str) -> dict[str, Any]:
         row = tx.records.get(("llm_request", request_id))
         if row is None:
             raise RequestAdmissionError("llm_request_identity_mismatch")
-        row = cls._checked_row(request_id, row)
+        row = cls.checked_record(request_id, row)
         if row["run_id"] != run_id:
             raise RequestAdmissionError("llm_request_identity_mismatch")
         return row
@@ -231,7 +268,7 @@ class RunRequestLedger:
         self, run_id: str, request_id: str, *, unknown: bool = False,
         total_tokens: int | None = None,
     ) -> None:
-        async def change(tx: ChangeSet) -> None:
+        async def change(tx: RequestSession) -> None:
             row = self._get(tx, run_id, request_id)
             state = "unknown" if unknown else "settled"
             tokens = total_tokens if type(total_tokens) is int and total_tokens >= 0 else None
@@ -240,18 +277,18 @@ class RunRequestLedger:
             if row["state"] != "dispatched":
                 raise RequestAdmissionError("llm_request_settlement_conflict")
             row.update(state=state, total_tokens=tokens)
-        await self.coordinator.change(change)
+        await self._change(run_id, change)
 
     async def release_undispatched(self, run_id: str, request_id: str) -> None:
-        async def change(tx: ChangeSet) -> None:
+        async def change(tx: RequestSession) -> None:
             row = self._get(tx, run_id, request_id)
             if row["state"] not in {"reserved", "released"}:
                 raise RequestAdmissionError("dispatched_request_cannot_be_refunded")
             row["state"] = "released"
-        await self.coordinator.change(change)
+        await self._change(run_id, change)
 
     async def snapshot(self, run_id: str) -> dict[str, Any]:
-        async def read(tx: ChangeSet) -> dict[str, Any]:
+        async def read(tx: RequestSession) -> dict[str, Any]:
             rows = self._rows(tx, run_id)
             spent = [r for r in rows if r["state"] in {"settled", "unknown"}]
             return {
@@ -263,4 +300,26 @@ class RunRequestLedger:
                 "unknown_dispatch": sum(r["state"] == "unknown" for r in spent),
                 "provider_cooldown": tx.records.get(("llm_provider_cooldown", run_id)),
             }
-        return await self.coordinator.change(read)
+        return await self._change(run_id, read)
+
+    async def recover_owner(self, run_id: str, *, owner: str | None) -> None:
+        """An exclusively owned, quiescent Run only: never refund dispatch.
+
+        Reserved means the provider has not been entered. Dispatched means
+        lost usage is unknown, retaining the original request and its charge.
+        The driver must establish that the actor is no longer running first.
+        """
+        async def change(tx: RequestSession) -> None:
+            for row in self._rows(tx, run_id):
+                if owner is not None and row["owner"] != owner:
+                    continue
+                current = self._get(tx, run_id, row["request_id"])
+                if current["state"] == "reserved":
+                    current["state"] = "released"
+                elif current["state"] == "dispatched":
+                    current.update(state="unknown", total_tokens=None)
+        await self._change(run_id, change)
+
+    async def recover_run(self, run_id: str) -> None:
+        """Exclusive cold Run recovery, including planner and verification scopes."""
+        await self.recover_owner(run_id, owner=None)

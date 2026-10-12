@@ -13,7 +13,6 @@ path.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -25,7 +24,6 @@ from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
 from redteam.core.contracts.events import EventType
 from redteam.core.contracts.mission import MissionPlan, MissionTask, Provenance
 from redteam.core.enums import (
-    AgentPhase,
     GraphNodeType,
     MissionStatus,
     OperatorIntentType,
@@ -42,17 +40,14 @@ from redteam.core.ids import (
 from redteam.event_bus.memory import InMemoryEventBus
 from redteam.event_bus.publisher import EventPublisher
 from redteam.orchestration.candidates.models import PriorityScore
-from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.coordination import coordinator_for
 from redteam.orchestration.events import CANDIDATE_REJECTED
-from redteam.orchestration.nodes import observe_node
 from redteam.orchestration.operator_intents import (
     InMemoryOperatorIntentStore,
     IntentInterpretationError,
     IntentRecord,
     IntentStatus,
     OperatorIntentService,
-    OperatorIntentStore,
     SQLiteOperatorIntentStore,
     classify_instruction,
     interpret_instruction,
@@ -69,15 +64,9 @@ from redteam.orchestration.operator_intents.models import (
     BlockedTaskExplanation,
     CandidateExplanation,
 )
-from redteam.orchestration.state import (
-    RuntimeState,
-    TerminationReason,
-    initial_graph_state,
-)
 from redteam.orchestration.task_graph.memory import InMemoryTaskGraphStore
 from redteam.orchestration.work.memory import InMemoryWorkStore
 from redteam.orchestration.work.models import WorkItem, WorkStatus
-from tests.fakes import build_test_application
 
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
 RUN = RunId("run_intent")
@@ -689,93 +678,12 @@ async def test_query_intent_is_applied_without_touching_state() -> None:
 # --- observe integration: pause before execution, resume same task -------
 
 
-@dataclass(frozen=True)
-class _IntentDeps(RuntimeDeps):
-    """Test-only shim: the composition root adds this field to RuntimeDeps."""
-
-    operator_intent_store: OperatorIntentStore | None = None
 
 
-def deps_with_intents(intent_store, task_store) -> RuntimeDeps:
-    base = replace(build_test_application(), task_graph_store=task_store)
-    # Forward-compatible: once the composition root adds the optional
-    # ``operator_intent_store`` field to ``RuntimeDeps`` itself, use it
-    # directly instead of the test-only subclass shim.
-    if any(field.name == "operator_intent_store" for field in fields(RuntimeDeps)):
-        return replace(base, operator_intent_store=intent_store)
-    values = {field.name: getattr(base, field.name) for field in fields(RuntimeDeps)}
-    values["operator_intent_store"] = intent_store
-    return _IntentDeps(**values)
 
 
-async def test_observe_pauses_before_execution_and_resumes_same_task() -> None:
-    task_store = InMemoryTaskGraphStore()
-    await task_store.create_mission(mission())
-    await coordinator_for(task_store).bind(str(RUN), str(MISSION), str(ENG))
-    await task_store.create_task(
-        task(
-            "recon-task",
-            status=TaskStatus.RUNNING,
-            priority=10,
-            capability="recon",
-            objective="Map the scope",
-        ).model_copy(update={"assigned_agent": AgentId("recon-agent")})
-    )
-    intent_store = InMemoryOperatorIntentStore()
-    deps = deps_with_intents(intent_store, task_store)
-    # A HOST node makes the recon role schedulable, so resume has somewhere to go.
-    await AttackGraphService(deps.graph_store).upsert_node(
-        GraphNodeType.HOST, key="a.local", attrs={"in_scope": True}
-    )
-
-    runtime = RuntimeState(
-        run_id=RUN,
-        engagement_id=ENG,
-        mission_id=MISSION,
-        active_task_id=TaskId("recon-task"),
-        current_agent=AgentId("recon-agent"),
-    )
-
-    # Out-of-band pause: no publisher at receive time; OBSERVE records it.
-    await service(task_store=task_store, intent_store=intent_store).receive(
-        "pause now", mission_id=MISSION, run_id=RUN
-    )
-
-    paused = await observe_node(initial_graph_state(runtime), deps=deps)
-    assert paused["runtime"].phase is AgentPhase.REPLAN
-    assert paused["runtime"].termination_reason == TerminationReason.OPERATOR_PAUSED
-    assert paused["runtime"].active_task_id == TaskId("recon-task")
-    assert paused["runtime"].current_agent is None
-    assert (await _require_mission(task_store)).status is MissionStatus.PAUSED
-    # The active Task is preserved, not completed.
-    assert (await _require_task(task_store, TaskId("recon-task"))).status is TaskStatus.RUNNING
-
-    chain = deps.event_bus.correlated(  # type: ignore[attr-defined]
-        (await intent_store.list_for_mission(MISSION))[0].correlation_id
-    )
-    assert [event.event_type for event in chain] == [
-        EventType.OPERATOR_INSTRUCTION_RECEIVED,
-        EventType.OPERATOR_INTENT_APPLIED,
-    ]
-
-    # Resume: same Mission, same Task, now schedulable again.
-    await service(task_store=task_store, intent_store=intent_store).receive(
-        "resume", mission_id=MISSION, run_id=RUN
-    )
-    resumed_runtime = paused["runtime"].model_copy(
-        update={"phase": AgentPhase.OBSERVE, "termination_reason": None}
-    )
-    resumed = await observe_node(initial_graph_state(resumed_runtime), deps=deps)
-
-    assert (await _require_mission(task_store)).status is MissionStatus.ACTIVE
-    assert (await _require_task(task_store, TaskId("recon-task"))).status is TaskStatus.RUNNING
-    assert resumed["runtime"].active_task_id == TaskId("recon-task")
-    assert resumed["runtime"].termination_reason is None
 
 
-async def test_observe_without_an_intent_store_is_unchanged() -> None:
-    # from_deps returns None for a deps bundle that never adopted the field.
-    assert OperatorIntentService.from_deps(build_test_application()) is None
 
 
 # --- structural boundary -------------------------------------------------

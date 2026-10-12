@@ -112,7 +112,9 @@ async def test_cli_reads_without_report_model_transport_or_new_directories(
     _, activation, originals, path = await reservation(tmp_path)
     await activation.entering(originals[0])
     before = snapshot(path)
-    monkeypatch.setattr(command, "load_terminal_report", lambda *_: pytest.fail("not report mode"))
+    monkeypatch.setattr(
+        "redteam.app.report_store.load_terminal_report", lambda *_: pytest.fail("not report mode"),
+    )
     from redteam.app import bootstrap
     build = AsyncMock(side_effect=AssertionError("diagnostics must not build"))
     monkeypatch.setattr(bootstrap, "build_application", build)

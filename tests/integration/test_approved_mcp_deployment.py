@@ -2,19 +2,23 @@
 
 import json
 import threading
-from contextlib import AsyncExitStack
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import urlsplit
 
 import pytest
 from mcp import Client
 
-from redteam.app.bootstrap import build_application, run_engagement
 from redteam.app.cli._shared import load_app_config_for_run
 from redteam.capability.deployment import DeploymentSpec, connection_environment, provision
 from redteam.capability.servers import web_http
 from redteam.capability.servers.config import ServerPolicy
-from redteam.core.config import AppConfig, CapabilityConfig, load_engagement_config
+from redteam.core.config import (
+    AppConfig,
+    CapabilityConfig,
+    OrchestrationConfig,
+    load_engagement_config,
+)
 from redteam.core.enums import RiskLevel
 from redteam.core.ports.llm import NativeCompletion, NativeToolCall
 from redteam.orchestration.engine import InvestigationEngine
@@ -22,6 +26,12 @@ from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.state import TerminationReason
 from tests.integration import _engine_llm_harness as h
 from tests.unit.test_mcp_deployment import engagement, source
+
+
+@pytest.fixture(autouse=True)
+def explicit_legacy_runtime(monkeypatch):
+    """These fixtures exercise the retained legacy CLI/schema, explicitly selected."""
+    monkeypatch.delenv("REDTEAM_RUNTIME_BACKEND", raising=False)
 
 
 class SessionLLM:
@@ -176,9 +186,7 @@ class SessionLLM:
                 ),
                 text="",
             )
-        assert len(compare_matches) == 1, (
-            "native model needs exactly one registered compare tool"
-        )
+        assert len(compare_matches) == 1, "native model needs exactly one registered compare tool"
         if not any(call.get("tool") == "compare" for call in self.calls):
             compare = compare_matches[0]
             self.calls.append({"turn": self.turns, "tool": "compare"})
@@ -224,7 +232,9 @@ def install(tmp_path, monkeypatch, origin, *, require_approval=False, port_pinne
     ).items():
         monkeypatch.setenv(key, value)
     return AppConfig(
-        engagement=loaded, capability=CapabilityConfig(mcp_servers=list(spec.roles))
+        orchestration=OrchestrationConfig(),
+        engagement=loaded,
+        capability=CapabilityConfig(mcp_servers=list(spec.roles)),
     ), path
 
 
@@ -257,50 +267,101 @@ def bank():
         thread.join(timeout=2)
 
 
+async def run_central_worker(config, tmp_path, llm):
+    from redteam.app.central_run import open_central_run
+    from redteam.core.contracts.llm_policy import LLMRequestPolicy
+
+    settings = OrchestrationSettings(
+        specialist_profile_path=str(
+            Path(__file__).resolve().parents[2] / "config/agents/native-specialists-web.yaml"
+        ),
+        llm_request_policy=LLMRequestPolicy(mode="bounded", max_requests=50),
+        max_steps=20,
+    )
+    return open_central_run(config, directory=tmp_path / "run", settings=settings, llm=llm)
+
+
+async def register_central_comparison(session):
+    from redteam.orchestration.knowledge_validation import known_target_ids
+    from redteam.orchestration.specialist_tasks import StrategyTasks, register_investigation_tasks
+    material = await InvestigationEngine(session.deps).execution_material(session.runtime)
+    targets = set(known_target_ids(material))
+    assert targets
+    condition = {"kind": "semantic", "description": "Observe scoped session responses"}
+    subject = {
+        "question_id": "compare",
+        "objective": "Compare synthetic test users",
+        "target_node_ids": sorted(targets),
+        "completion_criteria": [condition],
+    }
+    await register_investigation_tasks(
+        session.deps.central_state,
+        proposal_id="compare",
+        proposal=StrategyTasks.model_validate(
+            {
+                "questions": [subject],
+                "tasks": [
+                    {
+                        **subject,
+                        "task_key": "compare",
+                        "role_id": "web-executor",
+                        "title": "Observe session responses",
+                    }
+                ],
+            }
+        ),
+        agents=session.deps.agents,
+        known_targets=targets,
+        known_principals=set(),
+        max_tasks=1,
+        evidence_store=session.deps.evidence_store,
+    )
+
+
 @pytest.mark.parametrize("port_pinned", [False, True])
 async def test_agent_uses_inventory_and_two_users_through_real_mcp(
-    tmp_path, monkeypatch, bank, port_pinned
+    tmp_path,
+    monkeypatch,
+    bank,
+    port_pinned,
 ):
     origin, requests = bank
     config, path = install(tmp_path, monkeypatch, origin, port_pinned=port_pinned)
-    cli_config = load_app_config_for_run(str(path), require_llm=False)
-    assert cli_config.engagement == config.engagement
-    monkeypatch.setattr("redteam.app.bootstrap.save_terminal_report", lambda report: None)
+    assert load_app_config_for_run(str(path), require_llm=False).engagement == config.engagement
     llm = SessionLLM(config.engagement.scope.allowed_hosts[0])
-    async with AsyncExitStack() as stack:
-        eng, deps = await build_application(
-            config,
-            mcp_stack=stack,
-            llm=llm,
-            evidence_dir=tmp_path / "evidence",
-            audit_dir=tmp_path / "audit",
-            approval_dir=tmp_path / "approvals",
-            orchestration_settings=OrchestrationSettings(
-                max_steps=20,
-                checkpoint_backend="memory",
-                enforce_verification_reserve=False,
-            ),
-        )
+    async with await run_central_worker(config, tmp_path, llm) as session:
+        deps = session.deps
         assert len(deps.tool_catalog.all()) == 11
-        inventory = deps.tool_catalog.get("web.session_list")
-        assert inventory.operations == ["response_analysis"]
-        final = await run_engagement(eng, deps, objective="Compare only synthetic test users")
+        await register_central_comparison(session)
+        results = [
+            event
+            async for event in session.driver.drive_ready_tasks(
+                session.runtime,
+                max_instances=2,
+            )
+        ]
+        final = results[0].runtime
         assert final.actions_executed == 2, (final.termination_reason, final.planning_feedback)
         assert requests == ["/accounts/123", "/accounts/123"]
         records = await deps.evidence_store.list_for_run(final.run_id)
-        inventory_records = [r for r in records if r.source_id == str(inventory.tool_id)]
-        assert inventory_records, "inventory discovery must be recorded"
-        discovered = inventory_records[0].metadata["tool_result"]["output"]["sessions"]
-        assert [entry["session_ref"] for entry in discovered] == ["alice", "bob"]
-        compare_tool = deps.tool_catalog.get("web.http_compare_sessions")
-        assert compare_tool is not None
-        comparison = next(r for r in records if r.source_id == str(compare_tool.tool_id))
+        inventory = deps.tool_catalog.get("web.session_list")
+        inventory_record = next(
+            record for record in records if record.source_id == str(inventory.tool_id)
+        )
+        discovered = inventory_record.metadata["tool_result"]["output"]["sessions"]
+        assert [row["session_ref"] for row in discovered] == ["alice", "bob"]
+        comparison = next(
+            record
+            for record in records
+            if record.source_id == str(deps.tool_catalog.get("web.http_compare_sessions").tool_id)
+        )
         output = comparison.metadata["tool_result"]["output"]
         assert output["first"]["status_code"] == 200 and output["second"]["status_code"] == 403
         assert output["verdict"] == "observation_only"
         context = await InvestigationEngine(deps).context(final, None)
-        assert context["engagement_constraints"]["mcp_targets"]["bank-test"]["origin"] == origin
-        exposed = json.dumps([llm.calls, context, [r.model_dump(mode="json") for r in records]])
+        exposed = json.dumps(
+            [llm.calls, context, [record.model_dump(mode="json") for record in records]]
+        )
         assert "synthetic-a" not in exposed and "synthetic-b" not in exposed
         assert "BODY_MUST_NOT_REACH_AGENT" not in exposed
         assert final.termination_reason != TerminationReason.GOAL_ACHIEVED
@@ -309,18 +370,16 @@ async def test_agent_uses_inventory_and_two_users_through_real_mcp(
 async def test_real_control_still_requires_approval_before_mcp_call(tmp_path, monkeypatch, bank):
     origin, requests = bank
     config, _ = install(tmp_path, monkeypatch, origin, require_approval=True)
-    monkeypatch.setattr("redteam.app.bootstrap.save_terminal_report", lambda report: None)
-    async with AsyncExitStack() as stack:
-        eng, deps = await build_application(
-            config,
-            mcp_stack=stack,
-            llm=SessionLLM(),
-            evidence_dir=tmp_path / "evidence",
-            audit_dir=tmp_path / "audit",
-            approval_dir=tmp_path / "approvals",
-            orchestration_settings=OrchestrationSettings(max_steps=12, checkpoint_backend="memory"),
-        )
-        final = await run_engagement(eng, deps)
+    async with await run_central_worker(config, tmp_path, SessionLLM()) as session:
+        await register_central_comparison(session)
+        results = [
+            event
+            async for event in session.driver.drive_ready_tasks(
+                session.runtime,
+                max_instances=2,
+            )
+        ]
+        final = results[0].runtime
         assert final.pending_approval_id and final.actions_executed == 0
         assert requests == []
 

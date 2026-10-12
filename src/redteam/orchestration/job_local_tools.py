@@ -29,6 +29,8 @@ async def job_reconcile_handler(arguments: dict[str, Any], context: LocalToolCon
         diagnostic = diagnostic_for_exception(exc, stage="native_local_tool")
         return LocalToolResult(ok=False, error=diagnostic.feedback())
     deps, runtime = context.deps, context.runtime
+    if getattr(deps, "central_state", None) is not None:
+        return LocalToolResult(ok=False, error="central job collection is reserved for plan2c")
     if deps.long_job_adapter is None:
         return LocalToolResult(ok=False, error="registered job collection is not supported")
     from redteam.orchestration.engine import InvestigationEngine

@@ -132,7 +132,7 @@ def html_observations(
             "method": method if method in {"GET", "POST"} else "UNKNOWN",
             "query_omitted": bool(url.query),
             "fragment_omitted": bool(url.fragment),
-            "path_allowlisted": route in profile.allowed_paths,
+            "path_allowlisted": profile.allows_path(route),
         })
     return {
         "references": references,

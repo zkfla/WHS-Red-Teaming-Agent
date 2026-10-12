@@ -30,8 +30,12 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING, cast
 
 from pydantic import ValidationError
+
+if TYPE_CHECKING:
+    from redteam.orchestration.context import RuntimeDeps
 
 from redteam.attack_graph.identity import normalize_path
 from redteam.core.contracts.events import EventEnvelope, EventType
@@ -299,6 +303,7 @@ class OperatorIntentService:
         work_store: object | None = None,
         path_store: object | None = None,
         coordinator=None,
+        central_deps=None,
     ) -> None:
         self._store = store
         self._tasks = task_graph_store
@@ -311,6 +316,7 @@ class OperatorIntentService:
         # Task-only evidence rather than failing.
         self._graph_store = graph_store
         self._work_store = work_store
+        self._central_deps = central_deps
 
     @property
     def _coordinator(self):
@@ -330,7 +336,17 @@ class OperatorIntentService:
         """
         store = getattr(deps, "operator_intent_store", None)
         task_graph_store = getattr(deps, "task_graph_store", None)
-        if store is None or task_graph_store is None:
+        if store is None:
+            return None
+        central_state = getattr(deps, "central_state", None)
+        if central_state is not None:
+            central_deps = cast("RuntimeDeps", deps)
+            return cls(
+                store=central_state, task_graph_store=central_state,
+                event_bus=central_deps.event_bus, event_history=central_deps.event_history,
+                graph_store=central_deps.graph_store, central_deps=deps,
+            )
+        if task_graph_store is None:
             return None
         return cls(
             store=store,
@@ -393,6 +409,21 @@ class OperatorIntentService:
             run_id=run_id,
             correlation_id=correlation_id,
         )
+        if self._central_deps is not None:
+            from redteam.orchestration.central_runtime import event
+            state = self._central_deps.central_state
+            notification = event(state, EventType.OPERATOR_INSTRUCTION_RECEIVED, {
+                "intent_id": str(intent.intent_id), "intent_type": intent.intent_type.value,
+                "mission_id": str(mission_id),
+            })
+            record = record.model_copy(update={"received_event_id": notification.event_id})
+            def register(tx):
+                saved = tx.save_intent(record)
+                tx.queue(notification)
+                return saved
+            saved = await state.transaction(register)
+            await self._central_deps.event_bus.flush()
+            return self._application(saved, applied=False)
         try:
             saved = await self._register(record, publisher, last_event_id)
         except CoordinationError as exc:
@@ -514,6 +545,15 @@ class OperatorIntentService:
         now: datetime | None = None,
     ) -> IntentApplication:
         """Apply a previously received intent exactly once."""
+        if self._central_deps is not None:
+            from redteam.orchestration.central_runtime import process_controls
+            identity = getattr(intent, "intent_id", intent)
+            await process_controls(self._central_deps)
+            saved = await self._central_deps.central_state.get(identity)
+            if saved is None or (run_id is not None and saved.run_id != run_id):
+                return IntentApplication(status=IntentStatus.REJECTED, applied=False,
+                                         outcome="not_found")
+            return self._application(saved, applied=saved.status is IntentStatus.APPLIED)
         record = await self._resolve(intent)
         if record is None:
             return IntentApplication(

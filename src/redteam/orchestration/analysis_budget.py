@@ -43,8 +43,6 @@ def verification_guard(state: GraphState, *, deps: RuntimeDeps, budget: Decision
             TerminationReason.OPERATOR_PAUSED,
         }:
             raise ReasoningHalted("analysis_run_stopped_or_paused")
-        coordinator = deps.coordinator or coordinator_for(deps.task_graph_store, deps.path_store)
-
         async def inspect_current(change):
             if runtime.mission_id is None:
                 change.legacy_scope(str(runtime.run_id))
@@ -59,7 +57,14 @@ def verification_guard(state: GraphState, *, deps: RuntimeDeps, budget: Decision
 
         # The callback only reads the current canonical binding, mission and
         # intent generation. Store errors propagate to cognition's safe gate.
-        await coordinator.change(inspect_current)
+        if deps.central_state is not None:
+            from redteam.orchestration.central_runtime import runtime_token
+            await runtime_token(deps, runtime)
+        else:
+            coordinator = deps.coordinator or coordinator_for(
+                deps.task_graph_store, deps.path_store,
+            )
+            await coordinator.change(inspect_current)
         now = datetime.now(timezone.utc)
         if not reasoning_time_allowed(deps.engagement, runtime, now=now):
             raise ReasoningHalted("analysis_engagement_time_exhausted")

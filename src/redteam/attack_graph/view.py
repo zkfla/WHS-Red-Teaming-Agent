@@ -9,7 +9,6 @@ from __future__ import annotations
 from typing import Any
 
 from redteam.attack_graph.cleanup import CleanupReport, collect
-from redteam.attack_graph.identity import finding_node_id
 from redteam.attack_graph.integrity import IntegrityReport, check_integrity
 from redteam.attack_graph.observation import (
     ATTEMPTED_FACT_KEY,
@@ -24,9 +23,6 @@ from redteam.attack_graph.predicates import facts_of
 from redteam.attack_graph.stores.base import require_listable
 from redteam.attack_graph.traversal import (
     Direction,
-    EvidenceChain,
-    evidence_chain,
-    shortest_path,
     subgraph_around,
 )
 from redteam.core.contracts.graph import GraphEdge, GraphNode
@@ -37,7 +33,9 @@ from redteam.core.ports.attack_graph import AttackGraphStore
 _READ_METHODS = frozenset(
     {
         "get_node",
+        "cacheable",
         "get_edge",
+        "incident_edges",
         "neighbors",
         "query",
         "list_nodes",
@@ -48,9 +46,7 @@ _READ_METHODS = frozenset(
         "resolve",
         "integrity_report",
         "counts",
-        "shortest_path",
         "subgraph_around",
-        "evidence_chain",
         "cleanup_report",
     }
 )
@@ -63,6 +59,11 @@ class AttackGraphView:
 
     def __init__(self, store: AttackGraphStore) -> None:
         self._store = store
+
+    @property
+    def cacheable(self) -> bool:
+        """Whether caller-managed revisions can safely cache this backend's reads."""
+        return bool(getattr(self._store, "cacheable", True))
 
     async def get_node(self, node_id: GraphNodeId) -> GraphNode | None:
         return await self._store.get_node(node_id)
@@ -82,6 +83,16 @@ class AttackGraphView:
     async def list_edges(self) -> list[GraphEdge]:
         return await require_listable(self._store, "list_edges").list_edges()
 
+    async def incident_edges(
+        self, node_id: GraphNodeId, *, direction: Direction = "any",
+    ) -> list[GraphEdge]:
+        method = getattr(self._store, "incident_edges", None)
+        if callable(method):
+            return await method(node_id, direction=direction)
+        return [edge for edge in await self.list_edges() if
+                (direction in ("out", "any") and edge.source_id == node_id) or
+                (direction in ("in", "any") and edge.target_id == node_id)]
+
     async def has_attempted(self, node_id: GraphNodeId, operation_key: str) -> bool:
         """Was ``operation_key`` already tried against this node?
 
@@ -99,7 +110,7 @@ class AttackGraphView:
     ) -> bool:
         return any(
             edge.source_id == source_id and edge.target_id == target_id and edge.type == edge_type
-            for edge in await self.list_edges()
+            for edge in await self.incident_edges(source_id, direction="out")
         )
 
     async def observe(
@@ -138,20 +149,13 @@ class AttackGraphView:
             for_frontier=for_frontier,
         )
 
-    async def shortest_path(
-        self,
-        source_id: GraphNodeId,
-        target_id: GraphNodeId,
-        *,
-        direction: Direction = "out",
-    ) -> list[GraphEdge] | None:
-        return shortest_path(
-            source_id, target_id, edges=await self.list_edges(), direction=direction
-        )
 
     async def subgraph_around(
         self, node_id: GraphNodeId, *, radius: int = 1, direction: Direction = "any"
     ) -> tuple[list[GraphNode], list[GraphEdge]]:
+        method = getattr(self._store, "subgraph_around", None)
+        if callable(method):
+            return await method(node_id, radius=radius, direction=direction)
         return subgraph_around(
             node_id,
             nodes=await self.list_nodes(),
@@ -160,12 +164,6 @@ class AttackGraphView:
             direction=direction,
         )
 
-    async def evidence_chain(self, finding_id: str) -> EvidenceChain | None:
-        return evidence_chain(
-            finding_node_id(finding_id),
-            nodes=await self.list_nodes(),
-            edges=await self.list_edges(),
-        )
 
     async def cleanup_report(self) -> CleanupReport:
         return collect(await self.list_nodes())

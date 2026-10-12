@@ -7,13 +7,12 @@ Owned by Agent Team. Runtime execution state belongs in
 identity     stable "<type>:<key>" node ids
 predicates   GraphNode.properties layout, merge rules, secret guard
 patterns     preconditions / frontier
-traversal    reachability, paths, evidence chains
+traversal    bounded neighbourhoods
 retraction   which predicates went stale
 cleanup      resources this run must remove
 observation  bounded summary for a planner
 integrity    is this graph safe to report from
-snapshot     append-only JSONL export/import
-visualize    self-contained HTML/SVG render
+snapshot     internal SQLite/migration record format
 view         read-only handle
 service      the single write path
 stores/      AttackGraphStore implementations
@@ -55,19 +54,9 @@ from redteam.attack_graph.service import (
     NodeTypeConflictError,
     UngroundedFindingError,
 )
-from redteam.attack_graph.snapshot import SnapshotError, from_records, to_records
 from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
-from redteam.attack_graph.traversal import (
-    ChainLink,
-    EvidenceChain,
-    ancestors,
-    descendants,
-    evidence_chain,
-    shortest_path,
-    subgraph_around,
-)
+from redteam.attack_graph.traversal import subgraph_around
 from redteam.attack_graph.view import AttackGraphView
-from redteam.attack_graph.visualize import render_html, write_html
 
 __all__ = [
     "AttackGraphService",
@@ -87,23 +76,12 @@ __all__ = [
     "PlannedRetraction",
     "plan_retractions",
     "DEFAULT_RETRACTION_RULES",
-    "EvidenceChain",
-    "ChainLink",
-    "evidence_chain",
-    "shortest_path",
-    "descendants",
-    "ancestors",
     "subgraph_around",
-    "render_html",
-    "write_html",
     "Provenance",
     "Confidence",
     "SensitiveValueError",
     "UngroundedFindingError",
     "NodeTypeConflictError",
-    "SnapshotError",
-    "to_records",
-    "from_records",
     "attrs_of",
     "facts_of",
     "build_properties",

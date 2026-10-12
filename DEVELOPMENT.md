@@ -70,14 +70,37 @@ tightening once the skeleton fills in).
 
 ## Local data
 
+The central storage and runtime are documented in
+[Central state](docs/contracts/central-state.md). After plan2d verification,
+the CLI and application default to central state with two workers. Select a
+specialist profile with `REDTEAM_SPECIALIST_PROFILE` and an explicit shared LLM
+request policy with `REDTEAM_LLM_REQUEST_POLICY_JSON`. Missing configuration
+fails before execution. `REDTEAM_STATE_DB` selects the central database;
+`REDTEAM_MAX_WORKERS` or `run --workers` selects the worker limit. Limits remain
+bounded by the existing global, target, resource, ROE and Control admission.
+The explicit development assembly uses local LLM/tool/job doubles only.
+`open_central_run` selects a separate directory through the same application
+assembly. No default production path selects those doubles.
+
+After plan2e cleanup, central assembly also constructs no empty compatibility
+Task/Path/Work stores. Its SDK graph registers only MODEL/TOOLS/SETTLE; legacy
+recovery nodes and separate domain DB selectors remain confined to explicit
+compatibility consumers. Unused public graph visualization/traversal/snapshot
+APIs are removed; the internal SQLite/migration record codec and bounded
+neighbourhood reads remain. See the current agent guides for these boundaries.
+
 `data/` (gitignored, the whole directory) is where the CLI's filesystem-backed
 stores write runtime state when you run it: `data/evidence/<run_id>.jsonl`
 (`FilesystemEvidenceStore`), `data/audit/<run_id>.jsonl`
 (`FilesystemAuditStore`), `data/approvals/` (`FilesystemApprovalStore`),
-`data/orchestration/` (the SQLite work-ledger/checkpoint, `agent` extra
-runs), and `data/reports/<run_id>.json` (the persisted terminal report
-`redteam status`/`findings`/`report` read back). All regenerated per run —
-safe to delete between runs, never commit it.
+`data/orchestration/state.sqlite3` (Mission, investigations, executions, graph,
+LLM/network ledgers and original storage references), and separate SDK
+checkpoints. Reports under `data/reports/` are exports; `status`, `findings` and
+`report` read the current central originals, including suspended/running Runs.
+Pass `--state-db` for another database. Execution and resume use central state
+only. Old databases are retained for explicit offline migration, never an
+alternative runtime. Unspecified resource effects prevent goal success until
+cleanup is verified.
 
 ## Docker / MCP servers
 

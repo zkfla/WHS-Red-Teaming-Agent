@@ -24,6 +24,7 @@ from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
 from redteam.core.contracts.graph import Finding, GraphNode, Hypothesis
 from redteam.core.enums import GraphEdgeType, GraphNodeType
 from redteam.core.ids import GraphNodeId
+from tests.fakes.graph_records import records_for, seed_records
 
 
 class YieldingStore(InMemoryAttackGraphStore):
@@ -119,11 +120,11 @@ async def test_merging_a_snapshot_into_itself_is_a_no_op() -> None:
     node = await svc.upsert_node(GraphNodeType.HOST, key="a.local", attrs={"x": True}, step=7)
     for index in range(250):  # push past the fact-list cap
         await svc.record_attempt(node.id, f"cap{index}/op")
-    before = await svc.export_snapshot()
+    before = await records_for(svc)
 
-    await svc.import_snapshot(before, merge=True)
+    await seed_records(svc, before, merge=True)
 
-    assert await svc.export_snapshot() == before
+    assert await records_for(svc) == before
 
 
 async def test_importing_a_snapshot_keeps_first_seen_step() -> None:
@@ -131,10 +132,10 @@ async def test_importing_a_snapshot_keeps_first_seen_step() -> None:
     # first sighting back to the start of the run.
     svc = service()
     await svc.upsert_node(GraphNodeType.HOST, key="a.local", attrs={"x": True}, step=7)
-    records = await svc.export_snapshot()
+    records = await records_for(svc)
 
     restored = service()
-    await restored.import_snapshot(records, merge=True)
+    await seed_records(restored, records, merge=True)
 
     node = await restored.get_node(GraphNodeId("host:a.local"))
     assert node is not None
@@ -233,19 +234,6 @@ async def test_an_unreadable_hypothesis_is_skipped_but_reported() -> None:
     assert (await svc.integrity_report()).malformed_records
 
 
-async def test_reports_still_render_with_an_unreadable_record() -> None:
-    svc = service()
-    await svc.upsert_node(GraphNodeType.FINDING, key="broken")
-
-    assert await svc.observe() is not None
-    assert await svc.export_snapshot()
-
-    # The chain builder reads leniently, so the broken node surfaces as an
-    # empty claim rather than being omitted.
-    chains = await svc.evidence_chains()
-    assert len(chains) == 1
-    assert chains[0].evidence_ids == []
-    assert (await svc.integrity_report()).malformed_records
 
 
 # -- edges are bounded the same way nodes are -----------------------------

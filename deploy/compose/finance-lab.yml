@@ -142,9 +142,12 @@ services:
     profiles: [test]
     working_dir: /tmp
     entrypoint: [python, /app/finance_agent_smoke.py]
+    environment:
+      REDTEAM_SPECIALIST_PROFILE: /app/config/agents/native-specialists-web.yaml
     env_file: ../mcp/finance/framework.env.example
     volumes:
       - ../../examples/finance_agent_smoke.py:/app/finance_agent_smoke.py:ro
+      - ../../config/agents:/app/config/agents:ro
       - ../mcp/finance/app.yaml:/app/finance-app.yaml:ro
     healthcheck:
       disable: true

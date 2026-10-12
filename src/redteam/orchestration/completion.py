@@ -490,6 +490,48 @@ async def _verify_native_work_and_task(
     task_graph_store: Any | None,
     work_store: Any | None,
 ) -> tuple[list[str], bool]:
+    if metadata.get("central_execution_version") == 1:
+        lookup = getattr(task_graph_store, "get_execution", None)
+        if lookup is None or task_graph_store is None:
+            return ["central execution origin lookup unavailable"], False
+        from redteam.core.contracts.completion import completion_contract_hash
+        from redteam.core.contracts.tool import ToolInvocation
+        from redteam.core.convert import execution_input_digest
+
+        execution = await lookup(str(metadata.get("invocation_id", "")))
+        task = await task_graph_store.get_task(str(metadata.get("mission_task_id", "")))
+        original = metadata.get("tool_result", {})
+        proposal = metadata.get("proposal", {})
+        if original.get("metadata", {}).get("development_double") is True:
+            return ["development double cannot prove successful completion"], False
+        if (execution is None or task is None or str(execution.run_id) != str(run_id)
+                or str(task.mission_id) != str(mission_id)
+                or str(execution.task_id) != str(task.task_id)
+                or str(execution.action_id) != str(proposal.get("action_id"))
+                or str(execution.action_id) != str(original.get("action_id"))
+                or str(execution.instance_id) != str(proposal.get("instance_id"))
+                or str(execution.tool_id) != str(original.get("tool_id"))
+                or str(execution.invocation_id) != str(original.get("invocation_id"))
+                or execution.model_tool_call_id != metadata.get("model_tool_call_id")
+                or execution.ownership_version != metadata.get("task_ownership_version")
+                or completion_contract_hash(task) != metadata.get("task_purpose_hash")):
+            return ["central execution original identity disagrees"], False
+        if not await task_graph_store.has_inspected_evidence(str(execution.proposal_evidence_id)):
+            return ["central original submission is unproven"], False
+        # The immutable journal supplied the approved subject/input digest.
+        prepared = ToolInvocation.model_validate({
+            "invocation_id": execution.invocation_id, "action_id": execution.action_id,
+            "run_id": execution.run_id, "tool_id": execution.tool_id,
+            "binding_mode": "selected_tool", "arguments": proposal.get("arguments", {}),
+            "created_at": task.created_at,
+            "execution_context": {"engagement_id": execution.engagement_id,
+                                  "run_id": execution.run_id, "agent_id": proposal.get("agent_id"),
+                                  "instance_id": execution.instance_id,
+                                  "approved_target": proposal.get("target")},
+        })
+        if execution_input_digest(prepared) != execution.input_digest:
+            return ["central execution original input disagrees"], False
+        return [], True
     # Native origin proves an actual execution: a stored work record plus the
     # live task purpose it was delegated for. Task existence alone is not
     # execution proof, and identifier echoes without stored records prove
@@ -1576,7 +1618,11 @@ async def validate_result_claims(
             continue
         if expected_task_hash is not None:
             task_hash = _s(meta.get("task_purpose_hash", "") or "").strip()
-            if task_hash and task_hash != expected_task_hash:
+            from redteam.core.contracts.completion import completion_contract_hash
+            required_task_hash = (completion_contract_hash(task)
+                                  if meta.get("central_execution_version") == 1
+                                  else expected_task_hash)
+            if task_hash and task_hash != required_task_hash:
                 issues.add(
                     location=reference_location,
                     message=f"evidence '{eid}' purpose changed since the evidence",

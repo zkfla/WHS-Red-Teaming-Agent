@@ -1,0 +1,45 @@
+.graph-view { flex: 1; min-height: 0; display: flex; }
+.graph-canvas { position: relative; flex: 1; min-width: 0; overflow: auto; padding: 18px 24px 24px; }
+.graph-lines { position: absolute; left: 0; top: 0; pointer-events: none; }
+.graph-edge { fill: none; stroke: var(--ol); stroke-width: 1.6; opacity: .7; }
+.graph-edge.wakes { stroke: var(--or); stroke-dasharray: 5 4; }
+.graph-edge.returned { stroke-dasharray: 3 4; }
+.graph-edge.stored { stroke: var(--tn); }
+.graph-cols { position: relative; display: grid; grid-template-columns: repeat(4, minmax(170px, 1fr)); gap: 36px; align-items: start; }
+.graph-col .label { margin: 0 0 8px; }
+.graph-stack { display: flex; flex-direction: column; gap: 12px; }
+.gnode {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+  padding: 11px 13px;
+  border: 0;
+  border-radius: 14px;
+  background: var(--bg);
+  box-shadow: inset 0 0 0 1px var(--line-2);
+  text-align: left;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.gnode:hover { background: var(--ol-soft); }
+.gnode.on { box-shadow: inset 0 0 0 2px var(--ol); background: var(--ol-mid); }
+.gnode.planner { background: var(--ol-soft); }
+.gnode.task.s-blocked, .gnode.worker.p-waiting_approval, .gnode.worker.p-waiting_job, .gnode.worker.p-waiting_resource { background: var(--tn-soft); box-shadow: inset 0 0 0 1px var(--tn); }
+.gnode.worker.p-outcome_unknown, .gnode.task.s-failed { background: var(--or-soft); box-shadow: inset 0 0 0 1px var(--or); }
+.gnode.task.s-completed { box-shadow: inset 0 0 0 1px var(--ol); }
+.gnode.task.s-cancelled { opacity: .7; }
+.gchip { font-size: 12px; font-weight: 700; }
+.gmeta { font-size: 12px; color: var(--text-2); }
+.graph-detail { width: 340px; flex: none; padding: 18px 20px; overflow-y: auto; background: var(--ol-soft); border-left: 1px solid var(--line); }
+.graph-detail h3 { margin: 0 0 10px; font-size: 15px; }
+.graph-detail h4 { margin: 14px 0 6px; font-size: 13px; }
+.gdl { display: grid; grid-template-columns: 110px 1fr; gap: 6px 10px; margin: 0; font-size: 13px; }
+.gdl dt { color: var(--text-2); }
+.gdl dd { margin: 0; overflow-wrap: anywhere; font-weight: 600; }
+.gtimeline { margin: 0; padding-left: 18px; font-size: 12px; overflow-wrap: anywhere; }
+@media (max-width: 1100px) {
+  .graph-view { flex-direction: column; }
+  .graph-detail { width: auto; max-height: 38vh; border-left: 0; border-top: 1px solid var(--line); }
+  .graph-cols { gap: 24px; }
+}

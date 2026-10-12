@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping, MutableMapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -20,6 +22,7 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, EnvSettingsSource, SettingsConfigDict
 
 DEFAULT_ENV_PATH = Path(".env")
+_SESSION_ENV: ContextVar[Mapping[str, str] | None] = ContextVar("redteam_environment", default=None)
 
 __all__ = [
     "DEFAULT_ENV_PATH",
@@ -29,6 +32,7 @@ __all__ = [
     "AppSelectionEnvInput",
     "MCPListEnvInput",
     "env_snapshot",
+    "environment_context",
     "env_names_for",
     "fill_missing_from_dotenv",
     "load_dotenv_if_present",
@@ -86,6 +90,9 @@ class OrchestrationEnvInput(_SnapshotSettings):
     specialist_profile_path: str | None = Field(
         default=None, validation_alias="REDTEAM_SPECIALIST_PROFILE"
     )
+    runtime_backend: str | None = Field(default=None, validation_alias="REDTEAM_RUNTIME_BACKEND")
+    central_state_path: str | None = Field(default=None, validation_alias="REDTEAM_STATE_DB")
+    max_workers: str | None = Field(default=None, validation_alias="REDTEAM_MAX_WORKERS")
     code_fixture_policy_path: str | None = Field(
         default=None, validation_alias="REDTEAM_CODE_FIXTURE_POLICY_PATH"
     )
@@ -126,7 +133,24 @@ def env_snapshot(source: Mapping[str, str] | None = None) -> dict[str, str]:
     """One input snapshot. Explicit mapping wins; otherwise the live process env."""
     if source is not None:
         return dict(source)
+    selected = _SESSION_ENV.get()
+    if selected is not None:
+        return dict(selected)
     return dict(os.environ)
+
+
+@contextmanager
+def environment_context(source: Mapping[str, str]):
+    """One session's validated assembly inputs, without changing process/.env.
+
+    Tasks inherit the snapshot. Explicit reader arguments still take precedence;
+    leaving this context restores the caller's original snapshot.
+    """
+    token = _SESSION_ENV.set(dict(source))
+    try:
+        yield
+    finally:
+        _SESSION_ENV.reset(token)
 
 
 _SettingsT = TypeVar("_SettingsT", bound=BaseSettings)

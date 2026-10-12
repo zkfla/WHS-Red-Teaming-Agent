@@ -132,7 +132,7 @@ def _parse_har_entry(entry: Any, index: int, policy: ServerPolicy) -> ProxyFlow 
     profile = policy.targets[target_ref]
     path = parsed.path or "/"
     allowed_methods = profile.allowed_path_methods.get(path, profile.allowed_methods)
-    if path not in profile.allowed_paths or method not in allowed_methods:
+    if not profile.allows_path(path) or method not in allowed_methods:
         return None
 
     try:

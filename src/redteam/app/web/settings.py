@@ -1,0 +1,319 @@
+"""Web-editable runtime settings (plan3 W10).
+
+Reuses the existing environment readers (``LLMConfig.from_environment``,
+``OrchestrationConfig.from_environment``) as the single validation path. The
+API key is write-only: it lives in the process environment, is never returned,
+logged or saved to the web settings file, and reaches ``.env`` only when the
+operator explicitly asks for it. Non-secret choices are kept in a separate
+state file and are read back only for keys the environment did not set.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import tempfile
+from collections.abc import MutableMapping
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+from redteam.app.cli._shared import DEFAULT_ENV_PATH, env_file_is_gitignored, write_env_var
+from redteam.core.config import LLMConfig, OrchestrationConfig
+
+PROVIDER = "litellm"
+PROFILE_DIR = Path("config/agents")
+STATE_PATH = Path("data/web/settings.json")
+
+ENV_PROVIDER = "REDTEAM_LLM_PROVIDER"
+ENV_MODEL = "REDTEAM_LLM_MODEL"
+ENV_KEY_VAR = "REDTEAM_LLM_API_KEY_ENV_VAR"
+ENV_PROFILE = "REDTEAM_SPECIALIST_PROFILE"
+ENV_POLICY = "REDTEAM_LLM_REQUEST_POLICY_JSON"
+DEFAULT_KEY_VAR = "LLM_API_KEY"
+
+_MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,199}$")
+_KEY = re.compile(r"^[^\s\x00-\x1f\x7f]{1,4096}$")
+_KEY_VAR = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+_ALLOWED = frozenset(
+    {"model", "api_key", "persist_key", "profile_id", "max_requests", "max_concurrent_requests"}
+)
+_REQUEST_LIMIT = (1, 1_000_000)
+_CONCURRENT_LIMIT = (1, 64)
+
+
+class SettingsError(ValueError):
+    """Stable ``field``/``code`` pair; never carries the offending value."""
+
+    def __init__(self, field: str, code: str) -> None:
+        super().__init__(f"{field}:{code}")
+        self.field = field
+        self.code = code
+
+
+def _integer(value: Any, field: str, bounds: tuple[int, int]) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise SettingsError(field, "invalid_type")
+    if not bounds[0] <= value <= bounds[1]:
+        raise SettingsError(field, "out_of_range")
+    return value
+
+
+class SettingsStore:
+    def __init__(
+        self,
+        *,
+        env: MutableMapping[str, str] | None = None,
+        state_path: Path = STATE_PATH,
+        profile_dir: Path = PROFILE_DIR,
+        env_path: Path = DEFAULT_ENV_PATH,
+    ) -> None:
+        self.env: MutableMapping[str, str] = os.environ if env is None else env
+        self.state_path = state_path
+        self.profile_dir = profile_dir
+        self.env_path = env_path
+
+    # -- profiles -------------------------------------------------------
+
+    def profiles(self) -> list[dict[str, str]]:
+        """Selectable profile files. Only ids leave this module, never paths."""
+        listing: list[dict[str, str]] = []
+        try:
+            files = sorted(self.profile_dir.glob("*.yaml"))
+        except OSError:
+            return listing
+        for path in files:
+            label = path.stem
+            try:
+                loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict) and isinstance(loaded.get("profile_id"), str):
+                    label = loaded["profile_id"][:80]
+            except (OSError, yaml.YAMLError):
+                continue
+            listing.append({"id": path.stem, "label": label})
+        return listing
+
+    def _profile_path(self, profile_id: str) -> str | None:
+        if profile_id not in {item["id"] for item in self.profiles()}:
+            return None
+        return str(self.profile_dir / f"{profile_id}.yaml")
+
+    def _selected_profile_id(self) -> str | None:
+        raw = self.env.get(ENV_PROFILE)
+        if not raw:
+            return None
+        for item in self.profiles():
+            if self._profile_path(item["id"]) == raw:
+                return item["id"]
+        return "custom"
+
+    # -- reading --------------------------------------------------------
+
+    def _policy(self) -> dict[str, Any] | None:
+        raw = self.env.get(ENV_POLICY)
+        if not raw:
+            return None
+        try:
+            loaded = json.loads(raw)
+        except ValueError:
+            return None
+        return loaded if isinstance(loaded, dict) else None
+
+    def _key_var(self) -> str:
+        name = self.env.get(ENV_KEY_VAR) or DEFAULT_KEY_VAR
+        return name if _KEY_VAR.match(name) else DEFAULT_KEY_VAR
+
+    def problems(self) -> list[dict[str, str]]:
+        found: list[dict[str, str]] = []
+        provider = self.env.get(ENV_PROVIDER)
+        if not provider:
+            found.append({"field": "provider", "code": "missing"})
+        elif provider != PROVIDER:
+            found.append({"field": "provider", "code": "unsupported"})
+        model = self.env.get(ENV_MODEL)
+        if not model:
+            found.append({"field": "model", "code": "missing"})
+        if not (model or "").startswith("chatgpt/") and not self.env.get(self._key_var()):
+            found.append({"field": "api_key", "code": "missing"})
+        if not self.env.get(ENV_PROFILE):
+            found.append({"field": "profile_id", "code": "missing"})
+        if not self.env.get(ENV_POLICY):
+            found.append({"field": "llm_request_policy", "code": "missing"})
+        if not found:
+            try:
+                LLMConfig.from_environment(self.env)
+                OrchestrationConfig.from_environment(self.env)
+            except Exception:  # noqa: BLE001 - stable code only, never the raw message
+                found.append({"field": "settings", "code": "invalid"})
+        return found
+
+    def summary(self) -> dict[str, Any]:
+        policy = self._policy() or {}
+        problems = self.problems()
+        return {
+            "model": self.env.get(ENV_MODEL) or None,
+            "provider": self.env.get(ENV_PROVIDER) or None,
+            "api_key_set": bool(self.env.get(self._key_var())),
+            "api_key_env_var": self._key_var(),
+            "profile_id": self._selected_profile_id(),
+            "max_requests": policy.get("max_requests"),
+            "max_concurrent_requests": policy.get("max_concurrent_requests"),
+            "problems": problems,
+            "ready": not problems,
+        }
+
+    # -- saved non-secret choices ---------------------------------------
+
+    def load_saved(self) -> None:
+        """Fill only keys the environment left unset from the web state file."""
+        try:
+            saved = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(saved, dict):
+            return
+        model = saved.get("model")
+        if isinstance(model, str) and _MODEL.match(model):
+            self.env.setdefault(ENV_MODEL, model)
+            self.env.setdefault(ENV_PROVIDER, PROVIDER)
+        profile = saved.get("profile_id")
+        if isinstance(profile, str):
+            path = self._profile_path(profile)
+            if path is not None:
+                self.env.setdefault(ENV_PROFILE, path)
+        requests, concurrent = saved.get("max_requests"), saved.get("max_concurrent_requests")
+        if (
+            isinstance(requests, int) and not isinstance(requests, bool)
+            and isinstance(concurrent, int) and not isinstance(concurrent, bool)
+            and _REQUEST_LIMIT[0] <= requests <= _REQUEST_LIMIT[1]
+            and _CONCURRENT_LIMIT[0] <= concurrent <= _CONCURRENT_LIMIT[1]
+        ):
+            self.env.setdefault(ENV_POLICY, self._policy_json(requests, concurrent))
+
+    def _save(self, values: dict[str, Any]) -> None:
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        handle, name = tempfile.mkstemp(dir=self.state_path.parent, suffix=".tmp")
+        try:
+            with os.fdopen(handle, "w", encoding="utf-8") as stream:
+                json.dump(values, stream, ensure_ascii=False, indent=2)
+            os.chmod(name, 0o600)
+            os.replace(name, self.state_path)
+        except BaseException:
+            _discard(name)
+            raise
+
+    @staticmethod
+    def _policy_json(max_requests: int, max_concurrent: int) -> str:
+        return json.dumps(
+            {
+                "mode": "bounded",
+                "max_requests": max_requests,
+                "max_concurrent_requests": max_concurrent,
+            },
+            separators=(",", ":"),
+        )
+
+    # -- writing --------------------------------------------------------
+
+    def apply(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Validate on a candidate environment, then commit. Returns flags only."""
+        if not isinstance(payload, dict):
+            raise SettingsError("body", "invalid_type")
+        for name in payload:
+            if name not in _ALLOWED:
+                raise SettingsError("body", "unknown_field")
+        updates: dict[str, str] = {}
+        saved: dict[str, Any] = {}
+        current = self._policy() or {}
+
+        if "model" in payload:
+            model = payload["model"]
+            if not isinstance(model, str) or not _MODEL.match(model):
+                raise SettingsError("model", "invalid")
+            updates[ENV_MODEL] = model
+            updates[ENV_PROVIDER] = PROVIDER
+            saved["model"] = model
+        if "profile_id" in payload:
+            profile = payload["profile_id"]
+            path = self._profile_path(profile) if isinstance(profile, str) else None
+            if path is None:
+                raise SettingsError("profile_id", "unknown_profile")
+            updates[ENV_PROFILE] = path
+            saved["profile_id"] = profile
+        requests = (
+            _integer(payload["max_requests"], "max_requests", _REQUEST_LIMIT)
+            if "max_requests" in payload else current.get("max_requests")
+        )
+        concurrent = (
+            _integer(
+                payload["max_concurrent_requests"], "max_concurrent_requests", _CONCURRENT_LIMIT
+            )
+            if "max_concurrent_requests" in payload else current.get("max_concurrent_requests")
+        )
+        if "max_requests" in payload or "max_concurrent_requests" in payload:
+            if requests is None:
+                raise SettingsError("max_requests", "missing")
+            if concurrent is None:
+                raise SettingsError("max_concurrent_requests", "missing")
+            updates[ENV_POLICY] = self._policy_json(requests, concurrent)
+            saved["max_requests"], saved["max_concurrent_requests"] = requests, concurrent
+
+        key = payload.get("api_key")
+        if "api_key" in payload and (not isinstance(key, str) or not _KEY.match(key)):
+            raise SettingsError("api_key", "invalid")
+        persist = payload.get("persist_key", False)
+        if not isinstance(persist, bool):
+            raise SettingsError("persist_key", "invalid_type")
+        if persist and key is None:
+            raise SettingsError("persist_key", "requires_api_key")
+
+        candidate = dict(self.env)
+        candidate.update(updates)
+        if key is not None:
+            candidate[self._key_var()] = key
+        if updates.get(ENV_POLICY) or updates.get(ENV_PROFILE) or updates.get(ENV_MODEL):
+            try:
+                if candidate.get(ENV_PROVIDER):
+                    LLMConfig.from_environment(candidate)
+                OrchestrationConfig.from_environment(candidate)
+            except Exception:  # noqa: BLE001 - stable code only
+                raise SettingsError("settings", "invalid") from None
+
+        overridden = sorted(
+            name for name in updates if self.env.get(name) not in (None, updates[name])
+        )
+        # Persist before committing so a storage failure leaves the process unchanged.
+        try:
+            if saved:
+                self._save({**self._read_saved(), **saved})
+            if persist and key is not None:
+                write_env_var(self.env_path, self._key_var(), key)
+        except OSError:
+            raise SettingsError("storage", "write_failed") from None
+        for name, value in updates.items():
+            self.env[name] = value
+        if key is not None:
+            self.env[self._key_var()] = key
+        return {
+            "key_persisted": bool(persist and key is not None),
+            "env_gitignored": (
+                env_file_is_gitignored(self.env_path) if persist and key is not None else None
+            ),
+            "overrode_environment": overridden,
+        }
+
+    def _read_saved(self) -> dict[str, Any]:
+        try:
+            loaded = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return loaded if isinstance(loaded, dict) else {}
+
+
+def _discard(name: str) -> None:
+    try:
+        os.unlink(name)
+    except OSError:
+        pass

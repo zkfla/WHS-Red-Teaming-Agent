@@ -9,13 +9,14 @@ import pytest
 from redteam.attack_graph.integrity import check_integrity
 from redteam.attack_graph.predicates import Confidence, Provenance, build_properties
 from redteam.attack_graph.service import AttackGraphService
-from redteam.attack_graph.snapshot import SnapshotError, from_records, round_trip_ok, to_records
+from redteam.attack_graph.snapshot import SnapshotError, from_records, to_records
 from redteam.attack_graph.stores.base import StoreCapabilityError, require_listable
 from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
 from redteam.attack_graph.view import AttackGraphView
 from redteam.core.contracts.graph import Finding, GraphEdge, GraphNode, Hypothesis
 from redteam.core.enums import GraphEdgeType, GraphNodeType
 from redteam.core.ids import GraphEdgeId, GraphNodeId
+from tests.fakes.graph_records import records_for
 
 NOW = datetime.now(timezone.utc)
 
@@ -93,7 +94,7 @@ async def test_a_store_that_cannot_enumerate_says_so_clearly() -> None:
     with pytest.raises(StoreCapabilityError, match="ListableAttackGraphStore"):
         await service.observe()
     with pytest.raises(StoreCapabilityError):
-        await service.export_snapshot()
+        await records_for(service)
 
 
 def test_require_listable_accepts_the_in_memory_store() -> None:
@@ -195,7 +196,9 @@ def test_open_hypotheses_are_reported_but_do_not_block() -> None:
 
 def test_snapshot_export_order_is_deterministic() -> None:
     nodes = [graph_node("host:b", GraphNodeType.HOST), graph_node("host:a", GraphNodeType.HOST)]
-    assert round_trip_ok(nodes, [])
+    serialized = to_records(nodes, [])
+    restored_nodes, restored_edges, _ = from_records(serialized)
+    assert to_records(restored_nodes, restored_edges) == serialized
     ids = [record["id"] for record in to_records(nodes, []) if record["_collection"] == "nodes"]
     assert ids == ["host:a", "host:b"]
 

@@ -24,15 +24,13 @@ import argparse
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from types import SimpleNamespace
+
+import pytest
 
 from redteam.app.cli import _build_parser
-from redteam.app.cli._shared import EXIT_FAILURE, EXIT_OK, load_app_config_for_run, print_json
+from redteam.app.cli._shared import EXIT_OK, print_json
 from redteam.app.cli.commands import approvals as approvals_command
-from redteam.app.cli.commands import findings as findings_command
-from redteam.app.cli.commands import report as report_command
 from redteam.app.cli.commands import run as run_command
-from redteam.app.cli.commands import status as status_command
 from redteam.capability.adapters.mcp.streamable_http import (
     MCPServerAdapter,
     StreamableHTTPMCPAdapter,
@@ -40,12 +38,16 @@ from redteam.capability.adapters.mcp.streamable_http import (
 from redteam.control.approval import ApprovalService
 from redteam.control.stores.filesystem import FilesystemApprovalStore
 from redteam.core.contracts.events import EventEnvelope, EventType
-from redteam.core.enums import AgentPhase, ApprovalStatus
-from redteam.core.ids import ActionId, EngagementId, EventId, FindingId, RunId
-from redteam.orchestration.reporting import FindingProjection, TerminalReportProjection
-from redteam.orchestration.state import RuntimeState
+from redteam.core.enums import ApprovalStatus
+from redteam.core.ids import ActionId, EngagementId, EventId, RunId
 
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+
+@pytest.fixture(autouse=True)
+def explicit_legacy_runtime(monkeypatch):
+    """Persisted-report compatibility uses the explicitly selected legacy reader."""
+    monkeypatch.setenv("REDTEAM_RUNTIME_BACKEND", "legacy")
 
 
 def _event(event_type: str, payload: dict | None = None) -> EventEnvelope:  # noqa: ANN001
@@ -60,48 +62,10 @@ def _event(event_type: str, payload: dict | None = None) -> EventEnvelope:  # no
     )
 
 
-def _engagement_yaml(tmp_path: Path) -> Path:
-    path = tmp_path / "engagement.yaml"
-    path.write_text(
-        """
-name: "Compatibility"
-scope:
-  allowed_hosts: ["a.local"]
-execution_budget:
-  max_actions: 1
-rate_limit_policy:
-  max_actions_per_minute: 10
-approval_policy:
-  require_approval_for: []
-""",
-        encoding="utf-8",
-    )
-    return path
 
 
-def _finished(run_id: str = "run_compat") -> RuntimeState:
-    return RuntimeState(
-        run_id=RunId(run_id),
-        engagement_id=EngagementId("eng_compat"),
-        phase=AgentPhase.FINISHED,
-        termination_reason="no_actionable_plan",
-        actions_executed=0,
-    )
 
 
-def _report(
-    *, run_id: str = "run_compat", findings: list[FindingProjection] | None = None
-) -> TerminalReportProjection:
-    return TerminalReportProjection(
-        run_id=RunId(run_id),
-        phase=AgentPhase.FINISHED,
-        termination_reason="no_actionable_plan",
-        ready_for_release=True,
-        actions_executed=2,
-        finding_count=len(findings or []),
-        evidence_count=1,
-        findings=findings or [],
-    )
 
 
 # --- `redteam run --json`: one compact, self-describing event per line --------
@@ -175,69 +139,8 @@ def test_plain_event_stream_skips_unrendered_types_and_masks_secrets(capsys) -> 
     assert "raw-secret" not in out
 
 
-async def test_run_json_mode_suppresses_human_echo_and_summary(
-    tmp_path: Path, monkeypatch, capsys  # noqa: ANN001
-) -> None:
-    # build/execute are mocked below, but the real load_app_config_for_run()
-    # still runs first and now requires an explicit provider (section 4/20)
-    # -- there is no --config app.yaml path any more.
-    monkeypatch.setenv("REDTEAM_LLM_PROVIDER", "fake")
-    path = _engagement_yaml(tmp_path)
-
-    async def fake_build(config, *, max_steps, mcp_stack=None):  # noqa: ANN001, ANN202
-        return SimpleNamespace(name="Compatibility"), SimpleNamespace()
-
-    async def fake_execute(engagement, deps, **kwargs):  # noqa: ANN001, ANN202
-        kwargs["echo"]("Engagement: human line")
-        return _finished()
-
-    monkeypatch.setattr(run_command, "build", fake_build)
-    monkeypatch.setattr(run_command, "execute", fake_execute)
-    args = argparse.Namespace(
-        engagement_path=str(path),
-        non_interactive=True,
-        max_steps=None,
-        log_level="WARNING",
-        json=True,
-        objective=None,
-    )
-
-    code = await run_command.run(args)
-
-    assert code == EXIT_OK
-    assert capsys.readouterr().out == ""
 
 
-async def test_run_plain_mode_still_prints_the_human_summary(
-    tmp_path: Path, monkeypatch, capsys  # noqa: ANN001
-) -> None:
-    monkeypatch.setenv("REDTEAM_LLM_PROVIDER", "fake")
-    path = _engagement_yaml(tmp_path)
-
-    async def fake_build(config, *, max_steps, mcp_stack=None):  # noqa: ANN001, ANN202
-        return SimpleNamespace(name="Compatibility"), SimpleNamespace()
-
-    async def fake_execute(engagement, deps, **kwargs):  # noqa: ANN001, ANN202
-        kwargs["echo"]("Engagement: human line")
-        return _finished()
-
-    monkeypatch.setattr(run_command, "build", fake_build)
-    monkeypatch.setattr(run_command, "execute", fake_execute)
-    args = argparse.Namespace(
-        engagement_path=str(path),
-        non_interactive=True,
-        max_steps=None,
-        log_level="WARNING",
-        json=False,
-        objective=None,
-    )
-
-    code = await run_command.run(args)
-
-    assert code == EXIT_OK
-    out = capsys.readouterr().out
-    assert "Engagement: human line" in out
-    assert "Run finished: phase=finished" in out
 
 
 # --- the read-only commands still parse their compatibility flags ------------
@@ -277,153 +180,23 @@ async def test_approvals_list_json_is_a_machine_readable_array(tmp_path: Path, c
 # --- status / findings / report read the persisted terminal projection -------
 
 
-async def test_status_json_projects_the_persisted_report(monkeypatch, capsys) -> None:  # noqa: ANN001
-    monkeypatch.setattr(status_command, "load_terminal_report", lambda run_id: _report())
-
-    code = await status_command.run(
-        argparse.Namespace(run_id="run_compat", approval_dir="unused", json=True)
-    )
-
-    assert code == EXIT_OK
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["run_id"] == "run_compat"
-    assert payload["phase"] == "finished"
-    assert payload["actions_executed"] == 2
 
 
-async def test_status_unknown_run_is_reported_as_unknown_not_guessed(
-    monkeypatch, capsys  # noqa: ANN001
-) -> None:
-    monkeypatch.setattr(status_command, "load_terminal_report", lambda run_id: None)
-
-    code = await status_command.run(
-        argparse.Namespace(run_id="run_missing", approval_dir="unused", json=True)
-    )
-
-    assert code == EXIT_FAILURE
-    assert json.loads(capsys.readouterr().out) == {
-        "run_id": "run_missing",
-        "status": "unknown",
-    }
 
 
-async def test_findings_list_projects_persisted_findings(monkeypatch, capsys) -> None:  # noqa: ANN001
-    report = _report(
-        findings=[
-            FindingProjection(
-                finding_id=FindingId("find_1"),
-                title="IDOR on /orders",
-                severity="high",
-                verified=True,
-                evidence_ids=["ev_1"],
-            )
-        ]
-    )
-    monkeypatch.setattr(findings_command, "load_terminal_report", lambda run_id: report)
-
-    code = await findings_command.run_list(
-        argparse.Namespace(run_id="run_compat", json=True)
-    )
-
-    assert code == EXIT_OK
-    payload = json.loads(capsys.readouterr().out)
-    assert payload[0]["finding_id"] == "find_1"
-    assert payload[0]["verified"] is True
-    assert payload[0]["severity"] == "high"
 
 
-async def test_findings_list_without_a_report_fails_loudly(monkeypatch, capsys) -> None:  # noqa: ANN001
-    monkeypatch.setattr(findings_command, "load_terminal_report", lambda run_id: None)
-
-    code = await findings_command.run_list(
-        argparse.Namespace(run_id="run_missing", json=True)
-    )
-
-    assert code == EXIT_FAILURE
-    assert "no terminal report" in capsys.readouterr().err
 
 
-async def test_report_generate_json_writes_the_persisted_projection(
-    tmp_path: Path, monkeypatch, capsys  # noqa: ANN001
-) -> None:
-    monkeypatch.setattr(report_command, "load_terminal_report", lambda run_id: _report())
-
-    code = await report_command.run_generate(
-        argparse.Namespace(
-            run_id="run_compat", format="json", output_dir=str(tmp_path / "reports")
-        )
-    )
-
-    assert code == EXIT_OK
-    path = tmp_path / "reports" / "run_compat" / "report.json"
-    assert json.loads(path.read_text(encoding="utf-8"))["run_id"] == "run_compat"
-    assert "Report generated" in capsys.readouterr().out
 
 
-async def test_report_generate_defaults_to_markdown(
-    tmp_path: Path, monkeypatch  # noqa: ANN001
-) -> None:
-    monkeypatch.setattr(report_command, "load_terminal_report", lambda run_id: _report())
-
-    code = await report_command.run_generate(
-        argparse.Namespace(
-            run_id="run_compat", format="md", output_dir=str(tmp_path / "reports")
-        )
-    )
-
-    assert code == EXIT_OK
-    markdown = (tmp_path / "reports" / "run_compat" / "report.md").read_text(
-        encoding="utf-8"
-    )
-    assert "# Run Report: run_compat" in markdown
-    assert "Ready for release: True" in markdown
 
 
-async def test_report_generate_unknown_run_writes_nothing(
-    tmp_path: Path, monkeypatch, capsys  # noqa: ANN001
-) -> None:
-    monkeypatch.setattr(report_command, "load_terminal_report", lambda run_id: None)
-    output_dir = tmp_path / "reports"
-
-    code = await report_command.run_generate(
-        argparse.Namespace(run_id="run_missing", format="json", output_dir=str(output_dir))
-    )
-
-    assert code == EXIT_FAILURE
-    assert "no terminal report" in capsys.readouterr().err
-    assert not output_dir.exists()
 
 
 # --- legacy engagement.yaml --------------------------------------------------
 
 
-def test_legacy_engagement_yaml_keeps_the_auto_approve_flag(tmp_path: Path) -> None:
-    path = tmp_path / "engagement.yaml"
-    path.write_text(
-        """
-name: "Legacy Engagement"
-scope:
-  allowed_hosts: ["legacy.local"]
-execution_budget:
-  max_actions: 3
-approval_policy:
-  require_approval_for: ["recon"]
-  auto_approve: true
-""",
-        encoding="utf-8",
-    )
-
-    # This test is only about EngagementConfig compatibility, not LLM
-    # selection -- require_llm=False matches redteam validate/tools'
-    # own reasoning (section 4/20 only targets commands that actually
-    # build an LLM client).
-    config = load_app_config_for_run(str(path), require_llm=False)
-    policy = config.engagement.approval_policy
-
-    assert policy.auto_approve is True
-    # The new risk fields stay inert so the pre-configurable behaviour is kept.
-    assert policy.risk_threshold is None
-    assert policy.auto_approve_up_to is None
 
 
 # --- legacy persisted records ------------------------------------------------

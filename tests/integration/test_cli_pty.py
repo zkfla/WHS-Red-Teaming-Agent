@@ -10,11 +10,18 @@ from pathlib import Path
 
 import pytest
 
+from redteam.core.config import OrchestrationConfig
+
+
+@pytest.fixture(autouse=True)
+def explicit_legacy_runtime(monkeypatch):
+    """These fixtures exercise the retained legacy CLI/schema, explicitly selected."""
+    monkeypatch.delenv("REDTEAM_RUNTIME_BACKEND", raising=False)
+
 
 async def _fixture():
     from rich.console import Console
 
-    from redteam.app.cli.commands import run as run_command
     from redteam.app.cli.conversation import ConversationAssistant
     from redteam.app.cli.interactive_commands import InteractiveSession
     from redteam.app.cli.session_runtime import run_session
@@ -68,7 +75,8 @@ async def _fixture():
             termination_reason="no_actionable_plan",
         )
 
-    run_command.run_engagement = controlled
+    from redteam.app import central_run
+    central_run.run_central_engagement = controlled
     engagement = EngagementConfig.model_validate(
         {
             "name": "PTY fixture",
@@ -76,7 +84,9 @@ async def _fixture():
             "execution_budget": {"max_actions": 3},
         }
     )
-    config = AppConfig(engagement=engagement)
+    config = AppConfig(
+        orchestration=OrchestrationConfig(), engagement=engagement,
+    )
     session = InteractiveSession(engagement, config.llm, engagement_path=Path("uncreated.yaml"))
     result = await run_session(
         Console(),

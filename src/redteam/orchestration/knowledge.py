@@ -481,7 +481,8 @@ class HypothesisService:
     async def relations_for(self, hypothesis_id: str) -> builtins.list[dict[str, Any]]:
         node_id = str(hypothesis_node_id(str(hypothesis_id)))
         try:
-            edges = await self._graph.list_edges()
+            method = getattr(self._graph, "incident_edges", None)
+            edges = await method(node_id) if callable(method) else await self._graph.list_edges()
         except Exception:
             return []
         rels: list[dict[str, Any]] = []

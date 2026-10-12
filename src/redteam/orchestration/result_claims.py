@@ -6,9 +6,11 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from redteam.attack_graph.identity import hypothesis_node_id
+from redteam.core.ids import GraphNodeId
 from redteam.orchestration.analysis import claim_target_is_grounded
 from redteam.orchestration.completion import preserved_target_is_absent, validate_result_claims
-from redteam.orchestration.coordination import content_hash
+from redteam.orchestration.coordination import StateConflict, content_hash
 from redteam.orchestration.paths import CompletionCriterion
 
 
@@ -57,6 +59,25 @@ class TaskContractReview(ResultReview):
     """v2 requires an explicit AND judgment over every stored condition."""
 
     criterion_results: list[CriterionReview] = Field(min_length=1)
+
+
+async def capture_result_graph(service, claims=(), *, conditions=()):
+    """Only graph subjects consumed by fixed criteria or explicit result claims."""
+    identities = {str(hypothesis_node_id(item.hypothesis_id)) for item in conditions
+                  if item.hypothesis_id}
+    for raw in claims:
+        claim = ResultClaim.model_validate(raw)
+        identities.update(claim.target_node_ids)
+        if claim.hypothesis_id:
+            identities.add(str(hypothesis_node_id(claim.hypothesis_id)))
+    return {identity: content_hash(await service.get_node(GraphNodeId(identity)))
+            for identity in identities}
+
+
+def check_result_graph(tx, proof):
+    if any(content_hash(tx.graph.get_local_node(GraphNodeId(identity))) != expected
+           for identity, expected in proof.items()):
+        raise StateConflict("completion_graph_proof_changed_reassessment_required")
 
 
 RESULT_REVIEW_INSTRUCTION = (

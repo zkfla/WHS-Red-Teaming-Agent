@@ -14,6 +14,7 @@ from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
 from redteam.core.contracts.graph import GraphNode
 from redteam.core.enums import GraphEdgeType, GraphNodeType
 from redteam.core.ids import GraphNodeId
+from tests.fakes.graph_records import records_for, seed_records
 
 NOW = datetime.now(timezone.utc)
 
@@ -89,7 +90,7 @@ async def test_cleanup_survives_a_snapshot_round_trip() -> None:
     await svc.register_created_resource(node.id, resource_type="user_account", step=1)
 
     restored = service()
-    await restored.import_snapshot(await svc.export_snapshot())
+    await seed_records(restored, await records_for(svc))
 
     assert [i.node_id for i in await restored.pending_cleanup()] == [node.id]
 

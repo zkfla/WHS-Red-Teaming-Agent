@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from pydantic_core import InitErrorDetails, PydanticCustomError
 
 from redteam.core.contracts.completion import CompletionCriterion, criterion_id
@@ -124,6 +124,7 @@ class MissionCriterionResult(BaseModel):
     result_claims: list[dict[str, Any]] = Field(default_factory=list)
     #: The result meaning judged by the model; None on legacy records.
     purpose_hash: str | None = None
+    goal_revision: int | None = Field(default=None, ge=1)
 
     @field_validator("criterion")
     @classmethod
@@ -149,14 +150,15 @@ class MissionPlan(BaseModel):
     operator_preferences: dict[str, Any] = Field(default_factory=dict)
     status: MissionStatus = MissionStatus.DRAFT
     revision: int = Field(default=1, ge=1)
+    termination_reason: str | None = None
     created_at: datetime
     updated_at: datetime
     provenance: Provenance
 
-    @field_validator("objective")
+    @field_validator("objective", "termination_reason")
     @classmethod
-    def _objective_not_blank(cls, value: str) -> str:
-        return redact_sensitive_text(value.strip())
+    def _objective_not_blank(cls, value: str | None) -> str | None:
+        return redact_sensitive_text(value.strip()) if value is not None else None
 
     @field_validator("priorities", "success_criteria", "initial_workstreams", "assumptions")
     @classmethod
@@ -194,6 +196,58 @@ class MissionPlan(BaseModel):
         return MissionPlan.model_validate(payload)
 
 
+class ResultQuestion(BaseModel):
+    """An item of a task result, without an independent question lifecycle."""
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    question_id: str = Field(min_length=1)
+    question: str = Field(min_length=1)
+    evidence_ids: list[EvidenceId] = Field(default_factory=list)
+    required_for_goal: bool = False
+    reason: str | None = None
+
+    @field_validator("question", "reason")
+    @classmethod
+    def _safe_text(cls, value: str | None) -> str | None:
+        return redact_sensitive_text(value.strip()) if value is not None else None
+
+    @model_validator(mode="after")
+    def _required_reason(self) -> ResultQuestion:
+        if not self.question_id.strip() or not self.question.strip():
+            raise ValueError("result question must be nonblank")
+        if self.required_for_goal and not self.reason:
+            raise ValueError("goal-required question needs a reason")
+        return self
+
+
+class InvestigationResult(BaseModel):
+    """Investigation outcome; does not assert a Finding or Mission completion."""
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    result_id: str = Field(min_length=1)
+    outcome: Literal["confirmed", "refuted", "inconclusive", "blocked"]
+    summary: str = Field(min_length=1)
+    evidence_ids: list[EvidenceId] = Field(default_factory=list)
+    hypothesis_ids: list[HypothesisId] = Field(default_factory=list)
+    finding_node_ids: list[GraphNodeId] = Field(default_factory=list)
+    completion_receipt_id: EvidenceId | None = None
+    questions: list[ResultQuestion] = Field(default_factory=list)
+
+    @field_validator("summary")
+    @classmethod
+    def _safe_summary(cls, value: str) -> str:
+        return redact_sensitive_text(value.strip())
+
+    @model_validator(mode="after")
+    def _unique_questions(self) -> InvestigationResult:
+        ids = [item.question_id for item in self.questions]
+        if not self.result_id.strip() or not self.summary or len(ids) != len(set(ids)):
+            raise ValueError("invalid result identity, summary or repeated question id")
+        return self
+
+
 class MissionTask(BaseModel):
     task_id: TaskId
     mission_id: MissionId
@@ -212,6 +266,14 @@ class MissionTask(BaseModel):
     #: claimable by the first claimant (legacy-row migration path).
     #: No TTL — an unfinished claim is released explicitly, never by expiry.
     occupant_owner: str | None = None
+    # Central storage uses this generation, not an expiring TaskClaim.
+    ownership_version: int = Field(default=0, ge=0)
+    scope_refs: list[str] = Field(default_factory=list)
+    evidence_ids: list[EvidenceId] = Field(default_factory=list)
+    result: InvestigationResult | None = None
+    source_task_id: TaskId | None = None
+    source_result_id: str | None = None
+    source_question_id: str | None = None
     required_capability: str | None = None
     parent_task_id: TaskId | None = None
     dependency_task_ids: list[TaskId] = Field(default_factory=list)
@@ -244,6 +306,9 @@ class MissionTask(BaseModel):
 
     @model_validator(mode="after")
     def _task_invariants(self) -> MissionTask:
+        source = (self.source_task_id, self.source_result_id, self.source_question_id)
+        if any(source) and not all(source):
+            raise ValueError("follow-up task needs its source task, result and question")
         if self.completion_contract_version == 1 and self.completion_criteria:
             raise ValueError("explicit completion criteria require task contract v2")
         if self.completion_contract_version == 2:

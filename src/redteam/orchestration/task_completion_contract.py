@@ -36,7 +36,8 @@ async def check_task_conditions(
             evidence_store=deps.evidence_store,
             graph_service=AttackGraphService(deps.graph_store),
             run_id=run_id, path_store=deps.path_store, mission_id=str(task.mission_id),
-            task=task, task_graph_store=deps.task_graph_store, work_store=deps.work_store,
+            task=task, task_graph_store=getattr(deps, "investigations", deps.task_graph_store),
+            work_store=deps.work_store,
         )
         if errors:
             return errors

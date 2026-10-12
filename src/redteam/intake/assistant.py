@@ -41,9 +41,14 @@ class IntakeSession:
 
 
 class IntakeAssistant:
-    def __init__(self, llm: LLMClient) -> None:
+    def __init__(self, llm: LLMClient, *, reply_language: str | None = None) -> None:
         self._llm = llm
         self._system_prompt = build_system_prompt()
+        if reply_language:
+            self._system_prompt += (
+                f"\n\nWrite `acknowledgement` and `follow_up_questions` in {reply_language}. "
+                "Ask one or two short questions per turn."
+            )
 
     async def step(self, session: IntakeSession, user_message: str) -> IntakeTurn:
         """One conversational turn: user text in, a structured

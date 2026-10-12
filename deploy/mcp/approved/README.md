@@ -1,7 +1,17 @@
 # 승인 경로·시험 세션을 한 설정에서 연결하기
 
-이번 연결은 **capability 브랜치**, 로컬 `web-http`·`recon-passive` stdio 프로필 대상이다.
+이번 연결은 로컬 `web-http`·`recon-passive` stdio 프로필 대상이다.
 기존 ZAP/Burp/Chrome 원격 서버에 적용하는 일반 정책 자동화 기능은 아니다.
+
+웹의 조사 설정에서 `사이트 전체` 또는 `지정 경로만`을 선택하고 범위를 확인하면,
+같은 생성기가 조사별 `.mcp/<fingerprint>/`에 정책·배포 원본을 생성한다.
+설정 경로와 해시는 세션의 환경 스냅샷에 연결하며 `.env`는 변경하지 않는다.
+사이트 전체는 `TargetProfile.allow_all_paths=true`로 표현하고 선택한 origin의
+정상적인 로컬 URL 경로만 허용한다. 지정 경로는 기존 `allowed_paths` 정확 비교를
+사용한다. 세션·query·메서드 제한은 별개이며 자동 프로필은 비로그인 읽기 요청이다.
+`allow_all_paths=false`는 직렬화에서 생략하므로 기존 정확 경로 정책의 바이트와
+해시가 유지된다. 새 전체 경로 정책에는 업데이트된 로컬 서버 코드가 필요하다.
+범위 변경 시 새 배포를 생성하고 과거 정책 원본은 재개 검증을 위해 보존한다.
 
 ## 무엇을 해결하는가
 
@@ -86,7 +96,7 @@ storage-state를 쓰는 경우 bearer_env 대신 storage_state_path를 지정하
 - 기존 `ActionProposal.capability/operation`과 ToolId 규칙은 변경 없음.
 - 실제 ToolId `web.session_list`는 `web.response_analysis`에 등록됨.
 - `InvestigationEngine.context().engagement_constraints.mcp_targets`에서 정확한 origin,
-  allowed_paths, allowed_methods, allowed_path_methods, allowed_query_keys,
+  allowed_paths, 선택한 경우 allow_all_paths, allowed_methods, allowed_path_methods, allowed_query_keys,
   allowed_request_headers, 세션 참조·principal_ref·expected_access를 읽을 수 있음.
 - Graph Host의 auth_session_config는 동일 원본에서 유도된 등록을 사용함.
 - 등록 정보는 **제공된 설정**이고 관측된 인증 성공·취약점이 아님.

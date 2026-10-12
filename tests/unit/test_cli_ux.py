@@ -7,20 +7,22 @@ own SystemExit(2) for a bad command.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
+from tempfile import TemporaryDirectory
 
 
 def _cli(*args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        [sys.executable, "-m", "redteam.app.cli", *args],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        input="",
-        timeout=20,
-        check=False,
-    )
+    # Synthetic CLI checks must not load a user's .env or MCP connections.
+    environment = {key: value for key, value in os.environ.items()
+                   if not key.startswith("REDTEAM_")}
+    with TemporaryDirectory() as directory:
+        return subprocess.run(
+            [sys.executable, "-m", "redteam.app.cli", *args],
+            capture_output=True, text=True, encoding="utf-8", input="",
+            timeout=20, check=False, cwd=directory, env=environment,
+        )
 
 
 def test_help_lists_every_v1_command() -> None:

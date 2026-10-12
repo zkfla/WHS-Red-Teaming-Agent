@@ -17,13 +17,11 @@ import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import AsyncMock
 
 import pytest
 
 from redteam.app.cli import renderer
 from redteam.app.cli.commands import run as run_command
-from redteam.core.config import AppConfig
 from redteam.core.contracts.mission import MissionPlan, MissionTask, Provenance
 from redteam.core.enums import (
     AgentPhase,
@@ -40,9 +38,14 @@ from redteam.orchestration.operator_intents import (
     InMemoryOperatorIntentStore,
     IntentStatus,
 )
-from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.state import RuntimeState, TerminationReason
 from redteam.orchestration.task_graph.memory import InMemoryTaskGraphStore
+
+
+@pytest.fixture(autouse=True)
+def explicit_legacy_runtime(monkeypatch):
+    """These fixtures exercise the retained legacy CLI/schema, explicitly selected."""
+    monkeypatch.setenv("REDTEAM_RUNTIME_BACKEND", "legacy")
 
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
 RUN = RunId("run_hardening")
@@ -104,6 +107,8 @@ async def _deps(*, with_mission: bool = True) -> SimpleNamespace:
     return SimpleNamespace(
         operator_intent_store=InMemoryOperatorIntentStore(),
         task_graph_store=task_store,
+        investigations=task_store,
+        central_state=None,
         event_bus=InMemoryEventBus(),
         control_plane=SimpleNamespace(),
         tool_gateway=SimpleNamespace(),
@@ -130,68 +135,8 @@ async def test_non_tty_start_does_not_claim_live_input() -> None:
     await console.aclose()
 
 
-async def test_non_tty_approval_fails_safe_without_blocking(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    deps = await _deps()
-    monkeypatch.setattr(run_command, "_stdin_is_interactive", lambda: False)
-    # A real wait would poll forever in a script/CI session.
-    wait = AsyncMock(side_effect=AssertionError("must not block on an unresolvable approval"))
-    monkeypatch.setattr(run_command, "_wait_for_approval", wait)
-    monkeypatch.setattr(
-        run_command,
-        "run_engagement",
-        AsyncMock(
-            return_value=_runtime(
-                TerminationReason.APPROVAL_PENDING, pending_approval_id=ApprovalId("appr_1")
-            )
-        ),
-    )
-    lines: list[str] = []
-
-    final = await run_command.execute(
-        SimpleNamespace(name="Hardening"),
-        cast(RuntimeDeps, deps),
-        config=cast(AppConfig, SimpleNamespace(orchestration=None)),
-        non_interactive=False,
-        on_event=_noop_event,
-        echo=lines.append,
-        allow_operator_input=True,
-    )
-
-    assert final.termination_reason == TerminationReason.APPROVAL_PENDING
-    wait.assert_not_awaited()
-    joined = "\n".join(lines)
-    assert "no interactive input" in joined  # did not claim a live channel
-    assert "appr_1" in joined and "redteam resume" in joined
 
 
-async def test_explicit_external_approval_watch_keeps_plain_cli_alive(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    deps = await _deps()
-    monkeypatch.setattr(run_command, "_stdin_is_interactive", lambda: False)
-    pending = _runtime(
-        TerminationReason.APPROVAL_PENDING, pending_approval_id=ApprovalId("appr_external")
-    )
-    resumed = pending.model_copy(
-        update={"termination_reason": TerminationReason.NO_ACTIONABLE_PLAN}
-    )
-    wait = AsyncMock(return_value=resumed)
-    monkeypatch.setattr(run_command, "_wait_for_approval", wait)
-    monkeypatch.setattr(run_command, "run_engagement", AsyncMock(return_value=pending))
-
-    final = await run_command.execute(
-        SimpleNamespace(name="Plain CLI"), cast(RuntimeDeps, deps),
-        config=cast(AppConfig, SimpleNamespace(orchestration=None)), non_interactive=False,
-        on_event=_noop_event, echo=lambda _line: None,
-        allow_operator_input=True, wait_for_external_approval=True,
-    )
-
-    assert final is resumed
-    wait.assert_awaited_once()
-    assert wait.await_args is not None
-    assert wait.await_args.kwargs["in_session"] is False
 
 
 def test_pending_summary_is_suspended_not_finished(capsys: pytest.CaptureFixture[str]) -> None:
@@ -206,127 +151,14 @@ def test_pending_summary_is_suspended_not_finished(capsys: pytest.CaptureFixture
     assert "Run finished:" not in out
 
 
-async def test_no_console_approval_fails_safe_without_blocking(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Mirrors `redteam run --json`: operator input is off, but the caller did
-    # not pass --non-interactive. The run must not block on an Approval no one
-    # can resolve through this process.
-    deps = await _deps()
-    wait = AsyncMock(side_effect=AssertionError("must not block without an input channel"))
-    monkeypatch.setattr(run_command, "_wait_for_approval", wait)
-    monkeypatch.setattr(
-        run_command,
-        "run_engagement",
-        AsyncMock(
-            return_value=_runtime(
-                TerminationReason.APPROVAL_PENDING, pending_approval_id=ApprovalId("appr_2")
-            )
-        ),
-    )
-    lines: list[str] = []
-
-    final = await run_command.execute(
-        SimpleNamespace(name="Hardening"),
-        cast(RuntimeDeps, deps),
-        config=cast(AppConfig, SimpleNamespace(orchestration=None)),
-        non_interactive=False,
-        on_event=_noop_event,
-        echo=lines.append,
-        allow_operator_input=False,
-    )
-
-    assert final.termination_reason == TerminationReason.APPROVAL_PENDING
-    wait.assert_not_awaited()
-    assert any("appr_2" in line for line in lines)
 
 
-async def test_non_tty_pause_does_not_block(monkeypatch: pytest.MonkeyPatch) -> None:
-    deps = await _deps()
-    monkeypatch.setattr(run_command, "_stdin_is_interactive", lambda: False)
-    wait = AsyncMock(side_effect=AssertionError("must not wait for an input that is absent"))
-    monkeypatch.setattr(run_command, "_wait_for_pause", wait)
-    monkeypatch.setattr(
-        run_command,
-        "run_engagement",
-        AsyncMock(return_value=_runtime(TerminationReason.OPERATOR_PAUSED)),
-    )
-    lines: list[str] = []
-
-    final = await run_command.execute(
-        SimpleNamespace(name="Hardening"),
-        cast(RuntimeDeps, deps),
-        config=cast(AppConfig, SimpleNamespace(orchestration=None)),
-        non_interactive=False,
-        on_event=_noop_event,
-        echo=lines.append,
-        allow_operator_input=True,
-    )
-
-    assert final.termination_reason == TerminationReason.OPERATOR_PAUSED
-    wait.assert_not_awaited()
-    assert any("paused" in line and "no interactive input" in line for line in lines)
 
 
-async def test_live_console_pause_is_handled_in_session(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    deps = await _deps()
-    fake = _FakeOperatorConsole(input_available=True)
-    monkeypatch.setattr(run_command, "OperatorConsole", lambda *a, **k: fake)
-    resumed = _runtime("no_actionable_plan")
-    wait = AsyncMock(return_value=resumed)
-    monkeypatch.setattr(run_command, "_wait_for_pause", wait)
-    monkeypatch.setattr(
-        run_command,
-        "run_engagement",
-        AsyncMock(return_value=_runtime(TerminationReason.OPERATOR_PAUSED)),
-    )
-
-    final = await run_command.execute(
-        SimpleNamespace(name="Hardening"),
-        cast(RuntimeDeps, deps),
-        config=cast(AppConfig, SimpleNamespace(orchestration=None)),
-        non_interactive=False,
-        on_event=_noop_event,
-        echo=lambda _line: None,
-        allow_operator_input=True,
-    )
-
-    assert final is resumed
-    wait.assert_awaited_once()
-    assert fake.started and fake.closed
 
 
-async def _noop_event(event: object) -> None:  # noqa: ANN401
-    return None
 
 
-class _FakeOperatorConsole:
-    """Duck-typed console: input availability is explicit so the test does
-    not depend on the host terminal."""
-
-    def __init__(self, *, input_available: bool) -> None:
-        self._input_available = input_available
-        self.started = False
-        self.closed = False
-        self.pending: str | None = None
-
-    def start(self) -> None:
-        self.started = True
-
-    def set_pending_approval(self, value: object) -> None:
-        self.pending = str(value)
-
-    def clear_pending_approval(self) -> None:
-        self.pending = None
-
-    @property
-    def input_available(self) -> bool:
-        return self._input_available
-
-    async def aclose(self) -> None:
-        self.closed = True
 
 
 # --- reader exceptions: visible and fail-safe ------------------------------
@@ -388,100 +220,8 @@ async def test_reader_eof_is_quiet_and_disables_input() -> None:
 # --- same-session pause/resume ---------------------------------------------
 
 
-async def test_wait_for_pause_resumes_the_same_mission(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    deps = await _deps()
-    deps.settings = OrchestrationSettings()
-    paused = _runtime(TerminationReason.OPERATOR_PAUSED)
-    calls: list[float] = []
-
-    class _Runner:
-        last_event_id = None
-
-        def __init__(self, _deps: object, *, settings: object = None) -> None:
-            self._settings = settings
-
-        async def reconcile_once(self, runtime, *, timeout_seconds: float):  # noqa: ANN001
-            calls.append(timeout_seconds)
-            mission = await deps.task_graph_store.get_mission(MISSION)
-            await deps.task_graph_store.update_mission(
-                mission.model_copy(
-                    update={
-                        "status": MissionStatus.ACTIVE,
-                        "revision": mission.revision + 1,
-                    }
-                )
-            )
-            return SimpleNamespace(
-                runtime=runtime.model_copy(
-                    update={"termination_reason": "no_actionable_plan"}
-                )
-            )
-
-        async def aclose(self) -> None:
-            return None
-
-    monkeypatch.setattr(run_command, "AgentLoopRunner", _Runner)
-    settle = AsyncMock(side_effect=lambda runtime, _deps, **kw: runtime)
-    monkeypatch.setattr(run_command, "settle_engagement", settle)
-
-    result = await run_command._wait_for_pause(
-        cast(RuntimeDeps, deps), paused, echo=lambda _line: None
-    )
-
-    assert result.termination_reason == "no_actionable_plan"
-    assert calls == [run_command._APPROVAL_POLL_SECONDS_IN_SESSION]
-    settle.assert_awaited_once()
-    mission = await deps.task_graph_store.get_mission(MISSION)
-    assert mission.status is MissionStatus.ACTIVE
 
 
-async def test_wait_for_approval_exits_when_operator_stops_the_mission(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    deps = await _deps()
-    deps.settings = OrchestrationSettings()
-    pending = _runtime(
-        TerminationReason.APPROVAL_PENDING, pending_approval_id=ApprovalId("appr_stop")
-    )
-    calls = 0
-
-    class _Runner:
-        last_event_id = None
-
-        def __init__(self, _deps: object, *, settings: object = None) -> None:
-            pass
-
-        async def reconcile_once(self, runtime, *, timeout_seconds: float):  # noqa: ANN001
-            nonlocal calls
-            calls += 1
-            mission = await deps.task_graph_store.get_mission(MISSION)
-            await deps.task_graph_store.update_mission(
-                mission.model_copy(update={
-                    "status": MissionStatus.CANCELLED, "revision": mission.revision + 1
-                })
-            )
-            return SimpleNamespace(runtime=runtime)
-
-        async def aclose(self) -> None:
-            return None
-
-    monkeypatch.setattr(run_command, "AgentLoopRunner", _Runner)
-    settle = AsyncMock(side_effect=lambda runtime, _deps, **kw: runtime)
-    monkeypatch.setattr(run_command, "settle_engagement", settle)
-
-    result = await asyncio.wait_for(
-        run_command._wait_for_approval(
-            cast(RuntimeDeps, deps), pending, echo=lambda _line: None, in_session=True
-        ),
-        timeout=2,
-    )
-
-    assert calls == 1
-    assert result.termination_reason == TerminationReason.OPERATOR_STOPPED
-    assert result.pending_approval_id is None
-    settle.assert_awaited_once()
 
 
 # --- concise, honest notices ----------------------------------------------

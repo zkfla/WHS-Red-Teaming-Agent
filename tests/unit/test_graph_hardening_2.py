@@ -22,10 +22,10 @@ from redteam.attack_graph.predicates import (
 from redteam.attack_graph.service import AttackGraphService
 from redteam.attack_graph.snapshot import SnapshotError, from_records
 from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
-from redteam.attack_graph.traversal import evidence_chain
-from redteam.core.contracts.graph import Finding, GraphEdge, GraphNode, Hypothesis
+from redteam.core.contracts.graph import GraphNode
 from redteam.core.enums import GraphEdgeType, GraphNodeType
-from redteam.core.ids import GraphEdgeId, GraphNodeId
+from redteam.core.ids import GraphNodeId
+from tests.fakes.graph_records import records_for, seed_records
 
 NOW = datetime.now(timezone.utc)
 
@@ -44,10 +44,10 @@ async def test_importing_an_older_snapshot_does_not_resurrect_a_retraction() -> 
     node = await svc.upsert_node(
         GraphNodeType.HOST, key="a.local", attrs={"reachable": True}, step=1
     )
-    stale = await svc.export_snapshot()
+    stale = await records_for(svc)
     await svc.retract(node.id, "reachable", step=5, reason="stopped answering")
 
-    await svc.import_snapshot(stale, merge=True)
+    await seed_records(svc, stale, merge=True)
 
     refreshed = await svc.get_node(node.id)
     assert refreshed is not None
@@ -280,74 +280,14 @@ def test_a_boolean_predicate_does_not_match_an_integer() -> None:
     assert resolve(pattern, nodes=[flagged]).ok
 
 
-def test_a_chain_cut_short_by_the_depth_limit_says_so() -> None:
-    nodes = [
-        GraphNode(
-            id=GraphNodeId("finding:f"),
-            type=GraphNodeType.FINDING,
-            properties=build_properties(
-                facts={"finding_id": "f", "verified": True, "evidence_ids": ["ev"]}
-            ),
-            created_at=NOW,
-            updated_at=NOW,
-        )
-    ]
-    edges: list[GraphEdge] = []
-    previous = "finding:f"
-    for index in range(20):
-        node_id = f"hypothesis:h{index}"
-        nodes.append(
-            GraphNode(
-                id=GraphNodeId(node_id),
-                type=GraphNodeType.HYPOTHESIS,
-                properties=build_properties(facts={"hypothesis_id": f"h{index}"}),
-                created_at=NOW,
-                updated_at=NOW,
-            )
-        )
-        edges.append(
-            GraphEdge(
-                id=GraphEdgeId(f"e{index}"),
-                type=GraphEdgeType.SUPPORTED_BY,
-                source_id=GraphNodeId(previous),
-                target_id=GraphNodeId(node_id),
-                created_at=NOW,
-            )
-        )
-        previous = node_id
-
-    chain = evidence_chain(GraphNodeId("finding:f"), nodes=nodes, edges=edges)
-
-    assert chain is not None
-    assert chain.truncated is True
-    assert "truncated" in chain.describe()
 
 
-async def test_a_complete_chain_is_not_marked_truncated() -> None:
-    svc = service()
-    host = await svc.upsert_node(GraphNodeType.HOST, key="a.local")
-    await svc.record_hypothesis(
-        Hypothesis(hypothesis_id="hy", description="d"), about=host.id
-    )
-    await svc.record_finding(
-        Finding(finding_id="f", title="t", verified=True, evidence_ids=["ev"]),
-        hypothesis_id="hy",
-        about=host.id,
-    )
-
-    chain = evidence_chain(
-        GraphNodeId("finding:f"),
-        nodes=await svc.list_nodes(),
-        edges=await svc.list_edges(),
-    )
-
-    assert chain is not None and chain.truncated is False
 
 
 async def test_a_snapshot_without_a_header_is_refused() -> None:
     svc = service()
     await svc.upsert_node(GraphNodeType.HOST, key="a.local")
-    records = await svc.export_snapshot()
+    records = await records_for(svc)
     headerless = [r for r in records if r["_collection"] != "graph_meta"]
 
     # No header means no version to check, so a future schema would load

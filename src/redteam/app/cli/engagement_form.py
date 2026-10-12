@@ -143,46 +143,61 @@ def collect_engagement(console, existing: EngagementConfig | None = None):
             console.print(f"자동 집행되지 않는 제약으로 기록됨: {operation}")
         config = result.engagement_config
         if existing:
-            # The serializer recognizes its own generated rule. Preserve other
-            # contract fields and metadata rather than rebuilding the engagement.
-            old_rule = existing.rules_of_engagement[0]
-            rule_fields = (
-                "allowed_capabilities",
-                "denied_capabilities",
-                "denied_operations",
-                "availability_impact_allowed",
-                "notes",
-            )
-            rule = old_rule.model_copy(
-                update={
-                    field: getattr(config.rules_of_engagement[0], field) for field in rule_fields
-                }
-            )
-            scope = existing.scope.model_copy(
-                update={
-                    field: getattr(config.scope, field)
-                    for field in ("allowed_hosts", "allowed_domains", "allowed_networks")
-                }
-            )
-            config = EngagementConfig.model_validate(
-                {
-                    **existing.model_dump(),
-                    "name": config.name,
-                    "description": config.description,
-                    "scope": scope,
-                    "rules_of_engagement": [rule],
-                    "execution_budget": config.execution_budget,
-                    "metadata": {
-                        **existing.metadata,
-                        "focus_areas": draft.focus_areas,
-                        **({"objective": draft.objective} if draft.objective else {}),
-                    },
-                }
-            )
-            if not draft.objective:
-                config.metadata.pop("objective", None)
+            config = merge_edit(existing, config, draft)
             for field, (added, removed) in scope_diff(before, draft).items():
                 console.print(f"범위 변경 {field}: 추가 {added}, 제거 {removed}")
         return config
     except Cancelled:
         return None
+
+
+def merge_edit(
+    existing: EngagementConfig, converted: EngagementConfig, draft: EngagementDraft
+) -> EngagementConfig:
+    """Apply an edited draft onto ``existing`` without rebuilding the engagement.
+
+    The serializer recognizes its own generated rule. Every other contract field
+    and metadata entry of ``existing`` is preserved. Shared by the terminal form
+    and the web interview so both edit paths keep the same semantics.
+    """
+    rule_fields = (
+        "allowed_capabilities",
+        "denied_capabilities",
+        "denied_operations",
+        "availability_impact_allowed",
+        "notes",
+    )
+    new_rule = converted.rules_of_engagement[0]
+    # A file with no rule yet gets the generated one; otherwise keep the old rule's
+    # name, description and other fields and replace only what the draft represents.
+    rule = (
+        existing.rules_of_engagement[0].model_copy(
+            update={field: getattr(new_rule, field) for field in rule_fields}
+        )
+        if existing.rules_of_engagement
+        else new_rule
+    )
+    scope = existing.scope.model_copy(
+        update={
+            field: getattr(converted.scope, field)
+            for field in ("allowed_hosts", "allowed_domains", "allowed_networks")
+        }
+    )
+    merged = EngagementConfig.model_validate(
+        {
+            **existing.model_dump(),
+            "name": converted.name,
+            "description": converted.description,
+            "scope": scope,
+            "rules_of_engagement": [rule],
+            "execution_budget": converted.execution_budget,
+            "metadata": {
+                **existing.metadata,
+                "focus_areas": draft.focus_areas,
+                **({"objective": draft.objective} if draft.objective else {}),
+            },
+        }
+    )
+    if not draft.objective:
+        merged.metadata.pop("objective", None)
+    return merged

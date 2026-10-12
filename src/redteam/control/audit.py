@@ -31,11 +31,13 @@ from typing import Any, NewType, Protocol
 
 from pydantic import BaseModel, Field
 
+from redteam.control.approval import ApprovalStore
 from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.policy import Approval, PolicyDecision
 from redteam.core.enums import PolicyVerdict
 from redteam.core.ids import ActionId, ApprovalId, EngagementId, RunId, new_id
 from redteam.core.redaction import redact_sensitive_text
+from redteam.core.tool_binding import execution_fingerprint
 
 AuditId = NewType("AuditId", str)
 
@@ -126,6 +128,44 @@ class InMemoryAuditStore:
         return [e for e in self._entries if e.action_id == action_id]
 
 
+async def inspect_execution_approval(
+    audit: AuditStore, approvals: ApprovalStore | None, proposal: ActionProposal,
+) -> Approval | None:
+    """Read original Control bindings for migration; never grant execution.
+
+    Consumers do not reinterpret internal audit rows. Unavailable, conflicting
+    or denied decisions cannot prove approval of the immutable submission.
+    """
+    if proposal.tool_id is None:
+        raise ValueError("original_control_binding_unsupported")
+    fingerprint = execution_fingerprint(proposal.tool_id, proposal.target, proposal.arguments)
+    decisions = []
+    for entry in await audit.list_for_action(proposal.action_id):
+        if entry.run_id != proposal.run_id or entry.engagement_id != proposal.engagement_id:
+            raise ValueError("original_control_scope_mismatch")
+        if entry.decision is None:
+            continue
+        if (entry.action_summary != redact_arguments(proposal.model_dump(mode="json"))
+                or entry.decision.execution_fingerprint != fingerprint
+                or entry.decision.action_id != proposal.action_id):
+            raise ValueError("original_control_proposal_mismatch")
+        decisions.append(entry.decision)
+    if not decisions or any(d.verdict is PolicyVerdict.DENY for d in decisions):
+        raise ValueError("original_control_decision_unverified")
+    ids = {d.approval_id for d in decisions if d.approval_id is not None}
+    if not ids:
+        if any(d.verdict is not PolicyVerdict.ALLOW for d in decisions):
+            raise ValueError("original_control_approval_missing")
+        return None
+    if len(ids) != 1 or approvals is None:
+        raise ValueError("original_control_approval_unverified")
+    approval = await approvals.get(next(iter(ids)))
+    if (approval is None or approval.action_id != proposal.action_id
+            or approval.execution_fingerprint != fingerprint):
+        raise ValueError("original_control_approval_mismatch")
+    return approval
+
+
 class AuditLog:
     """Control Team's audit service. ``DefaultControlPlane`` calls
     ``record`` after every ``PolicyDecision`` and
@@ -135,7 +175,12 @@ class AuditLog:
     def __init__(self, store: AuditStore | None = None) -> None:
         self._store = store or InMemoryAuditStore()
 
-    async def record(self, action: ActionProposal, decision: PolicyDecision) -> None:
+    async def list_for_run(self, run_id: RunId) -> list[AuditEntry]:
+        """Original decision inventory for the Control-owned recovery boundary."""
+        return await self._store.list_for_run(run_id)
+
+    async def record(self, action: ActionProposal, decision: PolicyDecision, *,
+                     metadata: dict[str, Any] | None = None) -> None:
         entry = AuditEntry(
             audit_id=AuditId(new_id("audit")),
             entry_type=AuditEntryType.POLICY_DECISION,
@@ -143,6 +188,7 @@ class AuditLog:
             engagement_id=action.engagement_id,
             action_id=action.action_id,
             action_summary=redact_arguments(action.model_dump(mode="json")),
+            metadata=redact_arguments(metadata or {}),
             decision=decision.model_copy(
                 update={
                     "reasons": [redact_sensitive_text(reason) for reason in decision.reasons],

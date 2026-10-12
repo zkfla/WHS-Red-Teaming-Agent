@@ -1,12 +1,10 @@
-"""Append-only JSONL snapshot of the graph, for replay and reporting.
-
-Owned by Agent Team. Rationale: ``docs/agent/attack-graph.md``.
-"""
+"""Internal versioned graph records for SQLite and explicit legacy migration."""
 
 from __future__ import annotations
 
 from typing import Any
 
+from redteam.attack_graph.predicates import validate_properties
 from redteam.core.contracts.graph import GraphEdge, GraphNode
 
 SNAPSHOT_SCHEMA_VERSION = 1
@@ -81,11 +79,8 @@ def from_records(
             f"be checked"
         )
 
+    for node in nodes:
+        validate_properties(node.properties)
+    for edge in edges:
+        validate_properties(edge.properties)
     return nodes, edges, metadata
-
-
-def round_trip_ok(nodes: list[GraphNode], edges: list[GraphEdge]) -> bool:
-    """``export == export(import(export))`` — the property replay relies on."""
-    exported = to_records(nodes, edges)
-    reloaded_nodes, reloaded_edges, _ = from_records(exported)
-    return to_records(reloaded_nodes, reloaded_edges) == exported

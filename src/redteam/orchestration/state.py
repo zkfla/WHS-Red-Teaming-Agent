@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field, field_validator
 from redteam.attack_graph.observation import GraphObservation
 from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.policy import PolicyDecision
-from redteam.core.contracts.tool import ToolResult
+from redteam.core.contracts.tool import ToolInvocation, ToolResult
 from redteam.core.enums import AgentPhase, MissionStatus, Verdict
 from redteam.core.ids import (
     ActionId,
@@ -63,6 +63,7 @@ class TerminationReason:
     EXECUTION_ERROR = "execution_error"
     PLANNING_ERROR = "planning_error"
     GOAL_ACHIEVED = "goal_achieved"
+    EXHAUSTED = "exhausted"
     INVESTIGATION_HELD = "investigation_held"
     RESOURCE_WAIT = "resource_wait"
     #: Operator asked to hold the run before the next action executes. The
@@ -82,6 +83,9 @@ class RuntimeState(BaseModel):
     # None is the pre-instance central loop. Instances share the run/mission
     # but have independent LangGraph threads and work leases.
     instance_id: AgentInstanceId | None = None
+    task_ownership_version: int = Field(default=0, ge=0)
+    # Recovery changes the Task owner epoch, retaining the original actor/call IDs.
+    task_owner: str | None = None
 
     current_goal: str | None = None
     # Additive references for task-first execution. Optional defaults keep
@@ -165,7 +169,7 @@ class RuntimeState(BaseModel):
     @property
     def work_owner(self) -> str:
         """Lease identity; old single-run checkpoints retain their owner."""
-        return work_owner_for(self.run_id, self.instance_id)
+        return self.task_owner or work_owner_for(self.run_id, self.instance_id)
 
 
 class NativeCallState(BaseModel):
@@ -198,6 +202,8 @@ class GraphState(TypedDict, total=False):
     result_evidence_id: EvidenceId | None
     #: Internal WorkLedger reference for the in-flight proposal.
     current_work_id: str | None
+    current_execution_id: str | None
+    prepared_invocation: ToolInvocation | None
     #: A batch exists only when ``max_actions_per_turn`` admits fan-out.
     dispatch_items: list[DispatchItem]
     #: Map/reduce channel. Entries are retained by action id for replay/audit.

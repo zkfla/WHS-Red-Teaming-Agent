@@ -625,6 +625,18 @@ def _merge_cleanup(
         return incoming
     if incoming is None:
         return existing
+    if (incoming.get("created_evidence_id")
+            and incoming.get("created_by_action_id") != existing.get("created_by_action_id")):
+        from datetime import datetime
+        try:
+            created = datetime.fromisoformat(str(incoming["created_at"]).replace("Z", "+00:00"))
+            previous = existing.get("created_at")
+            if previous is None or created > datetime.fromisoformat(
+                str(previous).replace("Z", "+00:00"),
+            ):
+                return incoming
+        except (ValueError, KeyError, TypeError):
+            pass  # A different label alone cannot reset a cleaned resource.
     old = _CLEANUP_RANK.get(str(existing.get("status")), 0)
     new = _CLEANUP_RANK.get(str(incoming.get("status")), 0)
     return {**existing, **incoming} if new >= old else {**incoming, **existing}

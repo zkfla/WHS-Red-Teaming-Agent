@@ -20,10 +20,12 @@ from redteam.core.contracts.tool import (
     PROVIDER_METADATA_COMMAND_FIELDS,
     PROVIDER_METADATA_REQUIRES_TARGET,
     PROVIDER_METADATA_RESOURCE_BINDINGS,
+    PROVIDER_METADATA_RESOURCE_EFFECTS,
     PROVIDER_METADATA_TARGET_BINDING,
     ToolDescriptor,
     ToolError,
     ToolResourceBinding,
+    ToolResourceEffect,
     ToolTargetBinding,
 )
 from redteam.core.enums import RiskLevel, ToolHealthStatus
@@ -114,7 +116,12 @@ class MCPServerAdapter:
             error=error,
             started_at=started_at,
             finished_at=finished_at,
-            metadata={"mcp_server_id": self.server_id, "mcp_tool_name": tool.tool_name},
+            metadata={
+                "mcp_server_id": self.server_id, "mcp_tool_name": tool.tool_name,
+                **({"resource_effects": [effect.model_dump(mode="json")
+                                          for effect in tool.resource_effects]}
+                   if tool.resource_effects is not None else {}),
+            },
         )
 
     async def health_check(self) -> ToolHealthStatus:
@@ -130,6 +137,18 @@ def _apply_provider_metadata(
     # no per-tool central list lives here.
     if not metadata:
         return
+    annotations = metadata.get("annotations")
+    if (isinstance(annotations, Mapping)
+            and annotations.get("readOnlyHint") is True):
+        descriptor.resource_effects = []
+    if PROVIDER_METADATA_RESOURCE_EFFECTS in metadata:
+        from redteam.capability.settings import MCPConfigurationError
+        try:
+            descriptor.resource_effects = TypeAdapter(list[ToolResourceEffect]).validate_python(
+                metadata[PROVIDER_METADATA_RESOURCE_EFFECTS], strict=True,
+            )
+        except ValidationError:
+            raise MCPConfigurationError("invalid provider resource effect metadata") from None
     if PROVIDER_METADATA_RESOURCE_BINDINGS in metadata:
         from redteam.capability.settings import MCPConfigurationError
 

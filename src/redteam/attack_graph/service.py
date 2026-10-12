@@ -6,12 +6,9 @@ guaranteed to run here. Docs: ``docs/agent/attack-graph.md``.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, TypeVar
-from weakref import WeakKeyDictionary
 
 from redteam.attack_graph.cleanup import CleanupItem, CleanupReport, CleanupStatus, collect
 from redteam.attack_graph.identity import (
@@ -32,37 +29,28 @@ from redteam.attack_graph.observation import (
 )
 from redteam.attack_graph.patterns import NodePattern, ResolveResult
 from redteam.attack_graph.predicates import (
-    CLAIM_FACT_PREFIX,
     CLAIM_PROVENANCE_KEY,
     CLEANUP_KEY,
-    MAX_PROVENANCE_ENTRIES,
     RESERVED_KEYS,
     Provenance,
     apply_retraction,
     build_properties,
     claim_entries_for_fact_keys,
-    claim_provenance_of,
     cleanup_of,
     facts_of,
-    merge_properties,
-    retain_claim_confirmation,
     validate_properties,
-    values_equal,
 )
 from redteam.attack_graph.retraction import PlannedRetraction, RetractionRule, plan_retractions
-from redteam.attack_graph.snapshot import from_records, to_records
-from redteam.attack_graph.stores.base import require_listable, require_mutable
-from redteam.attack_graph.traversal import (
-    Direction,
-    EvidenceChain,
-    ancestors,
-    descendants,
-    evidence_chain,
-    shortest_path,
-    subgraph_around,
-)
+from redteam.attack_graph.stores.base import require_mutable
+from redteam.attack_graph.traversal import Direction
 from redteam.attack_graph.view import AttackGraphView
-from redteam.attack_graph.visualize import write_html
+from redteam.attack_graph.writes import (
+    NodeTypeConflictError as NodeTypeConflictError,
+)
+from redteam.attack_graph.writes import (
+    UngroundedFindingError as UngroundedFindingError,
+)
+from redteam.attack_graph.writes import merge_edge, merge_node, update_edge, update_node
 from redteam.core.contracts.graph import Finding, GraphEdge, GraphNode, Hypothesis
 from redteam.core.contracts.target import AnyTarget, target_display_name
 from redteam.core.enums import GraphEdgeType, GraphNodeType
@@ -75,10 +63,6 @@ HYPOTHESIS_OPEN = "open"
 HYPOTHESIS_CONFIRMED = "confirmed"
 HYPOTHESIS_REJECTED = "rejected"
 HYPOTHESIS_INCONCLUSIVE = "inconclusive"
-
-
-class UngroundedFindingError(ValueError):
-    """Raised when a verified Finding is recorded without Evidence."""
 
 
 _Record = TypeVar("_Record", Hypothesis, Finding)
@@ -98,11 +82,6 @@ def _read(model: type[_Record], node: GraphNode) -> _Record | None:
         return None
 
 
-class NodeTypeConflictError(ValueError):
-    """Raised when an upsert would change an existing node's type. Silently
-    keeping the old one lets a caller believe a write landed when it did not."""
-
-
 def _edge_id(
     edge_type: GraphEdgeType, source_id: GraphNodeId, target_id: GraphNodeId
 ) -> GraphEdgeId:
@@ -112,26 +91,6 @@ def _edge_id(
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
-
-
-#: Every write is read-modify-write, so concurrent writers to one node lose
-#: each other's changes once the store actually awaits I/O. Striped so the
-#: table cannot grow with the graph; keyed on the *store* so the service
-#: instances sharing one still serialise.
-_LOCK_STRIPES = 64
-_STORE_LOCKS: WeakKeyDictionary[Any, list[asyncio.Lock]] = WeakKeyDictionary()
-
-
-def _node_lock(store: Any, node_id: GraphNodeId) -> asyncio.Lock:
-    try:
-        stripes = _STORE_LOCKS[store]
-    except (KeyError, TypeError):
-        stripes = [asyncio.Lock() for _ in range(_LOCK_STRIPES)]
-        try:
-            _STORE_LOCKS[store] = stripes
-        except TypeError:  # store is not weak-referenceable
-            return stripes[hash(str(node_id)) % _LOCK_STRIPES]
-    return stripes[hash(str(node_id)) % _LOCK_STRIPES]
 
 
 class AttackGraphService:
@@ -150,6 +109,14 @@ class AttackGraphService:
 
     async def get_node(self, node_id: GraphNodeId) -> GraphNode | None:
         return await self._store.get_node(node_id)
+
+    async def get_edge(self, edge_id: GraphEdgeId) -> GraphEdge | None:
+        return await self._store.get_edge(edge_id)
+
+    async def incident_edges(
+        self, node_id: GraphNodeId, *, direction: Direction = "any",
+    ) -> list[GraphEdge]:
+        return await self._view.incident_edges(node_id, direction=direction)
 
     async def neighbors(self, node_id: GraphNodeId) -> list[GraphNode]:
         return await self._store.neighbors(node_id)
@@ -231,37 +198,15 @@ class AttackGraphService:
             properties, attrs=attrs, facts=facts, provenance=provenance, step=step
         )
 
-        async with _node_lock(self._store, node_id):
-            existing = await self._store.get_node(node_id)
-            if existing is None:
-                node = GraphNode(
-                    id=node_id,
-                    type=node_type,
-                    labels=sorted(set(labels or [])),
-                    properties=incoming,
-                    created_at=_now(),
-                    updated_at=_now(),
-                )
-            else:
-                if existing.type is not node_type:
-                    raise NodeTypeConflictError(
-                        f"{node_id} is a {existing.type.value} node; refusing to upsert "
-                        f"it as {node_type.value}"
-                    )
-                merged_labels = sorted(set(existing.labels) | set(labels or []))
-                merged_properties = merge_properties(existing.properties, incoming)
-                # A write that changes nothing is not a write.
-                if merged_labels == existing.labels and merged_properties == existing.properties:
-                    return existing
-                node = existing.model_copy(
-                    update={
-                        "labels": merged_labels,
-                        "properties": merged_properties,
-                        "updated_at": _now(),
-                    }
-                )
-            await self._store.add_node(node)
-            return node
+        proposal = GraphNode(
+            id=node_id, type=node_type, labels=sorted(set(labels or [])),
+            properties=incoming, created_at=_now(), updated_at=_now(),
+        )
+        node = await update_node(
+            self._store, node_id, lambda current: merge_node(current, proposal),
+        )
+        assert node is not None
+        return node
 
     @staticmethod
     def _normalize_properties(
@@ -359,17 +304,18 @@ class AttackGraphService:
 
     async def retract(self, node_id: GraphNodeId, key: str, *, step: int, reason: str) -> bool:
         """Withdraw a predicate that no longer holds, with a reason."""
-        async with _node_lock(self._store, node_id):
-            node = await self._store.get_node(node_id)
+        changed = False
+        def withdraw(node: GraphNode | None) -> GraphNode | None:
+            nonlocal changed
             if node is None:
-                return False
+                changed = False
+                return None
             properties, changed = apply_retraction(node.properties, key, step=step, reason=reason)
             if not changed:
-                return False
-            await self._store.add_node(
-                node.model_copy(update={"properties": properties, "updated_at": _now()})
-            )
-            return True
+                return node
+            return node.model_copy(update={"properties": properties, "updated_at": _now()})
+        await update_node(self._store, node_id, withdraw)
+        return changed
 
     async def record_attempt(
         self,
@@ -410,68 +356,29 @@ class AttackGraphService:
     ) -> GraphEdge:
         """Connect two nodes. The same relation twice stays one edge."""
         edge_id = _edge_id(edge_type, source_id, target_id)
-        existing = await self._store.get_edge(edge_id)
         edge_properties = validate_properties({**(properties or {})})
         if provenance is not None:
-            # Same ceiling as nodes: re-linking every turn would otherwise
-            # grow one edge without bound.
-            recorded = [
-                *(existing.properties.get("provenance", []) if existing else []),
-                provenance.model_dump(mode="json"),
-            ]
-            edge_properties["provenance"] = (
-                recorded
-                if len(recorded) <= MAX_PROVENANCE_ENTRIES
-                else [recorded[0], *recorded[-(MAX_PROVENANCE_ENTRIES - 1) :]]
-            )
-            # Per-claim source for the relation content. Flat edge properties
-            # read as ``facts:<key>`` under the same convention as nodes.
-            # Older edges without a claim map keep loading: readers only look
-            # up the coarse keys they already know.
+            edge_properties["provenance"] = [provenance.model_dump(mode="json")]
             relation_values = {
                 key: value
                 for key, value in edge_properties.items()
                 if key not in ("provenance", CLAIM_PROVENANCE_KEY)
             }
-            fresh_claims = claim_entries_for_fact_keys(
-                relation_values,
-                provenance,
-                provenance.step,
+            edge_properties[CLAIM_PROVENANCE_KEY] = claim_entries_for_fact_keys(
+                relation_values, provenance, provenance.step,
             )
-            prior_claims = claim_provenance_of(existing.properties) if existing else {}
-            prior_values = dict(existing.properties) if existing else {}
-            merged_claims = dict(prior_claims)
-            for claim_key, entry in fresh_claims.items():
-                prop_key = (
-                    claim_key[len(CLAIM_FACT_PREFIX) :]
-                    if claim_key.startswith(CLAIM_FACT_PREFIX)
-                    else None
-                )
-                if (
-                    prop_key is not None
-                    and prop_key in prior_values
-                    and prop_key in relation_values
-                    and claim_key in prior_claims
-                    and values_equal(prior_values[prop_key], relation_values[prop_key])
-                ):
-                    # Keep the first source sticky, while retaining the exact
-                    # current assertion for consumers of new source evidence.
-                    merged_claims[claim_key] = retain_claim_confirmation(
-                        prior_claims[claim_key], entry
-                    )
-                    continue
-                merged_claims[claim_key] = entry
-            edge_properties[CLAIM_PROVENANCE_KEY] = merged_claims
-
-        edge = GraphEdge(
+        proposal = GraphEdge(
             id=edge_id,
             type=edge_type,
             source_id=source_id,
             target_id=target_id,
-            properties={**(existing.properties if existing else {}), **edge_properties},
-            created_at=existing.created_at if existing else _now(),
+            properties=edge_properties,
+            created_at=_now(),
         )
-        await self._store.add_edge(edge)
+        edge = await update_edge(
+            self._store, edge_id, lambda current: merge_edge(current, proposal),
+        )
+        assert edge is not None
         return edge
 
     # -- hypotheses --------------------------------------------------
@@ -509,22 +416,26 @@ class AttackGraphService:
         step: int = 0,
     ) -> Hypothesis | None:
         """Close out a hypothesis as confirmed/rejected/inconclusive."""
-        hypothesis = await self.get_hypothesis(hypothesis_id)
-        if hypothesis is None:
-            return None
-        updated = hypothesis.model_copy(
-            update={
+        updated: Hypothesis | None = None
+        def resolve(current: GraphNode | None) -> GraphNode | None:
+            nonlocal updated
+            hypothesis = _read(Hypothesis, current) if current else None
+            if hypothesis is None:
+                updated = None
+                return current
+            updated = hypothesis.model_copy(update={
                 "status": status,
                 "confidence": hypothesis.confidence if confidence is None else confidence,
-            }
-        )
-        await self.upsert_node(
-            GraphNodeType.HYPOTHESIS,
-            node_id=hypothesis_node_id(hypothesis_id),
-            facts=updated.model_dump(mode="json"),
-            attrs={"status": status},
-            step=step,
-        )
+            })
+            incoming = self._normalize_properties(
+                None, attrs={"status": status}, facts=updated.model_dump(mode="json"),
+                provenance=None, step=step,
+            )
+            assert current is not None
+            return merge_node(current, current.model_copy(update={
+                "properties": incoming, "updated_at": _now(),
+            }))
+        await update_node(self._store, hypothesis_node_id(hypothesis_id), resolve)
         return updated
 
     async def list_hypotheses(self, *, status: str | None = None) -> list[Hypothesis]:
@@ -583,72 +494,13 @@ class AttackGraphService:
 
     # -- traversal ---------------------------------------------------
 
-    async def shortest_path(
-        self,
-        source_id: GraphNodeId,
-        target_id: GraphNodeId,
-        *,
-        direction: Direction = "out",
-        edge_types: set[GraphEdgeType] | None = None,
-    ) -> list[GraphEdge] | None:
-        """The edges linking two nodes, or ``None`` if they are unlinked."""
-        return shortest_path(
-            source_id,
-            target_id,
-            edges=await self.list_edges(),
-            direction=direction,
-            edge_types=edge_types,
-        )
-
-    async def descendants(
-        self, node_id: GraphNodeId, *, max_depth: int | None = None
-    ) -> list[GraphNode]:
-        """Everything reachable by following edges out of ``node_id``."""
-        reached = descendants(node_id, edges=await self.list_edges(), max_depth=max_depth)
-        return [node for node in await self.list_nodes() if node.id in reached]
-
-    async def ancestors(
-        self, node_id: GraphNodeId, *, max_depth: int | None = None
-    ) -> list[GraphNode]:
-        """Everything that leads to ``node_id``."""
-        reached = ancestors(node_id, edges=await self.list_edges(), max_depth=max_depth)
-        return [node for node in await self.list_nodes() if node.id in reached]
 
     async def subgraph_around(
         self, node_id: GraphNodeId, *, radius: int = 1, direction: Direction = "any"
     ) -> tuple[list[GraphNode], list[GraphEdge]]:
         """The neighbourhood of a node, for focused reporting or rendering."""
-        return subgraph_around(
-            node_id,
-            nodes=await self.list_nodes(),
-            edges=await self.list_edges(),
-            radius=radius,
-            direction=direction,
-        )
+        return await self._view.subgraph_around(node_id, radius=radius, direction=direction)
 
-    async def evidence_chain(self, finding_id: str) -> EvidenceChain | None:
-        """How a Finding came to be — hypothesis, target, evidence ids."""
-        return evidence_chain(
-            finding_node_id(finding_id),
-            nodes=await self.list_nodes(),
-            edges=await self.list_edges(),
-        )
-
-    async def evidence_chains(self) -> list[EvidenceChain]:
-        """Every Finding's chain, worst severity first."""
-        nodes = await self.list_nodes()
-        edges = await self.list_edges()
-        chains = [
-            chain
-            for chain in (
-                evidence_chain(node.id, nodes=nodes, edges=edges)
-                for node in nodes
-                if node.type is GraphNodeType.FINDING
-            )
-            if chain is not None
-        ]
-        rank = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
-        return sorted(chains, key=lambda item: (rank.get(item.severity, 9), item.finding_id))
 
     # -- cleanup -----------------------------------------------------
 
@@ -658,6 +510,9 @@ class AttackGraphService:
         *,
         resource_type: str,
         action_id: str | None = None,
+        evidence_id: str | None = None,
+        run_id: str | None = None,
+        created_at: datetime | None = None,
         step: int = 0,
         note: str = "",
         reopen: bool = False,
@@ -667,25 +522,25 @@ class AttackGraphService:
         A resource that was already cleaned is *not* put back to pending;
         pass ``reopen=True`` when it genuinely was created again.
         """
-        node = await self._store.get_node(node_id)
-        if node is None:
-            return None
-
-        existing = cleanup_of(node.properties)
-        if existing is not None and not reopen:
-            current = CleanupItem.model_validate({"node_id": node_id, **existing})
-            if not current.is_outstanding:
-                return current
-
-        item = CleanupItem(
-            node_id=node_id,
-            resource_type=resource_type,
-            status=CleanupStatus.PENDING,
-            created_at_step=step,
-            created_by_action_id=action_id,
-            note=note,
-        )
-        await self._write_cleanup(node, item)
+        item: CleanupItem | None = None
+        def register(current: GraphNode | None) -> GraphNode | None:
+            nonlocal item
+            if current is None:
+                item = None
+                return None
+            existing = cleanup_of(current.properties)
+            if existing is not None and not reopen:
+                item = CleanupItem.model_validate({"node_id": node_id, **existing})
+                if not item.is_outstanding:
+                    return current
+            item = CleanupItem(
+                node_id=node_id, resource_type=resource_type, status=CleanupStatus.PENDING,
+                created_at_step=step, created_by_action_id=action_id, note=note,
+                created_evidence_id=evidence_id, run_id=run_id,
+                created_at=created_at,
+            )
+            return self._with_cleanup(current, item)
+        await update_node(self._store, node_id, register)
         return item
 
     async def mark_cleaned(
@@ -721,37 +576,30 @@ class AttackGraphService:
         evidence_id: str | None = None,
         note: str = "",
     ) -> CleanupItem | None:
-        node = await self._store.get_node(node_id)
-        if node is None:
-            return None
-        existing = cleanup_of(node.properties)
-        if existing is None:
-            return None
-        item = CleanupItem.model_validate({"node_id": node_id, **existing})
-        item = item.model_copy(
-            update={
-                "status": status,
-                "cleanup_evidence_id": evidence_id or item.cleanup_evidence_id,
+        item: CleanupItem | None = None
+        def change(current: GraphNode | None) -> GraphNode | None:
+            nonlocal item
+            existing = cleanup_of(current.properties) if current else None
+            if existing is None:
+                item = None
+                return current
+            item = CleanupItem.model_validate({"node_id": node_id, **existing})
+            item = item.model_copy(update={
+                "status": status, "cleanup_evidence_id": evidence_id or item.cleanup_evidence_id,
                 "note": note or item.note,
-            }
-        )
-        await self._write_cleanup(node, item)
+            })
+            assert current is not None
+            return self._with_cleanup(current, item)
+        await update_node(self._store, node_id, change)
         return item
 
-    async def _write_cleanup(self, node: GraphNode, item: CleanupItem) -> None:
+    @staticmethod
+    def _with_cleanup(node: GraphNode, item: CleanupItem) -> GraphNode:
         payload = item.model_dump(mode="json")
         payload.pop("node_id", None)
-        async with _node_lock(self._store, node.id):
-            # Re-read inside the lock: the node may have moved on.
-            current = await self._store.get_node(node.id) or node
-            await self._store.add_node(
-                current.model_copy(
-                    update={
-                        "properties": {**current.properties, CLEANUP_KEY: payload},
-                        "updated_at": _now(),
-                    }
-                )
-            )
+        return node.model_copy(update={
+            "properties": {**node.properties, CLEANUP_KEY: payload}, "updated_at": _now(),
+        })
 
     # -- retraction sweep --------------------------------------------
 
@@ -773,64 +621,6 @@ class AttackGraphService:
                 applied.append(item)
         return applied
 
-    # -- rendering ---------------------------------------------------
-
-    async def export_html(
-        self,
-        path: str | Path,
-        *,
-        title: str = "Attack Graph",
-        around: GraphNodeId | None = None,
-        radius: int = 2,
-    ) -> Path:
-        """Write a self-contained HTML view. ``around`` renders one node's
-        neighbourhood, which is what a per-finding report wants."""
-        if around is None:
-            nodes, edges = await self.list_nodes(), await self.list_edges()
-        else:
-            nodes, edges = await self.subgraph_around(around, radius=radius)
-        return write_html(nodes, edges, path, title=title)
-
-    # -- snapshots ---------------------------------------------------
-
-    async def export_snapshot(
-        self, *, metadata: dict[str, Any] | None = None
-    ) -> list[dict[str, Any]]:
-        listable = require_listable(self._store, "export_snapshot")
-        return to_records(
-            await listable.list_nodes(), await listable.list_edges(), metadata=metadata
-        )
-
-    async def import_snapshot(
-        self, records: list[dict[str, Any]], *, merge: bool = False
-    ) -> dict[str, Any]:
-        """Load a snapshot back into the store.
-
-        Replaces same-id nodes by default (a restore should reproduce the
-        snapshot exactly); ``merge=True`` folds it into what is already
-        there, for combining two runs.
-        """
-        nodes, edges, metadata = from_records(records)
-        # A snapshot is an external file. Importing without the guard makes
-        # "write it to a file, read it back" the way around every check.
-        for node in nodes:
-            validate_properties(node.properties)
-        for edge in edges:
-            validate_properties(edge.properties)
-        for node in nodes:
-            if merge:
-                await self.upsert_node(
-                    node.type,
-                    node.properties,
-                    node_id=node.id,
-                    labels=list(node.labels),
-                    step=None,
-                )
-            else:
-                await self._store.add_node(node)
-        for edge in edges:
-            await self._store.add_edge(edge)
-        return metadata
 
     # -- removal -----------------------------------------------------
 

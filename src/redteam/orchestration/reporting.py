@@ -14,7 +14,7 @@ from redteam.core.contracts.mission import MissionPlan, MissionTask
 from redteam.core.enums import AgentPhase, MissionStatus, TaskStatus
 from redteam.core.ids import ApprovalId, EvidenceId, FindingId, MissionId, RunId, TaskId
 from redteam.core.ports.evidence_store import EvidenceStore
-from redteam.core.ports.task_graph import MissionTaskStore
+from redteam.core.ports.task_graph import InvestigationReader
 from redteam.orchestration.context_projection import MappingStatus, project_run_processing
 from redteam.orchestration.coverage import CoverageGapSummary, project_coverage_gaps
 from redteam.orchestration.diagnostics import DecisionDiagnostic, safe_feedback
@@ -374,6 +374,8 @@ def _project_run_outcome(
 ) -> str:
     if ready_for_release:
         return "goal_achieved"
+    if phase not in {AgentPhase.FINISHED, AgentPhase.FAILED}:
+        return "in_progress"
     if has_unresolved_detail:
         return "unresolved"
     if phase is AgentPhase.FAILED:
@@ -398,6 +400,7 @@ class TerminalReportProjection(BaseModel):
     run_id: RunId
     phase: AgentPhase
     termination_reason: str | None
+    previous_termination_reason: str | None = None
     planning_diagnostic: DecisionDiagnostic | None = None
     planning_diagnostic_history: list[DecisionDiagnostic] = Field(default_factory=list)
     runtime_observations: list[RuntimeObservation] = Field(
@@ -442,6 +445,13 @@ class TerminalReportProjection(BaseModel):
     unresolved_details: list[InvestigationUnresolvedProjection] = Field(default_factory=list)
     evidence_validity: list[dict[str, Any]] = Field(default_factory=list)
     evidence_validity_blockers: list[str] = Field(default_factory=list)
+    investigations: list[dict[str, Any]] = Field(default_factory=list)
+    executions: list[dict[str, Any]] = Field(default_factory=list)
+    criterion_evidence: list[dict[str, Any]] = Field(default_factory=list)
+    unresolved_questions: list[dict[str, Any]] = Field(default_factory=list)
+    cleanup_obligations: list[dict[str, Any]] = Field(default_factory=list)
+    cleanup_unmapped_tools: list[str] = Field(default_factory=list)
+    effective_limits: dict[str, Any] = Field(default_factory=dict)
 
 
 class ReportingAgent:
@@ -453,14 +463,15 @@ class ReportingAgent:
         *,
         graph: AttackGraphService,
         evidence_store: EvidenceStore,
-        work_store: WorkStore,
-        task_store: MissionTaskStore | None = None,
+        work_store: WorkStore | None,
+        task_store: InvestigationReader | None = None,
         required_hypothesis_ids: Collection[str] | None = None,
         agent_definitions: Iterable[AgentDefinition] = (),
         coverage: CoverageGapSummary | None = None,
         coordinator: Any | None = None,
+        central_state: Any | None = None,
     ) -> TerminalReportProjection:
-        if not runtime.is_terminal:
+        if not runtime.is_terminal and central_state is None:
             raise ValueError("reporting projection requires a terminal runtime")
 
         integrity = await graph.integrity_report()
@@ -489,8 +500,16 @@ class ReportingAgent:
             for item in await graph.list_findings()
             if not set(item.evidence_ids).isdisjoint(current_evidence_ids)
         ]
-        work = await work_store.list_items(run_id=runtime.run_id)
-        status_counts = Counter(item.status.value for item in work)
+        if central_state is None and work_store is None:
+            raise ValueError("reporting_original_execution_store_missing")
+        work: list[Any]
+        if central_state is not None:
+            work = await central_state.list_executions()
+        else:
+            assert work_store is not None
+            work = list(await work_store.list_items(run_id=runtime.run_id))
+        status_counts = Counter((item.state if central_state is not None else item.status).value
+                                for item in work)
         projected_findings = [
             FindingProjection(
                 finding_id=FindingId(item.finding_id),
@@ -533,7 +552,8 @@ class ReportingAgent:
         validity_blockers = [item.evidence_id for item in validity
                              if item.evidence_id in reuse_support
                              and item.status not in {"unbound", "valid"}]
-        actions = runtime.actions_executed
+        actions = (sum(item.result_evidence_id is not None for item in work)
+                   if central_state is not None else runtime.actions_executed)
         terminal_work = sum(status_counts.values())
         dead_ends = sum(
             status_counts.get(status, 0) for status in ("failed", "blocked", "stale", "cancelled")
@@ -567,7 +587,9 @@ class ReportingAgent:
             )
         evidence_read_projections = _project_evidence_reads(runtime)
         request_accounting = None
-        if runtime.llm_request_policy is not None and coordinator is not None:
+        if central_state is not None:
+            request_accounting = await central_state.request_ledger().snapshot(str(runtime.run_id))
+        elif runtime.llm_request_policy is not None and coordinator is not None:
             from redteam.orchestration.llm_requests import RunRequestLedger
 
             request_accounting = await RunRequestLedger(coordinator).snapshot(str(runtime.run_id))
@@ -620,7 +642,7 @@ class ReportingAgent:
                     )
                 )
             ),
-            actions_executed=runtime.actions_executed,
+            actions_executed=actions,
             finding_count=len(projected_findings),
             evidence_count=len(evidence),
             work_status_counts=dict(sorted(status_counts.items())),
@@ -649,6 +671,59 @@ class ReportingAgent:
             evidence_validity_blockers=validity_blockers,
             run_outcome="unknown",
         )
+        if central_state is not None:
+            from types import SimpleNamespace
+
+            from redteam.orchestration.central_completion import (
+                goal_inputs,
+                required_questions,
+                unsafe,
+            )
+            assert request_accounting is not None
+
+            tasks = await central_state.list_tasks()
+            plan = await central_state.get_mission(runtime.mission_id)
+            report.investigations = [task.model_dump(mode="json") for task in tasks]
+            report.executions = [item.model_dump(mode="json") for item in work]
+            report.criterion_evidence = [item.model_dump(mode="json")
+                                         for item in plan.criterion_results]
+            required_open = {(task_id, q.question_id) for task_id, q in required_questions(tasks)}
+            report.unresolved_questions = [
+                {"task_id": str(task.task_id), **q.model_dump(mode="json"),
+                 "resolved": q.required_for_goal and
+                 (str(task.task_id), q.question_id) not in required_open}
+                for task in tasks if task.result for q in task.result.questions
+            ]
+            report.cleanup_obligations = [item.model_dump(mode="json") for item in cleanup.items]
+            from redteam.orchestration.resource_cleanup import unmapped_resource_effects
+            report.cleanup_unmapped_tools = await unmapped_resource_effects(evidence_store, work)
+            report.model_requests_used = request_accounting["spent"]
+            report.model_tokens_used = request_accounting["known_tokens"]
+            report.model_usage_unknown = request_accounting["unknown_usage"]
+            report.ready_for_release = report.ready_for_release and (
+                not required_open and not any(unsafe(item) for item in work)
+                and bool(plan.success_criteria)
+                and {row.criterion for row in plan.criterion_results} == set(plan.success_criteria)
+            )
+            from redteam.orchestration.result_claims import mission_result_purpose
+            report.ready_for_release = report.ready_for_release and all(
+                row.goal_revision == plan.revision - 1
+                and row.purpose_hash == mission_result_purpose(plan)
+                for row in plan.criterion_results
+            )
+            if report.ready_for_release:
+                # Current originals may disappear/change after settlement.
+                # Read-only reports never inherit an old success flag blindly.
+                reader = SimpleNamespace(
+                    central_state=central_state,
+                    evidence_store=evidence_store, investigations=central_state, path_store=None,
+                )
+                try:
+                    proof_errors = (await goal_inputs(reader, runtime, graph_service=graph))[3]
+                except (ValueError, RuntimeError) as exc:
+                    proof_errors = [type(exc).__name__]
+                report.integrity_blockers.extend(proof_errors)
+                report.ready_for_release = not proof_errors
         report.run_outcome = _project_run_outcome(
             ready_for_release=report.ready_for_release,
             phase=report.phase,
@@ -658,7 +733,7 @@ class ReportingAgent:
 
 
 async def _resolve_mission(
-    task_store: MissionTaskStore, runtime: RuntimeState
+    task_store: InvestigationReader, runtime: RuntimeState
 ) -> MissionPlan | None:
     """Resolve the Mission for a Run without ever guessing between several.
 

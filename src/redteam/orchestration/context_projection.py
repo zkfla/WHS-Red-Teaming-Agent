@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from redteam.attack_graph.observation import GraphObservation, build_observation
 from redteam.attack_graph.service import AttackGraphService
+from redteam.attack_graph.view import AttackGraphView
 from redteam.core.contracts.evidence import EvidenceRecord
 from redteam.core.enums import GraphNodeType
 from redteam.core.ids import GraphNodeId
@@ -201,11 +202,12 @@ class ContextProjector:
 
     def __init__(
         self,
-        graph: AttackGraphService,
+        graph: AttackGraphService | AttackGraphView,
         cache: ContextProjectionCache | None = None,
     ) -> None:
         self._graph = graph
-        self._cache = cache
+        view = graph.view() if isinstance(graph, AttackGraphService) else graph
+        self._cache = cache if view.cacheable else None
 
     async def project(
         self,

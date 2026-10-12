@@ -78,8 +78,7 @@ async def resolve_target(policy: ServerPolicy, target_ref: str) -> ResolvedTarge
 
 
 def validate_path(profile: TargetProfile, path: str) -> None:
-    # An exact path list avoids URL joining ambiguities and accidental traversal of financial flows.
-    if path not in profile.allowed_paths:
+    if not profile.allows_path(path):
         raise ToolInputError("path outside configured allowlist")
 
 

@@ -31,7 +31,6 @@ from redteam.core.enums import (
 )
 from redteam.core.ports.control_plane import InvocationAdmissionControl
 from redteam.core.ports.tool_gateway import ToolStartAdmissionGateway, ToolStartRejected
-from redteam.core.tool_resources import ResourceBindingError
 from redteam.orchestration.action_naming import (
     canonical_action_key,
     tool_matches_action_namespace,
@@ -42,7 +41,6 @@ from redteam.orchestration.engine import claim_action_admission, validate_curren
 from redteam.orchestration.execution_journal import append_execution_receipt
 from redteam.orchestration.long_jobs import LongJobManager, LongJobState
 from redteam.orchestration.nodes._support import advance, publisher_for
-from redteam.orchestration.resource_conflicts import resource_conflict_keys
 from redteam.orchestration.runtime_observation import (
     RuntimeObservation,
     append_runtime_observation,
@@ -90,11 +88,14 @@ def _native_lineage(step, runtime, work_id=None) -> dict:
 
 
 async def _invocation_context(deps, runtime, proposal, work_id, tool_id=None):
-    items = await deps.work_store.list_items(run_id=runtime.run_id)
+    items = ([])
     others = sum(
         item.work_id != work_id and item.status in {WorkStatus.LEASED, WorkStatus.RUNNING}
         for item in items
     )
+    from redteam.orchestration.central_state import execution_occupies_capacity
+    others = sum(item.action_id != proposal.action_id and execution_occupies_capacity(item)
+                 for item in await deps.central_state.list_executions())
     return ControlContext(
         engagement_id=proposal.engagement_id,
         agent_id=proposal.agent_id,
@@ -126,6 +127,7 @@ async def _renew_lease_until_stopped(
         except asyncio.TimeoutError:
             pass
         try:
+            assert deps.work_store is not None
             renewed = await deps.work_store.heartbeat(
                 work_id,
                 owner=owner,
@@ -163,34 +165,22 @@ async def _invoke_with_semaphore(
         if problems:
             raise ToolStartRejected("action changed before invocation")
         await claim_action_admission(deps, runtime, step, proposal)
-        if isinstance(deps.control_plane, InvocationAdmissionControl):
+        from redteam.orchestration.central_runtime import start_execution
+
+        # Re-read and enter under the SAME lock as proposal admission.
+        # Otherwise two workers can both observe the last free slot.
+        async with deps.policy_lock:
             context = await _invocation_context(
-                deps, runtime, proposal, work_id, invocation.tool_id
+                deps, runtime, proposal, work_id, invocation.tool_id,
             )
-            async with deps.policy_lock:
+            if isinstance(deps.control_plane, InvocationAdmissionControl):
                 admitted = await deps.control_plane.admit_invocation(
-                    proposal, decision, context, receipt_id=str(invocation.invocation_id)
+                    proposal, decision, context, receipt_id=str(invocation.invocation_id),
                 )
-            if admitted.verdict is not PolicyVerdict.ALLOW:
-                raise InvocationAdmissionDenied(admitted)
-        work = await deps.work_store.get(work_id) if work_id is not None else None
-        tool = deps.tool_catalog.get(invocation.tool_id) if deps.tool_catalog else None
-        if tool is not None:
-            try:
-                declared = resource_conflict_keys(tool, invocation.arguments)
-            except ResourceBindingError:
-                raise ToolStartRejected("resource declaration invalid before invocation") from None
-            if declared and work is None:
-                raise ToolStartRejected("resource work unavailable before invocation")
-            if work is not None and work.resource_keys != declared:
-                raise ToolStartRejected("resource declaration changed before invocation")
-        elif work is not None and work.resource_keys:
-            raise ToolStartRejected("resource descriptor unavailable before invocation")
-        if work is not None and work.resource_keys:
-            if not await deps.work_store.mark_execution_started(
-                work.work_id, owner=runtime.work_owner, now=datetime.now(timezone.utc)
-            ):
-                raise ToolStartRejected("resource lease lost before invocation")
+                if admitted.verdict is not PolicyVerdict.ALLOW:
+                    raise InvocationAdmissionDenied(admitted)
+            await start_execution(deps, runtime, invocation, step)
+        return
 
     async def invoke():
         if deps.long_job_adapter is None:
@@ -198,18 +188,18 @@ async def _invoke_with_semaphore(
                 return await deps.tool_gateway.invoke_with_admission(invocation, before_start)
             await before_start()
             return await deps.tool_gateway.invoke(invocation)
-        if work_id is None:
-            raise ValueError("long jobs require a durable execution record")
         manager = LongJobManager(deps.long_job_adapter)
-        work = await deps.work_store.get(work_id)
-        job_id = work.job_id if work else None
+        work = (await deps.central_state.get_execution(str(invocation.invocation_id)))
+        job_id = (work.job_ref) if work else None
         if job_id is None:
             await before_start()
             job_id = await manager.submit(invocation)
-            if not await deps.work_store.bind_job(
-                work_id, owner=runtime.work_owner, job_id=job_id
-            ):
-                raise RuntimeError("submitted job could not be recorded; reconcile before retry")
+            current = await deps.central_state.get_execution(str(invocation.invocation_id))
+            await deps.central_state.transaction(lambda tx: tx.update_execution(
+                current.model_copy(update={"job_ref": job_id, "wait_reason": "job"}),
+                owner=runtime.work_owner, ownership_version=runtime.task_ownership_version,
+                now=datetime.now(timezone.utc).timestamp(),
+            ))
         try:
             deadline = asyncio.get_running_loop().time() + invocation.timeout_seconds
             while True:
@@ -230,13 +220,26 @@ async def _invoke_with_semaphore(
                     return result
                 if status.state is LongJobState.UNKNOWN:
                     raise RuntimeError("long job execution state is unknown; do not resubmit")
+                # Return the actor slot; the original job/resource/intent remains.
+                now = datetime.now(timezone.utc)
+                return ToolResult(
+                    invocation_id=invocation.invocation_id, action_id=invocation.action_id,
+                    tool_id=invocation.tool_id, success=False, started_at=now, finished_at=now,
+                    metadata={EXECUTION_STARTED_METADATA_KEY: True,
+                              "execution_uncertain": True, "job_id": job_id},
+                    error=ToolError(
+                        code="job_pending", message="Original job is still active.",
+                    ),
+                )
                 if asyncio.get_running_loop().time() >= deadline:
                     raise TimeoutError("registered job is still running; collect its result later")
                 await asyncio.sleep(0.5)
         except asyncio.CancelledError:
             # Keep the registered identity even if cancellation is unconfirmed.
             with suppress(Exception):
-                await asyncio.shield(manager.cancel(job_id))
+                await asyncio.wait_for(
+                    manager.cancel(job_id), timeout=deps.settings.drain_timeout_seconds,
+                )
             raise
 
     semaphore = deps.tool_semaphore
@@ -263,6 +266,13 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         timeout_seconds=deps.settings.tool_timeout_seconds,
         correlation_id=correlation_id,
     )
+    prepared = state.get("prepared_invocation")
+    if (prepared is None or prepared.action_id != invocation.action_id
+            or prepared.tool_id != invocation.tool_id
+            or prepared.arguments != invocation.arguments
+            or prepared.execution_context != invocation.execution_context):
+        raise ValueError("central_prepared_invocation_changed")
+    invocation = prepared
 
     started = None
 
@@ -300,6 +310,8 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     # descriptor *and* an explicitly read-only operation; LOW alone cannot
     # establish idempotency (for example, a login attempt mutates state).
     retry_enabled = bool(
+        deps.central_state is None
+        and
         deps.settings.retry_retryable_tool_failures
         and deps.settings.max_retries > 0
         and descriptor is not None
@@ -329,6 +341,7 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             )
     if work_id is not None:
         try:
+            assert deps.work_store is not None
             lease_ready = (
                 await deps.work_store.heartbeat(
                     work_id,
@@ -361,18 +374,6 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         # never reuse that identity to overwrite its preserved original.
         if reference is not None:
             retry_enabled = False
-        await append_execution_receipt(
-            deps.evidence_store, invocation=invocation, proposal=proposal, step=step,
-            work_id=work_id, reference=reference,
-            accounting_before={
-                "actions_executed": runtime.actions_executed,
-                "retry_tool_calls": runtime.retry_tool_calls,
-                "remaining_budget": runtime.remaining_budget,
-                "actions_by_agent": runtime.actions_by_agent,
-            },
-            target_node_id=(str(node_id_for_target(proposal.target))
-                            if proposal.target is not None else None),
-        )
         started = await publisher.publish(
             EventType.TOOL_EXECUTION_STARTED,
             {
@@ -584,14 +585,8 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     if runtime.remaining_budget is None:
         remaining_budget = None
     else:
-        total_budget = runtime.actions_executed + runtime.remaining_budget
+        runtime.actions_executed + runtime.remaining_budget
         remaining_budget = max(runtime.remaining_budget - consumed, 0)
-        if deps.settings.enforce_verification_reserve:
-            reserve = deps.settings.verification_reserve(total_budget)
-            if remaining_budget <= reserve:
-                # Leave the reserved slice for verification; the loop stops
-                # with that headroom untouched.
-                remaining_budget = 0
     actions_by_agent = dict(runtime.actions_by_agent)
     agent_key = str(proposal.agent_id)
     actions_by_agent[agent_key] = actions_by_agent.get(agent_key, 0) + executed

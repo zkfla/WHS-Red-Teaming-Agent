@@ -6,22 +6,16 @@ tests, not a live LLM or financial-target evaluation.
 
 import json
 import sqlite3
-from dataclasses import replace
 
 import pytest
 
-from redteam.app.bootstrap import run_engagement
 from redteam.app.cli import _build_parser
 from redteam.app.cli.commands import status as command
-from redteam.core.convert import digest_payload
-from redteam.core.ids import EvidenceId, RunId
+from redteam.core.ids import RunId
 from redteam.evidence.stores.filesystem import FilesystemEvidenceStore
 from redteam.orchestration.execution_diagnostics import inspect_execution_diagnostics
-from redteam.orchestration.execution_reconciliation import reconcile_execution_receipts
 from redteam.orchestration.task_activation import read_activation_diagnostics
 from redteam.orchestration.work.sqlite import SQLiteWorkStore
-from tests.integration.test_execution_receipt_reconciliation import _world
-from tests.integration.test_native_specialist_closed_loop import ClosedLoopProvider, assembled
 from tests.unit.test_activation_identity import reservation
 from tests.unit.test_orchestration_coordination import RUN
 from tests.unit.test_orchestration_work import item
@@ -37,98 +31,12 @@ def files(root):
             for path in root.rglob("*") if path.is_file()}
 
 
-async def audit(tmp_path, runtime, works, evidence_dir):
-    path = tmp_path / "work.sqlite"
-    store = SQLiteWorkStore(path)
-    for work in works:
-        assert await store.add(work)
-    before_db, before_files = snapshot(path), files(evidence_dir)
-    observed = await inspect_execution_diagnostics(
-        runtime.run_id, work_items=await SQLiteWorkStore.inspect_run(path, runtime.run_id),
-        evidence_store=await FilesystemEvidenceStore.inspect_run(evidence_dir, runtime.run_id),
-    )
-    assert snapshot(path) == before_db and files(evidence_dir) == before_files
-    assert observed.replay_permitted is False and observed.cross_store_atomic is False
-    return observed
 
 
-@pytest.mark.parametrize("case,expected", [
-    ("publication_loss", "unprocessed"), ("non_entry", "no_entry"),
-    ("late_original", "uncertain"), ("settled", "processed"),
-    ("late_resolved", "processed"),
-])
-async def test_native_originals_are_classified_without_new_calls(tmp_path, case, expected):
-    deps, gateway, store, runtime, work = await _world(
-        tmp_path, late=case in {"late_original", "late_resolved"}, before=case == "non_entry",
-    )
-    if case in {"settled", "late_resolved"}:
-        restored = await reconcile_execution_receipts(deps, runtime)
-        assert restored.ready
-        work = await deps.work_store.get(work.work_id)
-    calls = len(gateway.invocations)
-    queries, fetches = getattr(gateway, "queries", 0), getattr(gateway, "fetches", 0)
-    observed = await audit(tmp_path, runtime, [work], tmp_path / "evidence")
-    assert len(observed.executions) == 1
-    row = observed.executions[0]
-    assert row.state == expected and row.work_id == work.work_id
-    if expected == "unprocessed":
-        assert row.work_result_matches is False  # publication failure did not settle Work
-    if expected == "processed":
-        assert row.work_result_matches is True
-    if expected == "uncertain":
-        assert row.result_success is None and row.work_result_matches is None
-    assert len(gateway.invocations) == calls
-    assert getattr(gateway, "queries", 0) == queries and getattr(gateway, "fetches", 0) == fetches
 
 
-async def test_submission_without_original_is_not_an_execution_failure_or_non_entry(tmp_path):
-    _, _, store, runtime, work = await _world(tmp_path)
-    missing = FilesystemEvidenceStore(tmp_path / "missing")
-    for record in await store.list_for_run(runtime.run_id):
-        if record.metadata.get("receipt_kind") == "execution_submission":
-            await missing.append(record)
-    observed = await audit(tmp_path, runtime, [work], tmp_path / "missing")
-    assert observed.executions[0].state == "missing_original"
-    assert observed.executions[0].result_success is None
 
 
-@pytest.mark.parametrize("tamper,reason", [
-    ("digest", "execution_receipt_digest_mismatch"),
-    ("conflicting_result", "conflicting_execution_results"),
-    ("missing_submission", "execution_submission_missing"),
-    ("work_instance", "execution_recovery_work_mismatch"),
-    ("work_task", "execution_recovery_work_mismatch"),
-    ("processing", "execution_processing_receipt_invalid"),
-])
-async def test_invalid_original_or_work_correlation_is_not_hidden(tmp_path, tamper, reason):
-    deps, _, store, runtime, work = await _world(tmp_path)
-    if tamper == "processing":
-        assert (await reconcile_execution_receipts(deps, runtime)).ready
-        work = await deps.work_store.get(work.work_id)
-    target = FilesystemEvidenceStore(tmp_path / "changed")
-    for record in await store.list_for_run(runtime.run_id):
-        kind = record.metadata.get("receipt_kind")
-        if tamper == "missing_submission" and kind == "execution_submission":
-            continue
-        if tamper == "digest" and kind == "execution_result":
-            record = record.model_copy(deep=True)
-            record.metadata["original_result"]["output"] = {"password": "synthetic-secret"}
-        if tamper == "processing" and kind == "execution_processed":
-            record = record.model_copy(update={"digest": "not-the-original-digest"})
-        await target.append(record)
-        if tamper == "conflicting_result" and kind == "execution_result":
-            conflict = record.model_copy(deep=True, update={"evidence_id": EvidenceId("conflict")})
-            conflict.metadata["original_result"]["output"] = {"foreign": "synthetic body"}
-            conflict.digest = digest_payload(conflict.metadata)
-            await target.append(conflict)
-    if tamper == "work_instance":
-        work = work.model_copy(update={"instance_id": "foreign-instance"})
-    if tamper == "work_task":
-        work = work.model_copy(update={"mission_task_id": "foreign-task"})
-    observed = await audit(tmp_path, runtime, [work], tmp_path / "changed")
-    assert observed.executions[0].state == "invalid"
-    assert observed.executions[0].reason_code == reason
-    assert "synthetic-secret" not in observed.model_dump_json()
 
 
 async def test_orphan_work_and_missing_stores_are_explicit_unknown(tmp_path):
@@ -163,47 +71,10 @@ async def test_orphan_work_in_known_empty_inventory_still_does_not_prove_non_ent
     assert observed.executions[0].reason_code == "work_without_execution_receipts"
 
 
-async def test_missing_work_store_does_not_certify_known_original(tmp_path):
-    _, _, store, runtime, _ = await _world(tmp_path)
-    observed = await inspect_execution_diagnostics(
-        runtime.run_id, work_items=None,
-        evidence_store=await FilesystemEvidenceStore.inspect_run(
-            tmp_path / "evidence", runtime.run_id,
-        ),
-    )
-    assert observed.work_store == "unknown"
-    assert observed.executions[0].state == "unknown"
-    assert await store.list_for_run(runtime.run_id)  # originals retained
 
 
-async def test_evidence_snapshot_is_detached_and_refuses_append(tmp_path):
-    _, _, _, runtime, _ = await _world(tmp_path)
-    view = await FilesystemEvidenceStore.inspect_run(tmp_path / "evidence", runtime.run_id)
-    original = (await view.list_for_run(runtime.run_id))[0]
-    clone = await view.get(original.evidence_id)
-    clone.metadata.clear()
-    assert (await view.get(original.evidence_id)).metadata == original.metadata
-    with pytest.raises(RuntimeError, match="read_only"):
-        await view.append(original)
 
 
-@pytest.mark.parametrize("tamper", ["index", "unindexed", "duplicate_index", "truncated"])
-async def test_evidence_inventory_integrity_failure_is_not_empty(tmp_path, tamper):
-    _, _, _, runtime, _ = await _world(tmp_path)
-    root = tmp_path / "evidence"
-    path, index = root / f"{runtime.run_id}.jsonl", root / "_index.jsonl"
-    if tamper == "index":
-        index.write_text("", encoding="utf-8")
-    elif tamper == "unindexed":
-        index.unlink()
-    elif tamper == "duplicate_index":
-        index.write_text(index.read_text() * 2, encoding="utf-8")
-    else:
-        path.write_text(path.read_text()[:-17], encoding="utf-8")
-    before = files(root)
-    with pytest.raises(ValueError):
-        await FilesystemEvidenceStore.inspect_run(root, runtime.run_id)
-    assert files(root) == before
 
 
 @pytest.mark.parametrize("column,value", [
@@ -257,7 +128,9 @@ async def test_cli_explicit_cross_store_read_keeps_canonical_state(tmp_path, mon
         "instance_id": originals[0].instance_id,
     }))
     before = snapshot(path), snapshot(work_path)
-    monkeypatch.setattr(command, "load_terminal_report", lambda *_: pytest.fail("not report mode"))
+    monkeypatch.setattr(
+        "redteam.app.report_store.load_terminal_report", lambda *_: pytest.fail("not report mode"),
+    )
     args = _build_parser().parse_args([
         "status", RUN, "--activation-db", str(path), "--work-db", str(work_path),
         "--evidence-dir", str(tmp_path / "absent"), "--json",
@@ -320,30 +193,3 @@ async def test_cli_storage_error_is_not_absence_and_never_prints_raw_content(tmp
 async def test_partial_explicit_cli_paths_are_config_errors(flags, capsys):
     assert await command.run(_build_parser().parse_args(["status", RUN, *flags])) == 2
     assert not capsys.readouterr().out
-
-
-async def test_public_specialist_run_and_cli_match_actual_work_task_and_originals(
-    tmp_path, monkeypatch, capsys,
-):
-    monkeypatch.chdir(tmp_path)
-    provider = ClosedLoopProvider()
-    engagement, deps, gateway = await assembled(tmp_path, provider, durable=True)
-    deps = replace(deps, evidence_store=FilesystemEvidenceStore(tmp_path / "evidence"))
-    final = await run_engagement(engagement, deps)
-    assert len(gateway.invocations) == 2
-    calls = len(provider.requests)
-    state_path, work_path = tmp_path / "task-graph.sqlite3", tmp_path / "work.sqlite3"
-    before = snapshot(state_path), snapshot(work_path), files(tmp_path / "evidence")
-    args = _build_parser().parse_args([
-        "status", str(final.run_id), "--activation-db", str(state_path),
-        "--work-db", str(work_path), "--evidence-dir", str(tmp_path / "evidence"), "--json",
-    ])
-    assert await command.run(args) == 0
-    observed = json.loads(capsys.readouterr().out)
-    rows = observed["execution"]["executions"]
-    assert len(rows) == 2
-    assert all(row["state"] == "processed" and row["activation_matches"]
-               and row["work_result_matches"] for row in rows)
-    assert observed["execution"]["replay_permitted"] is False
-    assert len(provider.requests) == calls and len(gateway.invocations) == 2
-    assert before == (snapshot(state_path), snapshot(work_path), files(tmp_path / "evidence"))

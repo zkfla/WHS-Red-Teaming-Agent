@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -21,8 +21,10 @@ from redteam.core.ids import (
     ActionId,
     AgentInstanceId,
     EngagementId,
+    EvidenceId,
     InvocationId,
     RunId,
+    TaskId,
     ToolId,
 )
 
@@ -67,3 +69,62 @@ class ExecutionRecoveryAnswer(BaseModel):
     uncertain: bool = True
     result_available: bool = False
     error: ToolError | None = None
+
+
+class TaskExecution(BaseModel):
+    """Central execution bookkeeping; original bodies remain immutable evidence.
+
+    ``input_digest`` identifies the exact proposal, never a semantic duplicate.
+    A terminal state alone cannot release ``resource_execution_pending``.
+    This record supplies no execution permission or automatic retry policy.
+    """
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    engagement_id: EngagementId
+    run_id: RunId
+    task_id: TaskId
+    instance_id: AgentInstanceId
+    ownership_version: int = Field(ge=1)
+    # None is retained historical uncertainty, never admission for a new start.
+    goal_revision: int | None = Field(default=1, ge=1)
+    action_id: ActionId
+    invocation_id: InvocationId
+    model_tool_call_id: str = Field(min_length=1)
+    tool_id: ToolId
+    input_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    proposal_evidence_id: EvidenceId
+    # Canonical target identity checked against the immutable submission.
+    # Older executions without this identity conservatively occupy every target.
+    target_node_id: str | None = Field(default=None, min_length=1)
+    target_identity_verified: bool = False
+    approval_ref: str | None = None
+    approval_fingerprint: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    reservation_refs: list[str] = Field(default_factory=list)
+    state: ExecutionState = ExecutionState.PENDING
+    wait_reason: Literal["approval", "job", "resource"] | None = None
+    job_ref: str | None = None
+    result_evidence_id: EvidenceId | None = None
+    resource_keys: list[str] = Field(default_factory=list)
+    resource_execution_pending: bool = False
+    resource_lease_until: float = Field(default=0, ge=0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def _identity_and_wait(self) -> TaskExecution:
+        identities = (self.engagement_id, self.run_id, self.task_id, self.instance_id,
+                      self.action_id, self.invocation_id, self.tool_id,
+                      self.model_tool_call_id, self.proposal_evidence_id)
+        if any(not str(item).strip() for item in identities):
+            raise ValueError("execution requires original nonblank identities")
+        if any(not item.strip() for item in self.resource_keys):
+            raise ValueError("resource key must be nonblank")
+        self.resource_keys = sorted({item.strip() for item in self.resource_keys})
+        if self.wait_reason == "job" and not self.job_ref:
+            raise ValueError("job wait requires original job reference")
+        if self.wait_reason == "approval" and (
+            not self.approval_ref or not self.approval_fingerprint
+        ):
+            raise ValueError("approval wait requires original approval and exact fingerprint")
+        if self.resource_execution_pending and not self.resource_keys:
+            raise ValueError("pending resource execution requires resource keys")
+        return self

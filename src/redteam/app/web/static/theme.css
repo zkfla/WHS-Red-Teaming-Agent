@@ -1,0 +1,36 @@
+:root {
+  --dg: #283618;
+  --ol: #606C38;
+  --bg: #F4F5EB;
+  --tn: #DDA15E;
+  --or: #BC6C25;
+  --text-2: rgba(40, 54, 24, .74);
+  --line: rgba(40, 54, 24, .16);
+  --line-2: rgba(40, 54, 24, .30);
+  --ol-soft: rgba(96, 108, 56, .10);
+  --ol-mid: rgba(96, 108, 56, .18);
+  --tn-soft: rgba(221, 161, 94, .22);
+  --or-soft: rgba(188, 108, 37, .14);
+  --on-dark: rgba(244, 245, 235, .76);
+  --on-dark-soft: rgba(244, 245, 235, .12);
+  --font: system-ui, -apple-system, "Segoe UI", "Noto Sans KR", "Apple SD Gothic Neo", sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--dg);
+  font: 14px/1.6 var(--font);
+}
+
+button, input, select, textarea { font: inherit; color: inherit; }
+button { cursor: pointer; }
+[hidden] { display: none !important; }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+.mono { font-family: var(--mono); }
+.label { margin: 0; font-size: 12px; font-weight: 700; color: var(--text-2); }
+.note { margin: 0; font-size: 12px; color: var(--text-2); }

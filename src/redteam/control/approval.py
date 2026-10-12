@@ -100,7 +100,9 @@ class ApprovalService:
     async def list_pending(self) -> list[Approval]:
         return await self._store.list_pending()
 
-    async def sweep_expired(self, ttl_seconds: float) -> list[Approval]:
+    async def sweep_expired(
+        self, ttl_seconds: float, *, approval_ids: set[str] | None = None,
+    ) -> list[Approval]:
         """Mark PENDING approvals older than ``ttl_seconds`` as EXPIRED.
 
         Run ``redteam approvals expire --ttl-seconds N`` periodically
@@ -112,6 +114,8 @@ class ApprovalService:
         now = datetime.now(timezone.utc)
         expired: list[Approval] = []
         for approval in await self._store.list_pending():
+            if approval_ids is not None and str(approval.approval_id) not in approval_ids:
+                continue
             age = (now - approval.requested_at).total_seconds()
             if age >= ttl_seconds:
                 updated = approval.model_copy(

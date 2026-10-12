@@ -11,11 +11,16 @@ src/redteam/event_bus/       EventEnvelope transport + publisher
 
 | Page | What it covers |
 |---|---|
-| [orchestration.md](orchestration.md) | the loop, agents/playbooks, planners, verification, checkpointing |
+| [orchestration.md](orchestration.md) | the current central planner, investigations, parallel workers and exact resume |
 | [orchestration-implementation-plan.md](orchestration-implementation-plan.md) | benchmark-backed target design, phases, team contracts and completion criteria |
 | [2026-10-04 modularization plan and work records](modularization-20261004/README.md) | provider assembly implementation, audits, independent reviews and final CI results |
-| [attack-graph.md](attack-graph.md) | node identity, predicates, preconditions, integrity, snapshots |
+| [attack-graph.md](attack-graph.md) | retained graph writes/reads, provenance, integrity and internal storage |
 | [event-bus.md](event-bus.md) | envelope construction, correlation, what each node emits |
+
+The current runtime reference is `orchestration.md`, `attack-graph.md` and
+[`central-state.md`](../contracts/central-state.md). Dated plans, work logs and
+acceptance reports are historical records; their old queues, graph renderers or
+completion rules are not descriptions of the current default runtime.
 
 These pages document Agent Team's *implementation*. The shared contracts
 they build on are PM's and live in `docs/contracts/` and
@@ -23,11 +28,8 @@ they build on are PM's and live in `docs/contracts/` and
 
 ## What holds the boundary
 
-- `redteam.core` is read-only for this team. `core/contracts`,
-  `core/ports`, `core/ids.py`, `core/enums.py` are Contract v0.1 — a
-  change goes through the Issue -> Proposal -> PM Review flow in
-  `docs/contracts/versioning.md`. No frozen Core contract is modified by the
-  orchestration implementation.
+- `core/contracts` and `core/ports` own shared meanings. Central storage implements
+  these contracts; orchestration does not replace Control permission with planning.
 - Orchestration reaches Control and tool execution through `core.ports`
   Protocols. Catalog reads use an Agent-Team-owned structural subset that the
   Capability registry already satisfies; the compatibility boundary is
@@ -51,7 +53,7 @@ pytest tests/unit tests/integration -q
 | Tool retries | retryable/idempotency and budget semantics belong in the Capability gateway contract; orchestration does not duplicate an approved side effect |
 | Mobile asset scope | **Resolved.** `EngagementScope.allowed_assets`/`denied_assets` (exact `asset_id` match, `redteam.control.scope._check_asset_scope`) lets Mobile actions ALLOW explicitly; still fail-closed DENY outside scope. |
 | Shared graph tenancy | **Resolved.** `attack_graph.stores.namespaced.EngagementScopedAttackGraphStore` — a decorator over the existing `AttackGraphStore` Core Port, namespacing ids at the store boundary; `app.bootstrap` wires it in by default. |
-| Graph-DB backend | `InMemoryAttackGraphStore` only (deferred, instruction.md §21) |
-| Cleanup execution | the graph tracks what is owed; actually removing a resource is an Orchestration action |
+| Graph storage | Central SQLite by default, with graph mutation receipts in the same transaction as execution/result changes. |
+| Cleanup execution | Provider resource-effect metadata connects actual creation/removal originals to cleanup obligations; undeclared effects are reported as unmapped. |
 | Retraction rules | three conservative defaults in `attack_graph/retraction.py`; tune per engagement |
-| Built-in agent playbook depth | Recon/Web/Mobile playbooks are real but thin (3 of 12 canonical operations wired, no built-in step can reach `Verdict.VIOLATION`/produce a `Finding`, no result-driven branching) — see `docs/agent/orchestration-implementation-plan.md` section 16.1 for the full, itemized gap list. |
+| New graph/context API | A relation graph spanning Tasks/results/questions and a unified context API are follow-up scope. |

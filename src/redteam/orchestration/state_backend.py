@@ -22,7 +22,7 @@ import os
 import sqlite3
 import stat
 from collections.abc import AsyncIterator, Callable, Coroutine, Hashable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -33,11 +33,69 @@ from redteam.orchestration.coordination import (
 )
 from redteam.orchestration.paths.memory import InMemoryPathStore
 from redteam.orchestration.task_graph.memory import InMemoryTaskGraphStore
-from redteam.sqlite_support import run_sqlite
+from redteam.sqlite_support import StorageRetiredError, read_storage_retirement, run_sqlite
 
 T = TypeVar("T")
 
 SCHEMA_VERSION = 1
+
+
+@contextmanager
+def run_storage_ownership(
+    path: str | Path, run_id: str, *, create: bool = True, migrated_target: Path | None = None,
+):
+    """Share the original ownership inode across storage paths, including migration.
+
+    Read-only inspections use ``create=False`` and never create source files.
+    A missing inode then supplies no proof of inactivity; the caller must also
+    require an explicitly stopped, offline source cohort.
+    """
+    if not run_id.strip() or os.name != "posix" or not hasattr(os, "O_NOFOLLOW"):
+        raise CoordinationError("run_execution_backend_unsupported")
+    try:
+        fcntl = importlib.import_module("fcntl")
+    except ImportError as exc:
+        raise CoordinationError("run_execution_backend_unsupported") from exc
+    database = Path(path).resolve()
+    def check_destination():
+        retirement = read_storage_retirement(database)
+        if retirement is not None and (
+            migrated_target is None or retirement["target"] != str(migrated_target.resolve())
+        ):
+            raise StorageRetiredError("storage_retired_by_explicit_migration")
+    if create:
+        check_destination()
+    key = hashlib.sha256(run_id.encode()).hexdigest()
+    lock_path = database.with_name(f".{database.name}.run-{key}.lock")
+    flags = os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+    try:
+        fd = os.open(lock_path, flags | (os.O_CREAT if create else 0), 0o600)
+    except FileNotFoundError:
+        if create:
+            raise CoordinationError("run_execution_storage_unavailable") from None
+        yield
+        return
+    except OSError as exc:
+        raise CoordinationError("run_execution_storage_unavailable") from exc
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                or info.st_uid != os.getuid() or info.st_mode & 0o077):
+            raise CoordinationError("run_execution_storage_unsafe")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise CoordinationError("run_execution_already_owned") from exc
+        except OSError as exc:
+            raise CoordinationError("run_execution_storage_unavailable") from exc
+        try:
+            if create:
+                check_destination()
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 def _load_records(db: sqlite3.Connection) -> dict[tuple[str, str], Any]:
@@ -48,6 +106,7 @@ def _load_records(db: sqlite3.Connection) -> dict[tuple[str, str], Any]:
 
 async def inspect_sqlite_state(
     path: str | Path, callback: Callable[[ChangeSet], Coroutine[Any, Any, T]],
+    *, include_paths: bool = True,
 ) -> T | None:
     """Read an existing composite snapshot before runtime/transport assembly.
 
@@ -80,7 +139,7 @@ async def inspect_sqlite_state(
                 raise CoordinationError("unsupported_orchestration_schema_version")
             snapshot = ChangeSet(
                 SQLiteTaskGraphStore._load_memory(db),
-                SQLitePathStore._load_memory(db) if "path_snapshots" in tables
+                SQLitePathStore._load_memory(db) if include_paths and "path_snapshots" in tables
                 else InMemoryPathStore(), _load_records(db),
             )
             return asyncio.run(callback(snapshot))
@@ -211,37 +270,8 @@ class SqliteStateBackend:
         scope, never stored claims, request accounting or unknown executions.
         Acquisition has no await/thread cancellation window.
         """
-        if os.name != "posix" or not hasattr(os, "O_NOFOLLOW"):
-            raise CoordinationError("run_execution_backend_unsupported")
-        try:
-            fcntl = importlib.import_module("fcntl")
-        except ImportError as exc:
-            raise CoordinationError("run_execution_backend_unsupported") from exc
-        database = self._tasks._path.resolve()
-        key = hashlib.sha256(run_id.encode()).hexdigest()
-        lock_path = database.with_name(f".{database.name}.run-{key}.lock")
-        try:
-            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW
-                         | os.O_CLOEXEC | os.O_NONBLOCK, 0o600)
-        except OSError as exc:
-            raise CoordinationError("run_execution_storage_unavailable") from exc
-        try:
-            info = os.fstat(fd)
-            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
-                    or info.st_uid != os.getuid() or info.st_mode & 0o077):
-                raise CoordinationError("run_execution_storage_unsafe")
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as exc:
-                raise CoordinationError("run_execution_already_owned") from exc
-            except OSError as exc:
-                raise CoordinationError("run_execution_storage_unavailable") from exc
-            try:
-                yield
-            finally:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
+        with run_storage_ownership(self._tasks._path, run_id):
+            yield
 
     def _transaction(self, callback: Callable[[ChangeSet], Coroutine[Any, Any, T]]) -> T:
         from redteam.orchestration.task_graph.sqlite import SQLiteTaskGraphStore

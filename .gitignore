@@ -15,6 +15,7 @@ build/
 /engagement.yaml
 /vulnbank-web-policy.json
 /mcp-recon-policy.json
+*.mcp/
 tests/vuln-bank/
 tests/vulnbank/
 /plan.md

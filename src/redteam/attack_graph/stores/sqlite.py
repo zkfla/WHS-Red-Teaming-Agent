@@ -70,6 +70,7 @@ from redteam.attack_graph.stores.mutations import (
 )
 from redteam.core.contracts.graph import GraphEdge, GraphNode
 from redteam.core.ids import GraphEdgeId, GraphNodeId
+from redteam.sqlite_support import check_storage_writable
 
 
 class AttackGraphSchemaError(SnapshotError):
@@ -136,6 +137,7 @@ class SQLiteAttackGraphStore:
         async with self._lock:
             if self._ready:
                 return
+            check_storage_writable(self._path)
             self._path.parent.mkdir(parents=True, exist_ok=True)
             with closing(sqlite3.connect(self._path)) as db:
                 self._ensure_schema(db)
@@ -239,6 +241,7 @@ class SQLiteAttackGraphStore:
         await self.setup()
         async with self._lock:
             try:
+                check_storage_writable(self._path)
                 with closing(sqlite3.connect(self._path)) as db:
                     db.execute("BEGIN IMMEDIATE")
                     previous = self._read_receipt(
@@ -291,6 +294,7 @@ class SQLiteAttackGraphStore:
         return statements, removed
 
     def _write(self, statements: list[tuple[str, tuple[Any, ...]]]) -> None:
+        check_storage_writable(self._path)
         with closing(sqlite3.connect(self._path)) as db:
             db.execute("BEGIN IMMEDIATE")
             try:

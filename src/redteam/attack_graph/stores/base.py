@@ -7,6 +7,7 @@ Contract Change Proposal in ``docs/agent/attack-graph.md``.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Protocol, cast, runtime_checkable
 
 from redteam.attack_graph.stores.mutations import ReceiptedAttackGraphStore
@@ -31,6 +32,24 @@ class MutableAttackGraphStore(Protocol):
     async def remove_node(self, node_id: GraphNodeId) -> bool: ...
 
     async def remove_edge(self, edge_id: GraphEdgeId) -> bool: ...
+
+
+class AtomicAttackGraphStore(Protocol):
+    """Apply a pure synchronous update to the latest row under one write lock.
+
+    Returning None leaves a missing row absent; it does not remove a row.
+    Callbacks must not perform external I/O and can run again on lock contention.
+    """
+
+    async def mutate_node(
+        self, node_id: GraphNodeId,
+        update: Callable[[GraphNode | None], GraphNode | None],
+    ) -> GraphNode | None: ...
+
+    async def mutate_edge(
+        self, edge_id: GraphEdgeId,
+        update: Callable[[GraphEdge | None], GraphEdge | None],
+    ) -> GraphEdge | None: ...
 
 
 class StoreCapabilityError(RuntimeError):

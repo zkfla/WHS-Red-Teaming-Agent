@@ -5,13 +5,21 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from typing import Any
+from collections.abc import Awaitable, Callable, Coroutine
+from typing import Any, Protocol
 
 from redteam.core.contracts.events import EventEnvelope
-from redteam.orchestration.coordination import ChangeSet, CoordinationError, Coordinator
+from redteam.orchestration.coordination import CoordinationError, Coordinator
 
 
-def pending_count(change: ChangeSet, run_id: str) -> int:
+class OutboxSession(Protocol):
+    records: dict[tuple[str, str], Any]
+
+
+OutboxChange = Callable[[OutboxSession], Coroutine[Any, Any, Any]]
+
+
+def pending_count(change: OutboxSession, run_id: str) -> int:
     """One durable undelivered projection, including leased/failed deliveries."""
     return sum(
         kind == "outbox" and not row["delivered"] and row["envelope"]["run_id"] == run_id
@@ -20,18 +28,32 @@ def pending_count(change: ChangeSet, run_id: str) -> int:
 
 
 async def deliver_pending(
-    coordinator: Coordinator,
+    coordinator: Coordinator | None = None,
     *,
     run_id: str,
     engagement_id: str,
     event_bus: Any,
     budget_seconds: float = 2.0,
+    change: Callable[[OutboxChange], Awaitable[Any]] | None = None,
 ) -> int:
     """Return undelivered count; publishing never holds a storage lock."""
     owner = uuid.uuid4().hex
     deadline = time.monotonic() + budget_seconds
 
-    async def claim(change: ChangeSet) -> list[EventEnvelope]:
+    if (coordinator is None) == (change is None):
+        raise ValueError("select one outbox transaction boundary")
+
+    async def change_records(callback: OutboxChange) -> Any:
+        if change is not None:
+            return await change(callback)
+        assert coordinator is not None
+
+        async def legacy(tx):
+            return await callback(tx)
+
+        return await coordinator.change(legacy)
+
+    async def claim(change: OutboxSession) -> list[EventEnvelope]:
         binding = change.records.get(("binding", run_id))
         if binding is None or binding["engagement_id"] != engagement_id:
             raise CoordinationError("outbox_binding_mismatched")
@@ -56,7 +78,7 @@ async def deliver_pending(
                 break
         return batch
 
-    async def acknowledge(change: ChangeSet, event: EventEnvelope, *, delivered: bool) -> bool:
+    async def acknowledge(change: OutboxSession, event: EventEnvelope, *, delivered: bool) -> bool:
         row = change.records.get(("outbox", str(event.event_id)))
         if row is not None and row["owner"] == owner:
             if delivered:
@@ -66,34 +88,34 @@ async def deliver_pending(
             return True
         return False
 
-    async def count(change: ChangeSet) -> int:
+    async def count(change: OutboxSession) -> int:
         return pending_count(change, run_id)
 
     if event_bus is not None:
         while time.monotonic() < deadline:
-            batch = await coordinator.change(claim)
+            batch = await change_records(claim)
             if not batch:
                 break
             for event in batch:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    return await coordinator.change(count)
+                    return await change_records(count)
 
                 # Renew ownership before each publication; another worker cannot
                 # claim this batch while its current lease is valid.
-                async def renew(change: ChangeSet, event: EventEnvelope = event) -> bool:
+                async def renew(change: OutboxSession, event: EventEnvelope = event) -> bool:
                     return await acknowledge(change, event, delivered=False)
 
-                owned = await coordinator.change(renew)
+                owned = await change_records(renew)
                 if not owned:
-                    return await coordinator.change(count)
+                    return await change_records(count)
                 try:
                     await asyncio.wait_for(event_bus.publish(event), timeout=remaining)
                 except Exception:  # noqa: BLE001  # delivery is recoverable, never roll back effect
-                    return await coordinator.change(count)
+                    return await change_records(count)
 
-                async def ack(change: ChangeSet, event: EventEnvelope = event) -> bool:
+                async def ack(change: OutboxSession, event: EventEnvelope = event) -> bool:
                     return await acknowledge(change, event, delivered=True)
 
-                await coordinator.change(ack)
-    return await coordinator.change(count)
+                await change_records(ack)
+    return await change_records(count)

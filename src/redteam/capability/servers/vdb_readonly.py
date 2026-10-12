@@ -26,6 +26,8 @@ from typing import Annotated, Literal, Protocol, cast
 from mcp.server import MCPServer
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from redteam.core.contracts.tool import PROVIDER_METADATA_RESOURCE_EFFECTS
+
 UPSTREAM_COMMIT = "2dc040a44986da0c4eac1366ba77633f09e593b6"
 BACKEND_VERSION = "7.0.1"
 CVE_PATTERN = r"^CVE-[0-9]{4}-[0-9]{4,10}$"
@@ -517,7 +519,7 @@ def create_server(policy: VDBPolicy, *, extended: bool = False) -> MCPServer:
             function.__annotations__["cve_id"] = Annotated[str, Field(pattern=CVE_PATTERN)]
         if "purl" in function.__annotations__:
             function.__annotations__["purl"] = Annotated[str, Field(min_length=1, max_length=512)]
-        server.tool()(function)
+        server.tool(meta={PROVIDER_METADATA_RESOURCE_EFFECTS: []})(function)
     if extended:
         from redteam.capability.servers.vdb_extended import register_extended_tools
 

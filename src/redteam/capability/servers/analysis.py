@@ -29,6 +29,8 @@ from pathlib import Path
 from mcp.server import MCPServer
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from redteam.core.contracts.tool import PROVIDER_METADATA_RESOURCE_EFFECTS
+
 
 class ToolInputError(ValueError):
     """Messages contain only fixed explanations, never raw APK content."""
@@ -101,7 +103,7 @@ def _resolve(policy: AnalysisServerPolicy, apk_ref: str) -> Path:
 def create_server(policy: AnalysisServerPolicy) -> MCPServer:
     server = MCPServer("analysis-apk-inventory", log_level="WARNING")
 
-    @server.tool()
+    @server.tool(meta={PROVIDER_METADATA_RESOURCE_EFFECTS: []})
     def apk_file_listing(apk_ref: str) -> ApkFileListingOutput:
         """List zip entries inside a registered APK container; no decompilation."""
         path = _resolve(policy, apk_ref)
@@ -125,7 +127,7 @@ def create_server(policy: AnalysisServerPolicy) -> MCPServer:
             may_be_truncated=len(entries) == policy.max_listing_entries,
         )
 
-    @server.tool()
+    @server.tool(meta={PROVIDER_METADATA_RESOURCE_EFFECTS: []})
     def apk_entry_digest(apk_ref: str, entry_name: str) -> ApkEntryDigestOutput:
         """SHA-256 of one zip entry's decompressed bytes; content itself is never returned."""
         path = _resolve(policy, apk_ref)
@@ -143,7 +145,7 @@ def create_server(policy: AnalysisServerPolicy) -> MCPServer:
             sha256=hashlib.sha256(data).hexdigest(),
         )
 
-    @server.tool()
+    @server.tool(meta={PROVIDER_METADATA_RESOURCE_EFFECTS: []})
     def apk_string_search(apk_ref: str, entry_name: str, pattern: str) -> ApkStringSearchOutput:
         """Fixed-string (non-regex) search within one bounded, text-decoded zip entry."""
         if not 2 <= len(pattern) <= 200:

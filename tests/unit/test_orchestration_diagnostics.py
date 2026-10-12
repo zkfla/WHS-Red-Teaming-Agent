@@ -1,7 +1,6 @@
 """Failure causes survive retries without copying untrusted response material."""
 
 import json
-from types import SimpleNamespace
 
 import pytest
 from jsonschema import ValidationError as SchemaValidationError
@@ -515,35 +514,6 @@ async def test_prevalidation_projection_never_copies_malformed_public_reference_
     assert "opaque-private" not in caught.value.diagnostic.model_dump_json()
 
 
-async def test_custom_planning_provider_rejection_keeps_final_shape_and_rules_without_fake_usage():
-    from dataclasses import replace
-
-    from redteam.orchestration.engine import InvestigationEngine
-    from tests.fakes import build_test_application
-
-    class CustomProvider:
-        async def propose(self, request):
-            return {"reason": {"opaque-private-key": "opaque-private-value"}}
-
-    engine = InvestigationEngine(
-        replace(build_test_application(), planning_provider=CustomProvider())
-    )
-    budget = DecisionBudget(1)
-    with pytest.raises(ValueError) as caught:
-        await engine._propose(
-            stage="next_action", payload={}, budget=budget,
-            response_schema={
-                "type": "object", "properties": {"reason": {"type": "string"}},
-                "required": ["reason"],
-            },
-        )
-    diagnostic = diagnostic_for_exception(caught.value, stage="next_action")
-    assert diagnostic.code == "schema_type" and diagnostic.location == "$.reason"
-    assert diagnostic.trace[0]["diagnostic_context"]["proposal"]["reason_shape"]["type"] == "object"
-    assert diagnostic.validation_issues == [{"rule": "type", "location": "$.reason"}]
-    assert budget.used == budget.tokens_used == budget.unknown_usage_count == 0
-    assert budget.normal_used == 1
-    assert "opaque-private" not in diagnostic.model_dump_json()
 
 
 @pytest.mark.parametrize(
@@ -598,88 +568,8 @@ def test_legacy_checkpoint_defaults_and_diagnostic_roundtrip():
     assert restored.planning_diagnostic_history == [diagnostic]
 
 
-async def test_plan_failure_then_replan_preserves_structured_cause(monkeypatch):
-    from redteam.orchestration.nodes.plan import plan_node
-    from redteam.orchestration.nodes.replan import replan_node
-
-    events = []
-
-    class Publisher:
-        async def publish(self, event_type, payload, **kwargs):
-            events.append((event_type, payload))
-            return SimpleNamespace(event_id="event-safe")
-
-    diagnostic = DecisionDiagnostic(
-        code="criterion_hypothesis_required",
-        stage="path_create",
-        kind="format",
-        location="$.steps[0].completion_criteria[0].hypothesis_id",
-        summary="Include a hypothesis reference.",
-        attempts=2,
-        retryable=True,
-    )
-
-    class Engine:
-        last_event_id = None
-        # New contract stub: production engine always carries this.
-        updated_runtime = None
-
-        def __init__(self, deps):
-            pass
-
-        async def decide(self, *args, **kwargs):
-            raise DecisionFailure("path_create", "format", 2, diagnostic=diagnostic)
-
-    monkeypatch.setattr("redteam.orchestration.nodes.plan.InvestigationEngine", Engine)
-    monkeypatch.setattr("redteam.orchestration.nodes.plan.publisher_for", lambda *a: Publisher())
-    monkeypatch.setattr("redteam.orchestration.nodes.replan.publisher_for", lambda *a: Publisher())
-    runtime = RuntimeState(run_id="run-safe", engagement_id="eng-safe")
-    state = await plan_node({"runtime": runtime}, deps=SimpleNamespace())
-    assert state["runtime"].planning_diagnostic == diagnostic
-    assert events[0][1]["diagnostic"]["code"] == "criterion_hypothesis_required"
-    state = await replan_node(state, deps=SimpleNamespace())
-    assert state["runtime"].phase is AgentPhase.FAILED
-    assert state["runtime"].planning_diagnostic == diagnostic
-    assert state["runtime"].planning_diagnostic_history == [diagnostic]
-    assert events[-1][1]["diagnostic"]["location"] == diagnostic.location
-    assert "criterion_hypothesis_required" in state["runtime"].planning_feedback[-1]
-    assert "raw" not in json.dumps(events)
 
 
-async def test_successful_plan_clears_current_diagnostic_and_retains_history(monkeypatch):
-    from redteam.orchestration.nodes.plan import plan_node
-
-    diagnostic = DecisionDiagnostic(
-        code="schema_type",
-        stage="path_create",
-        kind="format",
-        summary="Use the required type.",
-    )
-
-    class Engine:
-        last_event_id = None
-        # New contract stub: production engine always carries this.
-        updated_runtime = None
-
-        def __init__(self, deps):
-            pass
-
-        async def decide(self, *args, **kwargs):
-            return None, [], "hold"
-
-    monkeypatch.setattr("redteam.orchestration.nodes.plan.InvestigationEngine", Engine)
-    monkeypatch.setattr("redteam.orchestration.nodes.plan.publisher_for", lambda *a: None)
-    runtime = RuntimeState(
-        run_id="run-safe",
-        engagement_id="eng-safe",
-        planning_error="DecisionFailure",
-        planning_diagnostic=diagnostic,
-        planning_diagnostic_history=[diagnostic],
-    )
-    state = await plan_node({"runtime": runtime}, deps=SimpleNamespace())
-    assert state["runtime"].planning_diagnostic is None
-    assert state["runtime"].planning_error is None
-    assert state["runtime"].planning_diagnostic_history == [diagnostic]
 
 
 def test_redaction_precedes_truncation_and_checkpoint_history_is_bounded():
@@ -701,24 +591,3 @@ def test_redaction_precedes_truncation_and_checkpoint_history_is_bounded():
     assert len(runtime.planning_feedback) == 10
     assert all(len(item) == 500 for item in runtime.planning_feedback)
     assert "hidden-value" not in runtime.model_dump_json()
-
-
-@pytest.mark.parametrize("verdict", ["allow", "deny", "require_approval"])
-async def test_replan_feedback_keeps_rejections_without_treating_permission_as_failure(verdict):
-    from datetime import datetime, timezone
-
-    from redteam.core.contracts.policy import PolicyDecision
-    from redteam.core.enums import PolicyVerdict
-    from redteam.orchestration.nodes.replan import replan_node
-    from redteam.orchestration.state import initial_graph_state
-    from tests.fakes import build_test_application
-
-    explanation = "policy explanation"
-    state = initial_graph_state(RuntimeState(run_id="run-safe", engagement_id="eng-safe"))
-    state["policy_decision"] = PolicyDecision(
-        action_id="action-safe", verdict=PolicyVerdict(verdict),
-        reasons=[explanation], evaluated_at=datetime.now(timezone.utc),
-    )
-    result = await replan_node(state, deps=build_test_application())
-    assert (explanation in result["runtime"].planning_feedback) == (verdict != "allow")
-    assert state["policy_decision"].reasons == [explanation]

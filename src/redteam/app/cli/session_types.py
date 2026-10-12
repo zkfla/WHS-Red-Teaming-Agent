@@ -80,7 +80,7 @@ class RunCompletionView:
         outcome = "ended"
         if result.error or result.exit_code or phase == "failed":
             outcome = "failed"
-        elif reason in {"approval_pending", "operator_paused"}:
+        elif reason in {"approval_pending", "operator_paused", "investigation_held"}:
             outcome = "suspended"
         elif state is None:
             outcome = "unknown"

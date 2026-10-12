@@ -1,19 +1,15 @@
 """Atomic activation/driver scheduling; native regression uses synthetic tools."""
 
 import asyncio
-from dataclasses import replace
 
 import pytest
 
-from redteam.core.contracts.events import EventEnvelope, EventType
-from redteam.core.enums import AgentPhase, MissionStatus, TaskStatus
+from redteam.core.enums import MissionStatus, TaskStatus
 from redteam.orchestration.agents.registry import default_registry
 from redteam.orchestration.coordination import coordinator_for
-from redteam.orchestration.instance_driver import InstanceDriver
 from redteam.orchestration.state import RuntimeState
 from redteam.orchestration.task_activation import TaskActivation
-from tests.integration.test_native_react_loop import ScriptedNativeLLM, _engagement, _native_deps
-from tests.unit.test_orchestration_coordination import ENG, MISSION, NOW, RUN, world
+from tests.unit.test_orchestration_coordination import ENG, MISSION, RUN, world
 
 
 async def prepared(tmp_path, backend="memory"):
@@ -163,84 +159,3 @@ async def test_exclusion_and_launch_limit_survive_repeated_wakeup(tmp_path):
         "task_id": "task-c", "status": TaskStatus.READY, "occupant_owner": None,
     }))
     assert await activation.ready(base, max_instances=2, max_activations=1) == []
-
-
-async def test_driver_launches_followup_before_independent_worker_finishes(tmp_path, monkeypatch):
-    w, activation, base = await prepared(tmp_path)
-    deps = replace(_native_deps(_engagement(), ScriptedNativeLLM([])),
-                   task_graph_store=w.tasks, path_store=w.paths,
-                   coordinator=activation.coordinator)
-    slow_started, release_slow, followup_started = asyncio.Event(), asyncio.Event(), asyncio.Event()
-    # Scripted runner verifies scheduling only. Native execution is tested below.
-    class Runner:
-        async def run(self, runtime):
-            if runtime.active_task_id == "task-b":
-                slow_started.set()
-                await release_slow.wait()
-            if runtime.active_task_id == "task-followup":
-                followup_started.set()
-            return runtime.model_copy(update={
-                "phase": AgentPhase.FINISHED, "termination_reason": "investigation_held",
-            })
-
-        def request_stop(self):
-            release_slow.set()
-
-    async with InstanceDriver(deps, checkpointer=object()) as driver:
-        monkeypatch.setattr(driver, "runner_for", lambda _: Runner())
-        stream = driver.drive_ready_tasks(base, max_instances=2, max_activations=3)
-        first = await anext(stream)
-        assert first.runtime.active_task_id == "task-a"
-        await asyncio.wait_for(slow_started.wait(), 1)
-        next_result = asyncio.create_task(anext(stream))
-        template = await w.tasks.get_task("task-a")
-        await w.tasks.create_task(template.model_copy(update={
-            "task_id": "task-followup", "status": TaskStatus.READY, "occupant_owner": None,
-        }))
-        await deps.event_bus.publish(EventEnvelope(
-            event_id="evt-followup", event_type=EventType.TASK_CREATED, run_id=RUN,
-            engagement_id=ENG, source="test", timestamp=NOW, payload={},
-        ))
-        await asyncio.wait_for(followup_started.wait(), 1)
-        followup = await asyncio.wait_for(next_result, 1)
-        assert followup.runtime.active_task_id == "task-followup"
-        assert followup.instance_id != first.instance_id
-        assert not release_slow.is_set()
-        release_slow.set()
-        assert (await anext(stream)).runtime.active_task_id == "task-b"
-        with pytest.raises(StopAsyncIteration):
-            await anext(stream)
-
-
-async def test_ready_driver_uses_real_native_graph_control_receipts_and_completion():
-    from redteam.attack_graph.service import AttackGraphService
-    from redteam.orchestration.seed import seed_from_engagement
-    from tests.integration.test_instance_driver_react import _engagement as engagement_fixture
-    from tests.integration.test_instance_driver_react import (
-        _mission_world,
-        _react_deps,
-        _runtime,
-        _TimingGateway,
-    )
-
-    engagement = engagement_fixture("a.local")
-    gateway = _TimingGateway()
-    deps = _react_deps(engagement, gateway)
-    await seed_from_engagement(AttackGraphService(deps.graph_store), engagement)
-    mission_id = await _mission_world(deps, ["task-real"])
-    task = await deps.task_graph_store.get_task("task-real")
-    await deps.task_graph_store.update_task(task.model_copy(update={
-        "assigned_agent": "recon-agent",
-    }))
-    coordinator = coordinator_for(deps.task_graph_store, deps.path_store)
-    await coordinator.bind("run-ready-native", mission_id, str(engagement.engagement_id))
-    base = _runtime("run-ready-native", str(engagement.engagement_id), "unused", "goal", mission_id)
-    async with InstanceDriver(deps) as driver:
-        events = [event async for event in driver.drive_ready_tasks(
-            base, max_instances=1, max_activations=2,
-        )]
-    assert len(events) == 1
-    assert events[0].runtime.actions_executed == 1
-    stored = await deps.task_graph_store.get_task("task-real")
-    assert stored.status == TaskStatus.COMPLETED
-    assert stored.completion_evidence_id is not None

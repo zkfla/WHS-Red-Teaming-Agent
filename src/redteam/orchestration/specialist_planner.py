@@ -4,9 +4,7 @@ No provider tools are exposed to these judgments. They propose investigation
 work, never execution permission, raw Tool calls, or a terminal goal result.
 """
 
-import asyncio
-from dataclasses import replace
-from datetime import datetime, timezone
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -15,38 +13,28 @@ from redteam.core.contracts.mission import redact_secret_material
 from redteam.core.ids import new_id
 from redteam.orchestration.cognition import (
     DecisionBudget,
-    DecisionFailure,
     DecisionValidationError,
     StructuredDecisionClient,
 )
-from redteam.orchestration.coordination import (
-    ChangeSet,
-    StateConflict,
-    content_hash,
-    coordinator_for,
-)
-from redteam.orchestration.diagnostics import DecisionDiagnostic, safe_feedback
+from redteam.orchestration.diagnostics import DecisionDiagnostic
 from redteam.orchestration.engine import InvestigationEngine
 from redteam.orchestration.knowledge_validation import known_principals, known_target_ids
 from redteam.orchestration.metered_llm import llm_request_scope
-from redteam.orchestration.outbox import deliver_pending
-from redteam.orchestration.planning_admission import PlanningAdmission
 from redteam.orchestration.specialist_tasks import (
     AtomicTaskProposal,
     InvestigationQuestion,
     SpecialistProposalError,
     StrategyTasks,
-    register_strategy_tasks,
     validate_strategy_questions,
     validate_strategy_tasks,
 )
-from redteam.orchestration.task_activation import TaskActivation
 
 
 class StrategyDraft(BaseModel):
     model_config = ConfigDict(extra="forbid")
     questions: list[InvestigationQuestion]
     reason: str = Field(min_length=1)
+    termination: Literal["continue", "exhausted", "goal_achieved", "held"] = "continue"
 
 
 class AtomizationDraft(BaseModel):
@@ -80,51 +68,36 @@ class SpecialistPlanner:
         if deps.specialist_policy is None:
             raise ValueError("specialist_policy_missing")
         self.deps, self.policy = deps, deps.specialist_policy
-        self.coordinator = deps.coordinator or coordinator_for(
-            deps.task_graph_store, deps.path_store,
-        )
-        self.admission = PlanningAdmission(self.coordinator)
+        self.coordinator: Any = None
+        self.admission: Any = None
         self.client = StructuredDecisionClient(deps.llm_client)
 
     async def advance(self, runtime) -> list[str]:
         """Once per meaningful input, with a finite strategy ceiling per Run."""
         if runtime.mission_id is None:
             raise ValueError("specialist_planning_requires_mission")
-        from redteam.orchestration.evidence_validity import ValidityProjection, refresh_validity
+        return await self._advance_central(runtime)
 
-        await refresh_validity(self.deps, runtime)
-        await self.admission.bind_inputs(str(runtime.run_id), specialist_planning_inputs(self.deps))
-        # Capture BEFORE store reads/model I/O. The graph writer fence and
-        # Task read set are checked in the final adoption transaction.
-        source = await TaskActivation(self.coordinator, self.deps.agents).source_task_id(runtime)
-        runtime = runtime.model_copy(update={"active_task_id": source})
-        task_ids = [str(source)] if source else []
-        stamp = await self.admission.capture(
-            str(runtime.run_id), str(runtime.mission_id), task_ids=task_ids,
-            reference_keys=("graph", "evidence"),
+    async def _advance_central(self, runtime):
+        """Judge current investigations at a notification, without graph-digest gates."""
+        from redteam.orchestration.agents.tool_access import role_readiness
+        from redteam.orchestration.central_completion import goal_snapshot
+        from redteam.orchestration.central_runtime import process_controls, runtime_token
+        from redteam.orchestration.specialist_tasks import register_investigation_tasks
+
+        await process_controls(self.deps)
+        await runtime_token(self.deps, runtime, require_task=False)
+        runtime = runtime.model_copy(update={"active_task_id": None, "current_agent": None})
+        stamp = await self.deps.central_state.transaction(
+            lambda tx: goal_snapshot(tx, include_assessment=False)[2], write=False,
         )
-        if stamp.strategy_revision >= self.policy.max_strategy_revisions:
-            return []
         engine = InvestigationEngine(self.deps)
-        # A planning judgment sees eligible execution roles, while the next
-        # native worker turn keeps only its own role's tool view.
-        context = await engine.context(runtime.model_copy(update={"current_agent": None}), None)
-        # Refresh is event bookkeeping, not this judgment's input snapshot.
-        # Bind expiry to the fresh context actually sent to the model, inside
-        # the already captured reference read set. Changes after capture fail
-        # the final CAS; already-stale context may propose revalidation.
-        validity = [ValidityProjection.model_validate(item)
-                    for item in context["evidence_validity"]]
-        stamp = replace(stamp, valid_until=min(
-            (item.valid_until for item in validity
-             if item.status == "valid" and item.valid_until is not None), default=None,
-        ))
+        context = await engine.context(runtime, None)
+        mission = await self.deps.central_state.get_mission(runtime.mission_id)
         material = await engine.execution_material(runtime)
         targets, principals = known_target_ids(material), known_principals(material)
         hypotheses = await AttackGraphService(self.deps.graph_store).list_hypotheses()
         hypothesis_ids = frozenset(h.hypothesis_id for h in hypotheses)
-        from redteam.orchestration.agents.tool_access import role_readiness
-
         payload = redact_secret_material({
             "goal": context["goal"], "success_criteria": context["success_criteria"],
             "constraints": context.get("engagement_constraints"),
@@ -133,108 +106,87 @@ class SpecialistPlanner:
             "role_readiness": await role_readiness(self.deps),
             "evidence_index": context["evidence_index"], "evidence": context["evidence"],
             "evidence_validity": context["evidence_validity"],
-            "related_task": context.get("active_task"),
+            "investigations": context["investigation_tasks"],
             "unresolved_results": context["unresolved_results"],
             "registered_principal_refs": sorted(principals),
-            "known_target_ids": sorted(targets),
-            "strategy_revision": stamp.strategy_revision,
-            "max_tasks": self.policy.max_tasks_per_strategy,
+            "known_target_ids": sorted(targets), "max_tasks": self.policy.max_tasks_per_strategy,
         })
-        digest = content_hash({key: value for key, value in payload.items()
-                               if key != "strategy_revision"})
-        attempt_id = new_id("strategy")
+        budget = DecisionBudget(normal_limit=self.deps.settings.decision_normal_limit,
+                                repair_limit=self.deps.settings.decision_max_attempts)
 
-        async def reserve(tx: ChangeSet) -> bool:
-            tx.admit(str(runtime.run_id), str(runtime.mission_id))
-            key = ("specialist_planning_attempt", f"{runtime.run_id}:{digest}")
-            if key in tx.records:
-                return False
-            tx.records[key] = {"attempt_id": attempt_id, "state": "reserved"}
-            return True
-
-        if not await self.coordinator.change(reserve):
-            return []
-        budget = DecisionBudget(
-            normal_limit=self.deps.settings.decision_normal_limit,
-            repair_limit=self.deps.settings.decision_max_attempts,
-        )
         def check_questions(raw):
             try:
                 validate_strategy_questions(
                     StrategyDraft.model_validate(raw).questions, known_targets=targets,
                     known_principals=principals, known_hypotheses=hypothesis_ids,
+                    investigation_only=True,
                 )
             except SpecialistProposalError as exc:
                 raise self._rejection(exc, "attack_path_proposal") from exc
 
-        try:
-            return await self._decide_and_admit(
-                runtime, stamp, digest, attempt_id, payload, budget, targets, principals,
-                hypothesis_ids, check_questions,
-            )
-        except DecisionFailure as exc:
-            await self._record(runtime, digest, "failed", exc.diagnostic.feedback(),
-                               diagnostic=exc.diagnostic)
-            raise
-        except StateConflict:
-            await self._record(runtime, digest, "stale", "Current planning inputs changed.")
-            raise
-        except asyncio.CancelledError:
-            await self._record(runtime, digest, "interrupted",
-                               "Planning was interrupted; dispatched requests stay charged.")
-            raise
-
-    async def _decide_and_admit(
-        self, runtime, stamp, digest, attempt_id, payload, budget, targets, principals,
-        hypothesis_ids, check_questions,
-    ):
-        # Bind the accepted question list into the pure atomization validator.
-        def validate_tasks(raw):
+        def check_tasks(raw):
             try:
                 validate_strategy_tasks(
                     StrategyTasks(questions=strategy.questions,
                                   tasks=AtomizationDraft.model_validate(raw).tasks),
                     agents=self.deps.agents, known_targets=targets, known_principals=principals,
                     known_hypotheses=hypothesis_ids, max_tasks=self.policy.max_tasks_per_strategy,
+                    investigation_only=True,
                 )
             except SpecialistProposalError as exc:
                 raise self._rejection(exc, "task_atomization") from exc
 
         with llm_request_scope(str(runtime.run_id), "specialist_planning"):
             strategy = StrategyDraft.model_validate(await self.client.ask(
-                stage="attack_path_proposal", payload=payload,
-                response_schema=StrategyDraft.model_json_schema(), budget=budget,
-                system="Propose investigation questions, not tool calls. Only known subjects. "
-                       "Preserve explicit evidence conditions. Empty questions means held, "
-                       "never success. Do not repeat completed/held work without new grounds.",
+                stage="attack_path_proposal", payload=payload, budget=budget,
+                response_schema=StrategyDraft.model_json_schema(),
                 validate_response=check_questions,
+                system="Propose useful investigation questions from current tasks, results and "
+                       "their follow-up questions. Reinvestigation may reuse the same evidence. "
+                       "Do not create ordering dependencies or paths. If no useful investigation "
+                       "remains, propose termination=exhausted and justify it from the supplied "
+                       "results and unresolved questions. Empty questions otherwise means held. "
+                       "Goal success requires a separate criterion/evidence review. "
+                       "Tools and text do not grant execution permission.",
             ))
             if not strategy.questions:
-                await self._record(runtime, digest, "held", strategy.reason)
+                def record_judgment(tx):
+                    import json
+                    tx.admit()
+                    if goal_snapshot(tx, include_assessment=False)[2] != stamp:
+                        # The next notification/scan evaluates the new originals.
+                        return
+                    tx.db.execute(
+                        "INSERT INTO state_requests VALUES(?,'planner_termination',?,?) "
+                        "ON CONFLICT(run_id,kind,identity) DO UPDATE SET payload=excluded.payload",
+                        (tx.run_id, tx.run_id, json.dumps({
+                            "termination": strategy.termination,
+                            "reason": strategy.reason, "inputs": stamp,
+                        })),
+                    )
+                await self.deps.central_state.transaction(record_judgment)
                 return []
             atomization = AtomizationDraft.model_validate(await self.client.ask(
-                stage="task_atomization",
+                stage="task_atomization", budget=budget,
                 payload={**payload, "questions": [q.model_dump(mode="json")
                                                   for q in strategy.questions]},
-                response_schema=AtomizationDraft.model_json_schema(), budget=budget,
-                system="Decompose the supplied questions into atomic Tasks. Preserve every "
-                       "original completion criterion and dependency; do not invent principals. "
-                       "Assign only registered executable roles with available tools.",
-                validate_response=validate_tasks,
+                response_schema=AtomizationDraft.model_json_schema(), validate_response=check_tasks,
+                system="Register investigations by purpose, evidence, role and fixed conditions. "
+                       "Preserve every question condition. No depends_on or tool-call queue. "
+                       "Follow-ups cite source_task_id, source_result_id and source_question_id "
+                       "from the original result item. Only registered ready roles "
+                       "and known subjects.",
             ))
-        task_ids = await register_strategy_tasks(
-            self.admission, stamp, proposal_id=attempt_id,
+        identities = await register_investigation_tasks(
+            self.deps.central_state, proposal_id=new_id("registration"),
             proposal=StrategyTasks(questions=strategy.questions, tasks=atomization.tasks),
             agents=self.deps.agents, known_targets=targets, known_principals=principals,
-            known_hypotheses=hypothesis_ids,
-            max_tasks=self.policy.max_tasks_per_strategy, now=datetime.now(timezone.utc),
+            known_hypotheses=hypothesis_ids, max_tasks=self.policy.max_tasks_per_strategy,
+            evidence_store=self.deps.evidence_store, expected_revision=mission.revision,
         )
-        await self._record(runtime, digest, "admitted", strategy.reason)
-        await deliver_pending(
-            self.coordinator, run_id=str(runtime.run_id),
-            engagement_id=str(runtime.engagement_id), event_bus=self.deps.event_bus,
-        )
-        return task_ids
+        await self.deps.event_bus.flush()
+        return identities
+
 
     @staticmethod
     def _rejection(error, stage):
@@ -243,11 +195,3 @@ class SpecialistPlanner:
             summary="The proposal failed the captured subject, dependency or condition contract.",
             location="$.questions" if stage == "attack_path_proposal" else "$.tasks",
         ))
-
-    async def _record(self, runtime, digest, state, reason, *, diagnostic=None):
-        async def record(tx: ChangeSet):
-            row = tx.records[("specialist_planning_attempt", f"{runtime.run_id}:{digest}")]
-            row.update(state=state, reason=safe_feedback(reason))
-            if diagnostic is not None:
-                row["diagnostic"] = diagnostic.model_dump(mode="json")
-        await self.coordinator.change(record)

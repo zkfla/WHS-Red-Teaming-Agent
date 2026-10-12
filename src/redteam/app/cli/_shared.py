@@ -140,6 +140,51 @@ def print_json(payload: BaseModel | dict[str, Any] | list[Any]) -> None:
     print(json.dumps(mask_secrets(data), indent=2, sort_keys=True))
 
 
+async def read_run_report(args):
+    """Read the current central projection, never an old report export."""
+    path = central_reader_state_path(args)
+    if path is not None:
+        import sqlite3
+
+        from redteam.app.central_views import inspect_central_run
+        from redteam.orchestration.coordination import CoordinationError, StateConflict
+        try:
+            _, _, report = await inspect_central_run(
+                path, args.run_id,
+            )
+        except (CoordinationError, StateConflict) as exc:
+            raise RuntimeError(str(exc)) from None
+        except sqlite3.Error:
+            raise RuntimeError("central_original_state_missing_or_unreadable") from None
+        return report
+
+
+def central_reader_state_path(args):
+    """Read-only consumers need selection, never today's model/worker policy."""
+    from redteam.core.environment import orchestration_env_values
+    raw = orchestration_env_values()
+    selected = OrchestrationConfig.model_validate({
+        key: value for key, value in raw.items()
+        if key in {"runtime_backend", "central_state_path"}
+    })
+    path = getattr(args, "state_db", None)
+    selected = OrchestrationConfig.model_validate({
+        "central_state_path": path or selected.central_state_path,
+    })
+    return selected.central_state_path
+
+
+def runtime_overrides(config, args):
+    from redteam.core.config import OrchestrationConfig
+    values = config.orchestration.model_dump()
+    for argument, field in (("workers", "max_workers"),
+                            ("state_db", "central_state_path")):
+        value = getattr(args, argument, None)
+        if value is not None:
+            values[field] = value
+    return config.model_copy(update={"orchestration": OrchestrationConfig.model_validate(values)})
+
+
 def prompt_secret(label: str) -> str:
     """Read a secret from the terminal without echoing it (section 7).
 

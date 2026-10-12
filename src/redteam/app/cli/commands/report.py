@@ -13,8 +13,7 @@ import argparse
 import json
 from pathlib import Path
 
-from redteam.app.cli._shared import EXIT_FAILURE, EXIT_OK, eprint
-from redteam.app.report_store import load_terminal_report
+from redteam.app.cli._shared import EXIT_FAILURE, EXIT_OK, eprint, read_run_report
 from redteam.orchestration.diagnostics import DecisionDiagnostic
 from redteam.orchestration.reporting import MissionProjection, TerminalReportProjection
 
@@ -27,11 +26,16 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     generate.add_argument("run_id")
     generate.add_argument("--format", choices=["md", "json"], default="md")
     generate.add_argument("--output-dir", default="reports")
+    generate.add_argument("--state-db", default=None)
     generate.set_defaults(handler=run_generate)
 
 
 async def run_generate(args: argparse.Namespace) -> int:
-    report = load_terminal_report(args.run_id)
+    try:
+        report = await read_run_report(args)
+    except (ValueError, OSError, RuntimeError) as exc:
+        eprint(f"ERROR: central report unavailable: {exc}")
+        return EXIT_FAILURE
     if report is None:
         eprint(f"ERROR: no terminal report for run {args.run_id} (unknown or still in progress).")
         return EXIT_FAILURE
@@ -85,6 +89,37 @@ def _render_markdown(report: TerminalReportProjection) -> str:
         f"- Dead-end work ratio: {report.effectiveness.dead_end_work_ratio}",
         "",
     ]
+    if report.investigations or report.effective_limits:
+        lines += ["## Central investigations", "",
+                  f"- Applied limits: {json.dumps(report.effective_limits, ensure_ascii=False)}"]
+        for investigation in report.investigations:
+            result = investigation.get("result") or {}
+            lines += [f"- {investigation['task_id']}: {investigation['status']}; "
+                      f"owner={investigation.get('occupant_owner')}; "
+                      f"result={result.get('outcome')}; required={investigation['required']}"]
+        lines += ["", "## Criterion evidence", ""]
+        for item in report.criterion_evidence:
+            lines += [f"- {item['criterion']}: met={item['met']}; "
+                      f"goal revision={item.get('goal_revision')}; "
+                      f"evidence={item['evidence_ids']}"]
+        lines += ["", "## Questions and original waits", ""]
+        for question in report.unresolved_questions:
+            lines += [f"- {question['question_id']}: required={question['required_for_goal']}; "
+                      f"resolved={question['resolved']}; {question['question']}"]
+        for execution in report.executions:
+            if execution.get("wait_reason") or execution["state"] == "unknown":
+                lines += [f"- {execution['instance_id']}/{execution['invocation_id']}: "
+                          f"{execution['state']}; approval={execution.get('approval_ref')}; "
+                          f"job={execution.get('job_ref')}"]
+        lines += ["", "## Resource cleanup", ""]
+        for item in report.cleanup_obligations:
+            lines += [f"- {item['node_id']}: {item['status']}; "
+                      f"created={item.get('created_evidence_id')}; "
+                      f"cleanup={item.get('cleanup_evidence_id')}"]
+        if report.cleanup_unmapped_tools:
+            lines += ["- Resource effects unavailable for tools: "
+                      + ", ".join(report.cleanup_unmapped_tools)]
+        lines += [""]
     if report.llm_request_accounting is not None:
         usage = report.llm_request_accounting
         policy = usage.get("policy") or {}

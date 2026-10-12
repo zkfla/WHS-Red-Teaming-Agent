@@ -11,11 +11,8 @@ from pathlib import Path
 
 import pytest
 
-from redteam.app.bootstrap import build_application
-from redteam.core.config import load_app_config
 from redteam.core.contracts.tool import ExecutionContext, ToolInvocation
 from redteam.core.ids import ActionId, EngagementId, InvocationId, RunId, ToolId
-from redteam.llm.fake import FakeLLMClient
 
 
 def _unused_local_port() -> int:
@@ -68,11 +65,14 @@ async def test_real_streamable_http_discovery_and_invocation(
             "REDTEAM_MCP_WEB_EXAMPLE_TOOL_OPERATIONS_JSON", '{"ping":["service_discovery"]}'
         )
         monkeypatch.setenv("REDTEAM_MCP_WEB_EXAMPLE_ENDPOINT", f"http://127.0.0.1:{port}/mcp")
-        config = load_app_config(repository_root / "examples/app.yaml")
-        config.capability.mcp_servers = ["web-example"]
-        _, deps = await build_application(config, llm=FakeLLMClient(), evidence_dir=tmp_path)
+        from contextlib import AsyncExitStack
+
+        from redteam.capability.bootstrap import open_mcp_tool_gateway
+        stack = AsyncExitStack()
+        await stack.__aenter__()
+        gateway = await stack.enter_async_context(open_mcp_tool_gateway(["web-example"]))
         run_id = RunId("run_mcp_integration")
-        result = await deps.tool_gateway.invoke(
+        result = await gateway.invoke(
             ToolInvocation(
                 invocation_id=InvocationId("inv_mcp_integration"),
                 action_id=ActionId("action_mcp_integration"),
@@ -92,6 +92,8 @@ async def test_real_streamable_http_discovery_and_invocation(
         assert result.output == {"message": "hello", "status": "ok"}
         assert result.invocation_id == InvocationId("inv_mcp_integration")
     finally:
+        if "stack" in locals():
+            await stack.aclose()
         if process.returncode is None:
             process.terminate()
         try:

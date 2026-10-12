@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Red Team Agent</title>
+<link rel="stylesheet" href="/static/theme.css">
+<link rel="stylesheet" href="/static/layout.css">
+<link rel="stylesheet" href="/static/components.css">
+<link rel="stylesheet" href="/static/graph.css">
+<link rel="stylesheet" href="/static/dialog.css">
+<script type="module" src="/static/app.js"></script>
+</head>
+<body>
+<div class="app">
+  <aside class="side" aria-label="사이드바">
+    <div class="brand">
+      <span class="mark" aria-hidden="true"></span>
+      <strong>Red Team Agent</strong>
+    </div>
+    <nav class="nav" aria-label="주 메뉴">
+      <button class="nav-item on" type="button" data-view="chat">대화</button>
+      <button class="nav-item" type="button" data-view="graph">그래프 보기</button>
+      <button class="nav-item" type="button" id="open-engagement">조사 선택</button>
+      <button class="nav-item" type="button" id="open-settings">설정</button>
+    </nav>
+    <section class="runs" aria-label="조사">
+      <h2 class="label">조사</h2>
+      <ul id="runs" class="run-list"></ul>
+    </section>
+    <section class="env" aria-label="연결 상태">
+      <h2 class="label">연결 상태</h2>
+      <dl>
+        <dt>세션</dt><dd id="env-session">확인 중</dd>
+        <dt>이벤트 스트림</dt><dd id="env-stream">연결 중</dd>
+      </dl>
+    </section>
+  </aside>
+
+  <div class="main">
+    <header class="top">
+      <div class="title">
+        <span class="label" id="engagement">—</span>
+        <h1 id="headline">대화</h1>
+      </div>
+      <span class="pill" id="scope">범위 —</span>
+      <span class="pill" id="phase">대기</span>
+      <div class="controls">
+        <button type="button" class="icon-btn" id="btn-pause" disabled>일시정지</button>
+        <button type="button" class="icon-btn" id="btn-resume" disabled>재개</button>
+        <button type="button" class="icon-btn danger" id="btn-stop" disabled>중단</button>
+      </div>
+    </header>
+
+    <section id="view-graph" class="graph-view" hidden aria-label="실행 그래프">
+      <div class="graph-canvas" id="graph-canvas">
+        <svg id="graph-lines" class="graph-lines" aria-hidden="true"></svg>
+        <div class="graph-cols">
+          <div class="graph-col"><h2 class="label">플래너</h2><div id="graph-planner" class="graph-stack"></div></div>
+          <div class="graph-col"><h2 class="label">조사 Task</h2><div id="graph-tasks" class="graph-stack"></div></div>
+          <div class="graph-col"><h2 class="label">워커</h2><div id="graph-workers" class="graph-stack"></div></div>
+          <div class="graph-col"><h2 class="label">원본 저장</h2><div id="graph-origin" class="graph-stack"></div></div>
+        </div>
+        <p id="graph-note" class="note"></p>
+      </div>
+      <aside class="graph-detail" id="graph-detail" aria-label="선택한 항목의 상세"></aside>
+    </section>
+
+    <div class="body" id="view-chat">
+      <main class="chat">
+        <div id="thread" class="thread" aria-live="polite"></div>
+        <form id="composer" class="composer">
+          <label class="sr-only" for="draft">에이전트에게 보낼 메시지</label>
+          <textarea id="draft" rows="2" placeholder="에이전트에게 지시하거나 질문하세요. 범위 밖 요청은 실행 전에 차단됩니다." maxlength="12000"></textarea>
+          <button type="submit" id="send">보내기</button>
+          <p id="composer-note" class="note"></p>
+        </form>
+      </main>
+
+      <aside class="insp" aria-label="상세 패널">
+        <div class="tabs" role="tablist">
+          <button type="button" role="tab" class="tab on" data-tab="approval" aria-selected="true">승인 검토</button>
+          <button type="button" role="tab" class="tab" data-tab="activity" aria-selected="false">활동</button>
+          <button type="button" role="tab" class="tab" data-tab="evidence" aria-selected="false">증거</button>
+        </div>
+        <section id="tab-approval" class="tabpane"></section>
+        <section id="tab-activity" class="tabpane" hidden></section>
+        <section id="tab-evidence" class="tabpane" hidden></section>
+        <section class="usage">
+          <h2 class="label">현황</h2>
+          <dl id="usage"></dl>
+        </section>
+      </aside>
+    </div>
+  </div>
+</div>
+
+<dialog id="settings" class="dialog">
+  <form id="settings-form" method="dialog">
+    <h2>실행 설정</h2>
+    <p class="note" id="settings-intro"></p>
+    <label>LLM 모델
+      <input id="s-model" name="model" autocomplete="off" spellcheck="false" placeholder="예: provider/model-name">
+    </label>
+    <label>API 키 <span class="note">(저장 후 다시 표시되지 않습니다)</span>
+      <input id="s-key" name="api_key" type="password" autocomplete="off" spellcheck="false">
+    </label>
+    <label class="check"><input id="s-persist" type="checkbox"> API 키를 .env에 저장</label>
+    <label>전문가 프로필
+      <select id="s-profile" name="profile_id"></select>
+    </label>
+    <div class="grid2">
+      <label>LLM 요청 상한
+        <input id="s-max" name="max_requests" type="number" min="1" max="1000000" step="1">
+      </label>
+      <label>동시 요청 수
+        <input id="s-conc" name="max_concurrent_requests" type="number" min="1" max="64" step="1">
+      </label>
+    </div>
+    <p class="error" id="settings-error" role="alert"></p>
+    <div class="row">
+      <button type="button" id="settings-cancel" class="ghost">닫기</button>
+      <button type="submit" id="settings-save">저장하고 적용</button>
+    </div>
+  </form>
+</dialog>
+<dialog id="engagement-dialog" class="dialog wide">
+  <form id="engagement-form" method="dialog">
+    <h2 id="eng-title">Engagement</h2>
+    <p class="note" id="eng-intro"></p>
+    <div id="eng-body" class="eng-body"></div>
+    <p class="error" id="eng-error" role="alert"></p>
+    <div class="row">
+      <button type="button" id="eng-cancel" class="ghost">닫기</button>
+      <button type="button" id="eng-back" class="ghost">목록</button>
+      <button type="button" id="eng-prev" class="ghost">이전</button>
+      <button type="button" id="eng-next">다음</button>
+      <button type="button" id="eng-save" hidden>저장하고 적용</button>
+    </div>
+  </form>
+</dialog>
+</body>
+</html>

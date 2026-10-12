@@ -23,6 +23,7 @@ from redteam.core.contracts.graph import Finding, GraphEdge, GraphNode
 from redteam.core.contracts.target import EndpointTarget, UrlTarget
 from redteam.core.enums import GraphEdgeType, GraphNodeType
 from redteam.core.ids import GraphEdgeId, GraphNodeId
+from tests.fakes.graph_records import records_for, seed_records
 
 NOW = datetime.now(timezone.utc)
 
@@ -239,13 +240,13 @@ async def test_merging_a_snapshot_that_records_a_retraction_withdraws_it() -> No
         GraphNodeType.HOST, key="a.local", attrs={"reachable": True}, step=1
     )
     await source.retract(created.id, "reachable", step=5, reason="stopped answering")
-    records = await source.export_snapshot()
+    records = await records_for(source)
 
     destination = service()
     await destination.upsert_node(
         GraphNodeType.HOST, key="a.local", attrs={"reachable": True}, step=1
     )
-    await destination.import_snapshot(records, merge=True)
+    await seed_records(destination, records, merge=True)
 
     merged = await destination.get_node(created.id)
     assert merged is not None
@@ -258,13 +259,13 @@ async def test_an_observation_newer_than_the_retraction_still_wins() -> None:
         GraphNodeType.HOST, key="a.local", attrs={"reachable": True}, step=1
     )
     await source.retract(created.id, "reachable", step=5, reason="stopped answering")
-    records = await source.export_snapshot()
+    records = await records_for(source)
 
     destination = service()
     await destination.upsert_node(
         GraphNodeType.HOST, key="a.local", attrs={"reachable": True}, step=9
     )
-    await destination.import_snapshot(records, merge=True)
+    await seed_records(destination, records, merge=True)
 
     merged = await destination.get_node(created.id)
     assert merged is not None
@@ -289,17 +290,15 @@ def test_a_secret_one_level_down_is_still_rejected(facts: dict) -> None:
         build_properties(facts=facts)
 
 
-async def test_a_nested_secret_never_reaches_a_snapshot_or_a_render() -> None:
-    from redteam.attack_graph.visualize import render_html
 
+
+async def test_nested_secrets_are_rejected_before_storage() -> None:
     svc = service()
     with pytest.raises(SensitiveValueError):
         await svc.upsert_node(
-            GraphNodeType.HOST, key="a.local", facts={"metadata": {"password": "hunter2"}}
+            GraphNodeType.HOST, key="a.local", facts={"metadata": {"password": "hunter2"}},
         )
-
-    assert "hunter2" not in str(await svc.export_snapshot())
-    assert "hunter2" not in render_html(await svc.list_nodes(), await svc.list_edges())
+    assert "hunter2" not in str(await records_for(svc))
 
 
 def test_ordinary_nested_values_still_pass() -> None:

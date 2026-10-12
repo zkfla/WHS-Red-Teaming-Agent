@@ -10,11 +10,12 @@ rule is enforced structurally (Agent code has no import path to
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from datetime import datetime
+from typing import Any, Protocol, runtime_checkable
 
 from redteam.core.contracts.action import ActionProposal
-from redteam.core.contracts.policy import ControlContext, PolicyDecision
-from redteam.core.ids import ApprovalId, EngagementId
+from redteam.core.contracts.policy import Approval, ControlContext, PolicyDecision
+from redteam.core.ids import ApprovalId, EngagementId, RunId
 
 
 class ControlPlane(Protocol):
@@ -82,3 +83,18 @@ class InvocationAdmissionControl(Protocol):
 class PolicyExplanationControl(Protocol):
     async def describe_policy(self, engagement_id: EngagementId | str) -> dict:
         ...
+
+
+@runtime_checkable
+class DurableControlRecovery(Protocol):
+    """Original decisions and accounting; inspection never grants execution."""
+
+    async def inspect_approval(self, approval_id: ApprovalId | str) -> Approval | None: ...
+
+    async def recorded_decision(self, proposal: ActionProposal) -> PolicyDecision | None: ...
+
+    async def register_pending_proposal(self, approval_id: ApprovalId,
+                                        proposal: ActionProposal) -> None: ...
+
+    async def rehydrate_run(self, engagement_id: EngagementId, run_id: RunId, *,
+                            started_at: datetime) -> Any: ...

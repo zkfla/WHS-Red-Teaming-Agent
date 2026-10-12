@@ -25,9 +25,12 @@ class ActionView:
 
 
 class SessionProjection:
-    def __init__(self, controller, *, verbose: bool = False) -> None:
+    def __init__(self, controller, *, verbose: bool = False, sink=None) -> None:
         self.controller = controller
         self.verbose = verbose
+        # Optional structured consumer (e.g. the web frontend). It receives each
+        # distinct event exactly once and can never affect terminal projection.
+        self.sink = sink
         self.actions: OrderedDict[tuple[str, str], ActionView] = OrderedDict()
         self.seen: OrderedDict[str, None] = OrderedDict()
         self.findings: set[str] = set()
@@ -43,6 +46,11 @@ class SessionProjection:
         self.seen[event_id] = None
         if len(self.seen) > 2048:
             self.seen.popitem(last=False)
+        if self.sink is not None:
+            try:
+                self.sink(event)
+            except Exception:  # noqa: BLE001 - a display consumer must not break the run
+                self.sink = None
         kind, p = event.event_type, event.payload
         detail = safe_text(f"{event.timestamp.isoformat()} · Run {event.run_id} · {kind} · {p}")
         c.output.history.append(detail)

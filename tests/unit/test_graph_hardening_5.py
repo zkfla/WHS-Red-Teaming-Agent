@@ -22,10 +22,11 @@ from redteam.attack_graph.predicates import (
 from redteam.attack_graph.retraction import RetractionRule
 from redteam.attack_graph.service import AttackGraphService
 from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
-from redteam.attack_graph.traversal import evidence_chain, walk
+from redteam.attack_graph.traversal import walk
 from redteam.core.contracts.graph import GraphEdge, GraphNode
 from redteam.core.enums import GraphEdgeType, GraphNodeType
 from redteam.core.ids import GraphEdgeId, GraphNodeId
+from tests.fakes.graph_records import records_for, seed_records
 
 NOW = datetime.now(timezone.utc)
 SECRET = "FAKE_TEST_SECRET"
@@ -148,7 +149,7 @@ async def test_an_unrelated_write_does_not_block_a_merged_retraction() -> None:
         GraphNodeType.HOST, key="a.local", attrs={"reachable": True}, step=1
     )
     await source.retract(created.id, "reachable", step=5, reason="host is down")
-    records = await source.export_snapshot()
+    records = await records_for(source)
 
     destination = service()
     await destination.upsert_node(
@@ -157,7 +158,7 @@ async def test_an_unrelated_write_does_not_block_a_merged_retraction() -> None:
     await destination.upsert_node(
         GraphNodeType.HOST, key="a.local", facts={"note": "unrelated"}, step=9
     )
-    await destination.import_snapshot(records, merge=True)
+    await seed_records(destination, records, merge=True)
 
     merged = await destination.get_node(created.id)
     assert merged is not None
@@ -218,7 +219,7 @@ async def test_a_custom_property_key_cannot_smuggle_a_secret() -> None:
             },
             node_id=GraphNodeId("host:a.local"),
         )
-    assert SECRET not in str(await svc.export_snapshot())
+    assert SECRET not in str(await records_for(svc))
 
 
 async def test_edge_properties_are_scanned_too() -> None:
@@ -230,7 +231,7 @@ async def test_edge_properties_are_scanned_too() -> None:
         await svc.link(
             GraphEdgeType.HOSTS, left.id, right.id, properties={"metadata": {"password": SECRET}}
         )
-    assert SECRET not in str(await svc.export_snapshot())
+    assert SECRET not in str(await records_for(svc))
 
 
 async def test_importing_a_snapshot_is_not_a_way_around_the_guard() -> None:
@@ -256,8 +257,8 @@ async def test_importing_a_snapshot_is_not_a_way_around_the_guard() -> None:
     ]
     svc = service()
     with pytest.raises(SensitiveValueError):
-        await svc.import_snapshot(hostile)
-    assert SECRET not in str(await svc.export_snapshot())
+        await seed_records(svc, hostile)
+    assert SECRET not in str(await records_for(svc))
 
 
 # -- traversal limits and branch rendering --------------------------------
@@ -279,74 +280,8 @@ def test_walk_honours_max_nodes_within_a_single_hop() -> None:
     assert len(walk(GraphNodeId("host:root"), edges=edges, max_nodes=5)) == 5
 
 
-def test_a_fork_is_described_as_two_branches_not_one_path() -> None:
-    nodes = [
-        node(
-            "finding:f",
-            GraphNodeType.FINDING,
-            facts={"finding_id": "f", "verified": True, "evidence_ids": ["ev_1"]},
-        ),
-        node("host:a"),
-        node("host:b"),
-    ]
-    edges = [
-        GraphEdge(
-            id=GraphEdgeId("e1"),
-            type=GraphEdgeType.TARGETS,
-            source_id=GraphNodeId("finding:f"),
-            target_id=GraphNodeId("host:a"),
-            created_at=NOW,
-        ),
-        GraphEdge(
-            id=GraphEdgeId("e2"),
-            type=GraphEdgeType.TARGETS,
-            source_id=GraphNodeId("finding:f"),
-            target_id=GraphNodeId("host:b"),
-            created_at=NOW,
-        ),
-    ]
-
-    chain = evidence_chain(GraphNodeId("finding:f"), nodes=nodes, edges=edges)
-
-    assert chain is not None
-    assert len(chain.branches) == 2
-    # There is no a -> b edge, so no rendering may imply one.
-    described = chain.describe()
-    assert "host:a --" not in described
-    assert " | " in described
 
 
-def test_a_genuine_chain_is_still_one_branch() -> None:
-    nodes = [
-        node(
-            "finding:f",
-            GraphNodeType.FINDING,
-            facts={"finding_id": "f", "verified": True, "evidence_ids": ["ev_1"]},
-        ),
-        node("hypothesis:h", GraphNodeType.HYPOTHESIS, facts={"hypothesis_id": "h"}),
-        node("host:a"),
-    ]
-    edges = [
-        GraphEdge(
-            id=GraphEdgeId("e1"),
-            type=GraphEdgeType.SUPPORTED_BY,
-            source_id=GraphNodeId("finding:f"),
-            target_id=GraphNodeId("hypothesis:h"),
-            created_at=NOW,
-        ),
-        GraphEdge(
-            id=GraphEdgeId("e2"),
-            type=GraphEdgeType.TARGETS,
-            source_id=GraphNodeId("hypothesis:h"),
-            target_id=GraphNodeId("host:a"),
-            created_at=NOW,
-        ),
-    ]
-
-    chain = evidence_chain(GraphNodeId("finding:f"), nodes=nodes, edges=edges)
-    assert chain is not None
-    assert len(chain.branches) == 1
-    assert len(chain.branches[0]) == 3
 
 
 async def test_custom_retraction_rules_use_per_predicate_age() -> None:

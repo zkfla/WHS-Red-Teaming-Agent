@@ -140,6 +140,10 @@ class OrchestrationConfig(BaseModel):
 
     max_retries: int = Field(default=3, ge=0)
     max_steps: int = Field(default=50, ge=1)
+    # Retained input identity for saved configurations; there is one runtime.
+    runtime_backend: Literal["central"] = "central"
+    central_state_path: str = Field(default="data/orchestration/state.sqlite3", min_length=1)
+    max_workers: int = Field(default=2, ge=1)
     llm_request_policy: LLMRequestPolicy | None = None
     specialist_profile_path: str | None = Field(default=None, min_length=1, max_length=4096)
     code_fixture_policy_path: str | None = Field(default=None, min_length=1, max_length=4096)

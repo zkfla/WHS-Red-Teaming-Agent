@@ -99,7 +99,9 @@ async def run_session(
                     exit_code=2,
                     error="설정이 변경되어 시작하지 않았습니다. 요청을 다시 확인하세요.",
                 )
-            projection = SessionProjection(controller, verbose=verbose)
+            projection = SessionProjection(
+                controller, verbose=verbose, sink=getattr(frontend, "event_sink", None)
+            )
             try:
                 final = await run_command.execute(
                     engagement,
@@ -174,7 +176,9 @@ async def run_session(
             if code:
                 return RunResult(previous, code, "승인 응답 확인 실패 — 기록을 확인하세요.")
         finals = []
-        projection = SessionProjection(controller, verbose=verbose)
+        projection = SessionProjection(
+            controller, verbose=verbose, sink=getattr(frontend, "event_sink", None)
+        )
         try:
             # Same-registry resume: only forwarded when set, so the
             # builtin-default path stays compatible with existing callers.

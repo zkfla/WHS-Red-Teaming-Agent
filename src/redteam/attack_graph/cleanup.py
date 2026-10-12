@@ -6,6 +6,7 @@ up in the integrity report. Docs: ``docs/agent/attack-graph.md``.
 
 from __future__ import annotations
 
+from datetime import datetime
 from enum import Enum
 
 from pydantic import BaseModel, Field
@@ -36,6 +37,9 @@ class CleanupItem(BaseModel):
     status: CleanupStatus = CleanupStatus.PENDING
     created_at_step: int = 0
     created_by_action_id: str | None = None
+    created_evidence_id: str | None = None
+    created_at: datetime | None = None
+    run_id: str | None = None
     #: Evidence that the removal actually happened — a claim of cleanup
     #: with nothing behind it is the same problem as an ungrounded finding.
     cleanup_evidence_id: str | None = None

@@ -1,0 +1,73 @@
+.app { display: grid; grid-template-columns: 264px 1fr; grid-template-rows: minmax(0, 1fr); height: 100vh; }
+
+.side {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 18px 14px;
+  background: var(--dg);
+  color: var(--bg);
+  overflow-y: auto;
+}
+.side .label { color: var(--on-dark); }
+.brand { display: flex; align-items: center; gap: 10px; padding: 0 4px; }
+.mark { width: 34px; height: 34px; border-radius: 12px; background: var(--tn); }
+.nav { display: flex; flex-direction: column; gap: 2px; }
+.nav-item {
+  height: 42px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 12px;
+  background: none;
+  color: var(--on-dark);
+  font-weight: 600;
+  text-align: left;
+}
+.nav-item:hover:not(:disabled) { background: var(--on-dark-soft); color: var(--bg); }
+.nav-item.on { background: var(--ol); color: var(--bg); }
+.nav-item:disabled { opacity: .5; cursor: not-allowed; }
+.run-list { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.run-list li { padding: 7px 12px; border-radius: 10px; font-size: 13px; color: var(--on-dark); }
+.env { margin-top: auto; padding: 14px; border-radius: 14px; background: var(--on-dark-soft); }
+.env dl { margin: 8px 0 0; display: grid; grid-template-columns: auto 1fr; gap: 6px 10px; font-size: 12px; }
+.env dt { color: var(--on-dark); }
+.env dd { margin: 0; text-align: right; font-weight: 700; }
+
+.main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.top {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 14px 28px 12px;
+  border-bottom: 1px solid var(--line);
+}
+.title { flex: 1 1 260px; min-width: 0; }
+.title h1 { margin: 0; font-size: 22px; line-height: 1.3; letter-spacing: -.02em; }
+.controls { display: flex; gap: 8px; }
+
+.body { flex: 1; min-height: 0; display: flex; }
+.chat { flex: 1 1 0; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.insp {
+  width: 352px;
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 18px 20px;
+  background: var(--ol-soft);
+  border-left: 1px solid var(--line);
+  overflow-y: auto;
+}
+.thread { flex: 1; min-height: 0; overflow-y: auto; padding: 20px 28px 8px; display: flex; flex-direction: column; }
+.thread-inner { margin: auto auto 0; width: 100%; max-width: 700px; display: flex; flex-direction: column; gap: 16px; }
+.composer { padding: 8px 28px 20px; width: 100%; max-width: 756px; margin: 0 auto; }
+
+/* The approval panel is never hidden: it narrows, then moves under the conversation. */
+@media (max-width: 1100px) { .app { grid-template-columns: 220px 1fr; } .insp { width: 300px; } }
+@media (max-width: 800px) {
+  .app { grid-template-columns: 1fr; }
+  .side { display: none; }
+  .body { flex-direction: column; }
+  .insp { width: auto; max-height: 45vh; border-left: 0; border-top: 1px solid var(--line); }
+}

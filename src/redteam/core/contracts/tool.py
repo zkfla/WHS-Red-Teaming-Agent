@@ -10,9 +10,9 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
 
 from redteam.core.contracts.target import TargetRef
 from redteam.core.enums import RiskLevel, ToolHealthStatus
@@ -72,6 +72,7 @@ PROVIDER_METADATA_REQUIRES_TARGET = "redteam.requires_target"
 PROVIDER_METADATA_COMMAND_FIELDS = "redteam.command_fields"
 PROVIDER_METADATA_AVAILABILITY_IMPACT = "redteam.availability_impact"
 PROVIDER_METADATA_RESOURCE_BINDINGS = "redteam.resource_bindings"
+PROVIDER_METADATA_RESOURCE_EFFECTS = "redteam.resource_effects"
 
 # Providers attach this when execution may have produced effects but its
 # terminal outcome cannot be established. This is independent of success,
@@ -97,6 +98,40 @@ def execution_outcome_uncertain(metadata: Mapping[str, Any]) -> bool:
     return bool(metadata.get("orchestration_exception"))
 
 
+class ToolResourceEffect(BaseModel):
+    """Provider-owned resource identity and output paths, not model claims.
+
+    Version 1 is historical decoding only: its local ID has no proven domain.
+    Version 2 names the stable backend/tenant domain shared by create/delete
+    tools. Providers spanning domains must return a qualified identity value.
+    """
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+    version: Literal[1, 2] = 1
+    identity_domain: str | None = Field(default=None, min_length=1, max_length=1024)
+    effect: Literal["created", "cleaned"]
+    resource_type: str = Field(min_length=1, max_length=128)
+    identity_path: list[str | int] = Field(min_length=1, max_length=16)
+    confirmation_path: list[str | int] = Field(min_length=1, max_length=16)
+
+    @model_validator(mode="after")
+    def validate_identity_domain(self):
+        if self.version == 2 and (
+            self.identity_domain is None or not self.identity_domain.strip()
+        ):
+            raise ValueError("resource effect v2 requires a provider identity domain")
+        if self.version == 1 and self.identity_domain is not None:
+            raise ValueError("resource identity domain requires effect version 2")
+        return self
+
+    @model_serializer(mode="wrap")
+    def serialize_identity(self, handler):
+        value = handler(self)
+        if self.identity_domain is None:
+            value.pop("identity_domain", None)
+        return value
+
+
 class ToolDescriptor(BaseModel):
     tool_id: ToolId
     server_id: str
@@ -108,6 +143,8 @@ class ToolDescriptor(BaseModel):
     # arguments; the convenience properties below only present that schema in
     # a form that Agent/Registry code can consume safely.
     output_schema: dict[str, Any] | None = None
+    # None means unspecified; an explicit empty list declares no created resources.
+    resource_effects: list[ToolResourceEffect] | None = None
     operations: list[str] = Field(default_factory=list)
     target_types: list[str] = Field(default_factory=list)
     capability_tags: list[str] = Field(default_factory=list)
@@ -115,6 +152,14 @@ class ToolDescriptor(BaseModel):
     health_status: ToolHealthStatus = ToolHealthStatus.UNKNOWN
     # Declared by the tool provider for its actual operation semantics.
     retry_safe: bool = False
+    @model_serializer(mode="wrap")
+    def serialize_optional_effects(self, handler):
+        value = handler(self)
+        # Preserve existing tool/binding fingerprints when the feature is absent.
+        if self.resource_effects is None:
+            value.pop("resource_effects", None)
+        return value
+
     # Input argument -> shared target value (host/url/port/path/asset_ref/etc.).
     # Providers declare different remote argument names without central edits.
     argument_bindings: dict[str, str] = Field(default_factory=dict)

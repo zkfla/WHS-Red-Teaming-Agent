@@ -52,7 +52,7 @@ jobs:
       - run: docker compose -f deploy/compose/finance-lab.yml up --build -d --wait --wait-timeout 120
       - name: Exercise five MCP services against the synthetic bank
         run: docker compose -f deploy/compose/finance-lab.yml run --build --rm smoke
-      - name: Exercise default Agent loop and approval gate over real MCP
+      - name: Exercise central planner/worker and approval gate over lab MCP
         run: docker compose -f deploy/compose/finance-lab.yml run --build --rm agent-smoke
       - name: Capture container logs on failure
         if: failure()

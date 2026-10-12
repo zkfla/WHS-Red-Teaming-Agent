@@ -19,8 +19,6 @@ def _hard_stop(runtime: RuntimeState, deps: RuntimeDeps) -> str | None:
     # call. PLAN and the Control Plane prevent any new execution at budget 0.
     if runtime.consecutive_failures >= deps.settings.max_consecutive_failures:
         return TerminationReason.CONSECUTIVE_FAILURES
-    if runtime.no_progress_turns >= deps.settings.max_no_progress_turns:
-        return TerminationReason.STALLED
     return None
 
 

@@ -22,6 +22,7 @@ from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
 from redteam.core.contracts.graph import Finding, GraphNode, Hypothesis
 from redteam.core.contracts.target import HostTarget
 from redteam.core.enums import GraphEdgeType, GraphNodeType
+from tests.fakes.graph_records import records_for, seed_records
 
 
 def service() -> AttackGraphService:
@@ -189,13 +190,13 @@ async def test_snapshot_round_trips_through_a_fresh_store() -> None:
     service_node = await svc.upsert_node(GraphNodeType.SERVICE, key="a.local/ssh")
     await svc.link(GraphEdgeType.HOSTS, host.id, service_node.id)
 
-    records = await svc.export_snapshot(metadata={"run_id": "run_1"})
+    records = await records_for(svc, metadata={"run_id": "run_1"})
 
     restored = service()
-    metadata = await restored.import_snapshot(records)
+    metadata = await seed_records(restored, records)
 
     assert metadata == {"run_id": "run_1"}
-    assert await restored.export_snapshot(metadata={"run_id": "run_1"}) == records
+    assert await records_for(restored, metadata={"run_id": "run_1"}) == records
     assert (await node_at(restored, host.id)).properties == host.properties
 
 

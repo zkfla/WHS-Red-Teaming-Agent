@@ -22,6 +22,7 @@ from redteam.capability.servers.web_search import (
     WebSearchReader,
     parse_search_request,
 )
+from redteam.core.contracts.tool import PROVIDER_METADATA_RESOURCE_EFFECTS
 
 REMOTE_TOOL_NAME = "web_search"
 PROPOSED_OPERATION = "web_search"
@@ -94,7 +95,7 @@ def create_server(
     web_search.__annotations__["max_results"] = Annotated[
         int, Field(strict=True, ge=1, le=config.max_results)
     ]
-    server.tool()(web_search)
+    server.tool(meta={PROVIDER_METADATA_RESOURCE_EFFECTS: []})(web_search)
     return server
 
 

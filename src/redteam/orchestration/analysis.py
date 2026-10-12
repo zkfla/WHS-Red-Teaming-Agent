@@ -690,6 +690,8 @@ class StructuredLLMAnalysisVerifier:
                 return self._unknown_claim(refs, "linked evidence is another engagement")
             source_engagement = engagement
             raw = raw_from_metadata(getattr(record, "metadata", None))
+            if isinstance(raw, dict) and raw.get("metadata", {}).get("development_double") is True:
+                return self._unknown_claim(refs, "development double cannot prove a real claim")
             gap = _posthoc_source_gap(record, raw)
             if gap is not None:
                 return self._unknown_claim(refs, gap)
@@ -896,7 +898,9 @@ class StructuredLLMAnalysisVerifier:
         budget: DecisionBudget | None = None,
         before_call: Callable[[], Any] | None = None,
     ) -> VerificationAssessment:
-        if self._llm is None:
+        if request.result.metadata.get("development_double") is True:
+            assessment = self._unknown(request, "development double cannot prove a real claim")
+        elif self._llm is None:
             assessment = self._unknown(
                 request,
                 "no model configured for analysis; evidence preserved, no verdict reached",

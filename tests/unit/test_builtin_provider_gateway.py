@@ -260,25 +260,3 @@ async def test_binding_does_not_require_a_diagnostic_prefix():
     result = await gateway.invoke(invocation({}))
     assert not result.success
     assert result.error.code == "provider_context_mismatch"
-
-
-async def test_application_assembles_builtin_before_control_and_catalog(tmp_path):
-    from redteam.app.bootstrap import build_application
-    from redteam.core.config import load_app_config
-    from redteam.llm.fake import FakeLLMClient
-
-    config = load_app_config("examples/app.yaml")
-    provider = ContextProvider()
-    _, deps = await build_application(
-        config, llm=FakeLLMClient(), builtin_adapters=[provider],
-        builtin_concurrency={provider.server_id: 2},
-        evidence_dir=tmp_path / "evidence", audit_dir=tmp_path / "audit",
-        approval_dir=tmp_path / "approvals",
-    )
-    assert deps.tool_catalog is deps.tool_gateway
-    assert [str(tool.tool_id) for tool in deps.tool_catalog.all_descriptors()] == [
-        "builtin.inspect",
-    ]
-    result = await deps.tool_gateway.invoke(invocation({}))
-    assert result.success
-    assert provider.calls == [{"run_id": "run-test"}]
