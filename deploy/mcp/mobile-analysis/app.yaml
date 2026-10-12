@@ -37,7 +37,6 @@ llm:
   provider: fake
 
 orchestration:
-  max_retries: 3
   max_steps: 50
   tool_timeout_seconds: 180
 

@@ -19,13 +19,11 @@ from redteam.core.contracts.tool import (
     ToolError,
     ToolInvocation,
     ToolResult,
-    execution_outcome_uncertain,
 )
 from redteam.core.convert import build_tool_invocation
 from redteam.core.enums import (
     AgentPhase,
     PolicyVerdict,
-    RiskLevel,
     Severity,
     ToolHealthStatus,
 )
@@ -306,39 +304,8 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             )
             and descriptor.health_status is not ToolHealthStatus.UNHEALTHY
         )
-    # A bounded retry needs a retryable gateway error, a known LOW-risk
-    # descriptor *and* an explicitly read-only operation; LOW alone cannot
-    # establish idempotency (for example, a login attempt mutates state).
-    retry_enabled = bool(
-        deps.central_state is None
-        and
-        deps.settings.retry_retryable_tool_failures
-        and deps.settings.max_retries > 0
-        and descriptor is not None
-        and descriptor.risk_level is RiskLevel.LOW
-        and (
-            descriptor.retry_safe
-            or (
-                step.binding_mode == "legacy_action"
-                and deps.retry_policy is not None
-                and deps.retry_policy.permits(
-                    proposal.capability, proposal.operation, proposal.arguments
-                )
-            )
-        )
-        and isinstance(deps.control_plane, InvocationAdmissionControl)
-        and deps.long_job_adapter is None
-    )
-    max_retries = deps.settings.max_retries
-    if step.delegation_id:
-        delegation = runtime.delegations.get(step.delegation_id)
-        if delegation is None:
-            binding_ready = False
-        else:
-            max_retries = min(
-                max_retries,
-                max(delegation.budget.max_actions - delegation.actions_used - 1, 0),
-            )
+    if step.delegation_id and runtime.delegations.get(step.delegation_id) is None:
+        binding_ready = False
     if work_id is not None:
         try:
             assert deps.work_store is not None
@@ -354,8 +321,10 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         except Exception:  # noqa: BLE001 - fail closed when lease state is unknown
             lease_ready = False
 
-    retry_attempts = 0
     admission_denial = None
+    # Central execution makes exactly one provider attempt; a retryable
+    # failure is returned to the model instead of re-run here.
+    retry_attempts = 0
     orchestration_diagnostic = None
     any_provider_started = False
     invocation_entered = False
@@ -370,10 +339,6 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             raise RuntimeError("work lease was lost before tool execution")
         if deps.execution_recovery is not None:
             reference = deps.execution_recovery.prepare_reference(invocation)
-        # Recoverable executions retain one provider identity. A retry must
-        # never reuse that identity to overwrite its preserved original.
-        if reference is not None:
-            retry_enabled = False
         started = await publisher.publish(
             EventType.TOOL_EXECUTION_STARTED,
             {
@@ -398,58 +363,22 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                     lease_lost=lease_lost,
                 )
             )
-        while True:
-            invocation_entered = True
-            result = await _invoke_with_semaphore(
-                deps,
-                invocation,
-                runtime=runtime,
-                step=step,
-                work_id=work_id,
-                proposal=proposal,
-                decision=decision,
-            )
-            error = result.error
-            any_provider_started = any_provider_started or (
-                result.metadata.get(EXECUTION_STARTED_METADATA_KEY) is not False
-            )
-            if (
-                result.success
-                or execution_outcome_uncertain(result.metadata)
-                or not retry_enabled
-                or retry_attempts >= max_retries
-                or error is None
-                or not error.retryable
-            ):
-                break
-            if runtime.remaining_budget is not None and (
-                runtime.remaining_budget <= 1 + retry_attempts
-            ):
-                break
-            context = await _invocation_context(
-                deps, runtime, proposal, work_id, invocation.tool_id
-            )
-            retry_control = deps.control_plane
-            if not isinstance(retry_control, InvocationAdmissionControl):
-                break
-            async with deps.policy_lock:
-                reservation = await retry_control.reserve_extra_tool_call(
-                    proposal,
-                    decision,
-                    context,
-                    receipt_id=str(invocation.invocation_id),
-                    attempt_index=retry_attempts + 1,
-                )
-            if reservation.verdict is not PolicyVerdict.ALLOW:
-                admission_denial = reservation
-                break
-            retry_attempts += 1
-            await append_execution_receipt(
-                deps.evidence_store, invocation=invocation, proposal=proposal, step=step,
-                work_id=work_id, retry_attempt=retry_attempts,
-                target_node_id=(str(node_id_for_target(proposal.target))
-                                if proposal.target is not None else None),
-            )
+        # One provider attempt only: central execution never auto-retries a
+        # tool call. A retryable failure is returned to the model as feedback
+        # for a legal follow-up decision.
+        invocation_entered = True
+        result = await _invoke_with_semaphore(
+            deps,
+            invocation,
+            runtime=runtime,
+            step=step,
+            work_id=work_id,
+            proposal=proposal,
+            decision=decision,
+        )
+        any_provider_started = any_provider_started or (
+            result.metadata.get(EXECUTION_STARTED_METADATA_KEY) is not False
+        )
     except Exception as exc:  # noqa: BLE001 - normalize adapter/transport failure
         now = datetime.now(timezone.utc)
         if isinstance(exc, InvocationAdmissionDenied):
@@ -539,13 +468,6 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         result = result.model_copy(update={
             "metadata": {**result.metadata, EXECUTION_STARTED_METADATA_KEY: True},
         })
-    if retry_attempts:
-        # Bounded-retry observability: how many extra attempts this action
-        # consumed (the final ToolResult is the one recorded as Evidence).
-        result = result.model_copy(
-            update={"metadata": {**result.metadata, "retry_attempts": retry_attempts}}
-        )
-
     await append_execution_receipt(
         deps.evidence_store, invocation=invocation, proposal=proposal, step=step,
         work_id=work_id, reference=reference, result=result,
@@ -568,9 +490,7 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         causation_id=started.event_id if started is not None else state.get("last_event_id"),
     )
 
-    # An action consumes one budget slot; each retry attempt consumes an
-    # extra slot so a bounded retry cannot silently exceed the run budget
-    # (the Control Plane's own budget is charged once per admitted action).
+    # One action consumes one budget slot; there are no automatic retries.
     executed = int(
         any_provider_started or (
             result.metadata.get(EXECUTION_STARTED_METADATA_KEY) is not False

@@ -49,7 +49,6 @@ orchestration:
   # Central execution also requires an explicitly selected specialist profile
   # and shared LLM request policy. The CLI reads those selections from REDTEAM_*
   # environment variables; see README's central runtime example.
-  max_retries: 3
   max_steps: 50
 
 capability:

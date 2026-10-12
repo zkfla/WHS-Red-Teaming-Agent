@@ -233,6 +233,14 @@ def llm_env_values(source: Mapping[str, str] | None = None) -> dict[str, str | N
 def orchestration_env_values(source: Mapping[str, str] | None = None) -> dict[str, Any]:
     """Thin raw values for the run-limit shape. Only set keys are returned."""
     raw = _collect_raw(OrchestrationEnvInput, source)
+    if raw.get("max_retries") is not None:
+        # Removed setting: reject new input explicitly instead of silently
+        # ignoring it. Original saved Runs still decode this key passively.
+        raise ValueError(
+            "REDTEAM_ORCHESTRATION_MAX_RETRIES was removed: central execution "
+            "never auto-retries a tool call, so this value selects nothing. A "
+            "retryable failure is returned to the model instead."
+        )
     return {key: value for key, value in raw.items() if value is not None}
 
 

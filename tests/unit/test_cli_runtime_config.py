@@ -39,7 +39,6 @@ async def test_runtime_environment_reaches_both_cli_entrypoints(tmp_path, monkey
     monkeypatch.setenv("REDTEAM_LLM_PROVIDER", "fake")
     monkeypatch.setenv("REDTEAM_ORCHESTRATION_LLM_CANDIDATE_GENERATION", "true")
     monkeypatch.setenv("REDTEAM_ORCHESTRATION_MAX_STEPS", "17")
-    monkeypatch.setenv("REDTEAM_ORCHESTRATION_MAX_RETRIES", "2")
     path = tmp_path / "engagement.yaml"
     path.write_text(dump_engagement_yaml(_engagement()), encoding="utf-8")
     config = load_app_config_for_run(str(path))
@@ -48,7 +47,6 @@ async def test_runtime_environment_reaches_both_cli_entrypoints(tmp_path, monkey
     settings = OrchestrationSettings.for_durable_run(config.orchestration)
     assert settings.llm_candidate_generation is True
     assert settings.max_steps == 17
-    assert settings.max_retries == 2
     assert OrchestrationSettings.for_durable_run(config.orchestration, max_steps=9).max_steps == 9
 
 
@@ -57,12 +55,19 @@ async def test_runtime_environment_reaches_both_cli_entrypoints(tmp_path, monkey
     [
         ("LLM_CANDIDATE_GENERATION", "perhaps"),
         ("MAX_STEPS", "0"),
-        ("MAX_RETRIES", "-1"),
     ],
 )
 def test_invalid_runtime_environment_is_rejected(monkeypatch, field, value):
     monkeypatch.setenv(f"REDTEAM_ORCHESTRATION_{field}", value)
     with pytest.raises(ValidationError):
+        OrchestrationConfig.from_environment()
+
+
+def test_removed_retry_environment_is_rejected(monkeypatch):
+    # F21: the retry knob was removed from the public contract; new input is
+    # rejected explicitly instead of silently ignored.
+    monkeypatch.setenv("REDTEAM_ORCHESTRATION_MAX_RETRIES", "2")
+    with pytest.raises(ValueError, match="REDTEAM_ORCHESTRATION_MAX_RETRIES"):
         OrchestrationConfig.from_environment()
 
 

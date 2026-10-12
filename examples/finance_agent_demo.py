@@ -30,7 +30,7 @@ async def main() -> None:
             print(f"EVENT {event.event_type}: {event.payload}")
 
     await deps.event_bus.subscribe("*", show)
-    final = await run_engagement(engagement, deps=deps, orchestration_config=config.orchestration)
+    final = await run_engagement(engagement, deps=deps)
     graph = AttackGraphService(deps.graph_store)
     findings = await graph.list_findings(verified=True)
     hypotheses = await graph.list_hypotheses()

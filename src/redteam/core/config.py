@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
 from redteam.core.contracts.engagement import (
     ApprovalPolicy,
@@ -138,7 +138,25 @@ class OrchestrationConfig(BaseModel):
     거짓은 규칙 경로 선택이 아니라 검증 오류로 거부된다.
     """
 
-    max_retries: int = Field(default=3, ge=0)
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_removed_retry_settings(cls, value):
+        """F21: removed settings are rejected, never silently dropped.
+
+        A direct API call or YAML with a retired retry key fails loudly here;
+        original saved Runs still decode it passively via
+        ``OrchestrationSettings``.
+        """
+        if isinstance(value, Mapping):
+            removed = sorted({"max_retries", "retry_retryable_tool_failures"} & set(value))
+            if removed:
+                raise ValueError(
+                    "removed orchestration settings: "
+                    + ", ".join(removed)
+                    + " — central execution never auto-retries a tool call."
+                )
+        return value
+
     max_steps: int = Field(default=50, ge=1)
     # Retained input identity for saved configurations; there is one runtime.
     runtime_backend: Literal["central"] = "central"

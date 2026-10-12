@@ -15,9 +15,14 @@ def test_defaults_are_usable_without_any_config() -> None:
     assert settings.checkpointing is True
 
 
-def test_from_config_reads_both_fields_of_the_shared_contract() -> None:
-    settings = OrchestrationSettings.from_config(OrchestrationConfig(max_steps=12, max_retries=5))
-    assert (settings.max_steps, settings.max_retries) == (12, 5)
+def test_from_config_reads_the_shared_contract() -> None:
+    settings = OrchestrationSettings.from_config(OrchestrationConfig(max_steps=12))
+    assert settings.max_steps == 12
+    # ``max_retries`` was removed from the public contract (F21): it is not a
+    # selectable field and no longer travels through ``from_config``.
+    assert "max_retries" not in type(settings).model_fields
+    assert "max_retries" not in type(OrchestrationConfig()).model_fields
+    assert settings.central_payload()["max_retries"] == 3
 
 
 def test_overrides_win_over_config_and_none_is_ignored() -> None:

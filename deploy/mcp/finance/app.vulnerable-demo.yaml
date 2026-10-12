@@ -23,7 +23,6 @@ engagement:
 capability:
   mcp_servers: [web-http, recon-passive]
 orchestration:
-  max_retries: 1
   max_steps: 30
 llm:
   # Deliberately vulnerable demo still requires a real model: provider +

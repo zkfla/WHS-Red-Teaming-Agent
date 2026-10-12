@@ -115,7 +115,6 @@ async def main() -> None:
         final = await run_engagement(
             engagement,
             deps=deps,
-            orchestration_config=config.orchestration,
             objective=os.environ.get("REDTEAM_OBJECTIVE") or None,
         )
 

@@ -737,7 +737,17 @@ async def run_engagement(
     engagement, *, deps, objective=None, run_id=None, instance_id=None,
     orchestration_config=None,
 ):
-    """Execute central state; limits are fixed by application assembly."""
+    """Execute central state with the limits fixed by application assembly.
+
+    The former override argument is rejected before entering the run. Pass
+    configuration to ``build_application`` when assembling a new run instead.
+    Saved runs retain their original settings and component binding.
+    """
+    if orchestration_config is not None:
+        raise ValueError(
+            "run_engagement_orchestration_override_removed: pass orchestration "
+            "configuration to build_application before starting a new Run"
+        )
     from redteam.app.central_run import run_central_engagement
     return await run_central_engagement(
         engagement, deps=deps, objective=objective, run_id=run_id, instance_id=instance_id,

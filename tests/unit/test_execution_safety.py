@@ -4,8 +4,9 @@ Covers the controls that only bite at the tool call site:
 
   - ``RuntimeDeps.tool_semaphore`` — the actual
     ``RateLimitPolicy.max_concurrent_actions`` execution gate.
-  - bounded retry of a *retryable, known-low-risk* failure, capped by
-    ``OrchestrationSettings.max_retries`` and accounted against budget.
+  - the retry contract is identity-only: central execution never
+    auto-retries a tool call, so a retryable failure is returned to the
+    model for a legal follow-up decision.
   - ``verification_reserve_ratio`` budget scheduling (opt-in).
   - policy denial never becomes a tool failure (it never reaches EXECUTE).
 """

@@ -456,11 +456,15 @@ library capability for code that calls
 (see `examples/finance_agent_demo.py`) — the CLI itself never reads one.
 
 Runtime settings also have a shared environment path for interactive, `run`, and
-`resume`: `REDTEAM_ORCHESTRATION_MAX_STEPS` (default `50`),
-`REDTEAM_ORCHESTRATION_MAX_RETRIES` (default `3`), and
+`resume`: `REDTEAM_ORCHESTRATION_MAX_STEPS` (default `50`) and
 `REDTEAM_ORCHESTRATION_LLM_CANDIDATE_GENERATION` (default `true`; LLM reasoning
 is mandatory and `false` is rejected). Invalid values fail configuration validation.
 The `--max-steps` option overrides the environment value.
+`REDTEAM_ORCHESTRATION_MAX_RETRIES` and the configuration keys `max_retries`
+and `retry_retryable_tool_failures` are removed and rejected in new inputs.
+Central execution returns retryable tool failures to the model for a follow-up
+decision. Stored Run settings retain the old values solely for original binding
+identity; decoding them does not enable automatic retries.
 
 Before starting another Mission in an interactive session, the CLI reloads and
 validates `engagement.yaml`, including scope, ROE, and budget. A missing or invalid

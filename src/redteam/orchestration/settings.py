@@ -45,6 +45,11 @@ _RETIRED_STATE_DEFAULTS = {
     "max_actions_per_turn": 1,
     "verification_reserve_ratio": 0.2,
     "enforce_verification_reserve": False,
+    # The retry knobs were advertised as execution policy, but the single
+    # central runtime never retried a tool call (see ``execute_node``). They
+    # are retained here purely so original bindings still decode.
+    "max_retries": 3,
+    "retry_retryable_tool_failures": True,
 }
 
 _LEGACY_ONLY_SETTINGS = frozenset(
@@ -88,14 +93,7 @@ class OrchestrationSettings(BaseModel):
     llm_request_policy: LLMRequestPolicy | None = None
     specialist_profile_path: str | None = Field(default=None, min_length=1, max_length=4096)
     code_fixture_policy_path: str | None = Field(default=None, min_length=1, max_length=4096)
-    #: Additional tool-execution attempts after a retryable failure. Only
-    #: ever applied to a *known low-risk* (passive/read-only) tool so a
-    #: bounded retry cannot silently repeat a state-changing side effect;
-    #: see ``execute_node``. Set ``retry_retryable_tool_failures=False`` to
-    #: disable retries entirely.
-    max_retries: int = Field(default=3, ge=0)
     tool_timeout_seconds: float = Field(default=10.0, gt=0, le=600)
-    retry_retryable_tool_failures: bool = Field(default=True)
     #: Stop after this many tool executions fail back to back — a target
     #: that keeps erroring should not be hammered for the whole budget.
     max_consecutive_failures: int = Field(default=3, ge=1)
@@ -187,7 +185,6 @@ class OrchestrationSettings(BaseModel):
             base["max_steps"] = config.max_steps
             base["central_state_path"] = config.central_state_path
             base["max_workers"] = config.max_workers
-            base["max_retries"] = config.max_retries
             base["tool_timeout_seconds"] = config.tool_timeout_seconds
             base["resource_wait_timeout_seconds"] = config.resource_wait_timeout_seconds
             base["llm_request_policy"] = config.llm_request_policy

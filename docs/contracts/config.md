@@ -55,12 +55,23 @@ The CLI accepts these optional orchestration environment variables:
 | Variable | Default | Validation |
 |---|---|---|
 | `REDTEAM_ORCHESTRATION_MAX_STEPS` | `50` | integer >= 1 |
-| `REDTEAM_ORCHESTRATION_MAX_RETRIES` | `3` | integer >= 0 |
-| `REDTEAM_ORCHESTRATION_LLM_CANDIDATE_GENERATION` | `false` | boolean (`true`/`false`) |
+| `REDTEAM_ORCHESTRATION_LLM_CANDIDATE_GENERATION` | `true` | only `true` is supported |
 
 Interactive, `run`, and `resume` share this loader. `--max-steps` takes
 precedence over the environment value. Library callers can still supply an
 explicit `OrchestrationConfig` without reading the environment.
+
+New API/YAML inputs containing `max_retries` or
+`retry_retryable_tool_failures`, and the environment variable
+`REDTEAM_ORCHESTRATION_MAX_RETRIES`, are rejected as removed settings. A
+retryable tool failure is returned to the model for a follow-up decision.
+Original saved Run settings decode these fields through
+`OrchestrationSettings` as passive binding identity; they never enable retries.
+
+`run_engagement(orchestration_config=...)` rejects a supplied override before
+entering the Run. Configure a new Run through `build_application(AppConfig, ...)`
+or its `orchestration_settings` assembly argument. Execution keeps the assembled
+dependencies and binding; resuming a Run does not grant a new budget.
 
 An interactive session reloads and validates its engagement file before each
 new Mission. Invalid YAML, missing files, or invalid scope/ROE prevent that
