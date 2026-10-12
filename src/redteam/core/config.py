@@ -117,7 +117,7 @@ class LLMConfig(BaseModel):
         if not provider:
             raise ValueError(
                 "REDTEAM_LLM_PROVIDER is not set. Set it explicitly -- "
-                "REDTEAM_LLM_PROVIDER=litellm (with REDTEAM_LLM_MODEL) for "
+                "REDTEAM_LLM_PROVIDER=<provider> (with REDTEAM_LLM_MODEL) for "
                 "a real provider. There is no implicit default."
             )
         kwargs: dict[str, str] = {"provider": provider}

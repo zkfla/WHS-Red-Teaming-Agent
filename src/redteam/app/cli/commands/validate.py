@@ -22,7 +22,7 @@ from redteam.app.cli._shared import (
     print_json,
 )
 from redteam.capability.settings import MCPConfigurationError, MCPServerSettings
-from redteam.core.config import AppConfig, load_engagement_config
+from redteam.core.config import AppConfig, LLMConfig, load_engagement_config
 from redteam.core.environment import env_snapshot
 from redteam.orchestration.action_naming import canonical_action_key
 
@@ -50,6 +50,9 @@ async def run(args: argparse.Namespace) -> int:
     except (OSError, ValidationError, ValueError) as exc:
         return _fail(args, [*checks, ("Application configuration", False, [str(exc)])])
     checks.append(("Application configuration", True, []))
+    # Parse configured LLM settings and check Go's model shape offline.
+    # An unset provider never blocks the pure engagement checks.
+    checks.append(check_llm(env_snapshot()))
 
     scope_problems = check_scope(engagement_config)
     checks.append(("Scope", not scope_problems, scope_problems))
@@ -109,6 +112,46 @@ def _fail(args: argparse.Namespace, checks: list[tuple[str, bool, list[str]]]) -
         for problem in problems:
             eprint(f"  {problem}")
     return EXIT_CONFIG_ERROR
+
+
+def check_llm(environment) -> tuple[str, bool, list[str]]:  # noqa: ANN001
+    """Offline LLM selection check: ordinary parsing plus a Go-only extra.
+
+    Uses LLMConfig.from_environment for the ordinary path, so defaults
+    (e.g. the litellm model) behave exactly as before. Only when the Go
+    provider is selected, the shared feature-owned helper validates the
+    model shape offline. Zero provider calls. An unset REDTEAM_LLM_PROVIDER
+    is informational, never a blocker. A missing key *value* is a labelled
+    pass, never an error: the value is only needed at run time. An
+    unrecognized provider name stays a startup error at run time
+    (build_llm_client), not an offline failure here. Cannot validate
+    offline: key validity, endpoint reachability, model existence/permission,
+    quota/429 behavior, or any live model quality -- no live paid testing.
+    """
+    from redteam.llm.opencode_go_config import is_go_provider, validate_model
+
+    provider = (environment.get("REDTEAM_LLM_PROVIDER") or "").strip()
+    if not provider:
+        return ("LLM configuration (not configured)", True, [])
+    try:
+        llm_config = LLMConfig.from_environment(environment)
+    except ValueError as exc:
+        return ("LLM configuration", False, [str(exc)])
+    if is_go_provider(llm_config.provider):
+        try:
+            validate_model(llm_config.default_model)
+        except ValueError as exc:
+            return ("LLM configuration", False, [str(exc)])
+    if llm_config.default_model.startswith("chatgpt/"):
+        # OAuth device flow: no API key value to check.
+        return ("LLM configuration", True, [])
+    if not environment.get(llm_config.api_key_env_var):
+        return (
+            "LLM configuration (API key value not set here -- required at run time)",
+            True,
+            [],
+        )
+    return ("LLM configuration", True, [])
 
 
 def check_scope(engagement_config) -> list[str]:  # noqa: ANN001

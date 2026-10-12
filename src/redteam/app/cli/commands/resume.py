@@ -218,8 +218,13 @@ async def _run(
     # profile id/version or changed component ids fail here. A missing
     # record is a legacy checkpoint and resumes as builtin.
     try:
-        stored_binding = binding_for_resume(hint.component_binding, registry=component_registry)
-    except ComponentBindingError as exc:
+        from redteam.llm.opencode_go_config import llm_connection_fingerprint_for_config
+
+        stored_binding = binding_for_resume(
+            hint.component_binding, registry=component_registry,
+            llm_connection_fingerprint=llm_connection_fingerprint_for_config(config.llm),
+        )
+    except (ComponentBindingError, ValueError) as exc:
         eprint(
             f"ERROR: stored component profile for run {args.run_id} is not "
             f"registered: {exc} -- refusing to resume."
@@ -570,8 +575,13 @@ async def _run_cohort(
             return EXIT_FAILURE
 
     try:
-        stored_binding = binding_for_resume(binding_raw, registry=component_registry)
-    except ComponentBindingError as exc:
+        from redteam.llm.opencode_go_config import llm_connection_fingerprint_for_config
+
+        stored_binding = binding_for_resume(
+            binding_raw, registry=component_registry,
+            llm_connection_fingerprint=llm_connection_fingerprint_for_config(config.llm),
+        )
+    except (ComponentBindingError, ValueError) as exc:
         eprint(f"ERROR: stored component profile for run {run_id} is not registered: {exc}")
         return EXIT_FAILURE
     config = config.model_copy(

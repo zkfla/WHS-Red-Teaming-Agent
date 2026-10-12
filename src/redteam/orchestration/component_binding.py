@@ -49,7 +49,7 @@ class UnknownComponentProfileError(ComponentBindingError):
 
 
 class ComponentMismatchError(ComponentBindingError):
-    """Stored component ids differ from the registered profile ids."""
+    """Stored components or connection differ from the current selection."""
 
 
 class NonRebuildableComponentsError(ComponentBindingError):
@@ -79,6 +79,7 @@ class RuntimeComponentBinding(BaseModel):
     role_tools_fingerprint: str | None = None
     specialist_fingerprint: str | None = None
     code_fixture_fingerprint: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    llm_connection_fingerprint: str | None = None
 
     @model_serializer(mode="wrap")
     def serialize_optional_fixture(self, handler):
@@ -87,6 +88,8 @@ class RuntimeComponentBinding(BaseModel):
         # input hashes merely by serializing a new default-null field.
         if self.code_fixture_fingerprint is None:
             value.pop("code_fixture_fingerprint", None)
+        if self.llm_connection_fingerprint is None:
+            value.pop("llm_connection_fingerprint", None)
         return value
 
     def component_id(self, slot: str) -> str | None:

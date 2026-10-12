@@ -4,38 +4,20 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Iterator
-from contextlib import contextmanager
-from contextvars import ContextVar
-from dataclasses import dataclass
 from typing import Any
 
 from redteam.core.ports.agent_prompts import AgentPrompts
 from redteam.core.ports.llm import LLMProviderFailure, StructuredCompletion
+from redteam.core.request_scope import RequestScope, current_request_scope, llm_request_scope
 from redteam.orchestration.llm_requests import RequestAdmissionError, RunRequestLedger
 
-
-@dataclass(frozen=True)
-class RequestScope:
-    run_id: str
-    owner: str
-
-
-_scope: ContextVar[RequestScope | None] = ContextVar("llm_request_scope", default=None)
-
-
-@contextmanager
-def llm_request_scope(run_id: str, owner: str) -> Iterator[None]:
-    token = _scope.set(RequestScope(run_id, owner))
-    try:
-        yield
-    finally:
-        _scope.reset(token)
-
-
-def current_request_scope() -> RequestScope | None:
-    """Read-only lifecycle identity for coordinated writes; never prompt data."""
-    return _scope.get()
+__all__ = [
+    "RequestScope",
+    "current_request_scope",
+    "llm_request_scope",
+    "RunMeteredLLM",
+    "configure_request_metering",
+]
 
 
 class RunMeteredLLM:
@@ -56,7 +38,7 @@ class RunMeteredLLM:
         self.prompts = prompts
 
     async def _call(self, method: str, **kwargs: Any) -> Any:
-        scope = _scope.get()
+        scope = current_request_scope()
         if scope is None:
             raise RequestAdmissionError("llm_request_run_scope_missing")
         call = getattr(self.client, method, None)

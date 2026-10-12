@@ -171,9 +171,25 @@ def build_llm_client(config: LLMConfig) -> LLMClient:
         from redteam.llm.litellm import LiteLLMClient
 
         return LiteLLMClient(model=config.default_model, api_key=config.resolve_api_key())
+    from redteam.llm.opencode_go_config import (
+        OPENCODE_GO_PROVIDER,
+    )
+    from redteam.llm.opencode_go_config import (
+        validate_model as validate_opencode_go_model,
+    )
+
+    if config.provider == OPENCODE_GO_PROVIDER:
+        # Offline shape check first so a typo fails here with an actionable
+        # message instead of inside the adapter or, worse, at request time.
+        # T1's authoritative parser reuses this same helper (single grammar).
+        validate_opencode_go_model(config.default_model)
+        from redteam.llm.opencode_go import build as build_opencode_go
+
+        return build_opencode_go(config)
     raise ValueError(
         f"production requires a real LLM provider, received {config.provider!r}; "
-        "configure 'litellm' (test clients must be explicitly injected)"
+        "configure 'litellm' or 'opencode-go' (test clients must be explicitly "
+        "injected)"
     )
 
 
@@ -367,6 +383,7 @@ async def build_runtime_deps(
         evidence_store = PlanningEvidenceStore(evidence_store, PlanningAdmission(coordinator))
     from redteam.orchestration.metered_llm import configure_request_metering
 
+    llm_connection_fingerprint = getattr(llm, "connection_fingerprint", None)
     llm = configure_request_metering(
         llm, settings, coordinator, prompts=specialists.prompts if specialists else None,
     )
@@ -443,6 +460,9 @@ async def build_runtime_deps(
         component_binding = component_binding.model_copy(update={
             "code_fixture_fingerprint": resolved_fixture_runner.fingerprint,
         })
+    component_binding = component_binding.model_copy(update={
+        "llm_connection_fingerprint": llm_connection_fingerprint,
+    })
     return RuntimeDeps(
         specialist_policy=specialists.run_policy() if specialists else None,
         agent_prompts=specialists.prompts if specialists else None,
@@ -552,7 +572,8 @@ async def build_application(
     - ``config.engagement`` -> ``Engagement`` handed to the default
       ``ControlPlane`` (and returned alongside ``RuntimeDeps`` — callers
       pass it to ``run_engagement``).
-    - ``config.llm`` -> ``build_llm_client`` (requires ``provider: "litellm"``).
+    - ``config.llm`` -> ``build_llm_client`` (requires ``provider: "litellm"``
+      or ``"opencode-go"``).
     - ``config.capability`` -> ``_build_default_tool_gateway``.
     - ``config.orchestration`` -> ``OrchestrationSettings.from_config``;
       an explicit ``orchestration_settings`` may additionally select durable
@@ -689,6 +710,7 @@ async def build_application(
     resolved_llm = llm or build_llm_client(config.llm)
     from redteam.orchestration.metered_llm import configure_request_metering
 
+    llm_connection_fingerprint = getattr(resolved_llm, "connection_fingerprint", None)
     resolved_llm = configure_request_metering(
         resolved_llm, resolved_settings, coordinator,
         prompts=specialists.prompts if specialists else None,
@@ -907,6 +929,7 @@ async def build_application(
         "role_tools_fingerprint": role_fingerprint,
         "code_fixture_fingerprint": (deps.code_fixture_runner.fingerprint
                                      if deps.code_fixture_runner is not None else None),
+        "llm_connection_fingerprint": llm_connection_fingerprint,
     }))
     from redteam.orchestration.mobile_mcp_binding import (
         builtin_mobile_vendor_policies,

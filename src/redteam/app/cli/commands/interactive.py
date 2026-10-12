@@ -189,6 +189,14 @@ async def _ensure_runtime_config(
     happened -- read the same way ``redteam run`` does
     (``LLMConfig.from_environment()``), no prompt.
     """
+    from redteam.llm.opencode_go_config import (
+        OPENCODE_GO_API_KEY_ENV_VAR,
+        OPENCODE_GO_PROVIDER,
+    )
+    from redteam.llm.opencode_go_config import (
+        validate_model as validate_opencode_go_model,
+    )
+
     if os.environ.get("REDTEAM_LLM_PROVIDER"):
         return (
             LLMConfig.from_environment(),
@@ -198,14 +206,45 @@ async def _ensure_runtime_config(
         )
 
     console.print("\n[dim]No REDTEAM_LLM_PROVIDER set -- one-time runtime setup.[/dim]")
-    while True:
-        model = console.input("LLM model (e.g. chatgpt/gpt-6.1-sol, openai/gpt-6-luna): ").strip()
-        if model:
-            break
-        console.print(
-            "[red]A real LLM model is required -- runs without a model are not supported.[/red]"
+    provider = ""
+    while provider not in ("litellm", OPENCODE_GO_PROVIDER):
+        provider = (
+            console.input("LLM provider [litellm/opencode-go] (default litellm): ")
+            .strip()
+            .lower()
+            or "litellm"
         )
-    llm_config = LLMConfig(provider="litellm", default_model=model)
+        if provider not in ("litellm", OPENCODE_GO_PROVIDER):
+            console.print("[red]Choose 'litellm' or 'opencode-go' (empty keeps litellm).[/red]")
+    while True:
+        if provider == OPENCODE_GO_PROVIDER:
+            model = console.input(
+                "Go model (openai/<id>, openai/responses/<id>, or anthropic/<id>): "
+            ).strip()
+        else:
+            model = console.input(
+                "LLM model (e.g. chatgpt/gpt-6.1-sol, openai/gpt-6-luna): "
+            ).strip()
+        if not model:
+            console.print(
+                "[red]A real LLM model is required -- runs without a model are not supported.[/red]"
+            )
+            continue
+        if provider == OPENCODE_GO_PROVIDER:
+            try:
+                model = validate_opencode_go_model(model)
+            except ValueError as exc:
+                console.print(f"[red]{exc}[/red]")
+                continue
+        break
+    # Preserve an already-configured key-variable reference; otherwise default
+    # to OPENCODE_API_KEY for opencode-go and LLM_API_KEY for litellm.
+    api_key_env_var = os.environ.get("REDTEAM_LLM_API_KEY_ENV_VAR") or (
+        OPENCODE_GO_API_KEY_ENV_VAR if provider == OPENCODE_GO_PROVIDER else "LLM_API_KEY"
+    )
+    llm_config = LLMConfig(
+        provider=provider, default_model=model, api_key_env_var=api_key_env_var
+    )
     if not llm_config.resolve_api_key():
         # A `chatgpt/...` model authenticates via the OAuth device flow
         # documented in README, not an API key -- nothing to collect here.
@@ -224,6 +263,14 @@ async def _ensure_runtime_config(
     os.environ["REDTEAM_LLM_PROVIDER"] = llm_config.provider
     write_env_var(DEFAULT_ENV_PATH, "REDTEAM_LLM_MODEL", llm_config.default_model)
     os.environ["REDTEAM_LLM_MODEL"] = llm_config.default_model
+    if llm_config.api_key_env_var != "LLM_API_KEY":
+        # Persist a non-default key-variable reference (OPENCODE_API_KEY for
+        # opencode-go, or an operator-preset REDTEAM_LLM_API_KEY_ENV_VAR) so
+        # later runs resolve the same variable instead of the default.
+        write_env_var(
+            DEFAULT_ENV_PATH, "REDTEAM_LLM_API_KEY_ENV_VAR", llm_config.api_key_env_var
+        )
+        os.environ["REDTEAM_LLM_API_KEY_ENV_VAR"] = llm_config.api_key_env_var
     console.print(f"[dim]Wrote REDTEAM_LLM_PROVIDER to {DEFAULT_ENV_PATH}.[/dim]")
 
     orchestration_config = OrchestrationConfig.from_environment()

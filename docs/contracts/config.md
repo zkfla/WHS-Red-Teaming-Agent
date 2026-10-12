@@ -91,3 +91,30 @@ directory into its own process environment automatically at startup,
 best-effort (`redteam.app.cli._shared.load_dotenv_if_present`) — a real
 shell/CI-exported variable always wins over a `.env` value, so this only
 fills in what is otherwise unset.
+
+## LLM providers: `litellm` and `opencode-go`
+
+`LLMConfig` has exactly three fields (`provider`, `default_model`,
+`api_key_env_var`) read from `REDTEAM_LLM_PROVIDER` / `REDTEAM_LLM_MODEL` /
+`REDTEAM_LLM_API_KEY_ENV_VAR` -- selecting the Go adapter needs no new
+variable and no multi-profile system (zero schema change).
+
+- `REDTEAM_LLM_PROVIDER=opencode-go` with an explicit SDK-qualified model:
+  `REDTEAM_LLM_MODEL=openai/<id>`, `openai/responses/<id>`, or
+  `anthropic/<id>`. The qualified model selects the wire protocol; there is
+  no model-name catalog. Endpoints are fixed adapter-owned constants -- no
+  endpoint field exists anywhere in config.
+- Key reference: onboarding writes `OPENCODE_API_KEY` and persists
+  `REDTEAM_LLM_API_KEY_ENV_VAR=OPENCODE_API_KEY`, but an already-configured
+  `REDTEAM_LLM_API_KEY_ENV_VAR` is always preserved, never overwritten.
+  The key value itself is never stored inline, logged, or checkpointed.
+- Dependency floor: the `llm`/`agent` extras stay at `litellm>=1.50` (no new
+  extra, no pyproject change). The Go adapter checks at runtime that the
+  installed `litellm` is `>=1.104.0` and raises an actionable error otherwise.
+- `redteam validate` checks the Go selection offline only (ordinary config
+  parsing plus a Go-only shape check; a missing key *value* is a labelled
+  pass, not an error) with zero provider calls. It cannot check key validity, endpoint
+  reachability, model existence/permission, quota/429 behavior, or live model
+  quality -- there is no live paid testing.
+- Resume: a run records a secret-free connection fingerprint; resuming with a
+  changed Go connection is refused before any new request or replay.
