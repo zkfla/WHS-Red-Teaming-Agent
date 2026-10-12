@@ -7,7 +7,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from redteam.attack_graph.identity import hypothesis_node_id
-from redteam.core.ids import GraphNodeId
+from redteam.core.ids import GraphEdgeId, GraphNodeId
 from redteam.orchestration.analysis import claim_target_is_grounded
 from redteam.orchestration.completion import preserved_target_is_absent, validate_result_claims
 from redteam.orchestration.coordination import StateConflict, content_hash
@@ -78,6 +78,14 @@ def check_result_graph(tx, proof):
     if any(content_hash(tx.graph.get_local_node(GraphNodeId(identity))) != expected
            for identity, expected in proof.items()):
         raise StateConflict("completion_graph_proof_changed_reassessment_required")
+
+
+def check_result_edge_proof(tx, proof):
+    """Final CAS over task-grounding relation edges proven before review."""
+    for edge_id, expected in proof.items():
+        edge = tx.graph.get_local_edge(GraphEdgeId(edge_id))
+        if edge is None or content_hash(edge) != expected:
+            raise StateConflict("completion_grounding_edge_changed_reassessment_required")
 
 
 RESULT_REVIEW_INSTRUCTION = (

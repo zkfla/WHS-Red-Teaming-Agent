@@ -133,6 +133,17 @@ class GraphTransaction:
         node = self.get_node(GraphNodeId(self._prefix + str(node_id)))
         return node.model_copy(update={"id": node_id}) if node is not None else None
 
+    def get_local_edge(self, edge_id: GraphEdgeId) -> GraphEdge | None:
+        """Read the same public ID as the engagement-scoped async graph port."""
+        edge = self.get_edge(GraphEdgeId(self._prefix + str(edge_id)))
+        if edge is None:
+            return None
+        return edge.model_copy(update={
+            "id": edge_id,
+            "source_id": GraphNodeId(str(edge.source_id)[len(self._prefix):]),
+            "target_id": GraphNodeId(str(edge.target_id)[len(self._prefix):]),
+        })
+
     def mutate_node(self, node_id: GraphNodeId, update: NodeUpdate) -> GraphNode | None:
         self._node_id(str(node_id))
         previous = self.get_node(node_id)

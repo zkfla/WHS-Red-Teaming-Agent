@@ -269,27 +269,39 @@ def _posthoc_source_gap(record: Any, raw: Any) -> str | None:
     return None
 
 
-async def claim_target_is_grounded(
-    graph_service: Any, record: Any, target_node_id: str
-) -> bool:
-    """A source target or a measured, source-backed direct relation."""
+def _grounding_source(record: Any) -> str | None:
+    """Evidence target bound to its stored proposal target, else None."""
     meta = getattr(record, "metadata", {}) or {}
     source = str(meta.get("target_node_id", "") or "").strip()
-    if not source or not target_node_id:
-        return False
+    if not source:
+        return None
     proposal = meta.get("proposal", {})
     try:
         parsed = ActionProposal.model_validate(proposal)
         if parsed.target is None:
-            return False
+            return None
         if str(node_id_for_target(parsed.target)) != source:
-            return False
+            return None
     except Exception:
-        return False
-    if source == target_node_id:
-        return True
+        return None
+    return source
+
+
+async def grounding_edge_for(
+    graph_service: Any, record: Any, target_node_id: str
+):
+    """Exact measured edge proving record's source reaches target, else None.
+
+    Single owner of the grounding meaning: a source-target match needs no
+    edge (None); otherwise exactly one direct relation edge whose relation
+    snapshot equals the edge endpoints, witnessed MEASURED by this same run
+    and this exact evidence record. claim_target_is_grounded reuses this.
+    """
+    source = _grounding_source(record)
+    if source is None or not target_node_id or source == target_node_id:
+        return None
     if graph_service is None:
-        return False
+        return None
     from redteam.attack_graph.predicates import (
         Confidence,
         claim_assertions,
@@ -320,8 +332,20 @@ async def claim_target_is_grounded(
                 and assertion.get("confidence") == Confidence.MEASURED
                 and values_equal(assertion.get("value"), relation)
             ):
-                return True
-    return False
+                return edge
+    return None
+
+
+async def claim_target_is_grounded(
+    graph_service: Any, record: Any, target_node_id: str
+) -> bool:
+    """A source target or a measured, source-backed direct relation."""
+    source = _grounding_source(record)
+    if source is None or not target_node_id:
+        return False
+    if source == target_node_id:
+        return True
+    return await grounding_edge_for(graph_service, record, target_node_id) is not None
 
 
 def _is_direct_tool_binding(proposal: Any) -> bool:

@@ -54,6 +54,7 @@ def result_for(
 
 async def commit_result(
     deps, runtime, task, result, token, *, final, validity_read=None, graph_proof=None,
+    edge_proof=None,
 ):
     checked = await check_evidence(
         deps.evidence_store,
@@ -86,6 +87,10 @@ async def commit_result(
             from redteam.orchestration.result_claims import check_result_graph
 
             check_result_graph(tx, graph_proof)
+        if edge_proof is not None:
+            from redteam.orchestration.result_claims import check_result_edge_proof
+
+            check_result_edge_proof(tx, edge_proof)
         if final:
             saved = tx.finish_task(
                 str(task.task_id),
@@ -167,6 +172,7 @@ def register_result_tool(registry):
 
 async def complete_reviewed_result(
     deps, runtime, task, token, receipt, proposal, *, validity_read, graph_proof,
+    edge_proof=None,
 ):
     """The existing positive origin/conditions/claims review has already succeeded."""
     result = result_for(
@@ -177,7 +183,8 @@ async def complete_reviewed_result(
         receipt_id=receipt.evidence_id,
     )
     await commit_result(deps, runtime, task, result, token, final=True,
-                        validity_read=validity_read, graph_proof=graph_proof)
+                        validity_read=validity_read, graph_proof=graph_proof,
+                        edge_proof=edge_proof)
 
 
 async def complete_unresolved_result(deps, runtime, task, token, proposal):

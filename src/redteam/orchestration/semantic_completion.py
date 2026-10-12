@@ -445,7 +445,8 @@ async def _verify_task_origin(
     step_principal_scope: set[str] | None = None,
     task_graph_store: Any | None = None,
     work_store: Any | None = None,
- ) -> tuple[Any | None, list[str]]:
+    graph_service: Any | None = None,
+ ) -> tuple[Any | None, list[str], dict[str, str]]:
     """Task-level origin check: actual linkage, stored origin, relevance.
 
     Readonly and purpose-free: no purpose hash is needed here and nothing
@@ -458,22 +459,22 @@ async def _verify_task_origin(
     try:
         record = await evidence_store.get(evidence_id)
     except Exception as exc:  # noqa: BLE001 - store failure reads as unproven
-        return None, ["evidence lookup failed: " + type(exc).__name__]
+        return None, ["evidence lookup failed: " + type(exc).__name__], {}
     if record is None:
-        return None, ["evidence '" + str(evidence_id) + "' does not exist"]
+        return None, ["evidence '" + str(evidence_id) + "' does not exist"], {}
     if _record_text(getattr(record, "run_id", "")) != str(run_id):
-        return None, ["evidence '" + str(evidence_id) + "' belongs to a different run"]
+        return None, ["evidence '" + str(evidence_id) + "' belongs to a different run"], {}
     if engagement_id and _record_text(getattr(record, "engagement_id", "")) != str(engagement_id):
-        return None, ["evidence '" + str(evidence_id) + "' belongs to a different engagement"]
+        return None, ["evidence '" + str(evidence_id) + "' belongs to a different engagement"], {}
     meta = getattr(record, "metadata", None) or {}
     if not isinstance(meta, dict):
-        return None, ["evidence '" + str(evidence_id) + "' has unreadable metadata"]
+        return None, ["evidence '" + str(evidence_id) + "' has unreadable metadata"], {}
     raw = raw_from_metadata(meta)
     if not isinstance(raw, dict):
-        return None, ["evidence '" + str(evidence_id) + "' has no preserved raw result"]
+        return None, ["evidence '" + str(evidence_id) + "' has no preserved raw result"], {}
     linkage = check_record_linkage(record, meta, raw, str(evidence_id), require_proposal=True)
     if linkage:
-        return None, [linkage[0][0]]
+        return None, [linkage[0][0]], {}
     origin_errors = await verify_stored_origin(
         path_store=path_store,
         run_id=str(run_id),
@@ -487,25 +488,36 @@ async def _verify_task_origin(
         work_store=work_store,
     )
     if origin_errors:
-        return None, ["evidence '" + str(evidence_id) + "' " + origin_errors[0]]
+        return None, ["evidence '" + str(evidence_id) + "' " + origin_errors[0]], {}
     task_hash = _record_text(meta.get("task_purpose_hash", "") or "").strip()
     if task_hash and task is not None:
         expected_hash = (completion_contract_hash(task)
                          if meta.get("central_execution_version") == 1
                          else purpose_hash(_record_text(getattr(task, "objective", ""))))
         if task_hash != expected_hash:
-            return None, ["evidence '" + str(evidence_id) + "' purpose changed since the evidence"]
+            message = "evidence '" + str(evidence_id) + "' purpose changed since the evidence"
+            return None, [message], {}
     target_ref = _record_text(meta.get("target_node_id", "")).strip()
     if not target_ref and not preserved_target_is_absent(meta):
-        return None, ["evidence '" + str(evidence_id) + "' has no target linkage"]
+        return None, ["evidence '" + str(evidence_id) + "' has no target linkage"], {}
     related_nodes: set[str] = set()
     if task is not None:
         for node in list(getattr(task, "related_attack_graph_node_ids", []) or []):
             cleaned = str(node).strip()
             if cleaned:
                 related_nodes.add(cleaned)
+    edge_proof: dict[str, str] = {}
     if target_ref and related_nodes and target_ref not in related_nodes:
-        return None, ["evidence '" + str(evidence_id) + "' targets an object outside this task"]
+        from redteam.orchestration.analysis import grounding_edge_for
+
+        for node in sorted(related_nodes):
+            edge = await grounding_edge_for(graph_service, record, node)
+            if edge is not None:
+                edge_proof[str(edge.id)] = content_hash(edge)
+                break
+        if not edge_proof:
+            message = "evidence '" + str(evidence_id) + "' targets an object outside this task"
+            return None, [message], {}
     principals: set[str] = set()
     single = meta.get("principal_ref")
     if isinstance(single, str) and single.strip():
@@ -520,8 +532,8 @@ async def _verify_task_origin(
     anonymous = meta.get("anonymous") is True or "anonymous" in lowered
     scope = {str(item).strip() for item in (step_principal_scope or set()) if str(item).strip()}
     if scope and principals and not anonymous and principals.isdisjoint(scope):
-        return None, ["evidence '" + str(evidence_id) + "' uses a principal outside this task"]
-    return record, []
+        return None, ["evidence '" + str(evidence_id) + "' uses a principal outside this task"], {}
+    return record, [], edge_proof
 
 
 def _excerpt_of(record: Any, *, limit: int = EXCERPT_CHARS) -> dict[str, Any]:
@@ -767,8 +779,9 @@ async def complete_task(
         return errors
     verified: list[Any] = []
     excerpt_notes: list[dict[str, Any]] = []
+    task_edge_proof: dict[str, str] = {}
     for identity in evidence_ids:
-        record, errors = await _verify_task_origin(
+        record, errors, proof = await _verify_task_origin(
             evidence_store=engine.deps.evidence_store,
             path_store=getattr(getattr(engine, "deps", None), "path_store", None),
             run_id=str(runtime.run_id),
@@ -779,12 +792,14 @@ async def complete_task(
             step_principal_scope=None,
             task_graph_store=getattr(engine.deps, "investigations", engine.deps.task_graph_store),
             work_store=getattr(getattr(engine, "deps", None), "work_store", None),
+            graph_service=AttackGraphService(engine.deps.graph_store),
         )
         if errors:
             return errors
         if record is not None:
             verified.append(record)
             excerpt_notes.append(_excerpt_of(record))
+            task_edge_proof.update(proof)
     if not verified:
         return ["task completion needs related stored evidence"]
     contract_errors = await check_task_conditions(
@@ -891,7 +906,7 @@ async def complete_task(
     await complete_reviewed_result(
         engine.deps, runtime, task, token, receipt_record,
         CompletionProposal.model_validate(raw_proposal), validity_read=validity_read,
-        graph_proof=graph_proof,
+        graph_proof=graph_proof, edge_proof=task_edge_proof,
     )
     return []
 
