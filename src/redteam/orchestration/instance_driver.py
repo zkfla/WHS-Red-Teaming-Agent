@@ -47,6 +47,30 @@ from redteam.orchestration.state import RuntimeState
 logger = logging.getLogger(__name__)
 
 
+#: Checkpoint-less collection rejections: the preserved original exists but
+#: its digest/scope/identity does not match this Run/action/invocation. These
+#: stay rejected ("invalid") instead of held, so a later retry cannot silently
+#: adopt a foreign or tampered original. Every other failure keeps the
+#: original held with its bounded reason.
+_COLLECTION_REJECTIONS = frozenset({
+    "execution_original_receipt_mismatch_or_uncertain",
+    "execution_result_original_not_proven",
+    "evidence_scope_mismatch",
+    "evidence_file_index_disagreement",
+    "execution_receipt_digest_mismatch",
+    "execution_receipt_identity_mismatch",
+    "execution_receipt_action_mismatch",
+    "execution_receipt_reference_mismatch",
+    "execution_receipt_result_identity_mismatch",
+    "execution_resolution_unverified",
+    "execution_original_job_mismatch",
+    "execution_recovery_input_mismatch",
+    "conflicting_execution_results",
+    "conflicting_uncertain_execution_results",
+    "conflicting_execution_submissions",
+})
+
+
 class InstanceEvent(BaseModel):
     """One instance's terminal result, yielded as soon as it is ready."""
 
@@ -577,6 +601,7 @@ class InstanceDriver:
 
     async def collect_checkpointless_originals(
         self, run_id: str, *, checkpoint_instances: set[str],
+        instance_ids: set[str] | None = None,
     ) -> list[ExecutionOriginalCollection]:
         """Preserve proved originals, but keep entered/no-checkpoint actors held.
 
@@ -584,6 +609,9 @@ class InstanceDriver:
         The existing Run owner/quiescent lock prevents concurrent actors and
         driver teardown. No Control, model, Graph, Work/Task settlement, claim
         release, accounting restoration or new checkpoint runs here.
+        An explicit instance selection scopes reads and probes to those actors
+        only; unselected siblings are never inspected. Quiescence stays global:
+        any live actor still refuses the whole collection.
         """
         from redteam.orchestration.central_recovery import collect_original
         from redteam.orchestration.central_state import check_evidence, check_execution_receipt
@@ -591,13 +619,14 @@ class InstanceDriver:
             ExecutionOriginal,
             ExecutionOriginalCollection,
         )
+        from redteam.orchestration.execution_journal import ExecutionReceiptError
 
         await self.own_run(run_id)
         if self._active or any(runner.is_active for runner in self._runners.values()):
             raise StateConflict("central_recovery_requires_quiescent_run")
         state = self._deps.central_state
         collected = []
-        for proof in await state.activation_inventory():
+        for proof in await state.activation_inventory(instance_ids=instance_ids):
             if (proof["instance_id"] in checkpoint_instances
                     or proof["launch_stage"] == "reserved"):
                 continue
@@ -619,6 +648,18 @@ class InstanceDriver:
                         state="known" if original else "held",
                         reason_code="original_collected" if original else "original_unresolved",
                         original_receipt_id=str(original[1]) if original else None,
+                    ))
+                except ExecutionReceiptError as exc:
+                    original_results.append(ExecutionOriginal(
+                        invocation_id=str(execution.invocation_id), state="invalid",
+                        reason_code=exc.reason_code,
+                    ))
+                except StateConflict as exc:
+                    code = str(exc)
+                    original_results.append(ExecutionOriginal(
+                        invocation_id=str(execution.invocation_id),
+                        state="invalid" if code in _COLLECTION_REJECTIONS else "held",
+                        reason_code=code,
                     ))
                 except Exception as exc:
                     original_results.append(ExecutionOriginal(

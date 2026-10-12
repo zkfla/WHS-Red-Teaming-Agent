@@ -86,6 +86,7 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=False)
     for module in _COMMAND_MODULES:
         module.add_parser(subparsers)
+    resume.add_collect_originals_parser(subparsers)
     return parser
 
 

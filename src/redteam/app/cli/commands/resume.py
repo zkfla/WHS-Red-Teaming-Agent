@@ -24,6 +24,11 @@ redacted Audit snapshot.
 Without any checkpoint, only a coherent versioned, never-entered specialist
 reservation may supply an assembly identity. It is NOT replay permission;
 the owned driver verifies current state and actual absence of effects again.
+
+`collect-originals` (same module) only gathers already-existing originals
+for entered actors that never wrote a checkpoint. It reuses the central
+assembly for queries, never drives actors, and never resumes tasks, releases
+claims, or settles usage. See docs/agent/collect-originals-cli.md.
 """
 
 from __future__ import annotations
@@ -252,3 +257,163 @@ def _exit_code_for(final: RuntimeState) -> int:
     if final.phase.value == "failed":
         return EXIT_FAILURE
     return EXIT_OK
+
+
+def add_collect_originals_parser(subparsers) -> None:
+    parser = subparsers.add_parser(
+        "collect-originals",
+        help="Collect existing originals only; never resume or release claims",
+    )
+    parser.add_argument("run_id")
+    parser.add_argument("engagement_path")
+    parser.add_argument(
+        "--instance",
+        default=None,
+        help="Collect one instance thread only (default: every entered actor)",
+    )
+    parser.add_argument("--log-level", default=None)
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--state-db", default=None)
+    parser.set_defaults(handler=run_collect_originals)
+
+
+def _collection_reason(exc: Exception) -> str:
+    from redteam.orchestration.coordination import CoordinationError, StateConflict
+
+    if isinstance(exc, (CoordinationError, StateConflict)):
+        return str(exc)
+    return type(exc).__name__
+
+
+async def run_collect_originals(args, *, component_registry=None) -> int:
+    async with AsyncExitStack() as stack:
+        try:
+            config = load_app_config_for_run(args.engagement_path)
+            from redteam.app.cli._shared import runtime_overrides
+
+            config = runtime_overrides(config, args)
+        except (OSError, ValidationError, ValueError) as exc:
+            eprint(f"ERROR: {exc}")
+            return EXIT_CONFIG_ERROR
+        log_level = args.log_level or config.logging.level
+        logging.basicConfig(level=log_level, force=True)
+        return await _run_collect_central(
+            args, config, mcp_stack=stack, component_registry=component_registry,
+        )
+
+
+async def _run_collect_central(args, config, *, mcp_stack, component_registry=None) -> int:
+    from pathlib import Path
+
+    from redteam.app.bootstrap import build_central_storage
+    from redteam.app.central_views import inspect_central_run
+    from redteam.app.cli._shared import print_json
+    from redteam.app.cli.commands.run import build
+    from redteam.orchestration.coordination import StateConflict
+    from redteam.orchestration.instance_driver import InstanceDriver
+    from redteam.orchestration.state import RuntimeState
+
+    chosen = getattr(args, "instance", None)
+    selected_ids = {str(chosen)} if chosen is not None else None
+    try:
+        inspected, original, _ = await inspect_central_run(
+            getattr(args, "state_db", None) or config.orchestration.central_state_path,
+            args.run_id,
+        )
+    except Exception as exc:
+        eprint(f"ERROR: original collection refused: {_collection_reason(exc)}")
+        return EXIT_FAILURE
+    try:
+        before = await inspected.activation_inventory(instance_ids=selected_ids)
+        selected = OrchestrationSettings.model_validate(original["settings"])
+        overrides = {}
+        if config.orchestration.specialist_profile_path is not None:
+            overrides["specialist_profile_path"] = config.orchestration.specialist_profile_path
+        if config.orchestration.llm_request_policy is not None:
+            overrides["llm_request_policy"] = config.orchestration.llm_request_policy
+        selected = selected.with_overrides(**overrides)
+        state, _ = await build_central_storage(
+            config.engagement.to_engagement(inspected.engagement_id),
+            run_id=args.run_id, path=inspected.path,
+        )
+        _, deps = await build(
+            config, max_steps=None, mcp_stack=mcp_stack, central_state=state,
+            original_stores=original["storage_refs"], original_settings=selected,
+            component_registry=component_registry,
+        )
+        probe_checkpoint = Path(original["storage_refs"]["checkpoints"]).is_file()
+        driver_settings = selected
+        if not probe_checkpoint:
+            driver_settings = selected.model_copy(update={"checkpointing": False})
+        driver = InstanceDriver(deps, settings=driver_settings)
+        body_error = None
+        try:
+            await driver.open()
+            await driver.own_run(args.run_id)
+            current = await state.activation_inventory(instance_ids=selected_ids)
+            if sorted(map(_inventory_key, current)) != sorted(map(_inventory_key, before)):
+                raise StateConflict("activation_collection_inventory_changed")
+            checkpoint_instances = set()
+            if probe_checkpoint:
+                for row in await state.activation_inventory(instance_ids=selected_ids):
+                    if row["launch_stage"] == "reserved":
+                        continue
+                    probe = RuntimeState(
+                        run_id=args.run_id, engagement_id=inspected.engagement_id,
+                        instance_id=row["instance_id"],
+                    )
+                    if await driver.runner_for(probe).checkpoint_exists(probe):
+                        checkpoint_instances.add(row["instance_id"])
+            results = await driver.collect_checkpointless_originals(
+                args.run_id, checkpoint_instances=checkpoint_instances,
+                instance_ids=selected_ids,
+            )
+        except BaseException as exc:
+            body_error = exc
+            raise
+        finally:
+            try:
+                await driver.close()
+            except Exception as exc:
+                if body_error is None:
+                    raise
+                eprint(f"ERROR: original collection teardown incomplete: {type(exc).__name__}")
+    except Exception as exc:
+        eprint(f"ERROR: original collection refused: {_collection_reason(exc)}")
+        return EXIT_FAILURE
+    collected = bool(results) and all(
+        item.originals and all(original.state == "known" for original in item.originals)
+        for item in results
+    )
+    if not results:
+        eprint(
+            "NOTE: no proved entered/checkpointless actor; nothing collected. "
+            "Resume and claim release are not authorized."
+        )
+    if getattr(args, "json", False):
+        print_json({
+            "schema_version": 1,
+            "run_id": args.run_id,
+            "outcome": "collected" if collected else "held",
+            "replay_permitted": False,
+            "claim_release_permitted": False,
+            "instances": [item.model_dump(mode="json") for item in results],
+        })
+    else:
+        outcome = "collected" if collected else "held"
+        print(f"Original collection for Run {args.run_id}: " + outcome)
+        for item in results:
+            print(f"  instance={item.instance_id}; originals={len(item.originals)}")
+            for original in item.originals:
+                print(f"    {original.invocation_id}: {original.state}, "
+                      f"reason={original.reason_code}, receipt={original.original_receipt_id}")
+        print("Originals only: no resume, Task completion or claim release. "
+              "Empty inventory does not prove non-entry.")
+    return EXIT_OK if collected else EXIT_FAILURE
+
+
+def _inventory_key(row) -> tuple:
+    return (
+        row["instance_id"], row["task_id"], row["owner"], row["ownership_version"],
+        row["launch_stage"], row["proof_version"], row["binding_hash"],
+    )
