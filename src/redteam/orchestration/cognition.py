@@ -420,6 +420,30 @@ def _parse_text_result(
     raise _NonObjectDecision(raw)
 
 
+def _metered_guard_scope(llm, guard):
+    """Run the caller's guard inside the metered facade's post-wait hook.
+
+    The metered facade re-checks time/mission admission after its shared
+    semaphore/cooldown wait; routing the existing guard through the same
+    ContextVar keeps one time policy for planner, repair, native and
+    code-role requests. Non-metered clients keep the caller's pre-call
+    guard, so fakes and direct transports are unchanged.
+    """
+    from contextlib import nullcontext
+
+    from redteam.orchestration.metered_llm import RunMeteredLLM, llm_request_guard
+
+    if guard is not None and isinstance(llm, RunMeteredLLM):
+        return llm_request_guard(guard)
+    return nullcontext()
+
+
+def _is_metered(llm) -> bool:
+    from redteam.orchestration.metered_llm import RunMeteredLLM
+
+    return isinstance(llm, RunMeteredLLM)
+
+
 class StructuredDecisionClient:
     """Ask the model for a JSON decision validated against a schema.
 
@@ -538,7 +562,7 @@ class StructuredDecisionClient:
         active = budget or DecisionBudget(self._max_attempts)
         repair = False
         while active.permits(repair=repair):
-            if before_call is not None:
+            if before_call is not None and not _is_metered(self._llm):
                 guarded = before_call()
                 if inspect.isawaitable(guarded):
                     await guarded
@@ -546,7 +570,9 @@ class StructuredDecisionClient:
             try:
                 from redteam.orchestration.prompts import instruction_scope
 
-                with instruction_scope("native_action", role_id):
+                with instruction_scope("native_action", role_id), _metered_guard_scope(
+                    self._llm, before_call
+                ):
                     response = await request(
                         messages=messages, tools=tools, system=system, num_retries=0
                     )
@@ -609,30 +635,32 @@ class StructuredDecisionClient:
         feedback: str,
         kind: str,
         budget: DecisionBudget,
+        guard: Callable[..., Any] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         messages = [{"role": "user", "content": self._prompt_for(working, feedback, kind)}]
         use_metered = callable(getattr(self._llm, "complete_structured_with_usage", None))
         attempt_start = time.perf_counter()
         try:
-            if use_metered:
-                completion = await self._llm.complete_structured_with_usage(
-                    messages=messages,
-                    response_schema=response_schema,
-                    system=system,
-                    num_retries=0,
-                )
-                budget.add_usage(getattr(completion, "total_tokens", None))
-                raw = getattr(completion, "value", None)
-            else:
-                raw = await self._llm.complete_structured(
-                    messages=messages,
-                    response_schema=response_schema,
-                    system=system,
-                    num_retries=0,
-                )
-                # Legacy dict-only providers never report usage: the cost of
-                # this request is unknown, never zero.
-                budget.add_usage(None)
+            with _metered_guard_scope(self._llm, guard):
+                if use_metered:
+                    completion = await self._llm.complete_structured_with_usage(
+                        messages=messages,
+                        response_schema=response_schema,
+                        system=system,
+                        num_retries=0,
+                    )
+                    budget.add_usage(getattr(completion, "total_tokens", None))
+                    raw = getattr(completion, "value", None)
+                else:
+                    raw = await self._llm.complete_structured(
+                        messages=messages,
+                        response_schema=response_schema,
+                        system=system,
+                        num_retries=0,
+                    )
+                    # Legacy dict-only providers never report usage: the cost of
+                    # this request is unknown, never zero.
+                    budget.add_usage(None)
         except ReasoningHalted as halted:
             raise DecisionFailure(
                 stage, "budget", budget.used,
@@ -810,6 +838,10 @@ class StructuredDecisionClient:
             ):
                 if not budget.permits(repair=is_repair):
                     raise exhausted()
+                # Non-metered transports check the guard here; metered ones
+                # also re-check it AFTER their semaphore/cooldown wait (see
+                # ``_metered_guard_scope``), so exhaustion while waiting for a
+                # slot still stops with a structured budget error.
                 await run_guard()
                 budget.consume(stage=stage, repair=is_repair)
                 budget.record(stage, "request", feedback=safe_feedback(feedback))
@@ -823,6 +855,7 @@ class StructuredDecisionClient:
                             feedback=feedback,
                             kind=kind,
                             budget=budget,
+                            guard=before_call,
                         )
                         if validate_response is not None:
                             try:

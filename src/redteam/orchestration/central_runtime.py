@@ -93,7 +93,9 @@ async def process_controls(deps):
                 OperatorIntentType.EXPLANATION_QUERY,
                 OperatorIntentType.GUIDANCE,
                 OperatorIntentType.FOCUS,
+                OperatorIntentType.REPRIORITIZE,
             }
+
             query = kind in {OperatorIntentType.STATUS_QUERY, OperatorIntentType.EXPLANATION_QUERY}
             if mission.status in {
                 MissionStatus.CANCELLED,
@@ -101,6 +103,7 @@ async def process_controls(deps):
                 MissionStatus.FAILED,
             }:
                 supported = query
+            rejection_reason = "central_development_intent_not_supported"
             if kind is OperatorIntentType.PAUSE:
                 status = MissionStatus.PAUSED
             elif kind is OperatorIntentType.STOP:
@@ -132,13 +135,65 @@ async def process_controls(deps):
                 preferences["guidance"] = saved.intent.instruction
             elif kind is OperatorIntentType.FOCUS:
                 preferences["focus_areas"] = saved.intent.parameters.get("focus_areas", [])
+            if kind is OperatorIntentType.REPRIORITIZE and supported:
+                params = saved.intent.parameters
+                if any(key in params for key in ("scope", "approval", "budget", "target")):
+                    supported = False
+                    rejection_reason = "operator_reprioritize_forbidden_field"
+                else:
+                    areas = params.get("focus_areas", [])
+                    endpoints = params.get("endpoint_selectors", [])
+                    selectors = params.get("task_selectors", [])
+                    def _str_list(value):
+                        return isinstance(value, list) and all(
+                            isinstance(i, str) for i in value
+                        )
+                    shapes_ok = (
+                        _str_list(areas)
+                        and _str_list(endpoints)
+                        and _str_list(selectors)
+                    )
+                    existing = {str(task.task_id) for task in tx.list_tasks()}
+                    named = [str(t) for t in saved.intent.task_ids]
+                    unknown = [t for t in named if t not in existing]
+                    def _sel_hit(sel):
+                        token = sel.strip()
+                        return bool(token) and any(
+                            token in tid or tid in token for tid in existing
+                        )
+                    matched_selector = not selectors or any(
+                        _sel_hit(sel) for sel in selectors
+                    )
+                    empty = not named and not selectors and not areas and not endpoints
+                    if not shapes_ok or unknown or not matched_selector or empty:
+                        supported = False
+                        if unknown or not matched_selector:
+                            rejection_reason = "operator_reprioritize_unknown_task"
+                        else:
+                            rejection_reason = "operator_reprioritize_empty_or_malformed"
+                    else:
+                        ordered = list(dict.fromkeys([
+                            *named,
+                            *[s.strip() for s in selectors if s.strip()],
+                        ]))
+                        stored_ids = preferences.get("prioritized_task_ids", []) or []
+                        kept = [i for i in stored_ids if isinstance(i, str)][-100:]
+                        pending = [t for t in ordered if t not in kept]
+                        preferences["prioritized_task_ids"] = (kept + pending)[-100:]
+                        if areas:
+                            preferences["focus_areas"] = areas
+                        if endpoints:
+                            stored = preferences.get("focus_endpoints", []) or []
+                            current = [i for i in stored if isinstance(i, str)]
+                            merged = list(dict.fromkeys([*current, *endpoints]))
+                            preferences["focus_endpoints"] = merged[-100:]
             result = saved.model_copy(
                 update={
                     "status": IntentStatus.APPLIED if supported else IntentStatus.REJECTED,
                     "applied_at": now if supported else None,
                     "applied_event_id": notification.event_id if supported else None,
                     "outcome": f"{kind.value}_applied" if supported else "unsupported_or_closed",
-                    "reason": None if supported else "central_development_intent_not_supported",
+                    "reason": None if supported else rejection_reason,
                 }
             )
 
@@ -240,7 +295,30 @@ def tool_limit(deps):
     return min(limits)
 
 
+def _candidate_order(tasks, mission):
+    prefs = mission.operator_preferences or {}
+    prioritized = [str(i) for i in (prefs.get("prioritized_task_ids", []) or []) if str(i).strip()]
+    rank = {tid: index for index, tid in enumerate(prioritized)}
+    focus = [str(a).lower() for a in (prefs.get("focus_areas", []) or []) if str(a).strip()]
+    endpoints = [str(e) for e in (prefs.get("focus_endpoints", []) or []) if str(e).strip()]
+
+    def key(task):
+        tid = str(task.task_id)
+        ordered = rank.get(tid)
+        if ordered is not None:
+            return (0, ordered, 0, tid)
+        haystack = (task.title + " " + task.objective).lower()
+        nodes = {str(n) for n in task.related_attack_graph_node_ids}
+        focused = any(area in haystack for area in focus) or any(
+            sel and (sel in nodes or any(sel in node for node in nodes)) for sel in endpoints
+        )
+        return (1, 0, 0 if focused else 1, tid)
+
+    return sorted(tasks, key=key)
+
+
 async def ready_workers(deps, base, *, max_instances=None):
+
     from redteam.orchestration.agents.tool_access import ready_role_ids
 
     state = deps.central_state
@@ -253,7 +331,7 @@ async def ready_workers(deps, base, *, max_instances=None):
         mission = tx.admit()
         slots = limit - tx.active_activation_count()
         claimed = []
-        for candidate in candidates:
+        for candidate in _candidate_order(candidates, mission):
             if slots <= 0:
                 break
             task = tx.get_task(str(candidate.task_id))

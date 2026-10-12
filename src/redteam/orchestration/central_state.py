@@ -625,6 +625,89 @@ class CentralTransaction:
             "status": TaskStatus.READY, "updated_at": datetime.now(timezone.utc),
         }))
 
+    def adjust_task_necessity(
+        self, task_id: str, *, action: str, required=None, reason="", goal_revision=None,
+        owner=None, version=None, criterion_refs=(), evidence_ids=(),
+        source_task_id=None, source_result_id=None, source_question_id=None,
+    ) -> MissionTask:
+        self.admit()
+        mission_id, _ = self.binding()
+        mission = self.get_mission(mission_id)
+        if mission is None:
+            raise StateConflict("planning_mission_missing")
+        if goal_revision is not None and mission.revision != goal_revision:
+            raise StateConflict("planning_goal_changed")
+        task = self.get_task(task_id)
+        if task is None or str(task.mission_id) != mission_id:
+            raise StateConflict("planning_task_scope_mismatch")
+        if task.status not in {TaskStatus.PENDING, TaskStatus.READY}:
+            raise StateConflict("task_necessity_requires_unstarted_task")
+        if task.result is not None:
+            raise StateConflict("task_necessity_result_already_recorded")
+        if task.occupant_owner is not None:
+            if owner != task.occupant_owner or version != task.ownership_version:
+                raise StateConflict("stale_task_ownership")
+            if self._active_requests(owner):
+                raise StateConflict("task_has_unresolved_activity")
+        elif owner is not None or version is not None:
+            raise StateConflict("stale_task_ownership")
+        if self._unsafe_execution(task_id):
+            raise StateConflict("task_has_unresolved_execution")
+        if self.db.execute(
+            "SELECT 1 FROM state_activations WHERE run_id=? AND task_id=? LIMIT 1",
+            (self.run_id, task_id),
+        ).fetchone() is not None:
+            raise StateConflict("task_has_unreconciled_activation")
+        if not reason.strip():
+            raise CoordinationError("task_necessity_reason_required")
+        criteria = [c for c in (criterion_refs or []) if str(c).strip()]
+        evidence = [e for e in (evidence_ids or []) if str(e).strip()]
+        if set(criteria) - set(mission.success_criteria):
+            raise StateConflict("planner_adjustment_unknown_criterion")
+        if evidence:
+            self._require_refs(evidence)
+        if source_task_id is not None:
+            source = self.get_task(str(source_task_id))
+            if (
+                source is None or str(source.mission_id) != mission_id
+                or source.result is None
+                or source.result.result_id != source_result_id
+                or str(source_question_id) not in {
+                    q.question_id for q in source.result.questions
+                }
+            ):
+                raise StateConflict("planner_adjustment_bad_result_link")
+        if not (criteria or evidence or source_task_id is not None):
+            raise StateConflict("planner_adjustment_ungrounded")
+        if action == "cancel":
+            update = {"status": TaskStatus.CANCELLED, "required": False}
+        elif action == "set_required":
+            if required is None or required == task.required:
+                raise CoordinationError("task_necessity_no_required_change")
+            update = {"required": required}
+        else:
+            raise CoordinationError("task_necessity_unknown_action")
+        metadata = dict(task.provenance.metadata)
+        if "original_required" not in metadata:
+            metadata["original_required"] = task.required
+        history = list(metadata.get("necessity_adjustments", []))
+        history.append({
+            "action": action, "reason": reason.strip()[:500], "goal_revision": mission.revision,
+            "criteria": criteria[:8], "evidence": evidence[:8],
+            "source": (
+                {
+                    "task_id": str(source_task_id), "result_id": source_result_id,
+                    "question_id": source_question_id,
+                }
+                if source_task_id is not None else None
+            ),
+        })
+        metadata["necessity_adjustments"] = history[-10:]
+        provenance = task.provenance.model_copy(update={"metadata": metadata})
+        return self._write_task(task.model_copy(update={
+            **update, "provenance": provenance, "updated_at": datetime.now(timezone.utc),
+        }))
+
     def recover_unentered(
         self, task_id: str, *, previous_owner: str, version: int, owner: str, instance_id: str,
     ) -> MissionTask:
@@ -1610,6 +1693,21 @@ class CentralStateStore:
         return await self.transaction(lambda tx: tx.claim_task(
             task_id, owner=owner, instance_id=instance_id,
         ))
+
+    async def adjust_task_necessity(
+        self, task_id: str, *, action: str, required=None, reason="", goal_revision=None,
+        owner=None, version=None, criterion_refs=(), evidence_ids=(),
+        source_task_id=None, source_result_id=None, source_question_id=None,
+    ):
+        def adjust(tx):
+            return tx.adjust_task_necessity(
+                task_id, action=action, required=required, reason=reason,
+                goal_revision=goal_revision, owner=owner, version=version,
+                criterion_refs=criterion_refs, evidence_ids=evidence_ids,
+                source_task_id=source_task_id, source_result_id=source_result_id,
+                source_question_id=source_question_id,
+            )
+        return await self.transaction(adjust)
 
     async def get(self, intent_id: OperatorIntentId) -> IntentRecord | None:
         return await self.transaction(lambda tx: tx.get_intent(str(intent_id)), write=False)

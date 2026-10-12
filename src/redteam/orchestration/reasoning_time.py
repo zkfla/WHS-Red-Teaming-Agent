@@ -34,3 +34,21 @@ def reasoning_time_failure(
 
 def reasoning_time_allowed(engagement, runtime, *, now=None) -> bool:
     return reasoning_time_failure(engagement, runtime, now=now) is None
+
+
+def planning_request_guard(deps, runtime, *, now_fn=None):
+    async def _guard():
+        from redteam.core.enums import MissionStatus
+        from redteam.orchestration.llm_requests import RequestAdmissionError
+        now = now_fn() if now_fn is not None else None
+        failure = reasoning_time_failure(deps.engagement, runtime, now=now)
+        if failure is not None:
+            raise RequestAdmissionError(failure[0])
+        mission_id = getattr(runtime, "mission_id", None)
+        state = getattr(deps, "central_state", None)
+        if mission_id is not None and state is not None:
+            mission = await state.get_mission(mission_id)
+            paused_or_stopped = (MissionStatus.PAUSED, MissionStatus.CANCELLED)
+            if mission is not None and mission.status in paused_or_stopped:
+                raise RequestAdmissionError("reasoning_mission_paused_or_stopped")
+    return _guard

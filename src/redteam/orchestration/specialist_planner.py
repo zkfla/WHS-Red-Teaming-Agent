@@ -21,12 +21,16 @@ from redteam.orchestration.cognition import (
 from redteam.orchestration.diagnostics import DecisionDiagnostic
 from redteam.orchestration.engine import InvestigationEngine
 from redteam.orchestration.knowledge_validation import known_principals, known_target_ids
-from redteam.orchestration.metered_llm import llm_request_scope
+from redteam.orchestration.metered_llm import llm_request_guard, llm_request_scope
+from redteam.orchestration.reasoning_time import planning_request_guard
 from redteam.orchestration.specialist_tasks import (
     AtomicTaskProposal,
     InvestigationQuestion,
     SpecialistProposalError,
     StrategyTasks,
+    TaskNecessityProposal,
+    apply_necessity_adjustments,
+    validate_necessity_proposals,
     validate_strategy_questions,
     validate_strategy_tasks,
 )
@@ -37,6 +41,7 @@ class StrategyDraft(BaseModel):
     questions: list[InvestigationQuestion]
     reason: str = Field(min_length=1)
     termination: Literal["continue", "exhausted", "goal_achieved", "held"] = "continue"
+    task_adjustments: list[TaskNecessityProposal] = Field(default_factory=list)
 
 
 class AtomizationDraft(BaseModel):
@@ -84,7 +89,54 @@ def specialist_planning_inputs(deps) -> dict:
     return inputs
 
 
+_MAX_PLANNER_INTENT_HISTORY = 5
+
+
+def operator_planner_context(mission, intents, *, run_id=None) -> dict:
+    from redteam.core.enums import OperatorIntentType
+    from redteam.orchestration.operator_intents.models import IntentStatus
+    applied = [r for r in intents if r.status is IntentStatus.APPLIED]
+    if run_id is not None:
+        applied = [
+            r for r in applied
+            if r.run_id is None or str(r.run_id) == str(run_id)
+        ]
+    applied.sort(key=lambda r: (r.intent.created_at, str(r.intent_id)))
+    prefs = mission.operator_preferences or {}
+    guidance = None
+    for record in reversed(applied):
+        if record.intent.intent_type is OperatorIntentType.GUIDANCE:
+            guidance = record.intent.instruction[:500]
+            break
+    history = applied[-_MAX_PLANNER_INTENT_HISTORY:]
+    ledger = [
+        {
+            "intent_id": str(record.intent_id),
+            "intent_type": record.intent.intent_type.value,
+            "created_at": record.intent.created_at.isoformat(),
+            "outcome": record.outcome,
+        }
+        for record in history
+    ]
+
+    def _bounded_list(value, limit=8):
+        return [str(i) for i in (value or []) if str(i).strip()][:limit]
+
+    return {
+        "mission_revision": mission.revision,
+        "guidance": guidance,
+        "focus_areas": _bounded_list(prefs.get("focus_areas")),
+        "focus_endpoints": _bounded_list(prefs.get("focus_endpoints")),
+        "prioritized_task_ids": _bounded_list(prefs.get("prioritized_task_ids"), 32),
+        "excluded_areas": _bounded_list(prefs.get("excluded_areas")),
+        "excluded_endpoints": _bounded_list(prefs.get("excluded_endpoints")),
+        "excluded_task_ids": _bounded_list(prefs.get("excluded_task_ids"), 32),
+        "applied_intents": ledger,
+    }
+
+
 class SpecialistPlanner:
+
     def __init__(self, deps) -> None:
         if deps.specialist_policy is None:
             raise ValueError("specialist_policy_missing")
@@ -115,6 +167,11 @@ class SpecialistPlanner:
         engine = InvestigationEngine(self.deps)
         context = await engine.context(runtime, None)
         mission = await self.deps.central_state.get_mission(runtime.mission_id)
+        intents = await self.deps.central_state.list_for_mission(runtime.mission_id)
+        operator_context = operator_planner_context(mission, intents, run_id=runtime.run_id)
+        central_tasks = await self.deps.central_state.list_tasks()
+        existing_tasks = {str(task.task_id): task for task in central_tasks}
+        admission_guard = planning_request_guard(self.deps, runtime)
         material = await engine.execution_material(runtime)
         targets, principals = known_target_ids(material), known_principals(material)
         hypotheses = await AttackGraphService(self.deps.graph_store).list_hypotheses()
@@ -131,18 +188,33 @@ class SpecialistPlanner:
             "unresolved_results": context["unresolved_results"],
             "registered_principal_refs": sorted(principals),
             "known_target_ids": sorted(targets), "max_tasks": self.policy.max_tasks_per_strategy,
+            "mission_revision": mission.revision,
+            "operator_guidance": operator_context,
         })
         budget = DecisionBudget(normal_limit=self.deps.settings.decision_normal_limit,
                                 repair_limit=self.deps.settings.decision_max_attempts)
 
         def check_questions(raw):
             try:
+                draft = StrategyDraft.model_validate(raw)
                 validate_strategy_questions(
-                    StrategyDraft.model_validate(raw).questions, known_targets=targets,
+                    draft.questions, known_targets=targets,
                     known_principals=principals, known_hypotheses=hypothesis_ids,
                     investigation_only=True,
                 )
+                validate_necessity_proposals(
+                    draft.task_adjustments, mission=mission, tasks_by_id=existing_tasks,
+                    evidence_ids=set(context["evidence_index"]),
+                )
             except SpecialistProposalError as exc:
+                if exc.code.startswith("planner_adjustment_"):
+                    raise DecisionValidationError(DecisionDiagnostic(
+                        code=exc.code, stage="attack_path_proposal", kind="validation",
+                        retryable=True,
+                        summary=_REJECTION_SUMMARIES.get(
+                            exc.code, "The task adjustment is not grounded."),
+                        location="$.task_adjustments",
+                    )) from exc
                 raise self._rejection(exc, "attack_path_proposal") from exc
 
         def check_tasks(raw):
@@ -157,22 +229,34 @@ class SpecialistPlanner:
             except SpecialistProposalError as exc:
                 raise self._rejection(exc, "task_atomization") from exc
 
-        with llm_request_scope(str(runtime.run_id), "specialist_planning"):
+        with llm_request_scope(str(runtime.run_id), "specialist_planning"), llm_request_guard(
+            admission_guard
+        ):
             strategy = StrategyDraft.model_validate(await self.client.ask(
                 stage="attack_path_proposal", payload=payload, budget=budget,
                 response_schema=_schema_with_completion_criterion_hint(
                     StrategyDraft.model_json_schema()
                 ),
                 validate_response=check_questions,
+                before_call=admission_guard,
                 system="Propose useful investigation questions from current tasks, results and "
                        "their follow-up questions. Reinvestigation may reuse the same evidence. "
                        "Do not create ordering dependencies or paths. If no useful investigation "
                        "remains, propose termination=exhausted and justify it from the supplied "
                        "results and unresolved questions. Empty questions otherwise means held. "
+                       "Prefer investigations named by operator_guidance. A registered task that "
+                       "is no longer needed may be proposed under task_adjustments with "
+                       "goal, criterion or result grounds. "
                        "Goal success requires a separate criterion/evidence review. "
                        "Tools and text do not grant execution permission.",
             ))
             if not strategy.questions:
+                await apply_necessity_adjustments(
+                    self.deps.central_state, strategy.task_adjustments,
+                    expected_revision=mission.revision,
+                    evidence_store=self.deps.evidence_store,
+                )
+
                 def record_judgment(tx):
                     import json
                     tx.admit()
@@ -197,12 +281,18 @@ class SpecialistPlanner:
                     AtomizationDraft.model_json_schema()
                 ),
                 validate_response=check_tasks,
+                before_call=admission_guard,
                 system="Register investigations by purpose, evidence, role and fixed conditions. "
                        "Preserve every question condition. No depends_on or tool-call queue. "
                        "Follow-ups cite source_task_id, source_result_id and source_question_id "
                        "from the original result item. Only registered ready roles "
                        "and known subjects.",
             ))
+        await apply_necessity_adjustments(
+            self.deps.central_state, strategy.task_adjustments,
+            expected_revision=mission.revision,
+            evidence_store=self.deps.evidence_store,
+        )
         identities = await register_investigation_tasks(
             self.deps.central_state, proposal_id=new_id("registration"),
             proposal=StrategyTasks(questions=strategy.questions, tasks=atomization.tasks),
@@ -260,4 +350,17 @@ _REJECTION_SUMMARIES: dict[str, str] = {
         "question must be retained by at least one of its tasks.",
     "specialist_role_not_executable": "role_id must be a registered, schedulable role that is "
         "currently available.",
+    "planner_adjustment_duplicate_task": "each task_id may appear once in task_adjustments.",
+    "planner_adjustment_unknown_task": "task_id must reference a task of this mission.",
+    "planner_adjustment_stale_goal": "goal_revision must match the current mission revision.",
+    "planner_adjustment_blank_reason": "reason must be non-blank.",
+    "planner_adjustment_unknown_criterion": "criterion_refs must be current success criteria.",
+    "planner_adjustment_blank_evidence_ref": "evidence_ids must be non-blank references.",
+    "planner_adjustment_unknown_evidence": "evidence_ids must be known same-run evidence.",
+    "planner_adjustment_bad_result_link": "source links must name a recorded result question.",
+    "planner_adjustment_ungrounded": "name a goal criterion, evidence ref or result link.",
+    "planner_adjustment_missing_required_flag": "set_required needs a required value.",
+    "planner_adjustment_cancel_keeps_required": "cancel cannot keep required=true.",
+    "planner_adjustment_stale_owner": "owner/version must match the holding worker.",
+    "planner_adjustment_unowned_has_owner": "unowned tasks take no owner/version.",
 }

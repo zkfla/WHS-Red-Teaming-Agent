@@ -447,6 +447,7 @@ def _structured_completion_unresolved(decision: Any) -> bool:
 
 
 class InvestigationEngine:
+
     def __init__(self, deps) -> None:
         self.deps = deps
         self.client = StructuredDecisionClient(

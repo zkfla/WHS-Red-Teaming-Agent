@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -36,6 +36,34 @@ def llm_request_scope(run_id: str, owner: str) -> Iterator[None]:
 def current_request_scope() -> RequestScope | None:
     """Read-only lifecycle identity for coordinated writes; never prompt data."""
     return _scope.get()
+
+
+_guard: ContextVar[Callable[[], Awaitable[None]] | None] = ContextVar(
+    "llm_request_guard", default=None,
+)
+
+
+@contextmanager
+def llm_request_guard(
+    guard: Callable[[], Awaitable[None]] | None,
+) -> Iterator[None]:
+    """Per-task time/mission re-check run AFTER semaphore/cooldown wait.
+
+    The planner/engine set this around their model requests; the metered
+    facade invokes it immediately BEFORE reserve/dispatch so exhaustion
+    while waiting for a slot (or between strategy and atomization) still
+    stops with a structured budget error instead of an empty success.
+    Context-local, so concurrent Runs never share a guard.
+    """
+    token = _guard.set(guard)
+    try:
+        yield
+    finally:
+        _guard.reset(token)
+
+
+def current_request_guard() -> Callable[[], Awaitable[None]] | None:
+    return _guard.get()
 
 
 class RunMeteredLLM:
@@ -82,6 +110,19 @@ class RunMeteredLLM:
         delay = await self.ledger.wait_seconds(scope.run_id)
         if delay:
             await self.sleep(delay)
+        # Time/mission admission AFTER semaphore + cooldown wait, immediately
+        # BEFORE reserve/dispatch. Covers strategy, atomization, repair and
+        # code-role requests alike: they all pass through this one path and
+        # charge the shared Run ledger below. A denial raises
+        # RequestAdmissionError (a ReasoningHalted) so the decision client
+        # converts it to a structured budget stop, never an empty success.
+        # Feed path: an explicit admission_guard call kwarg, else the task-local
+        # llm_request_guard scope bound by the owning planner/engine turn.
+        guard = kwargs.pop("admission_guard", None)
+        if guard is None:
+            guard = _guard.get()
+        if guard is not None:
+            await guard()
         kwargs["num_retries"] = 0
         request = await self.ledger.reserve(scope.run_id, owner=scope.owner, kind=method)
         # A failed durable dispatch update never starts the external request.
