@@ -1,6 +1,7 @@
 """Default central planner/worker execution over one canonical state store."""
 
 import asyncio
+import logging
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -12,14 +13,90 @@ from redteam.core.contracts.mission import Provenance
 from redteam.core.enums import AgentPhase, MissionStatus
 from redteam.core.ids import EngagementId, MissionId, RunId, new_id
 from redteam.orchestration.central_results import RESULT_UPDATED
-from redteam.orchestration.central_runtime import ACTOR_RETURNED, process_controls
+from redteam.orchestration.central_runtime import ACTOR_RETURNED, CentralEventBus, process_controls
 from redteam.orchestration.cognition import DecisionFailure, ReasoningHalted
 from redteam.orchestration.context import RuntimeDeps
+from redteam.orchestration.coordination import StateConflict
+from redteam.orchestration.evidence_validity import (
+    ExpiryWatch,
+    ValidityChange,
+    emit_allowed,
+    next_expiry,
+    queue_validity_change,
+    refresh_validity,
+    validity_change_envelope,
+)
 from redteam.orchestration.instance_driver import InstanceDriver
 from redteam.orchestration.seed import seed_from_engagement
 from redteam.orchestration.specialist_planner import SpecialistPlanner, specialist_planning_inputs
 from redteam.orchestration.state import RuntimeState, TerminationReason
 from redteam.orchestration.wakeup import EventWakeup
+
+logger = logging.getLogger(__name__)
+
+
+def _delivery_bus(deps: RuntimeDeps):
+    """Raw bus for durable outbox delivery."""
+    if isinstance(deps.event_bus, CentralEventBus):
+        return deps.event_bus.bus
+    return deps.event_bus
+
+
+async def recheck_evidence_expiry(deps: RuntimeDeps, runtime: RuntimeState, watch: ExpiryWatch,
+                                   *, baseline_silent: bool = False,
+                                   ) -> tuple[list[ValidityChange], datetime | None]:
+    """One bounded originals re-read; queue grounded changes for the planner.
+
+    Reads evidence/graph originals only: never a model or tool call, never
+    scope/approval/target authorization, and never deletion of
+    originals/Findings/task results. With ``baseline_silent`` the observation
+    only establishes the watch baseline (restart recovery reads original
+    conditions without notifying). Otherwise real transitions are queued on
+    the existing outbox as EvidenceValidityChanged with related evidence
+    refs and a change reason, advancing the existing event sequence so the
+    planner re-judges through its normal bounded path. While the mission is
+    not ACTIVE the observation is absorbed and nothing is queued, so
+    pause/stop/shutdown start no new work; resume and the authoritative
+    final validity gate re-read the same originals.
+    """
+    projections = await refresh_validity(deps, runtime)
+    now = datetime.now(timezone.utc)
+    if baseline_silent:
+        watch.observe(projections, now=now)
+        return [], next_expiry(projections, now=now)
+    # Peek first: the baseline advances only after the change is durably
+    # queued, so a failed queue retries instead of dropping the change.
+    changes = watch.pending_changes(projections, now=now)
+    upcoming = next_expiry(projections, now=now)
+    if not changes:
+        watch.advance(projections)
+        return [], upcoming
+    if runtime.mission_id is None:
+        raise StateConflict("evidence_expiry_mission_unavailable")
+    mission = await deps.central_state.get_mission(runtime.mission_id)
+    if mission is None or mission.status is None:
+        raise StateConflict("evidence_expiry_mission_unavailable")
+    if not emit_allowed(mission.status):
+        watch.advance(projections)
+        return [], upcoming
+    envelopes = [
+        validity_change_envelope(
+            run_id=runtime.run_id, engagement_id=runtime.engagement_id, change=change,
+        )
+        for change in changes
+    ]
+
+    def queue_all(tx):
+        for envelope in envelopes:
+            queue_validity_change(tx, envelope)
+
+    await deps.central_state.transaction(queue_all)
+    watch.advance(projections)
+    try:
+        await deps.central_state.deliver_outbox(_delivery_bus(deps))
+    except Exception as exc:  # noqa: BLE001 - durable row redelivers on later ticks
+        logger.warning("evidence expiry delivery deferred: %s", type(exc).__name__)
+    return changes, upcoming
 
 
 @dataclass
@@ -82,6 +159,7 @@ class CentralRun:
             ACTOR_RETURNED,
             EventType.GRAPH_UPDATED,
             EventType.EVIDENCE_CREATED,
+            EventType.EVIDENCE_VALIDITY_CHANGED,
             EventType.TASK_COMPLETED,
             EventType.OPERATOR_INTENT_APPLIED,
         }
@@ -100,6 +178,20 @@ class CentralRun:
             lambda tx: tx.latest_event_sequence(tuple(kinds)),
             write=False,
         )
+        validity_watch = ExpiryWatch()
+        validity_next: datetime | None = None
+        validity_baselined = False
+        validity_flush_due = False
+        try:
+            # Restart recovery reads original conditions without notifying;
+            # queued-but-undelivered rows are redelivered durably below.
+            _, validity_next = await recheck_evidence_expiry(
+                self.deps, self.runtime, validity_watch, baseline_silent=True,
+            )
+            validity_baselined = True
+            await self.deps.central_state.deliver_outbox(_delivery_bus(self.deps))
+        except Exception as exc:  # noqa: BLE001 - expiry recheck retries on tick
+            logger.warning("evidence expiry baseline skipped: %s", type(exc).__name__)
 
         async def changed(envelope):
             if listening and str(envelope.run_id) == str(self.runtime.run_id):
@@ -157,6 +249,7 @@ class CentralRun:
 
         async def tick():
             nonlocal planning_task, next_scan, planning_halt, last_planned
+            nonlocal validity_watch, validity_next, validity_baselined, validity_flush_due
             if control_task is not None and control_task.done():
                 await control_task
             await apply_controls()
@@ -168,10 +261,42 @@ class CentralRun:
             periodic = now >= next_scan
             if periodic:
                 next_scan = now + timedelta(seconds=interval)
+            validity_changed = False
+            if (not validity_baselined
+                    or validity_next is None
+                    or now >= validity_next
+                    or updates.pending
+                    or periodic):
+                # New bindings arrive without a dedicated wake event, and a new
+                # earlier deadline supersedes a far-future one: re-read current
+                # originals on any activity or bounded scan and recompute the
+                # earliest observed deadline.
+                try:
+                    queued, validity_next = await recheck_evidence_expiry(
+                        self.deps, self.runtime, validity_watch,
+                        baseline_silent=not validity_baselined,
+                    )
+                    validity_baselined = True
+                    validity_changed = bool(queued)
+                except Exception as exc:  # noqa: BLE001 - retry bounded, never raw text
+                    logger.warning("evidence expiry recheck skipped: %s", type(exc).__name__)
+                    validity_next = now + timedelta(seconds=interval)
+            if validity_changed:
+                # A queued change may still sit undelivered; redeliver on
+                # later ticks until the dispatcher reports nothing pending.
+                validity_flush_due = True
+            if validity_flush_due:
+                try:
+                    remaining = await self.deps.central_state.deliver_outbox(
+                        _delivery_bus(self.deps))
+                    validity_flush_due = remaining > 0
+                except Exception as exc:  # noqa: BLE001 - redelivery retries on tick
+                    logger.warning("evidence expiry redelivery skipped: %s",
+                                   type(exc).__name__)
             if (
                 planning_task is None
                 and planning_halt is None
-                and (updates.pending or periodic)
+                and (updates.pending or periodic or validity_changed)
             ):
                 if updates.pending:
                     await updates.wait(timeout_seconds=interval)
@@ -190,6 +315,8 @@ class CentralRun:
                 lambda tx: tx.active_activation_count(),
                 write=False,
             ):
+                if validity_next is not None:
+                    return min(next_scan, validity_next)
                 return next_scan
             return None
 

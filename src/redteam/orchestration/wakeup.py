@@ -31,6 +31,25 @@ class WakeupBatch(BaseModel):
     observed_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
+def expiry_timeout(wake_at: datetime | None, *, now: datetime | None = None,
+                   max_timeout_seconds: float) -> float:
+    """Bound an existing wait by the next observed expiry; pure computation.
+
+    Returns ``max_timeout_seconds`` when no expiry is known (never invents
+    one), 0.0 when the expiry already passed, otherwise the clamped delta.
+    No polling and no model calls: the caller still performs a single bounded
+    wait and re-reads originals afterwards.
+    """
+    if max_timeout_seconds <= 0:
+        raise ValueError("wakeup timeout must be positive")
+    if wake_at is None:
+        return max_timeout_seconds
+    if wake_at.tzinfo is None:
+        raise ValueError("wakeup deadline timezone required")
+    moment = now if now is not None else datetime.now(timezone.utc)
+    return max(0.0, min(max_timeout_seconds, (wake_at - moment).total_seconds()))
+
+
 class EventWakeup:
     """Collapses event bursts into one scheduler tick.
 
@@ -73,13 +92,27 @@ class EventWakeup:
             self._events[event.event_id] = event
             self._signal.set()
 
-    async def wait(self, *, timeout_seconds: float) -> WakeupBatch:
-        if timeout_seconds <= 0:
-            raise ValueError("wakeup timeout must be positive")
-        try:
-            await asyncio.wait_for(self._signal.wait(), timeout=timeout_seconds)
-        except asyncio.TimeoutError:
-            return WakeupBatch(triggered=False, reason="periodic_reconciliation")
+    async def wait(self, *, timeout_seconds: float, wake_at: datetime | None = None,
+                   now: datetime | None = None) -> WakeupBatch:
+        """Wait for events, bounded by ``timeout_seconds`` and ``wake_at``.
+
+        ``wake_at`` is the next observed evidence expiry from originals;
+        passing it only shortens this single wait, never invents a deadline
+        (``None`` keeps the previous behaviour exactly). A wait that outlasts
+        ``wake_at`` reports ``validity_recheck`` so the caller re-reads
+        originals once instead of polling or calling a model per tick.
+        ``now`` is a test hook; production re-reads the clock.
+        """
+        effective = expiry_timeout(wake_at, now=now, max_timeout_seconds=timeout_seconds)
+        if not (effective <= 0 and self._signal.is_set()):
+            try:
+                await asyncio.wait_for(self._signal.wait(), timeout=effective)
+            except asyncio.TimeoutError:
+                if wake_at is not None:
+                    moment = now if now is not None else datetime.now(timezone.utc)
+                    if moment >= wake_at:
+                        return WakeupBatch(triggered=False, reason="validity_recheck")
+                return WakeupBatch(triggered=False, reason="periodic_reconciliation")
 
         async with self._lock:
             events = sorted(
