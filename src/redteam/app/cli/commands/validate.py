@@ -184,6 +184,10 @@ def check_execution_configuration(app_config: AppConfig) -> list[tuple[str, bool
             "Offline fixture policy" if fixture is not None else "Offline fixture policy (disabled)"
         )
         checks.append((name, True, []))
+    code_enabled = specialists is not None and specialists.code_artifacts_enabled
+    checks.append((
+        "Code artifacts (enabled)" if code_enabled else "Code artifacts (disabled)", True, [],
+    ))
     return checks
 
 

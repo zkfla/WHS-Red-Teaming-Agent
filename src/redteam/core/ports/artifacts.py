@@ -13,6 +13,11 @@ class ArtifactWriteResult:
 
 
 class ArtifactStore(Protocol):
+    @property
+    def fingerprint(self) -> str:
+        """Stable identity of the configured backend, location and storage policy."""
+        ...
+
     async def put(self, data: bytes, content_type: str) -> ArtifactWriteResult: ...
 
     async def get(self, artifact_ref: str) -> bytes: ...

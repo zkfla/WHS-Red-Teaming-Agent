@@ -682,6 +682,18 @@ async def bind_run_metadata(deps, *, before_bind=None):
             "execution_budget": deps.engagement.execution_budget.model_dump(mode="json"),
         },
     }
+    if deps.artifact_store is not None:
+        metadata["code_features"] = {
+            "code_artifacts": "enabled",
+            "code_fixtures": (
+                "configured" if deps.code_fixture_runner is not None else "unconfigured"
+            ),
+            "artifact_store_fingerprint": deps.artifact_store.fingerprint,
+            "fixture_runner_fingerprint": (
+                deps.code_fixture_runner.fingerprint
+                if deps.code_fixture_runner is not None else None
+            ),
+        }
     def bind(tx):
         if before_bind is not None:
             before_bind(tx)

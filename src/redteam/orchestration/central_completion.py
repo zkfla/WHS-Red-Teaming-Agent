@@ -134,6 +134,8 @@ async def goal_inputs(deps, runtime, *, graph_service=None, validity_reads=None)
     cleanup = await graph.cleanup_report()
     if cleanup.outstanding:
         errors.append("required_cleanup_outstanding")
+    from redteam.orchestration.code_artifacts import fixture_cleanup_blockers
+    errors.extend(await fixture_cleanup_blockers(deps, runtime))
     required_hypotheses = {str(identity) for task in tasks if task.required
                            for identity in task.related_hypothesis_ids}
     integrity = await graph.integrity_report()
@@ -321,6 +323,15 @@ async def complete_goal(deps, runtime, *, budget=None):
     before_hashes = {str(item.record.evidence_id): item.content_hash for item in checked}
     if any(before_hashes[str(item.record.evidence_id)] != item.content_hash for item in refreshed):
         return ["goal_original_evidence_changed_reassessment_required"]
+    from redteam.orchestration.code_artifacts import (
+        check_fixture_admissions,
+        fixture_cleanup_blockers,
+        read_fixture_admissions,
+    )
+    fixture_snapshot = await read_fixture_admissions(deps, str(runtime.run_id))
+    fixture_errors = await fixture_cleanup_blockers(deps, runtime)
+    if fixture_errors:
+        return fixture_errors
     now = datetime.now(timezone.utc)
 
     def commit(tx):
@@ -328,6 +339,7 @@ async def complete_goal(deps, runtime, *, budget=None):
         tx.admit(settlement=True)
         if current_stamp != stamp:
             raise StateConflict("goal_related_inputs_changed_reassessment_required")
+        check_fixture_admissions(tx, fixture_snapshot)
         check_result_graph(tx, proof_nodes)
         if tx.active_activation_count() or any(tx._unsafe_execution(str(t.task_id))
                                               for t in current_tasks):

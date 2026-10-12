@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import json
 import os
 import re
 import secrets
@@ -45,6 +46,14 @@ class FilesystemArtifactBackend:
         os.chmod(self._root, 0o700)
         self._root_resolved = self._root.resolve(strict=True)
         self._max_size_bytes = max_size_bytes
+
+    @property
+    def fingerprint(self) -> str:
+        material = {
+            "mechanism": "immutable-filesystem-artifacts-v1",
+            "root": str(self._root_resolved), "max_size_bytes": self._max_size_bytes,
+        }
+        return hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()
 
     def _path_for_ref(self, artifact_ref: str) -> Path:
         if _REF_PATTERN.fullmatch(artifact_ref) is None:

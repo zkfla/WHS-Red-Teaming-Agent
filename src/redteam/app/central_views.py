@@ -55,5 +55,8 @@ async def inspect_central_run(path, run_id):
                                  for h in task.related_hypothesis_ids},
     )
     report.effective_limits = config["effective_limits"]
+    report.feature_availability = config.get("code_features", {
+        "code_artifacts": "disabled", "code_fixtures": "disabled",
+    })
     report.previous_termination_reason = mission.termination_reason if active_actors else None
     return state, config, report

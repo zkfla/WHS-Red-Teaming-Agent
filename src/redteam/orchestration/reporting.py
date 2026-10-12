@@ -452,6 +452,7 @@ class TerminalReportProjection(BaseModel):
     cleanup_obligations: list[dict[str, Any]] = Field(default_factory=list)
     cleanup_unmapped_tools: list[str] = Field(default_factory=list)
     effective_limits: dict[str, Any] = Field(default_factory=dict)
+    feature_availability: dict[str, Any] = Field(default_factory=dict)
 
 
 class ReportingAgent:

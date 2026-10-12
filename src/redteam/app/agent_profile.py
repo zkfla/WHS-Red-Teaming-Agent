@@ -130,6 +130,10 @@ class LoadedSpecialists:
         from redteam.orchestration.agents.tool_access import register_role_readiness
 
         register_role_readiness(components.local_tools)
+        if include_code_artifacts and self.code_artifacts_enabled:
+            from redteam.orchestration.code_artifacts import register_code_artifacts
+
+            register_code_artifacts(components.local_tools)
         return replace(components, agents=registry)
 
 

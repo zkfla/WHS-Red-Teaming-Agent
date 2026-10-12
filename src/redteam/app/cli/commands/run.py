@@ -819,10 +819,13 @@ async def build(
         identity = EngagementId(central_state.engagement_id)
         component_options.update({"central_state": central_state, "engagement_id": identity})
     if original_stores is not None:
+        component_options["include_code_artifacts"] = "artifacts" in original_stores
         component_options.update({
             "evidence_dir": original_stores["evidence"], "audit_dir": original_stores["audit"],
             "approval_dir": original_stores["approvals"],
         })
+        if "artifacts" in original_stores:
+            component_options["artifact_dir"] = original_stores["artifacts"]
     return await build_application(
         config,
         orchestration_settings=orchestration_settings,

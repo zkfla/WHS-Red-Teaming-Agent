@@ -283,6 +283,8 @@ async def build_application(
     attack_graph: AttackGraphStore | None = None,
     llm: LLMClient | None = None,
     evidence_dir: str | Path = "data/evidence",
+    artifact_dir: str | Path | None = None,
+    include_code_artifacts: bool = True,
     audit_dir: str | Path = "data/audit",
     approval_dir: str | Path = "data/approvals",
     orchestration_settings: OrchestrationSettings | None = None,
@@ -363,6 +365,33 @@ async def build_application(
     resolved_fixture_runner = build_selected_code_fixture_runner(
         specialists, code_fixture_runner, resolved_settings,
     )
+    code_enabled = (
+        include_code_artifacts and specialists is not None and specialists.code_artifacts_enabled
+    )
+    if not code_enabled and resolved_fixture_runner is not None:
+        raise ValueError("fixture_requires_enabled_code_artifacts")
+    if artifact_store is not None and not code_enabled:
+        raise ValueError("artifact_store_requires_selected_code_roles")
+    if artifact_store is not None and artifact_dir is None:
+        raise ValueError("injected_artifact_store_requires_original_location")
+    resolved_artifact_store: ArtifactStore | None = None
+    artifact_path = (
+        Path(artifact_dir) if artifact_dir is not None else Path(evidence_dir).parent / "artifacts"
+    )
+    if code_enabled:
+        if artifact_path.resolve() in {
+            Path(evidence_dir).resolve(), Path(audit_dir).resolve(), Path(approval_dir).resolve(),
+        }:
+            raise ValueError("artifact_original_store_must_be_separate")
+        if artifact_store is None:
+            from redteam.evidence.artifacts.filesystem import FilesystemArtifactBackend
+
+            resolved_artifact_store = FilesystemArtifactBackend(artifact_path)
+        else:
+            resolved_artifact_store = artifact_store
+        fingerprint = getattr(resolved_artifact_store, "fingerprint", None)
+        if not isinstance(fingerprint, str) or len(fingerprint) != 64:
+            raise ValueError("artifact_store_stable_fingerprint_required")
     if central_state is None:
         if specialists is None or resolved_settings.llm_request_policy is None:
             raise ValueError("central_runtime_requires_explicit_specialists_and_request_policy")
@@ -387,16 +416,16 @@ async def build_application(
         "audit": str(Path(audit_dir).resolve()), "approvals": str(Path(approval_dir).resolve()),
         "checkpoints": str(Path(resolved_settings.checkpoint_path).resolve()),
     }
+    if resolved_artifact_store is not None:
+        central_state.original_store_paths["artifacts"] = str(artifact_path.resolve())
 
     if (specialists is None or resolved_settings.llm_request_policy is None
             or not resolved_settings.checkpointing
             or resolved_settings.checkpoint_backend != "sqlite"):
         raise ValueError("central_selection_requires_specialists_policy_and_sqlite_checkpoint")
     if any(item is not None for item in (task_graph_store, path_store, atomic_state_backend,
-                                        attack_graph, artifact_store, code_fixture_runner)):
-        raise ValueError("central_selection_cannot_mix_domain_stores_or_artifact_execution")
-    if resolved_settings.code_fixture_policy_path is not None:
-        raise ValueError("central_code_fixture_selection_not_wired")
+                                        attack_graph)):
+        raise ValueError("central_selection_cannot_mix_domain_stores")
     if control_plane is not None and not (
         isinstance(control_plane, DurableControlRecovery)
         and isinstance(control_plane, InvocationAdmissionControl)
@@ -504,7 +533,7 @@ async def build_application(
         if agents is not None:
             raise ValueError("specialist_profile_and_explicit_agents_are_ambiguous")
         profile_components = specialists.assemble(
-            profile_components, include_code_artifacts=central_state is None,
+            profile_components, include_code_artifacts=code_enabled,
         )
         component_binding = component_binding.model_copy(update={
             "specialist_fingerprint": specialists.fingerprint,
@@ -640,7 +669,7 @@ async def build_application(
             "max_instances": resolved_settings.max_workers or specialists.profile.max_instances,
         }) if specialists else None),
         agent_prompts=specialists.prompts if specialists else None,
-        artifact_store=(None),
+        artifact_store=resolved_artifact_store,
         code_fixture_runner=resolved_fixture_runner,
         control_plane=resolved_control_plane,
         tool_gateway=resolved_tool_gateway,
@@ -691,6 +720,18 @@ async def build_application(
         "code_fixture_fingerprint": (deps.code_fixture_runner.fingerprint
                                      if deps.code_fixture_runner is not None else None),
     }))
+    if resolved_artifact_store is not None:
+        from redteam.orchestration.coordination import content_hash
+
+        assert deps.component_binding is not None
+        deps = replace(deps, component_binding=deps.component_binding.model_copy(update={
+            "extension_versions": {
+                **deps.component_binding.extension_versions,
+                "central-code-artifacts": content_hash({
+                    "version": "1", "store": resolved_artifact_store.fingerprint,
+                }),
+            },
+        }))
     from redteam.orchestration.mobile_mcp_binding import (
         builtin_mobile_vendor_policies,
         wire_mobile_mcp,
