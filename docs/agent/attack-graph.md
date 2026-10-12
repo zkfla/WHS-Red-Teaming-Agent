@@ -36,7 +36,22 @@ A verified Finding requires preserved original evidence and the existing origin,
 claim review and promotion checks; a successful tool call alone is insufficient.
 
 Retraction records keep the history of withdrawn predicates. Independent predicate
-ages prevent an unrelated observation from renewing a stale claim. Actual cleanup
+ages prevent an unrelated observation from renewing a stale claim.
+
+Retraction entries record the withdrawn observation lineage (the run, evidence
+and source each withdrawn claim came from) alongside the step, key, reason and
+the row version the retraction superseded. Every applied row update advances a
+per-node observation version, and each claim entry records the version at which
+its value or source last changed. Worker-local step counters share one numeric
+axis, so ordering uses these versions instead: a live re-observation with lineage
+never withdrawn restores even when its local step number is smaller; a snapshot
+whose claim or row version does not postdate the recorded withdrawal stays
+withdrawn, even with unseen evidence; and a merged tombstone withdraws a held
+predicate only when the retraction is newer than the current establishment of
+that predicate. Writes without provenance and entries written before versions
+existed keep the numeric step comparison, so un-comparable past originals keep
+their uncertainty instead of rewriting the graph. No step TTL sweep, automatic
+retraction or planner kickoff is attached to this path. Actual cleanup
 creation/removal records carry original action/evidence IDs; confirmed cleanup
 requires the corresponding successful original execution. A new confirmed creation
 reopens its obligation. Unmapped resource effects are visible in reports.

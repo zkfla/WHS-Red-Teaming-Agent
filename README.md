@@ -171,7 +171,10 @@ Tree", and `docs/architecture/team-boundaries.md`.
 - **EventEnvelope** — common shape for everything on the Event Bus.
 - **Shared Attack Graph** — Host/Service/Endpoint/Principal/Credential/
   Asset/Hypothesis/Finding nodes, referenced by ID from `RuntimeState`
-  rather than duplicated into it.
+  rather than duplicated into it. Predicates stay until explicitly retracted; each
+  retraction records the withdrawn observation lineage and the row version it
+  superseded, so a later worker re-observation restores on new evidence while a
+  pre-retraction snapshot import stays withdrawn (see `docs/agent/attack-graph.md`).
 - **AppConfig / EngagementConfig** — the shared `.env`/YAML config
   shape (`redteam.core.config`) so teams don't each invent their own.
 

@@ -97,7 +97,9 @@ def test_retraction_records_why_and_drops_the_predicate() -> None:
 
     assert changed is True
     assert "funded" not in attrs_of(props)
-    assert props["retractions"] == [{"step": 5, "key": "funded", "reason": "balance spent"}]
+    assert props["retractions"] == [{"step": 5, "key": "funded", "reason": "balance spent",
+        "lineage_version": 1, "supersedes_version": 1, "withdrawn": []}]
+    assert props["observation_version"] == 1
 
 
 def test_retracting_an_absent_predicate_changes_nothing() -> None:

@@ -8,9 +8,11 @@ from typing import Any
 from weakref import WeakKeyDictionary
 
 from redteam.attack_graph.predicates import (
+    ASSERTED_VERSION_KEY,
     CLAIM_FACT_PREFIX,
     CLAIM_PROVENANCE_KEY,
     MAX_PROVENANCE_ENTRIES,
+    OBSERVATION_VERSION_KEY,
     claim_provenance_of,
     facts_of,
     merge_properties,
@@ -48,6 +50,10 @@ def validate_node(node: GraphNode) -> GraphNode:
 def merge_node(existing: GraphNode | None, incoming: GraphNode) -> GraphNode:
     incoming = validate_node(incoming)
     if existing is None:
+        if not isinstance(incoming.properties.get(OBSERVATION_VERSION_KEY), int):
+            properties = dict(incoming.properties)
+            properties[OBSERVATION_VERSION_KEY] = 1
+            return validate_node(incoming.model_copy(update={"properties": properties}))
         return incoming
     if existing.type is not incoming.type:
         raise NodeTypeConflictError(
@@ -56,8 +62,25 @@ def merge_node(existing: GraphNode | None, incoming: GraphNode) -> GraphNode:
         )
     labels = sorted(set(existing.labels) | set(incoming.labels))
     properties = merge_properties(existing.properties, incoming.properties)
-    if labels == existing.labels and properties == existing.properties:
+    existing_content = {
+        key: value for key, value in existing.properties.items()
+        if key != OBSERVATION_VERSION_KEY
+    }
+    merged_content = {
+        key: value for key, value in properties.items() if key != OBSERVATION_VERSION_KEY
+    }
+    if labels == existing.labels and merged_content == existing_content:
         return existing
+    base = properties.get(OBSERVATION_VERSION_KEY, 0)
+    new_version = (base if isinstance(base, int) else 0) + 1
+    properties[OBSERVATION_VERSION_KEY] = new_version
+    previous_claims = claim_provenance_of(existing.properties)
+    merged_claims = claim_provenance_of(properties)
+    for claim_key, entry in merged_claims.items():
+        if previous_claims.get(claim_key) != entry:
+            merged_claims[claim_key] = {**entry, ASSERTED_VERSION_KEY: new_version}
+    if merged_claims or CLAIM_PROVENANCE_KEY in properties:
+        properties[CLAIM_PROVENANCE_KEY] = merged_claims
     return validate_node(existing.model_copy(update={
         "labels": labels, "properties": properties, "updated_at": incoming.updated_at,
     }))

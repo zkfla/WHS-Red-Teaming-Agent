@@ -31,6 +31,7 @@ from redteam.attack_graph.patterns import NodePattern, ResolveResult
 from redteam.attack_graph.predicates import (
     CLAIM_PROVENANCE_KEY,
     CLEANUP_KEY,
+    OBSERVATION_VERSION_KEY,
     RESERVED_KEYS,
     Provenance,
     apply_retraction,
@@ -267,6 +268,8 @@ class AttackGraphService:
             else:
                 built["first_seen_step"] = min(recorded_first, step)
                 built["last_seen_step"] = max(recorded_last, step)
+            if OBSERVATION_VERSION_KEY in raw:
+                built[OBSERVATION_VERSION_KEY] = raw[OBSERVATION_VERSION_KEY]
             if CLEANUP_KEY in raw and CLEANUP_KEY not in built:
                 built[CLEANUP_KEY] = raw[CLEANUP_KEY]
         return built
@@ -302,7 +305,10 @@ class AttackGraphService:
             step=step,
         )
 
-    async def retract(self, node_id: GraphNodeId, key: str, *, step: int, reason: str) -> bool:
+    async def retract(
+        self, node_id: GraphNodeId, key: str, *, step: int, reason: str,
+        provenance: Provenance | None = None,
+    ) -> bool:
         """Withdraw a predicate that no longer holds, with a reason."""
         changed = False
         def withdraw(node: GraphNode | None) -> GraphNode | None:
@@ -310,7 +316,9 @@ class AttackGraphService:
             if node is None:
                 changed = False
                 return None
-            properties, changed = apply_retraction(node.properties, key, step=step, reason=reason)
+            properties, changed = apply_retraction(
+                node.properties, key, step=step, reason=reason, provenance=provenance
+            )
             if not changed:
                 return node
             return node.model_copy(update={"properties": properties, "updated_at": _now()})
