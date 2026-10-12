@@ -134,6 +134,7 @@ class _ScriptedLabModel:
         self._task_call: str | None = None
         self._goal_call: str | None = None
         self._remote_errors: dict[str, str] = {}
+        self._settle_diagnostic: str | None = None
 
     def use_registered_tools(self, tool_ids: list[str]) -> None:
         """Inject the catalog-resolved tool ids after discovery, before run.
@@ -149,7 +150,10 @@ class _ScriptedLabModel:
 
     def error_summary(self) -> dict[str, str]:
         """Short safe per-call reasons for TRACE; never full responses."""
-        return dict(self._remote_errors)
+        summary = dict(self._remote_errors)
+        if self._settle_diagnostic:
+            summary["call-lab-task"] = self._settle_diagnostic
+        return summary
 
     @staticmethod
     def _route_key(schema: dict[str, Any]) -> str:
@@ -235,7 +239,7 @@ class _ScriptedLabModel:
                         "reason": "Actual responses inspected",
                         "evidence_ids": receipts,
                     }
-                    for row in review_payload.get("completion_criteria", [])
+                    for row in review_payload.get("task", {}).get("completion_criteria", [])
                 ],
                 "claims": [
                     {
@@ -366,7 +370,13 @@ class _ScriptedLabModel:
                 text="",
             )
         if self._task_call is None:
-            evidenced = _executed_evidence_ids(messages)
+            # This task declares the host. Cite its exact probe original;
+            # endpoint investigations still execute and are checked below,
+            # but do not become host-task proof merely by sharing a run.
+            evidenced = _executed_evidence_ids([
+                message for message in messages
+                if message.get("tool_call_id") == self._issued_remote[0]
+            ])
             assert evidenced, "task settlement needs the executed call evidence"
             self._settlement_evidence = evidenced
             self._task_call = "call-lab-task"
@@ -387,6 +397,10 @@ class _ScriptedLabModel:
             )
         seen = _tool_result(messages, self._task_call)
         if seen is None or seen.get("ok") is not True:
+            if seen is None:
+                self._settle_diagnostic = "no result yet"
+            else:
+                self._settle_diagnostic = str(seen.get("error") or "not ok")[:200]
             self.calls.append({"turn": self.turns, "tool_calls": []})
             return NativeCompletion(tool_calls=(), text="")
         return NativeCompletion(tool_calls=(), text="Lab investigation result recorded")
