@@ -4,11 +4,13 @@ No provider tools are exposed to these judgments. They propose investigation
 work, never execution permission, raw Tool calls, or a terminal goal result.
 """
 
+from copy import deepcopy
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from redteam.attack_graph.service import AttackGraphService
+from redteam.core.contracts.completion import ALLOWED_CRITERION_KINDS
 from redteam.core.contracts.mission import redact_secret_material
 from redteam.core.ids import new_id
 from redteam.orchestration.cognition import (
@@ -40,6 +42,25 @@ class StrategyDraft(BaseModel):
 class AtomizationDraft(BaseModel):
     model_config = ConfigDict(extra="forbid")
     tasks: list[AtomicTaskProposal] = Field(min_length=1)
+
+
+def _schema_with_completion_criterion_hint(schema: dict[str, Any]) -> dict[str, Any]:
+    """Declare the allowed ``completion_criteria.kind`` values in the proposed schema.
+
+    ``CompletionCriterion.kind`` is a permissive ``str`` on the shared contract (other
+    consumers, e.g. ``PathPlan``'s raw storage schema, must stay enum-free -- see
+    ``orchestration/paths/writing.py``'s own narrower patch for that surface). This
+    copy is local to the schema handed to the model for this decision only; it does
+    not touch the contract or any other schema the model, or anything else, sees.
+    Without it the model has no way to learn the allowed set, and a response that
+    picks an unlisted value is normalized to "unknown" and rejected -- previously with
+    no indication of what the real set was, so a retry had nothing to correct.
+    """
+    schema = deepcopy(schema)
+    criterion = schema.get("$defs", {}).get("CompletionCriterion")
+    if criterion is not None:
+        criterion["properties"]["kind"]["enum"] = sorted(ALLOWED_CRITERION_KINDS)
+    return schema
 
 
 def specialist_planning_inputs(deps) -> dict:
@@ -139,7 +160,9 @@ class SpecialistPlanner:
         with llm_request_scope(str(runtime.run_id), "specialist_planning"):
             strategy = StrategyDraft.model_validate(await self.client.ask(
                 stage="attack_path_proposal", payload=payload, budget=budget,
-                response_schema=StrategyDraft.model_json_schema(),
+                response_schema=_schema_with_completion_criterion_hint(
+                    StrategyDraft.model_json_schema()
+                ),
                 validate_response=check_questions,
                 system="Propose useful investigation questions from current tasks, results and "
                        "their follow-up questions. Reinvestigation may reuse the same evidence. "
@@ -170,7 +193,10 @@ class SpecialistPlanner:
                 stage="task_atomization", budget=budget,
                 payload={**payload, "questions": [q.model_dump(mode="json")
                                                   for q in strategy.questions]},
-                response_schema=AtomizationDraft.model_json_schema(), validate_response=check_tasks,
+                response_schema=_schema_with_completion_criterion_hint(
+                    AtomizationDraft.model_json_schema()
+                ),
+                validate_response=check_tasks,
                 system="Register investigations by purpose, evidence, role and fixed conditions. "
                        "Preserve every question condition. No depends_on or tool-call queue. "
                        "Follow-ups cite source_task_id, source_result_id and source_question_id "
@@ -190,8 +216,48 @@ class SpecialistPlanner:
 
     @staticmethod
     def _rejection(error, stage):
+        summary = _REJECTION_SUMMARIES.get(
+            error.code,
+            "The proposal failed the captured subject, dependency or condition contract.",
+        )
         return DecisionValidationError(DecisionDiagnostic(
             code=error.code, stage=stage, kind="validation", retryable=True,
-            summary="The proposal failed the captured subject, dependency or condition contract.",
+            summary=summary,
             location="$.questions" if stage == "attack_path_proposal" else "$.tasks",
         ))
+
+
+#: Repair feedback sent back to the model on the next attempt (cognition.py's
+#: DecisionDiagnostic.feedback()). Each message names the actual fix so a retry can
+#: succeed instead of repeating the same rejected shape -- a generic restatement of
+#: the contract gives the model nothing to act on (section 5: code decides, but a
+#: validation failure still owes the proposer an actionable reason).
+_REJECTION_SUMMARIES: dict[str, str] = {
+    "specialist_duplicate_identity": "question_id/task_key values must be unique.",
+    "specialist_blank_subject": "objective and every target_node_ids entry must be non-blank.",
+    "specialist_blank_title": "title must be non-blank.",
+    "specialist_unknown_target": "target_node_ids must only reference ids already listed in "
+        "known_target_ids.",
+    "specialist_unknown_principal": "principal_refs must only reference ids already listed in "
+        "registered_principal_refs.",
+    "specialist_duplicate_completion_condition": "completion_criteria entries must be distinct "
+        "(same kind/description/hypothesis_id/principal_refs is a duplicate).",
+    "specialist_unknown_completion_condition": "every completion_criteria.kind must be one of: "
+        + ", ".join(sorted(ALLOWED_CRITERION_KINDS))
+        + "; description must also be non-blank.",
+    "specialist_condition_principal_outside_subjects": "a completion_criteria.principal_refs "
+        "entry must also appear in the question/task's own principal_refs.",
+    "specialist_unknown_hypothesis": "completion_criteria.hypothesis_id must reference an "
+        "existing hypothesis id, or be omitted.",
+    "specialist_task_count_limit": "reduce the number of tasks to the stated max_tasks limit.",
+    "specialist_question_coverage_mismatch": "every task's question_id must match exactly one "
+        "proposed question, and every question needs at least one task.",
+    "specialist_question_targets_changed": "a question's tasks must together cover exactly its "
+        "own target_node_ids, no more and no fewer.",
+    "specialist_question_principals_changed": "a question's tasks must together cover exactly "
+        "its own principal_refs, no more and no fewer.",
+    "specialist_question_completion_conditions_dropped": "every completion_criteria entry on a "
+        "question must be retained by at least one of its tasks.",
+    "specialist_role_not_executable": "role_id must be a registered, schedulable role that is "
+        "currently available.",
+}
