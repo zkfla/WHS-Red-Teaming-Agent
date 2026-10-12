@@ -1,0 +1,26 @@
+name: "Vulnbank stdio recon test"
+description: "Authorized local test against self-hosted vulnbank via stdio MCP."
+scope:
+  allowed_hosts: ["127.0.0.1"]
+  allowed_domains: []
+  allowed_networks: []
+  denied_hosts: []
+rules_of_engagement:
+  - name: "local-open"
+    description: "No restrictions; local vulnerable lab."
+execution_budget:
+  max_actions: 8
+  max_tool_calls: 8
+  max_duration_seconds: 180
+rate_limit_policy:
+  max_actions_per_minute: 30
+  max_concurrent_actions: 1
+approval_policy:
+  require_approval_for: []
+  auto_approve: true
+metadata:
+  owner: "agent-team"
+  target_refs:
+    "127.0.0.1": vulnbank
+  auth_sessions:
+    "127.0.0.1": []

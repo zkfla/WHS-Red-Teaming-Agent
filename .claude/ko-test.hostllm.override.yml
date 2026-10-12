@@ -1,0 +1,28 @@
+# 오버라이드: 컨테이너 ollama 대신 WSL 호스트의 네이티브 ollama 사용 (C: 용량 절약).
+# 모델은 호스트 /dev/sdc. 컨테이너→호스트는 Windows portproxy + host.docker.internal 경유.
+# 사용: docker compose -p artex-ko-ui -f docker-compose.ko-test.yml -f <이 파일> up -d postgres artex ui
+services:
+  ollama:
+    profiles: ["disabled"]
+  ollama-init:
+    profiles: ["disabled"]
+
+  artex:
+    depends_on: !override
+      postgres:
+        condition: service_healthy
+    environment:
+      ARTEX_PG_DSN: postgres://artex:artex_local_ui_only@postgres:5432/artex?sslmode=disable
+      ARTEX_LLM_PROVIDER: openai
+      ARTEX_LLM_BASE_URL: http://host.docker.internal:11434/v1
+      ARTEX_LLM_MODEL: llama3.1:8b
+      OPENAI_API_KEY: "ollama"
+      ANTHROPIC_API_KEY: ""
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - default
+      - llm_egress
+
+networks:
+  llm_egress: {}

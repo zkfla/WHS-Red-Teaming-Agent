@@ -56,6 +56,28 @@ extra marker.
 
 ## Lint / types
 
+### Optional browser UI checks
+
+The UI uses local HTML/CSS/JavaScript; there is no frontend build step. Run
+`redteam web --engagements-dir data/ui-dev/engagements` and open the printed
+loopback URL. Static changes appear on reload; restart for Python changes.
+
+For Chromium interaction and responsive-layout checks:
+
+```bash
+python -m pip install playwright
+python -m playwright install chromium
+pytest -q tests/browser/test_web_ui.py
+```
+
+These tests serve static files on a temporary local port and intercept every API
+request with explicit fixtures. No LLM, MCP server, or target is called. The
+module is skipped when Playwright is not installed. To save preview screenshots,
+set `WHS_UI_SCREENSHOTS=data/ui-dev` when running the tests. These screenshots
+show synthetic test data, not investigation results.
+
+### Python checks
+
 ```bash
 ruff check src tests examples
 ruff check --fix src tests examples   # autofix what's fixable

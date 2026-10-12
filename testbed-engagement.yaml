@@ -1,0 +1,26 @@
+name: "Testbed vulnbank (Control Plane scoped)"
+description: "Authorized local test against the self-hosted testbed vulnbank via streamable-http MCP. The Control Plane allowlist deliberately excludes destructive admin endpoints (/admin/delete_account, /admin/create_admin, /admin/toggle_suspension), so the agent cannot invoke them even if the model tries."
+scope:
+  allowed_hosts: ["127.0.0.1"]
+  allowed_domains: []
+  allowed_networks: []
+  denied_hosts: []
+rules_of_engagement:
+  - name: "local-lab"
+    description: "Local vulnerable lab. Non-destructive attack surface only; destructive ops are out of scope at the capability allowlist."
+execution_budget:
+  max_actions: 40
+  max_tool_calls: 40
+  max_duration_seconds: 600
+rate_limit_policy:
+  max_actions_per_minute: 30
+  max_concurrent_actions: 1
+approval_policy:
+  require_approval_for: []
+  auto_approve: true
+metadata:
+  owner: "agent-team"
+  target_refs:
+    "127.0.0.1": testbed
+  auth_sessions:
+    "127.0.0.1": []

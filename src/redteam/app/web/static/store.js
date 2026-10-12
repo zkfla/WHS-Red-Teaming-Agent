@@ -36,7 +36,7 @@ function shortTime(iso) {
 }
 
 function logActivity(store, item, text) {
-  store.activity.push({ ts: shortTime(item.ts), text });
+  store.activity.push({ ts: shortTime(item.ts), text, kind: item.kind, key: String(item.seq) });
   if (store.activity.length > ACTIVITY_LIMIT) store.activity.shift();
 }
 
@@ -49,14 +49,14 @@ function applyEvent(store, item) {
     const text = p.response || p.decision_summary;
     if (text) {
       upsert(store, `turn:${item.data.event_id}`, {
-        type: "agent", text, summary: p.decision_summary && p.decision_summary !== text ? p.decision_summary : null,
+        type: "agent", text, ts: item.ts, summary: p.decision_summary && p.decision_summary !== text ? p.decision_summary : null,
       });
     }
   } else if (type === "ActionProposed") {
     store.actionCount += 1;
     const action = upsert(store, `act:${p.action_id}`, {
       type: "action", action_id: p.action_id, operation: p.operation || p.tool_id || "action",
-      target: p.target || "", verdict: null, result: null, rules: [],
+      target: p.target || "", verdict: null, result: null, rules: [], ts: item.ts,
     });
     store.actions.set(p.action_id, action);
   } else if (type === "PolicyEvaluated" || type === "ActionDenied") {
@@ -76,11 +76,14 @@ function applyEvent(store, item) {
     }
   } else if (type === "ApprovalRequired") {
     upsert(store, `apr:${p.approval_id}`, {
-      type: "approval", approval_id: p.approval_id, run_id: runId, action_id: p.action_id, reasons: p.reasons || [],
+      type: "approval", approval_id: p.approval_id, run_id: runId, action_id: p.action_id, reasons: p.reasons || [], ts: item.ts,
     });
   } else if (type === "FindingCreated" || type === "FindingVerified") {
-    upsert(store, `fnd:${p.finding_id || item.data.event_id}`, {
-      type: "finding", title: p.title || p.summary || "Finding", verified: type === "FindingVerified",
+    const key = `fnd:${p.finding_id || item.data.event_id}`;
+    const previous = store.entries.get(key);
+    upsert(store, key, {
+      type: "finding", title: p.title || p.summary || previous?.title || "발견사항",
+      verified: type === "FindingVerified" || Boolean(previous?.verified), ts: item.ts,
     });
   } else if (type === "EvidenceCreated") {
     store.evidence.push({ id: p.evidence_id, action_id: p.action_id, ts: shortTime(item.ts) });
@@ -123,5 +126,5 @@ export function runList(store) {
   return [...store.entries.values()]
     .filter((e) => e.type === "input" && e.decision && e.decision.mode === "execute")
     .slice(-RUN_LIMIT)
-    .map((e) => ({ text: e.decision.objective || e.text, state: e.state }));
+    .map((e) => ({ key: e.key, text: e.decision.objective || e.text, state: e.state }));
 }

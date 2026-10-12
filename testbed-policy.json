@@ -1,0 +1,24 @@
+{
+  "targets": {
+    "testbed": {
+      "origin": "http://127.0.0.1:5000",
+      "allowed_paths": [
+        "/", "/healthz", "/login", "/register", "/dashboard", "/debug/users",
+        "/privacy", "/terms", "/compliance", "/blog", "/careers",
+        "/graphql",
+        "/api/login", "/api/check_balance", "/api/transactions",
+        "/api/transfer", "/api/kr/transfer", "/api/kr/_topup", "/api/kr/_state",
+        "/api/virtual-cards", "/api/virtual-cards/create",
+        "/api/v1/user/1", "/api/v1/user/2", "/api/v1/user/3",
+        "/api/v1/payments",
+        "/forgot-password", "/api/v1/forgot-password", "/api/v2/forgot-password", "/api/v3/forgot-password",
+        "/merchant/login", "/merchant/register", "/api/v1/merchants/login", "/api/v1/merchants/register",
+        "/api/ai/chat/anonymous", "/api/ai/system-info", "/api/ai/rate-limit-status"
+      ],
+      "allowed_methods": ["GET", "HEAD", "OPTIONS", "POST"]
+    }
+  },
+  "allowed_networks": ["127.0.0.0/8"],
+  "timeout_seconds": 10,
+  "max_response_bytes": 262144
+}
