@@ -10,7 +10,7 @@ export const PHASE = {
 };
 
 export const HOST = {
-  needs_engagement: "Engagement 필요",
+  needs_engagement: "조사 선택 필요",
   needs_settings: "설정 필요",
   starting: "시작 중",
   ready: "준비됨",

@@ -1,0 +1,1 @@
+- [Control scope port work](control-scope-port-work.md) — dev-control branch; port-aware scope matching + fail-safe hardening; dev PR cherry-picks fix commits only (tests stay off dev)

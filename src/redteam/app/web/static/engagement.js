@@ -198,5 +198,10 @@ export function setupEngagement(afterSave) {
   $("eng-back").addEventListener("click", openList);
   $("engagement-form").addEventListener("submit", (event) => event.preventDefault());
   $("open-engagement").addEventListener("click", open);
+  $("new-engagement").addEventListener("click", async () => {
+    if (!dialog.open) dialog.showModal();
+    replace(body, h("p", { class: "note", text: "조사 양식을 준비하고 있습니다." }));
+    await openWizard(null);
+  });
   return { open };
 }

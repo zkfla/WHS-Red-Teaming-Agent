@@ -1,6 +1,7 @@
 // Right-hand detail for the selected node. Only stored or published-summary fields appear.
 import { h, replace } from "./dom.js";
 import { PLANNER, TASK, UNKNOWN, WAIT, WORKER } from "./labels.js";
+import { badge } from "./ui.js";
 
 const rows = (pairs) => h("dl", { class: "gdl" }, pairs.flatMap(([k, v]) => [h("dt", { text: k }), h("dd", { text: v === null || v === undefined || v === "" ? UNKNOWN : String(v) })]));
 
@@ -15,7 +16,8 @@ function timeline(view, taskId) {
 
 function planner(view) {
   const p = view.planner;
-  return [h("h3", { text: "Planner" }), rows([
+  return [badge(PLANNER[p.state] || UNKNOWN), h("h3", { text: "Planner" }),
+    p.inputs.goal ? h("p", { class: "gdetail-summary", text: p.inputs.goal }) : null, rows([
     ["상태", PLANNER[p.state]], ["판단 단계", p.stage], ["깨운 이벤트", p.trigger],
     ["목표", p.inputs.goal], ["증거 수", p.inputs.evidence], ["조사 Task 수", p.inputs.tasks],
     ["미해결 질문 수", p.inputs.open_questions],
@@ -30,9 +32,12 @@ function planner(view) {
 function task(view, id) {
   const t = view.tasks.find((x) => x.task_id === id);
   if (!t) return [h("p", { class: "note", text: "이 Task는 더 이상 목록에 없습니다." })];
-  return [h("h3", { text: t.title }), rows([
+  return [badge(t.wait ? `${WAIT[t.wait.reason] || t.wait.reason} 대기` : TASK[t.status] || UNKNOWN, t.wait ? "wait" : ""),
+    h("h3", { text: t.title }), h("p", { class: "gdetail-id", text: t.task_id }),
+    h("div", { class: "gdetail-summary" }, h("strong", { text: "완료 조건" }),
+      h("p", { class: "note", text: t.completion.join(" / ") })), rows([
     ["상태", TASK[t.status]], ["담당 역할", t.role], ["현재 워커", t.worker || "없음"],
-    ["완료 조건", t.completion.join(" / ")], ["막힌 사유", t.blocking_reason || "없음"],
+    ["막힌 사유", t.blocking_reason || "없음"],
     ["대기", t.wait ? `${WAIT[t.wait.reason] || t.wait.reason}${t.wait.approval_ref ? ` · 승인 ${t.wait.approval_ref}` : ""}` : "없음"],
     ["증거 수", t.evidence], ["결과", t.has_result ? "저장됨" : "아직 없음"],
   ]), h("h4", { text: "기록" }), timeline(view, id)];
@@ -41,7 +46,10 @@ function task(view, id) {
 function worker(view, id) {
   const w = view.workers.find((x) => x.instance_id === id);
   if (!w) return [h("p", { class: "note", text: "이 워커는 더 이상 목록에 없습니다." })];
-  return [h("h3", { text: w.instance_id }), rows([
+  const assigned = view.tasks.find((item) => item.task_id === w.task_id);
+  return [badge(WORKER[w.phase] || UNKNOWN, w.phase.startsWith("waiting_") ? "wait" : ""),
+    h("h3", { text: w.instance_id }),
+    assigned ? h("p", { class: "gdetail-summary", text: assigned.title }) : null, rows([
     ["단계", WORKER[w.phase]], ["맡은 Task", w.task_id], ["모델 요청", w.model_requests], ["도구 호출", w.tool_calls],
     ["호출 중인 도구", w.current_tool || "없음"],
     ["대기", w.wait ? `${WAIT[w.wait.reason] || w.wait.reason}${w.wait.approval_ref ? ` · 승인 ${w.wait.approval_ref}` : ""}` : "없음"],
@@ -52,7 +60,8 @@ function worker(view, id) {
 
 function origin(view) {
   const o = view.origin;
-  return [h("h3", { text: "원본 저장" }), rows([
+  return [h("h3", { text: "증거와 발견사항" }),
+    h("p", { class: "gdetail-summary", text: `증거 ${o.evidence}건 · 발견사항 ${o.findings}건 · 검증 ${o.verified_findings}건` }), rows([
     ["증거 참조", o.evidence], ["그래프 변경", o.graph_updates], ["Finding", o.findings],
     ["검증된 Finding", o.verified_findings], ["가설", o.hypotheses],
     ["남은 액션 예산", view.usage.budget_remaining],
