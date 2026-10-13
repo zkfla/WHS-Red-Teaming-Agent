@@ -116,6 +116,10 @@ class SettingsStore:
         self.profile_dir = profile_dir
         self.env_path = env_path
         self._key_var_explicit = ENV_KEY_VAR in self.env
+        if is_go_provider(self.env.get(ENV_PROVIDER)) and not self._key_var_explicit:
+            # Publish the same derived reference to the runtime consumer, even
+            # on first startup before any web settings file has been written.
+            self.env[ENV_KEY_VAR] = OPENCODE_GO_API_KEY_ENV_VAR
 
     # -- profiles -------------------------------------------------------
 

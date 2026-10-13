@@ -557,3 +557,16 @@ def test_litellm_model_shape_not_go_validated(store):
     store.apply({"model": "provider/model-1", "api_key": SECRET})
     assert store.env[ENV_PROVIDER] == "litellm"
     assert store.env[ENV_MODEL] == "provider/model-1"
+
+
+def test_go_first_startup_publishes_derived_key_reference(store):
+    from redteam.core.config import LLMConfig
+
+    initial = SettingsStore(
+        env={ENV_PROVIDER: "opencode-go", ENV_MODEL: "openai/gpt-x", "OPENCODE_API_KEY": SECRET},
+        state_path=store.state_path, profile_dir=store.profile_dir, env_path=store.env_path,
+    )
+    initial.load_saved()
+    assert LLMConfig.from_environment(initial.env).api_key_env_var == "OPENCODE_API_KEY"
+    initial.apply({"provider": "litellm", "model": "provider/model-1"})
+    assert LLMConfig.from_environment(initial.env).api_key_env_var == "LLM_API_KEY"
