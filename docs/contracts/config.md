@@ -86,6 +86,45 @@ and want the minimal wiring to run one (`examples/minimal_run.py`, most
 unit/integration tests). Production code always goes through
 `build_application(AppConfig, ...)`.
 
+## Web investigation request permissions
+
+The investigation form separates path scope (`site`/`paths`) from request
+permissions (`read_only`/`custom`/`full`). Full permits all supported HTTP methods,
+valid query names and ordinary request headers within the selected origins and
+paths. Host, authentication/cookie and transport-control headers remain provider
+owned. Custom selects methods, query names, headers and JSON/form body permission.
+Scope, ROE, approval and execution budgets still apply to every action.
+
+`metadata.web_policy` records these explicit operator selections. Generated
+`DeploymentSpec.request_permissions=testing` enables the write-method declaration;
+historical specs retain the read-only default. New schema defaults are omitted
+from serialized historical policies to preserve their digests. Edits generate
+new bound artifacts and never overwrite old Run policies. Existing Run snapshots
+and resume bindings are unchanged by editing today's investigation.
+
+An optional response preview exposes at most 16,384 characters of redacted text
+or JSON as untrusted data. The raw response digest and size remain available;
+binary content stays omitted. JSON and form requests are supported; multipart
+uploads and arbitrary raw bodies are not advertised as available.
+
+Sessions use named principal/session references and either a bearer environment
+variable name or an existing private Playwright storage-state file, plus explicit
+paths. The form never accepts raw credential values or claims a login was verified.
+
+Kali communication is independently closed, inherited, or selected via an existing
+reviewed gated-network policy file. Selected policies require a pinned sidecar,
+bounded network budgets, registry names matching the chosen hosts, and no package
+mirror/install route. Startup checks each registry IP against its selected host's
+resolved addresses and snapshots the hash-bound file privately. This selection
+does not build a sidecar or prove its kernel prerequisites; those remain execution
+startup/runtime checks of the existing gate. Local shell execution stays network
+closed. Full web request permission never implies unrestricted shell networking.
+
+Conversation inputs receive configured, unverified server declarations before
+a Run and finalized catalog/health data while attached to a live Run. Declaration
+inspection performs no MCP or Docker startup. Planner and worker contexts receive
+the generated target permissions; tool discovery does not replace Control admission.
+
 ## Secrets
 
 Never stored inline. `LLMConfig.api_key_env_var` names an environment

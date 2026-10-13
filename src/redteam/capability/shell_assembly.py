@@ -136,7 +136,9 @@ def build_shell_entries(
     return descriptors, adapter
 
 
-def build_gated_provider_config(policy_path: str | None) -> GatedProviderConfig | None:
+def build_gated_provider_config(
+    policy_path: str | None, *, policy_bytes: bytes | None = None,
+) -> GatedProviderConfig | None:
     """Build the gated-network provider config, or None when closed.
 
     None (undeclared REDTEAM_GATED_NETWORK_POLICY_PATH) means gated egress
@@ -153,7 +155,8 @@ def build_gated_provider_config(policy_path: str | None) -> GatedProviderConfig 
     from redteam.capability.gated_activation import GatedProviderConfig
 
     try:
-        raw = Path(policy_path).read_text(encoding="utf-8")
+        raw = (Path(policy_path).read_text(encoding="utf-8") if policy_bytes is None
+               else policy_bytes.decode("utf-8"))
     except OSError as exc:
         raise MCPConfigurationError(
             f"gated network policy unreadable ({policy_path}): {exc}"

@@ -19,7 +19,15 @@ from pydantic import Field, ValidationError
 
 from redteam.app.cli.display import safe_text
 from redteam.app.cli.engagement_form import QUESTIONS, merge_edit
-from redteam.app.web_policy import DEPLOYMENT_KEYS, WEB_POLICY_KEY, WebPolicySelection
+from redteam.app.web_policy import (
+    DEPLOYMENT_KEYS,
+    WEB_POLICY_KEY,
+    WebPolicySelection,
+    WebSessionSelection,
+    permissions_expand,
+    validate_kali_network_policy,
+)
+from redteam.capability.servers.config import HTTPMethod, read_methods
 from redteam.core.config import EngagementConfig, OrchestrationConfig, load_engagement_config
 from redteam.intake.models import CANONICAL_CAPABILITIES, EngagementDraft
 from redteam.intake.serializer import (
@@ -38,11 +46,30 @@ class WebEngagementDraft(EngagementDraft):
     web_policy_mode: Literal["manual", "site", "paths"] = "manual"
     web_paths: list[str] = Field(default_factory=list)
     web_origins: list[str] = Field(default_factory=list, exclude=True)
+    web_permissions: Literal["read_only", "custom", "full"] = "read_only"
+    web_methods: list[HTTPMethod] = Field(default_factory=read_methods)
+    web_query_keys: list[str] = Field(default_factory=list)
+    web_all_query_keys: bool = False
+    web_request_headers: list[str] = Field(default_factory=list)
+    web_all_request_headers: bool = False
+    web_request_body: bool = False
+    web_response_body_chars: int = Field(default=0, ge=0, le=16384)
+    web_sessions: list[WebSessionSelection] = Field(default_factory=list)
+    kali_network_mode: Literal["inherit", "closed", "configured"] = "inherit"
+    kali_network_policy_path: str | None = None
+
+
+WEB_PERMISSION_FIELDS = (
+    "web_permissions", "web_methods", "web_query_keys", "web_all_query_keys",
+    "web_request_headers", "web_all_request_headers", "web_request_body",
+    "web_response_body_chars", "web_sessions", "kali_network_mode", "kali_network_policy_path",
+)
 
 FIELD_ORDER = (
     "name", "description", "objective",
     "allowed_hosts", "allowed_domains", "allowed_networks",
     "web_policy_mode", "web_paths",
+    *WEB_PERMISSION_FIELDS,
     "allowed_capabilities", "denied_capabilities", "denied_operations",
     "availability_impact_allowed", "notes", "focus_areas",
     "max_actions", "max_tool_calls", "max_duration_seconds",
@@ -51,6 +78,7 @@ STEPS = (
     ("basic", "기본", ("name", "description", "objective")),
     ("scope", "범위", ("allowed_hosts", "allowed_domains", "allowed_networks",
                        "web_policy_mode", "web_paths")),
+    ("permissions", "요청 권한", WEB_PERMISSION_FIELDS),
     ("limits", "제한", ("allowed_capabilities", "denied_capabilities", "denied_operations",
                        "availability_impact_allowed", "notes", "focus_areas")),
     ("budget", "예산", ("max_actions", "max_tool_calls", "max_duration_seconds")),
@@ -83,7 +111,18 @@ def field_definitions() -> list[dict[str, Any]]:
         schema = properties[name]
         options = schema.get("anyOf", [schema])
         kind = next((o.get("type") for o in options if o.get("type") != "null"), "string")
-        labels = {"web_policy_mode": "웹 탐색 범위", "web_paths": "지정 경로 (쉼표로 구분)"}
+        labels = {
+            "web_policy_mode": "웹 탐색 범위", "web_paths": "지정 경로 (쉼표로 구분)",
+            "web_permissions": "웹 요청 권한", "web_methods": "허용 HTTP 메서드",
+            "web_query_keys": "허용 query 이름 (쉼표로 구분)",
+            "web_all_query_keys": "모든 query 이름 허용",
+            "web_request_headers": "허용 요청 header 이름 (쉼표로 구분)",
+            "web_all_request_headers": "모든 사용자 지정 header 허용 (인증·통신 제어 header 제외)",
+            "web_request_body": "JSON·form 요청 본문 전송 허용",
+            "web_response_body_chars": "모델에 제공할 응답 본문 최대 글자 수 (0: 제공 안 함)",
+            "web_sessions": "테스트 계정 session", "kali_network_mode": "Kali 대상 통신",
+            "kali_network_policy_path": "검토된 Kali 네트워크 정책 파일의 절대 경로",
+        }
         item: dict[str, Any] = {"name": name, "label": labels.get(name, QUESTIONS.get(name)),
                                 "kind": kind}
         if name == "web_policy_mode":
@@ -91,6 +130,21 @@ def field_definitions() -> list[dict[str, Any]]:
                 {"value": "site", "label": "사이트 전체 — 정책 자동 생성"},
                 {"value": "paths", "label": "지정 경로만 — 정책 자동 생성"},
                 {"value": "manual", "label": "기존 MCP 설정 사용"},
+            ])
+        if name == "web_permissions":
+            item.update(default="read_only", choices=[
+                {"value": "read_only", "label": "읽기 위주 (GET·HEAD·OPTIONS)"},
+                {"value": "custom", "label": "부분 허용 — 아래 항목 직접 선택"},
+                {"value": "full", "label": "대상 범위 내 전체 웹 요청 허용"},
+            ])
+        if name == "web_methods":
+            item["options"] = ["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"]
+            item["default"] = read_methods()
+        if name == "kali_network_mode":
+            item.update(default="closed", choices=[
+                {"value": "closed", "label": "차단 — Kali 로컬 분석만"},
+                {"value": "configured", "label": "허용 — 검토된 대상 통신 정책 사용"},
+                {"value": "inherit", "label": "기존 실행 환경 설정 유지"},
             ])
         if name in {"allowed_capabilities", "denied_capabilities"}:
             item["options"] = list(CANONICAL_CAPABILITIES)
@@ -114,6 +168,23 @@ def _items(value: Any) -> list[str]:
 
 
 def coerce_field(name: str, value: Any) -> Any:
+    if name in {"web_permissions", "kali_network_mode"}:
+        choices = ({"read_only", "custom", "full"} if name == "web_permissions"
+                   else {"inherit", "closed", "configured"})
+        if not isinstance(value, str) or value not in choices:
+            raise ValueError("invalid_choice")
+        return value
+    if name == "web_sessions":
+        if not isinstance(value, list) or len(value) > 60:
+            raise ValueError("invalid_type")
+        try:
+            return [WebSessionSelection.model_validate(item) for item in value]
+        except ValidationError:
+            raise ValueError("invalid_session_reference") from None
+    if name == "kali_network_policy_path":
+        if value is not None and (not isinstance(value, str) or len(value) > 4096):
+            raise ValueError("invalid_type")
+        return value.strip() or None if isinstance(value, str) else None
     if name == "web_policy_mode":
         if not isinstance(value, str) or value not in {"manual", "site", "paths"}:
             raise ValueError("invalid_choice")
@@ -127,11 +198,12 @@ def coerce_field(name: str, value: Any) -> Any:
         if len(text) > _TEXT_LIMIT[name]:
             raise ValueError("too_long")
         return text or None
-    if name == "availability_impact_allowed":
+    if name in {"availability_impact_allowed", "web_all_query_keys", "web_all_request_headers",
+                "web_request_body"}:
         if value is not None and not isinstance(value, bool):
             raise ValueError("invalid_type")
         return value
-    if name in {"max_actions", "max_tool_calls", "max_duration_seconds"}:
+    if name in {"max_actions", "max_tool_calls", "max_duration_seconds", "web_response_body_chars"}:
         if value is None or value == "":
             return None
         if isinstance(value, bool) or not isinstance(value, int):
@@ -272,6 +344,18 @@ class EngagementStore:
                 selection = WebPolicySelection.model_validate(raw)
                 draft.update(web_policy_mode=selection.mode, web_paths=selection.paths,
                              allowed_hosts=selection.origins)
+                draft.update(
+                    web_permissions=selection.permissions, web_methods=selection.methods,
+                    web_query_keys=selection.query_keys,
+                    web_all_query_keys=selection.allow_all_query_keys,
+                    web_request_headers=selection.request_headers,
+                    web_all_request_headers=selection.allow_all_request_headers,
+                    web_request_body=selection.request_body_enabled,
+                    web_response_body_chars=selection.response_body_max_chars,
+                    web_sessions=[item.model_dump() for item in selection.sessions],
+                    kali_network_mode=selection.kali_network_mode,
+                    kali_network_policy_path=selection.kali_network_policy_path,
+                )
             else:
                 draft.update(web_policy_mode="manual", web_paths=[])
             editable, reason = True, None
@@ -311,20 +395,42 @@ class EngagementStore:
         previous_selection = existing.metadata.get(WEB_POLICY_KEY) if existing else None
         metadata = dict(config.metadata)
         if draft.web_policy_mode == "manual":
+            if draft.web_permissions != "read_only" or draft.kali_network_mode == "configured" \
+                    or draft.web_sessions:
+                raise EngagementError("invalid", problems=[
+                    {"field": "web_policy_mode", "code": "automatic_policy_required"},
+                ])
             selection_data = None
             metadata.pop(WEB_POLICY_KEY, None)
         else:
             try:
+                network_path, network_hash = None, None
+                if draft.kali_network_mode == "configured":
+                    network_path = draft.kali_network_policy_path
+                    if not network_path:
+                        raise ValueError("kali_network_policy_required")
+                    network_hash, _ = validate_kali_network_policy(network_path, draft.web_origins)
+                custom = draft.web_permissions == "custom"
                 selection = WebPolicySelection(
                     mode=draft.web_policy_mode, origins=draft.web_origins, paths=draft.web_paths,
+                    permissions=draft.web_permissions,
+                    methods=draft.web_methods if custom else read_methods(),
+                    query_keys=draft.web_query_keys if custom else [],
+                    allow_all_query_keys=custom and draft.web_all_query_keys,
+                    request_headers=draft.web_request_headers if custom else [],
+                    allow_all_request_headers=custom and draft.web_all_request_headers,
+                    request_body_enabled=custom and draft.web_request_body,
+                    response_body_max_chars=draft.web_response_body_chars,
+                    sessions=draft.web_sessions,
+                    kali_network_mode=draft.kali_network_mode,
+                    kali_network_policy_path=network_path, kali_network_policy_sha256=network_hash,
                 )
                 from redteam.capability.deployment import check_origin_scope
                 for origin in selection.origins:
                     check_origin_scope(origin, config.scope)
-            except ValueError:
+            except (ValueError, OSError):
                 raise EngagementError("invalid", problems=[
-                    {"field": "web_paths" if draft.web_policy_mode == "paths"
-                     else "allowed_hosts", "code": "web_policy_invalid"},
+                    {"field": "web_permissions", "code": "web_policy_invalid"},
                 ]) from None
             selection_data = selection.model_dump(mode="json")
             metadata[WEB_POLICY_KEY] = selection_data
@@ -346,6 +452,7 @@ class EngagementStore:
             added = added or (before_policy.mode == "paths" and after_policy.mode == "site")
             added = added or (before_policy.mode == after_policy.mode == "paths"
                               and bool(set(after_policy.paths) - set(before_policy.paths)))
+            added = added or permissions_expand(before_policy, after_policy)
         elif selection_data is not None and existing is not None:
             added = True  # Switching a manual policy requires explicit scope confirmation.
         return config, {

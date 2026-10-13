@@ -644,8 +644,10 @@ class OperatorConsole:
 
     async def route_conversation(self, router, *args, **kwargs):
         """A live input uses the same Run ledger as the executing instances."""
+        from redteam.app.cli.tool_context import live_tool_context
         from redteam.orchestration.metered_llm import llm_request_scope
 
+        kwargs.update(live_tool_context(self._deps.tool_catalog, self._deps.engagement))
         if self._deps.settings.llm_request_policy is not None:
             kwargs["llm_override"] = self._deps.llm_client
         with llm_request_scope(str(self._identity.run_id), "conversation"):
@@ -1008,15 +1010,26 @@ async def wait_for_central_suspensions(
     instance_id=None,
 ):
     """Watch original waits within the requested resume scope on the same driver."""
+    from redteam.core.contracts.execution import ExecutionState
     from redteam.core.enums import MissionStatus
+    from redteam.core.ports.control_plane import DurableControlRecovery
     from redteam.orchestration.central_runtime import process_controls
     deps = session.deps
     last_wait = None
+    last_attempt = None
+    next_poll = 0.0
+    loop = asyncio.get_running_loop()
     while final.termination_reason in {
         TerminationReason.INVESTIGATION_HELD, TerminationReason.OPERATOR_PAUSED,
     }:
+        await process_controls(deps)
+        mission = await deps.central_state.get_mission(final.mission_id)
+        if mission.status is MissionStatus.CANCELLED:
+            return await session.settle(final)
         history = await deps.central_state.list_executions()
-        waiting = [item for item in history if (item.wait_reason or item.job_ref)
+        waiting = [item for item in history if item.state in {
+            ExecutionState.PENDING, ExecutionState.RUNNING, ExecutionState.UNKNOWN,
+        } and (item.wait_reason or item.job_ref)
                    and (instance_id is None or str(item.instance_id) == str(instance_id))]
         if not waiting and final.termination_reason != TerminationReason.OPERATOR_PAUSED:
             break
@@ -1025,30 +1038,68 @@ async def wait_for_central_suspensions(
             break
         if non_interactive or (not live and not wait_for_external_approval):
             break
-        approvals = [str(item.approval_ref) for item in waiting if item.approval_ref]
+        control = deps.control_plane
+        if not isinstance(control, DurableControlRecovery):
+            raise ValueError("durable_control_recovery_not_bound")
+        approval_states = {}
+        for item in waiting:
+            if item.approval_ref:
+                record = await control.inspect_approval(item.approval_ref)
+                approval_states[str(item.approval_ref)] = record.status if record else None
+        approvals = [identity for identity, status in approval_states.items()
+                     if status is ApprovalStatus.PENDING]
         if session_channel is not None:
             # Surface every exact pending action. Each decision is still bound
             # to one approval/action and never authorizes a sibling.
-            session_channel.suspended(
-                final.model_copy(update={
-                    "pending_approval_id": approvals[0] if approvals else None,
-                }),
-                approvals,
-            )
+            if approvals or mission.status is MissionStatus.PAUSED:
+                session_channel.suspended(
+                    final.model_copy(update={
+                        "pending_approval_id": approvals[0] if approvals else None,
+                    }),
+                    approvals,
+                )
+            else:
+                session_channel.resumed()
         waits = (tuple(approvals), tuple(item.job_ref for item in waiting if item.job_ref))
         if waits != last_wait:
             echo(f"Run {final.run_id}: waiting for approvals={approvals}; jobs={list(waits[1])}")
             last_wait = waits
         if session_channel is None and live and operator_console is not None:
             operator_console.replace_pending_approvals(approvals)
-        await asyncio.sleep(0.5)
-        await process_controls(deps)
-        mission = await deps.central_state.get_mission(final.mission_id)
-        if mission.status is MissionStatus.CANCELLED:
-            return await session.settle(final)
         if mission.status is MissionStatus.PAUSED:
+            last_attempt = None
+            await asyncio.sleep(0.5)
             continue
+        # Polling an unchanged approval never starts actor recovery. Resource
+        # and job waits use the configured bounded reconciliation interval.
+        signature = (
+            tuple((str(item.invocation_id), item.state.value, item.wait_reason, item.job_ref)
+                  for item in waiting),
+            tuple((identity, status.value if status else None)
+                  for identity, status in approval_states.items()),
+            mission.status.value,
+        )
+        pending_only = bool(waiting) and all(
+            item.wait_reason == "approval" and item.approval_ref
+            and approval_states.get(str(item.approval_ref)) is ApprovalStatus.PENDING
+            for item in waiting
+        )
+        external_wait = any(item.wait_reason in {"resource", "job"} or item.job_ref
+                            for item in waiting)
+        if pending_only or (signature == last_attempt and (
+            not external_wait or loop.time() < next_poll
+        )):
+            await asyncio.sleep(0.5)
+            continue
+        last_attempt = signature
+        next_poll = loop.time() + deps.settings.resource_wait_timeout_seconds
         final = await session.resume(instance_id=instance_id, transfer_owner=False)
+        diagnostic = final.planning_diagnostic
+        if (diagnostic and diagnostic.stage == "execution_reconciliation"
+                and not diagnostic.retryable):
+            echo(f"Run {final.run_id}: 재개 보류 · {diagnostic.code} · "
+                 f"{diagnostic.summary} · {diagnostic.validation_issues}")
+            break
     if session_channel is not None and final.termination_reason not in {
         TerminationReason.INVESTIGATION_HELD, TerminationReason.OPERATOR_PAUSED,
     }:
