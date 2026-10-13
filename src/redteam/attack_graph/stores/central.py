@@ -12,8 +12,14 @@ import json
 import sqlite3
 from collections import deque
 from collections.abc import Callable
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, TypeVar
 
+from redteam.attack_graph.hypotheses import (
+    HypothesisConflict,
+    candidate_facts_changed,
+    prepare_hypothesis_update,
+)
 from redteam.attack_graph.identity import split_node_id
 from redteam.attack_graph.predicates import validate_properties
 from redteam.attack_graph.stores.mutations import (
@@ -31,7 +37,7 @@ from redteam.attack_graph.writes import (
     merge_node,
     validate_node,
 )
-from redteam.core.contracts.graph import GraphEdge, GraphNode
+from redteam.core.contracts.graph import GraphEdge, GraphNode, HypothesisUpdate
 from redteam.core.enums import GraphNodeType
 from redteam.core.ids import GraphEdgeId, GraphNodeId
 
@@ -153,6 +159,8 @@ class GraphTransaction:
         result = self.check_node(result)
         if result.id != node_id or (previous is not None and result.type is not previous.type):
             raise GraphMutationConflict("graph_node_update_identity_conflict")
+        if candidate_facts_changed(previous, result):
+            raise HypothesisConflict("candidate_write_requires_revisioned_admission")
         if result != previous:
             self.db.execute(
                 "INSERT INTO state_graph_nodes VALUES(?,?,?,?) ON CONFLICT(namespace,node_id) "
@@ -161,6 +169,32 @@ class GraphTransaction:
                  _json(result.model_dump(mode="json"))),
             )
         return result
+
+    def save_hypothesis(self, update: HypothesisUpdate, *, now: datetime) -> GraphNode:
+        """Participant in central, reviewed candidate/Task admission, never commits."""
+        from redteam.attack_graph.identity import hypothesis_node_id
+
+        local_id = hypothesis_node_id(update.hypothesis.hypothesis_id)
+        identity = GraphNodeId(self._prefix + str(local_id))
+        node = prepare_hypothesis_update(
+            self.get_node(identity), update, now=now, run_id=self.run_id,
+        ).model_copy(update={"id": identity})
+        node = self.check_node(node)
+        self.db.execute(
+            "INSERT INTO state_graph_nodes VALUES(?,?,?,?) ON CONFLICT(namespace,node_id) "
+            "DO UPDATE SET payload=excluded.payload",
+            (self.namespace, str(node.id), node.type.value, _json(node.model_dump(mode="json"))),
+        )
+        from redteam.core.enums import GraphEdgeType
+
+        for target in update.hypothesis.target_node_ids:
+            self.add_edge(GraphEdge(
+                id=GraphEdgeId(self._prefix + f"targets:{local_id}->{target}"),
+                type=GraphEdgeType.TARGETS, source_id=identity,
+                target_id=GraphNodeId(self._prefix + target), created_at=now,
+                properties={"provenance": node.properties["provenance"][-1:]},
+            ))
+        return node
 
     def mutate_edge(self, edge_id: GraphEdgeId, update: EdgeUpdate) -> GraphEdge | None:
         previous = self.get_edge(edge_id)
@@ -292,6 +326,11 @@ class GraphTransaction:
 
     def remove_node(self, node_id: GraphNodeId) -> bool:
         self._node_id(str(node_id))
+        current = self.get_node(node_id)
+        if current is not None and current.type is GraphNodeType.HYPOTHESIS and (
+            current.properties.get("facts", {}).get("contract_version") == 2
+        ):
+            raise HypothesisConflict("candidate_identity_must_be_retained")
         removed = self.db.execute(
             "DELETE FROM state_graph_nodes WHERE namespace=? AND node_id=?",
             (self.namespace, str(node_id)),

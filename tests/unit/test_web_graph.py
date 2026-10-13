@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime, timezone
 
 import pytest
 
 from redteam.app.web.graph_read import read_graph
+from redteam.attack_graph.hypotheses import prepare_hypothesis_update
 from redteam.core.contracts.execution import ExecutionState
+from redteam.core.contracts.graph import Hypothesis, HypothesisUpdate
 from redteam.core.contracts.llm_policy import LLMRequestPolicy
 from redteam.core.tool_binding import execution_fingerprint
 from redteam.evidence.stores.filesystem import FilesystemEvidenceStore
@@ -57,6 +60,49 @@ async def test_planner_state_follows_the_stored_model_request_and_judgment(tmp_p
         "requests": 1, "in_flight": 0, "known_tokens": 42, "unknown_usage": 0,
         "unknown_outcome": 0,
     }
+
+
+async def test_candidate_is_projected_separately_from_tasks_findings_and_mission(tmp_path):
+    state, _ = await bound(tmp_path)
+    candidate = Hypothesis(
+        hypothesis_id="candidate-a",
+        description="Authorization may be missing",
+        status="open",
+        contract_version=2,
+        target_node_ids=["host:example.invalid"],
+        reason="Verify one response",
+    )
+    node = prepare_hypothesis_update(
+        None,
+        HypothesisUpdate(hypothesis=candidate),
+        now=datetime.now(timezone.utc),
+        run_id=RUN,
+    )
+    node = node.model_copy(update={"id": f"{state.engagement_id}\x1f{node.id}"})
+    await state.transaction(lambda tx: tx.db.execute(
+        "INSERT INTO state_graph_nodes VALUES(?,?,?,?)",
+        (state.engagement_id, str(node.id), node.type.value, node.model_dump_json()),
+    ))
+
+    view = await graph(state)
+    assert view["candidates"] == [{
+        "hypothesis_id": "candidate-a",
+        "description": "Authorization may be missing",
+        "status": "open",
+        "confidence": 0.0,
+        "revision": 1,
+        "reason": "Verify one response",
+        "target_node_ids": ["host:example.invalid"],
+        "supporting_evidence_ids": [],
+        "refuting_evidence_ids": [],
+        "source_hypothesis_ids": [],
+        "task_ids": [],
+    }]
+    assert view["origin"]["hypotheses"] == 1
+    assert {"from": "planner", "to": "candidate:candidate-a", "kind": "judged"} in view[
+        "edges"
+    ]
+    assert view["tasks"] == [] and view["origin"]["findings"] == 0
 
 
 async def test_two_workers_one_running_a_tool_and_one_waiting_for_approval_with_slot_returned(
@@ -179,12 +225,11 @@ async def test_api_rejects_malformed_run_ids(bad, tmp_path):
         assert ok.json() == {"available": False, "reason": "state_unconfigured", "run_id": None}
 
 
-def test_planner_input_does_not_carry_operator_guidance_so_the_view_says_so():
+def test_candidate_planner_input_carries_operator_guidance_without_view_guessing():
     import inspect
 
     from redteam.app.web.graph_model import build_graph  # noqa: F401
-    from redteam.orchestration.specialist_planner import SpecialistPlanner
+    from redteam.orchestration.hypothesis_planner import advance_hypotheses
 
-    source = inspect.getsource(SpecialistPlanner._advance_central)
-    # If guidance is ever added to the planner payload, graph_model must report it.
-    assert "operator_instructions" not in source
+    source = inspect.getsource(advance_hypotheses)
+    assert "operator_instructions" in source

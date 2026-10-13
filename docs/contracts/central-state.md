@@ -1,5 +1,47 @@
 # Central state foundation (schema 3)
 
+## Candidate/probe admission (plan5a)
+
+`register_probe_tasks` consumes a `HypothesisProbeProposal` through the existing
+central transaction. Hypotheses remain graph facts; probes remain `MissionTask`
+rows. No SQL schema change, candidate table, question lifecycle or second queue
+is introduced. The exact proposal receipt uses `state_requests` with kind
+`hypothesis_probe_registration`; it stores only request hash, original Task IDs
+and committed candidate revisions. Different requests may reuse the same evidence
+and candidate. Exact replay returns the receipt before checking current revisions.
+
+The caller supplies the original Mission revision, Run binding hash and hashes
+of consumed graph subjects. Candidate revisions provide CAS independently of
+local graph steps. Consumed source Task/results also use the caller's `task_read`
+hashes, so a stable result ID cannot hide a newer intermediate result. Candidate
+changes, checked evidence references, Task admission, receipt and outbox
+notifications commit or roll back together. External original
+inspection and existing claim/validity proof checks precede the SQL transaction.
+`HypothesisJudgmentCommitted` identifies planner-produced updates separately from
+worker feedback; it is not subscribed as a planner wakeup in the current runtime.
+
+Tasks with `investigation_contract_version=2` reference admitted candidates in
+`hypothesis_revisions` and `related_hypothesis_ids`. These links impose no candidate
+verdict on Mission completion. `required` controls the probe's relevance to the
+goal, and `goal_required_hypothesis_ids` explicitly selects any candidate verdicts
+the goal also requires. New probes default to optional; required proposals need
+a reason. Version 1 keeps its previous required-hypothesis behavior and original
+serialized identities. Completion receipts also bind the v2 probe purpose/version
+and admitted candidate revisions, so old receipts cannot prove a different probe.
+
+Result contract v2 adds structured `observations` and `limitations`; its outcome
+concerns the current probe purpose. Confirming an observation does not confirm
+the vulnerability candidate. Existing settlement/claim/original proof gates still
+apply to confirmed and refuted v2 results. The result tool descriptor is version 2,
+with legacy v1 result input still supported. Intermediate results retain their ID and prior original
+references and observation items. A v2 blocked probe can publish partial feedback
+without completing the Task or releasing unresolved executions. Direct follow-ups
+may cite source Task/result without inventing a result question; when a question
+is supplied, it must still exist on the original source result.
+
+The v2 admission/result contracts are the default new-Run path. Reading v1
+records does not reinterpret their original Run as a v2 candidate Run.
+
 The foundation implements plan1a, plan1b and the explicit plan1c migration
 entrypoints. Plans2a–2c connect the planner, native workers and original
 approval/job/accounting recovery. Plan2d connects criterion completion,
@@ -820,6 +862,123 @@ retain original checkpoint identity; they select no store or exploration rule.
 
 There is no cumulative activation or strategy-revision ceiling. Live worker,
 resource and actual request/action/time budgets remain authoritative.
+
+## Bounded common workers (plan5b)
+
+`config/agents/native-probes.yaml` is the default schema-3 assembly: one
+schedulable executor definition, multiple independent worker instances, existing
+conversation/evidence/code review seams and a `hypothesis_planning` stage without
+an atomizer. CLI configuration uses it when no profile environment override is
+present, and the web settings UI selects it by default. The profile connects to
+the candidate planner loop through the existing central assembly.
+Tests may also register v2 probes directly through the existing central admission.
+Schema-2 profiles retain their original serialized policy and prompt fingerprints.
+
+The profile's `probe_limits` defaults to four original action submissions and
+eight model request reservations per Task. A proposal may tighten either limit,
+but cannot exceed the selected profile. Limits are immutable Task input, included
+in its completion purpose hash, while the entire profile participates in the
+existing persisted selection fingerprint. No new queue, ledger or database is
+created: usage comes from `state_executions` and existing `llm_request` rows with
+the Task ID. Pending approval/resource submissions count; reviews and repairs
+inherit the same Task charge and existing Run charge. Released undispatched model
+reservations do not count. Slot return, owner transfer and checkpoint resume do
+not reset usage; continuing an original invocation does not submit another action.
+Run admission and its original time/action/model budgets still apply.
+
+Claim atomically captures the candidate's admitted revision in the worker's SDK
+checkpoint. The authoritative candidate stays in the graph. The worker receives
+its own Task, candidate snapshot, related current knowledge and original evidence
+references; unrelated tasks, execution histories and other-run knowledge are
+omitted. Target binding uses the Task's registered subjects and existing address
+semantics, permitting method/path selection on a supplied host while retaining
+Control scope checks. All selected sessions must belong to the Task's registered
+principals. New candidate proposals go back as feedback; bounded graph recording
+cannot register another candidate or review an unassigned candidate.
+
+The worker prompt and native contract allow early inconclusive/blocked return,
+intermediate result publication and an existing independently reviewed short
+completion. Task outcome never automatically settles a candidate or Finding.
+At the admission boundary, code publishes original ToolResult references,
+execution observations and a system-authored limitation without another model
+request. Execution journal/resolution IDs remain in the original execution rows;
+they are not substituted for review-facing ToolResult evidence. Safe partial
+work can finish inconclusively. Approval/job/resource/UNKNOWN work remains
+blocked with original ownership and reservations; only the actor slot returns.
+Original continuation/collection and automatic resource wake-up remain active.
+
+Tool cards and native binding use existing configured selectors, registry,
+eligibility and health. The tags in the example YAML are deployment selection,
+not a runtime union of specialist roles or execution permission. Trusted reference
+lookups, evidence review and code generation/review remain registered; domain
+knowledge does not require a separate worker queue. Verification uses temporary
+state and explicit model/tool/job doubles, without paid or target calls.
+
+## Candidate planner feedback (plan5c)
+
+The explicit schema-3 profile uses `hypothesis_planning` and the versioned
+`hypothesis-planner.md` prompt. One structured judgment proposes candidate updates,
+short probe purposes and a reasoned continue/held/exhausted/goal-review proposal.
+There is no atomizer request. New `hypothesis_id` values in absence-expecting
+updates are local proposal keys; code issues durable IDs and resolves probe
+references before existing candidate/Task admission. Existing IDs and expected
+revisions come from the captured snapshot. Observation tasks need no candidate.
+
+Inputs include full candidate snapshots, Task/result originals, supporting/opposing
+evidence references, public independent review receipts, current validity, operator
+instructions, registered subjects, tool readiness and remaining shared budget.
+Missing prerequisites and denied/UNKNOWN calls remain limitations. Verdicts still
+require original evidence and the exact candidate revision/purpose review; no
+new Finding or goal-success bypass is introduced. New purposes create linked
+follow-up Tasks instead of rewriting active work. Held candidates and empty
+judgments retain explicit reconsideration conditions.
+
+The application keeps one planner task alongside as-ready workers. Result updates,
+Task completion and applied operator instructions wake this planning contract;
+individual tool calls, tokens and actor returns do not request another judgment.
+The captured committed outbox sequence is recorded in the existing `state_requests`
+rows with each accepted structured pass. That cursor and candidate/probe registration
+commit together. Duplicate event delivery or reopening an already-consumed cursor
+does not request another model response. The cursor identifies exact input events,
+not semantic evidence reuse; another result publication with the same `result_id`
+has a new committed sequence and remains eligible for feedback.
+
+All requests and repairs use existing Run/time/token/request admission. A request's
+payload stays fixed while another worker publishes; the later sequence remains
+pending for the next pass. Commit fences the goal/binding and only referenced
+candidates, subjects and source/reviewed Task results. A related change rejects
+the complete write and queues `HypothesisPlanningInvalidated` for reconsideration.
+An unrelated sibling update does not discard a candidate-local decision. Global
+held/exhausted judgments also fence the current work/candidate inventory; exhausted
+reporting rechecks its original candidate facts and existing goal input stamp.
+Periodic reconciliation reads the outbox cursor without a model busy loop.
+
+Schema-2 profiles remain readable and retain their serialized identities; the
+new default never invokes their strategy/atomizer stages. The probe profile's
+version, prompts and planning-input schema are bound into the existing Run and
+checkpoint fingerprints. A stored schema-2 Run is not resumed under schema-3
+meaning; changing the selection requires a new Run. Read-only status/report
+continues to project its originals.
+The planner cursor/proposal records use existing tables, not another candidate
+store or event ledger. Tests use temporary DBs and explicit provider/model/review
+doubles, and do not establish successful live vulnerability discovery.
+
+## Default candidate runtime and projections (plan5d)
+
+New CLI and web Runs resolve the normal configuration default through the same
+profile loader used by explicit selections. The selected catalog, generated web
+policy, scope, provider readiness and shared worker/request limits continue into
+the common-worker assembly. The default stage map has no `task_atomization` and
+no specialized schedulable role; evidence/claim/task/goal reviews and code
+generation/review remain explicit nonschedulable model stages.
+
+The read-only web graph projects current v2 candidates from the existing central
+graph beside their related probe Tasks, workers and stored evidence. Terminal
+reports expose the candidate revision, judgment, supporting/refuting evidence
+and related probe Task IDs separately from Findings and Mission status. No UI
+database or duplicated candidate authority is introduced. Historical `web.md`,
+`mobile.md`, `planner.md` and `atomizer.md` files remain because schema-2 profile
+identities still reference them; they are not consumers in the default path.
 
 Resource effects distinguish an absent declaration (`None`) from an explicit
 empty declaration (`[]`). Confirmed creation/removal uses original evidence;

@@ -82,6 +82,10 @@ where = ["src"]
 [tool.setuptools.package-data]
 redteam = ["capability/reference_data/*.json", "capability/reference_data/*.yaml", "capability/reference_data/templates/*.md", "app/web/static/*"]
 
+[tool.setuptools.data-files]
+"share/redteam/agents" = ["config/agents/*.yaml"]
+"share/redteam/agents/prompts" = ["config/agents/prompts/*.md"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]

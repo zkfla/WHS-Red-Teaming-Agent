@@ -7,6 +7,7 @@ from collections.abc import Callable
 from typing import Any
 from weakref import WeakKeyDictionary
 
+from redteam.attack_graph.hypotheses import HypothesisConflict, candidate_facts_changed
 from redteam.attack_graph.predicates import (
     ASSERTED_VERSION_KEY,
     CLAIM_FACT_PREFIX,
@@ -20,7 +21,7 @@ from redteam.attack_graph.predicates import (
     validate_properties,
     values_equal,
 )
-from redteam.core.contracts.graph import GraphEdge, GraphNode
+from redteam.core.contracts.graph import GraphEdge, GraphNode, Hypothesis
 from redteam.core.enums import GraphNodeType
 from redteam.core.ids import GraphEdgeId, GraphNodeId
 from redteam.core.ports.attack_graph import AttackGraphStore
@@ -40,6 +41,14 @@ class UngroundedFindingError(ValueError):
 def validate_node(node: GraphNode) -> GraphNode:
     node = GraphNode.model_validate(node.model_dump())
     validate_properties(node.properties)
+    if node.type is GraphNodeType.HYPOTHESIS and facts_of(node.properties).get(
+        "contract_version"
+    ) == 2:
+        candidate = Hypothesis.model_validate(facts_of(node.properties))
+        if candidate.revision < 1 or node.properties.get("attrs", {}).get(
+            "status"
+        ) != candidate.status:
+            raise HypothesisConflict("candidate_graph_state_inconsistent")
     if node.type is GraphNodeType.FINDING:
         facts = facts_of(node.properties)
         if facts.get("verified") and not facts.get("evidence_ids"):
@@ -49,6 +58,8 @@ def validate_node(node: GraphNode) -> GraphNode:
 
 def merge_node(existing: GraphNode | None, incoming: GraphNode) -> GraphNode:
     incoming = validate_node(incoming)
+    if candidate_facts_changed(existing, incoming):
+        raise HypothesisConflict("candidate_write_requires_revisioned_admission")
     if existing is None:
         if not isinstance(incoming.properties.get(OBSERVATION_VERSION_KEY), int):
             properties = dict(incoming.properties)

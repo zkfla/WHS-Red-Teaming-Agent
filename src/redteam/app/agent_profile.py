@@ -8,9 +8,9 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
 
-from redteam.core.contracts.specialists import SpecialistRunPolicy
+from redteam.core.contracts.specialists import ProbeLimits, SpecialistRunPolicy
 from redteam.core.ports.agent_prompts import PromptBinding
 from redteam.orchestration.agents.base import AgentSpec
 from redteam.orchestration.agents.definition import AgentDefinition
@@ -43,17 +43,40 @@ class SpecialistProfile(BaseModel):
     max_activations: int = Field(ge=1, strict=True)
     max_tasks_per_strategy: int = Field(ge=1, strict=True)
     max_strategy_revisions: int = Field(ge=1, strict=True)
+    probe_limits: ProbeLimits | None = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        result = handler(self)
+        if self.probe_limits is None:
+            result.pop("probe_limits", None)
+        return result
 
     @model_validator(mode="after")
     def validate_bindings(self):
         identities = [str(role.definition.agent_id) for role in self.roles]
-        required = {"attack_path_proposal", "task_atomization", "native_action",
+        required = {"native_action",
                     "conversation_decide", "analysis_verify", "analysis_claim_verify",
                     "task_completion_review", "goal_completion_review"}
-        if (self.schema_version != "2" or len(set(identities)) != len(identities)
+        if self.schema_version == "2":
+            required.update({"attack_path_proposal", "task_atomization"})
+            if self.probe_limits is not None:
+                raise ValueError("specialist_profile_v2_cannot_enable_probes")
+        elif self.schema_version == "3":
+            required.add("hypothesis_planning")
+            if self.probe_limits is None or "task_atomization" in self.stages:
+                raise ValueError("probe_profile_limits_or_stages_invalid")
+            executors = [role for role in self.roles if role.definition.schedulable]
+            if len(executors) != 1 or self.stages.get("native_action") != str(
+                executors[0].definition.agent_id
+            ):
+                raise ValueError("probe_profile_requires_one_common_executor_role")
+        if (self.schema_version not in {"2", "3"} or len(set(identities)) != len(identities)
                 or required - self.stages.keys() or set(self.stages.values()) - set(identities)):
             raise ValueError("specialist_profile_bindings_invalid")
-        if self.stages["attack_path_proposal"] == self.stages["task_atomization"]:
+        if self.schema_version == "2" and (
+            self.stages["attack_path_proposal"] == self.stages["task_atomization"]
+        ):
             raise ValueError("specialist_planner_atomizer_must_be_separate")
         if not any(role.definition.schedulable for role in self.roles):
             raise ValueError("specialist_executor_missing")
@@ -110,6 +133,7 @@ class LoadedSpecialists:
             fingerprint=self.fingerprint, **self.profile.model_dump(include={
                 "max_instances", "max_activations", "max_tasks_per_strategy",
                 "max_strategy_revisions",
+                "probe_limits",
             }),
         )
 

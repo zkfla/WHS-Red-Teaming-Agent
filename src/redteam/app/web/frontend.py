@@ -143,8 +143,10 @@ class WebFrontend:
             "phase": controller.phase.value,
             "activity": safe_text(controller.activity, limit=1000),
             "pending_approval": controller.pending_approval,
+            "pending_approvals": list(controller.pending_approvals),
             "binding": binding_data(controller.input_binding),
             "active_run": controller.run_task is not None,
+            "termination_reason": controller.terminal_event_reason,
             "engagement": safe_text(controller.engagement_name, limit=200),
             "scope": [safe_text(item, limit=200) for item in list(controller.scope)[:50]],
             "model": safe_text(controller.model_label, limit=200),
@@ -156,8 +158,9 @@ class WebFrontend:
         if data is None:
             return
         signature = (
-            data["phase"], data["activity"], data["pending_approval"],
+            data["phase"], data["activity"], tuple(data["pending_approvals"]),
             repr(data["binding"]), data["active_run"], data["last_summary"],
+            data["termination_reason"],
         )
         if signature == self._state_signature:
             return

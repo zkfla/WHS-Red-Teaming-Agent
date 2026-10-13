@@ -94,15 +94,24 @@ tightening once the skeleton fills in).
 
 The central storage and runtime are documented in
 [Central state](docs/contracts/central-state.md). After plan2d verification,
-the CLI and application default to central state with two workers. Select a
-specialist profile with `REDTEAM_SPECIALIST_PROFILE` and an explicit shared LLM
-request policy with `REDTEAM_LLM_REQUEST_POLICY_JSON`. Missing configuration
-fails before execution. `REDTEAM_STATE_DB` selects the central database;
+the CLI and application default to central state with two workers. New Runs use
+`config/agents/native-probes.yaml` unless `REDTEAM_SPECIALIST_PROFILE` selects a
+compatible override. An explicit shared LLM request policy is still required via
+`REDTEAM_LLM_REQUEST_POLICY_JSON`; missing request limits fail before execution.
+`REDTEAM_STATE_DB` selects the central database;
 `REDTEAM_MAX_WORKERS` or `run --workers` selects the worker limit. Limits remain
 bounded by the existing global, target, resource, ROE and Control admission.
 The explicit development assembly uses local LLM/tool/job doubles only.
 `open_central_run` selects a separate directory through the same application
 assembly. No default production path selects those doubles.
+
+`config/agents/native-probes.yaml` is the default common-worker profile. It uses
+one executor definition with independent instances and cumulative per-Task
+action/model bounds. Its candidate planner consumes committed result feedback
+through the existing central run; no atomizer or domain-specific work queue is
+part of the default path.
+See [bounded common workers](docs/contracts/central-state.md#bounded-common-workers-plan5b)
+for limits, input snapshots, partial results and original-call resume semantics.
 
 After plan2e cleanup, central assembly also constructs no empty compatibility
 Task/Path/Work stores. Its SDK graph registers only MODEL/TOOLS/SETTLE; legacy

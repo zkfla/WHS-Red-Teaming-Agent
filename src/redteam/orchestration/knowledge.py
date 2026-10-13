@@ -185,6 +185,13 @@ class HypothesisItem(BaseModel):
     first_seen_step: int | None = None
     last_seen_step: int | None = None
     origin: str = "inferred"
+    contract_version: int = 1
+    revision: int = 0
+    target_node_ids: list[str] = Field(default_factory=list)
+    principal_refs: list[str] = Field(default_factory=list)
+    premise: str | None = None
+    reason: str | None = None
+    source_hypothesis_ids: list[str] = Field(default_factory=list)
 
 
 class FindingItem(BaseModel):
@@ -507,6 +514,8 @@ class HypothesisService:
         ids: list[str] = []
         hyp = await self.get(hid)
         if hyp is not None:
+            ids.extend(hyp.supporting_evidence_ids)
+            ids.extend(hyp.refuting_evidence_ids)
             meta = hyp.metadata or {}
             for key in ("evidence_ids", "supporting_evidence_ids", "refuting_evidence_ids"):
                 raw = meta.get(key, [])
@@ -1042,7 +1051,10 @@ async def _hypothesis_items(
     items: list[HypothesisItem] = []
     for hyp in hyps:
         hid = str(hyp.hypothesis_id)
-        meta = hyp.metadata or {}
+        meta = {**(hyp.metadata or {})}
+        if hyp.contract_version == 2:
+            for name in ("supporting_evidence_ids", "refuting_evidence_ids"):
+                meta[name] = getattr(hyp, name)
         node = None
         try:
             node = await graph_service.get_node(hypothesis_node_id(hid))
@@ -1081,6 +1093,9 @@ async def _hypothesis_items(
         neutral = [eid for eid in linked if eid not in set(supporting) and eid not in set(refuting)]
         meta_target = meta.get("target_node_id", None)
         edge_targets = sorted(set(target_links.get(hid, [])))
+        if hyp.contract_version == 2:
+            edge_targets = hyp.target_node_ids
+            meta_target = edge_targets[0] if edge_targets else None
         target_node_id = (
             str(meta_target)
             if isinstance(meta_target, str) and meta_target
@@ -1125,6 +1140,10 @@ async def _hypothesis_items(
             expectation = {"value": expectation}
         items.append(
             HypothesisItem(
+                contract_version=hyp.contract_version, revision=hyp.revision,
+                target_node_ids=hyp.target_node_ids, principal_refs=hyp.principal_refs,
+                premise=hyp.premise, reason=hyp.reason,
+                source_hypothesis_ids=hyp.source_hypothesis_ids,
                 hypothesis_id=hid,
                 claim=str(hyp.description or ""),
                 confidence=float(hyp.confidence or 0.0),

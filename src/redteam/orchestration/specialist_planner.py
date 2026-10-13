@@ -4,6 +4,7 @@ No provider tools are exposed to these judgments. They propose investigation
 work, never execution permission, raw Tool calls, or a terminal goal result.
 """
 
+import asyncio
 from copy import deepcopy
 from typing import Any, Literal
 
@@ -71,7 +72,10 @@ def _schema_with_completion_criterion_hint(schema: dict[str, Any]) -> dict[str, 
 def specialist_planning_inputs(deps) -> dict:
     """Assembler-owned input identity, also checked before reservation recovery."""
     inputs = {
-        "schema_version": 2,
+        # Schema 3 is the candidate-planner/common-worker meaning.  Keeping the
+        # old value for historical profiles prevents a stored schema-2 Run from
+        # being silently reinterpreted when bindings are compared on resume.
+        "schema_version": 3 if deps.specialist_policy.probe_limits is not None else 2,
         # Assembly assigns a fresh created_at on every CLI rebuild. It is not
         # scope/policy and must not stale an otherwise identical saved Run.
         # All substantive fields, including the original engagement ID, remain.
@@ -144,11 +148,34 @@ class SpecialistPlanner:
         self.coordinator: Any = None
         self.admission: Any = None
         self.client = StructuredDecisionClient(deps.llm_client)
+        self._hypothesis_lock = asyncio.Lock()
+
+    def wake_events(self):
+        """The selected planning contract owns meaningful decision wake sources."""
+        if self.policy.probe_limits is not None:
+            from redteam.orchestration.hypothesis_planner import PROBE_WAKE_EVENTS
+
+            return PROBE_WAKE_EVENTS
+        from redteam.core.contracts.events import EventType
+        from redteam.orchestration.central_results import RESULT_UPDATED
+        from redteam.orchestration.central_runtime import ACTOR_RETURNED
+
+        return frozenset({RESULT_UPDATED, ACTOR_RETURNED, EventType.GRAPH_UPDATED,
+                          EventType.EVIDENCE_CREATED, EventType.EVIDENCE_VALIDITY_CHANGED,
+                          EventType.TASK_COMPLETED,
+                          EventType.OPERATOR_INTENT_APPLIED})
 
     async def advance(self, runtime) -> list[str]:
-        """Once per meaningful input, with a finite strategy ceiling per Run."""
+        """Propose current work under the selected planning contract and shared Run budget."""
         if runtime.mission_id is None:
             raise ValueError("specialist_planning_requires_mission")
+        if self.policy.probe_limits is not None:
+            from redteam.orchestration.hypothesis_planner import advance_hypotheses
+
+            async with self._hypothesis_lock:
+                return await advance_hypotheses(
+                    self, runtime, _schema_with_completion_criterion_hint,
+                )
         return await self._advance_central(runtime)
 
     async def _advance_central(self, runtime):

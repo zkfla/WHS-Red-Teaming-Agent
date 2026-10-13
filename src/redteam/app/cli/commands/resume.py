@@ -159,7 +159,13 @@ async def _run_central(args, config, *, mcp_stack, on_finished=None,
                 raise StateConflict("central_original_checkpoint_missing")
         selected = OrchestrationSettings.model_validate(original["settings"])
         overrides = {}
-        if config.orchestration.specialist_profile_path is not None:
+        # The normal config now has a schema-3 default for *new* Runs.  Resume
+        # keeps the stored profile unless the operator explicitly supplied the
+        # profile environment variable; otherwise an old schema-2 Run would be
+        # silently rebuilt with new candidate-planner meaning.
+        from redteam.core.environment import env_snapshot
+
+        if env_snapshot().get("REDTEAM_SPECIALIST_PROFILE"):
             overrides["specialist_profile_path"] = config.orchestration.specialist_profile_path
         if config.orchestration.llm_request_policy is not None:
             overrides["llm_request_policy"] = config.orchestration.llm_request_policy

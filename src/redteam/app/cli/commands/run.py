@@ -297,7 +297,8 @@ class OperatorConsole:
         self._conversation = conversation
         self._engagement_name = engagement_name
         self._scope = list(scope or [])
-        self._pending_approval_id: str | None = None
+        self._pending_approval_ids: dict[str, None] = {}
+        self._resolved_approval_ids: set[str] = set()
         self._queue: asyncio.Queue[str] | None = None
         self._consumer: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
@@ -481,10 +482,23 @@ class OperatorConsole:
     # -- approval identity ---------------------------------------------
 
     def set_pending_approval(self, approval_id: object | None) -> None:
-        self._pending_approval_id = str(approval_id) if approval_id else None
+        if approval_id:
+            value = str(approval_id)
+            if value not in self._resolved_approval_ids:
+                self._pending_approval_ids[value] = None
 
-    def clear_pending_approval(self) -> None:
-        self._pending_approval_id = None
+    def replace_pending_approvals(self, approval_ids: tuple[str, ...] | list[str]) -> None:
+        self._pending_approval_ids = {
+            str(value): None
+            for value in approval_ids
+            if value and str(value) not in self._resolved_approval_ids
+        }
+
+    def clear_pending_approval(self, approval_id: object | None = None) -> None:
+        if approval_id is None:
+            self._pending_approval_ids.clear()
+        else:
+            self._pending_approval_ids.pop(str(approval_id), None)
 
     # -- dispatch -------------------------------------------------------
 
@@ -657,7 +671,7 @@ class OperatorConsole:
         calls the existing application services, not tools or policy evaluation.
         """
         if kind in {"approve", "deny"}:
-            if not value or value != self._pending_approval_id:
+            if not value or value not in self._pending_approval_ids:
                 return False, "승인 대상이 변경되었거나 없습니다."
             resolver = getattr(self._deps.control_plane, "resolve_approval", None)
             if resolver is None:
@@ -666,7 +680,8 @@ class OperatorConsole:
             result = await resolver(value, status, self._resolved_by)
             if str(result.approval_id) != value or result.status != status:
                 raise RuntimeError("approval response did not acknowledge this request")
-            self.clear_pending_approval()
+            self.clear_pending_approval(value)
+            self._resolved_approval_ids.add(value)
             return (
                 True,
                 f"승인 결정 수락: {value} · {status.value} — action 실행 성공과 별개입니다.",
@@ -720,16 +735,26 @@ class OperatorConsole:
     # -- approval path (same DefaultControlPlane resolution) ------------
 
     async def _resolve_approval(self, status: ApprovalStatus, explicit_id: str) -> None:
-        pending = self._pending_approval_id
-        if not pending:
+        pending_ids = tuple(self._pending_approval_ids)
+        if not pending_ids:
             self._echo(renderer.operator_notice_text("no action is awaiting approval"))
             return
-        if explicit_id and explicit_id != pending:
-            # Never resolve a different Approval than the one this run is
-            # actually suspended on -- that would break the resume identity.
+        if explicit_id:
+            if explicit_id not in self._pending_approval_ids:
+                self._echo(
+                    renderer.operator_notice_text(
+                        f"approval '{explicit_id}' does not match a pending approval for this run"
+                    )
+                )
+                return
+            pending = explicit_id
+        elif len(pending_ids) == 1:
+            pending = pending_ids[0]
+        else:
             self._echo(
                 renderer.operator_notice_text(
-                    f"approval '{explicit_id}' does not match the pending approval '{pending}'"
+                    "multiple actions are awaiting approval; specify one exact approval id: "
+                    + ", ".join(pending_ids)
                 )
             )
             return
@@ -752,7 +777,8 @@ class OperatorConsole:
                 )
             )
             return
-        self._pending_approval_id = None
+        self.clear_pending_approval(pending)
+        self._resolved_approval_ids.add(pending)
         self._echo(renderer.operator_approval_resolved_text(pending, status))
 
 
@@ -974,33 +1000,36 @@ async def wait_for_central_suspensions(
             break
         approvals = [str(item.approval_ref) for item in waiting if item.approval_ref]
         if session_channel is not None:
-            # Display one exact pending action at a time; status exposes every
-            # instance. Resolving it never resumes another approval's action.
-            session_channel.suspended(final.model_copy(update={
-                "pending_approval_id": approvals[0] if approvals else None,
-            }))
+            # Surface every exact pending action. Each decision is still bound
+            # to one approval/action and never authorizes a sibling.
+            session_channel.suspended(
+                final.model_copy(update={
+                    "pending_approval_id": approvals[0] if approvals else None,
+                }),
+                approvals,
+            )
         waits = (tuple(approvals), tuple(item.job_ref for item in waiting if item.job_ref))
         if waits != last_wait:
             echo(f"Run {final.run_id}: waiting for approvals={approvals}; jobs={list(waits[1])}")
             last_wait = waits
-        if live and operator_console is not None and approvals:
-            operator_console.set_pending_approval(approvals[0])
-        try:
-            await asyncio.sleep(0.5)
-            await process_controls(deps)
-            mission = await deps.central_state.get_mission(final.mission_id)
-            if mission.status is MissionStatus.CANCELLED:
-                return await session.settle(final)
-            if mission.status is MissionStatus.PAUSED:
-                continue
-            final = await session.resume(instance_id=instance_id, transfer_owner=False)
-        finally:
-            if operator_console is not None:
-                operator_console.clear_pending_approval()
+        if session_channel is None and live and operator_console is not None:
+            operator_console.replace_pending_approvals(approvals)
+        await asyncio.sleep(0.5)
+        await process_controls(deps)
+        mission = await deps.central_state.get_mission(final.mission_id)
+        if mission.status is MissionStatus.CANCELLED:
+            return await session.settle(final)
+        if mission.status is MissionStatus.PAUSED:
+            continue
+        final = await session.resume(instance_id=instance_id, transfer_owner=False)
     if session_channel is not None and final.termination_reason not in {
         TerminationReason.INVESTIGATION_HELD, TerminationReason.OPERATOR_PAUSED,
     }:
         session_channel.resumed()
+    if operator_console is not None and final.termination_reason not in {
+        TerminationReason.INVESTIGATION_HELD, TerminationReason.OPERATOR_PAUSED,
+    }:
+        operator_console.clear_pending_approval()
     return final
 
 

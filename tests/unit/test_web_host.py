@@ -328,6 +328,30 @@ async def test_approval_requires_the_pending_id_and_the_current_run(stack):
     assert ("approve", "APR-1") in stack.launcher.operator.calls
 
 
+async def test_each_live_parallel_approval_can_be_decided_by_exact_id(stack):
+    await become_ready(stack)
+    stack.launcher.conversation.mode = "execute"
+    await post(stack.client, "/api/v1/input", {"text": "점검"})
+    await asyncio.wait_for(stack.launcher.started.wait(), 2)
+    controller = stack.host.frontend.controller
+    for approval_id in ("APR-1", "APR-2"):
+        controller.observe(
+            SimpleNamespace(
+                run_id="run-A",
+                event_type="ApprovalRequired",
+                payload={"approval_id": approval_id},
+            )
+        )
+
+    response = await post(
+        stack.client, "/api/v1/approvals/APR-2/deny", {"run_id": "run-A"}
+    )
+    assert response.status_code == 202
+    await settled(stack)
+    assert ("deny", "APR-2") in stack.launcher.operator.calls
+    assert controller.pending_approvals == ("APR-1",)
+
+
 async def test_approval_route_rejects_unknown_decisions_and_bad_ids(stack):
     await become_ready(stack)
     unknown = await post(stack.client, "/api/v1/approvals/APR-1/maybe", {"run_id": "r"})

@@ -19,14 +19,18 @@ from redteam.orchestration.llm_requests import RequestAdmissionError, RunRequest
 class RequestScope:
     run_id: str
     owner: str
+    task_id: str | None = None
 
 
 _scope: ContextVar[RequestScope | None] = ContextVar("llm_request_scope", default=None)
 
 
 @contextmanager
-def llm_request_scope(run_id: str, owner: str) -> Iterator[None]:
-    token = _scope.set(RequestScope(run_id, owner))
+def llm_request_scope(run_id: str, owner: str, *, task_id: str | None = None) -> Iterator[None]:
+    parent = _scope.get()
+    if task_id is None and parent is not None and parent.run_id == run_id:
+        task_id = parent.task_id
+    token = _scope.set(RequestScope(run_id, owner, task_id))
     try:
         yield
     finally:
@@ -124,7 +128,8 @@ class RunMeteredLLM:
         if guard is not None:
             await guard()
         kwargs["num_retries"] = 0
-        request = await self.ledger.reserve(scope.run_id, owner=scope.owner, kind=method)
+        request = await self.ledger.reserve(scope.run_id, owner=scope.owner, kind=method,
+                                            task_id=scope.task_id)
         # A failed durable dispatch update never starts the external request.
         # A possibly committed update is left reserved for explicit recovery.
         await self.ledger.dispatch(scope.run_id, request)

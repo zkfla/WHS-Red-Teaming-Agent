@@ -342,10 +342,29 @@ async def ready_workers(deps, base, *, max_instances=None):
                 or is_task_suppressed(task, mission)
             ):
                 continue
+            snapshots = None
+            if deps.specialist_policy.probe_limits is not None and task.probe_limits is None:
+                continue
+            if task.probe_limits is not None:
+                from redteam.attack_graph.identity import hypothesis_node_id
+                from redteam.attack_graph.predicates import facts_of
+                from redteam.core.contracts.graph import Hypothesis
+
+                snapshots = {}
+                for identity, revision in task.hypothesis_revisions.items():
+                    node = tx.graph.get_local_node(hypothesis_node_id(identity))
+                    candidate = (Hypothesis.model_validate(facts_of(node.properties))
+                                 if node else None)
+                    if candidate is None or candidate.revision != revision:
+                        break
+                    snapshots[identity] = candidate.model_dump(mode="json")
+                if len(snapshots) != len(task.hypothesis_revisions):
+                    continue  # The planner refreshes the changed candidate's probe purpose.
             instance = AgentInstanceId(new_id("inst"))
             owner = work_owner_for(base.run_id, instance)
             claimed.append(
-                (instance, tx.claim_task(str(task.task_id), owner=owner, instance_id=str(instance)))
+                (instance, tx.claim_task(str(task.task_id), owner=owner, instance_id=str(instance)),
+                 snapshots)
             )
             slots -= 1
         return claimed
@@ -366,9 +385,10 @@ async def ready_workers(deps, base, *, max_instances=None):
                 "termination_reason": None,
                 "pending_action_id": None,
                 "pending_approval_id": None,
+                "probe_hypotheses": snapshots,
             },
         )
-        for instance, task in claimed
+        for instance, task, snapshots in claimed
     ]
 
 

@@ -35,7 +35,10 @@ from redteam.orchestration.engine import (
     operator_epoch,
 )
 from redteam.orchestration.evidence_access import DEFAULT_CONTEXT_CHARS, EvidenceReader
-from redteam.orchestration.knowledge_validation import registered_principal_for_arguments
+from redteam.orchestration.knowledge_validation import (
+    check_principal_arguments,
+    registered_principal_for_arguments,
+)
 from redteam.orchestration.local_tools import LocalToolContext
 from redteam.orchestration.native_binding import exposed_tool_name, resolve_native_target
 from redteam.orchestration.nodes._support import publisher_for
@@ -203,6 +206,20 @@ async def _bind_call(call: NativeCallState, *, deps: RuntimeDeps, runtime, conte
             location="arguments",
         )
     material = await InvestigationEngine(deps).execution_material(runtime)
+    canonical_task = await deps.central_state.get_task(str(runtime.active_task_id))
+    if canonical_task is None:
+        raise DecisionRuleError("The current task is missing.", code="probe_task_missing",
+                                location="arguments")
+    if canonical_task.probe_limits is not None:
+        from dataclasses import replace
+
+        material = replace(material, targets={
+            identity: reference for identity, reference in material.targets.items()
+            if identity in canonical_task.related_attack_graph_node_ids
+        }, principal_bindings={
+            identity: sessions for identity, sessions in material.principal_bindings.items()
+            if identity in canonical_task.principal_refs
+        })
     target = await resolve_native_target(deps, tool, call.arguments or {}, material)
     call_namespace = (
         str(runtime.run_id)
@@ -246,6 +263,14 @@ async def _bind_call(call: NativeCallState, *, deps: RuntimeDeps, runtime, conte
         principal_ref=registered_principal_for_arguments(call.arguments or {}, material),
         repeatable=True,
     )
+    if canonical_task.probe_limits is not None:
+        try:
+            check_principal_arguments(step, step.principal_ref, call.arguments or {}, material)
+        except ValueError as exc:
+            raise DecisionRuleError(
+                "The selected sessions do not match this probe's registered principals.",
+                code="probe_principal_outside_subjects", location="arguments",
+            ) from exc
     draft = CandidateDraft(
         agent_id=roles[0],
         plan_step=step,
@@ -306,6 +331,18 @@ async def _bind_call(call: NativeCallState, *, deps: RuntimeDeps, runtime, conte
 
 async def model_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     runtime = state["runtime"]
+    from redteam.orchestration.probes import (
+        PROBE_SYSTEM,
+        boundary_reason,
+        context_for_probe,
+        probe_task,
+        yield_probe,
+    )
+
+    probe = await probe_task(deps, runtime)
+    boundary = await boundary_reason(deps, runtime)
+    if boundary:
+        return await yield_probe(deps, state, boundary)
     reason = runtime.termination_reason or _hard_stop(runtime, deps)
     if reason == TerminationReason.STALLED and await canonical_graph_changed(deps, runtime):
         # Same contract as REPLAN: the stored counter predates the content this
@@ -327,6 +364,7 @@ async def model_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     )
     try:
         context = await engine.context(runtime, state.get("observation"))
+        context = await context_for_probe(deps, runtime, context)
         # Strategy artifacts may be consulted voluntarily. They are not the
         # execution contract and are not repeated as mandatory model fields.
         context.pop("evidence_read_contract", None)
@@ -407,7 +445,7 @@ async def model_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         response = await engine.client.ask_native(
             messages=messages,
             tools=tools,
-            system=SYSTEM,
+            system=SYSTEM + PROBE_SYSTEM if probe else SYSTEM,
             budget=budget,
             before_call=engine.guard_reasoning,
             role_id=str(runtime.current_agent) if runtime.current_agent is not None else None,
@@ -599,6 +637,16 @@ async def tools_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         if call.dispatch is None:
             await _local_call(call, state, deps=deps)
         else:
+            from redteam.orchestration.probes import boundary_reason
+
+            previous = (await deps.central_state.get_execution(
+                str(call.dispatch.invocation.invocation_id)
+            ) if call.dispatch.invocation is not None else None)
+            boundary = await boundary_reason(deps, state["runtime"], actions_only=True)
+            if previous is None and boundary:
+                call.feedback = {"ok": False, "executed": False, "reason_code": boundary}
+                call.completed = True
+                continue
             state = await run_call(call, state, deps)
     for call in calls:
         if call.completed:
@@ -617,6 +665,11 @@ async def tools_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
 async def settle_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     """Only canonical settlement tools can set a successful final outcome."""
     runtime = state["runtime"]
+    from redteam.orchestration.probes import boundary_reason, yield_probe
+
+    boundary = await boundary_reason(deps, runtime)
+    if boundary or runtime.termination_reason:
+        state = await yield_probe(deps, state, boundary or runtime.termination_reason)
     outcome = state.get("native_outcome")
     if deps.central_state is not None and outcome == "goal_achieved":
         outcome = "investigation_held"

@@ -5,10 +5,19 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 from pydantic_core import InitErrorDetails, PydanticCustomError
 
 from redteam.core.contracts.completion import CompletionCriterion, criterion_id
+from redteam.core.contracts.specialists import ProbeLimits
 from redteam.core.enums import MissionStatus, OperatorIntentType, TaskStatus
 from redteam.core.ids import (
     AgentId,
@@ -234,6 +243,25 @@ class InvestigationResult(BaseModel):
     finding_node_ids: list[GraphNodeId] = Field(default_factory=list)
     completion_receipt_id: EvidenceId | None = None
     questions: list[ResultQuestion] = Field(default_factory=list)
+    # v2 outcome concerns the probe purpose, never the related candidate's verdict.
+    contract_version: Literal[1, 2] = 1
+    observations: list[str] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+
+    @field_validator("observations", "limitations")
+    @classmethod
+    def _safe_items(cls, values: list[str]) -> list[str]:
+        if any(not value.strip() for value in values):
+            raise ValueError("result observations and limitations must be nonblank")
+        return list(dict.fromkeys(redact_sensitive_text(value.strip()) for value in values))
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        result = handler(self)
+        if self.contract_version == 1:
+            for key in ("contract_version", "observations", "limitations"):
+                result.pop(key, None)
+        return result
 
     @field_validator("summary")
     @classmethod
@@ -245,6 +273,8 @@ class InvestigationResult(BaseModel):
         ids = [item.question_id for item in self.questions]
         if not self.result_id.strip() or not self.summary or len(ids) != len(set(ids)):
             raise ValueError("invalid result identity, summary or repeated question id")
+        if self.contract_version == 1 and (self.observations or self.limitations):
+            raise ValueError("structured probe observations require result contract v2")
         return self
 
 
@@ -254,6 +284,8 @@ class MissionTask(BaseModel):
     title: str = Field(min_length=1)
     objective: str = Field(min_length=1)
     completion_contract_version: Literal[1, 2] = 1
+    investigation_contract_version: Literal[1, 2] = 1
+    probe_limits: ProbeLimits | None = None
     completion_criteria: list[CompletionCriterion] = Field(default_factory=list)
     principal_refs: list[str] = Field(default_factory=list)
     status: TaskStatus = TaskStatus.PENDING
@@ -282,6 +314,9 @@ class MissionTask(BaseModel):
     completion_evidence_id: EvidenceId | None = None
     related_attack_graph_node_ids: list[GraphNodeId] = Field(default_factory=list)
     related_hypothesis_ids: list[HypothesisId] = Field(default_factory=list)
+    # Context relevance is independent of the goal's required hypothesis proofs.
+    goal_required_hypothesis_ids: list[HypothesisId] = Field(default_factory=list)
+    hypothesis_revisions: dict[str, int] = Field(default_factory=dict)
     provenance: Provenance
     created_at: datetime
     updated_at: datetime
@@ -306,9 +341,29 @@ class MissionTask(BaseModel):
 
     @model_validator(mode="after")
     def _task_invariants(self) -> MissionTask:
+        if self.probe_limits is not None and self.investigation_contract_version != 2:
+            raise ValueError("bounded probes require investigation contract v2")
         source = (self.source_task_id, self.source_result_id, self.source_question_id)
-        if any(source) and not all(source):
+        if self.investigation_contract_version == 1 and any(source) and not all(source):
             raise ValueError("follow-up task needs its source task, result and question")
+        if self.investigation_contract_version == 2:
+            if bool(self.source_task_id) != bool(self.source_result_id) or (
+                self.source_question_id and not self.source_task_id
+            ):
+                raise ValueError("probe follow-up needs its source task and result")
+            if self.completion_contract_version != 2:
+                raise ValueError("probe tasks require explicit purpose conditions")
+            related = set(map(str, self.related_hypothesis_ids))
+            if set(self.hypothesis_revisions) != related or any(
+                type(value) is not int or value < 1 for value in self.hypothesis_revisions.values()
+            ):
+                raise ValueError("probe tasks need each related candidate's admitted revision")
+            if set(map(str, self.goal_required_hypothesis_ids)) - related:
+                raise ValueError("goal-required candidates must be related to the probe")
+            if self.goal_required_hypothesis_ids and not self.required:
+                raise ValueError("goal-required candidates need a goal-required task")
+            if self.result is not None and self.result.contract_version != 2:
+                raise ValueError("probe tasks require result contract v2")
         if self.completion_contract_version == 1 and self.completion_criteria:
             raise ValueError("explicit completion criteria require task contract v2")
         if self.completion_contract_version == 2:
@@ -337,6 +392,22 @@ class MissionTask(BaseModel):
             # See MissionPlan._timestamps_are_ordered: clamp, don't crash.
             self.updated_at = self.created_at
         return self
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        result = handler(self)
+        if self.probe_limits is None:
+            result.pop("probe_limits", None)
+        if self.investigation_contract_version == 1:
+            for key in ("investigation_contract_version", "goal_required_hypothesis_ids",
+                        "hypothesis_revisions"):
+                result.pop(key, None)
+        return result
+
+    def goal_hypothesis_ids(self) -> list[HypothesisId]:
+        """Keep v1 completion meaning; v2 links alone impose no final verdict."""
+        return (self.related_hypothesis_ids if self.investigation_contract_version == 1
+                else self.goal_required_hypothesis_ids)
 
     def redacted_copy(self) -> MissionTask:
         """Return a re-validated, secret-free copy for a persistence boundary.

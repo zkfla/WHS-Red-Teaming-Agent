@@ -4,13 +4,15 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from redteam.core.contracts.completion import CompletionCriterion, criterion_id
 from redteam.core.contracts.events import EventEnvelope, EventType
+from redteam.core.contracts.graph import HypothesisUpdate
 from redteam.core.contracts.mission import MissionTask, Provenance
+from redteam.core.contracts.specialists import ProbeLimits
 from redteam.core.enums import TaskStatus
-from redteam.core.ids import AgentId, EventId, GraphNodeId, HypothesisId, RunId, TaskId
+from redteam.core.ids import AgentId, EventId, EvidenceId, GraphNodeId, HypothesisId, RunId, TaskId
 from redteam.orchestration.agents.registry import AgentRegistry
 from redteam.orchestration.coordination import content_hash
 
@@ -71,7 +73,7 @@ def validate_strategy_questions(
 
 
 def _validate_subjects(
-    items: list[InvestigationQuestion] | list[AtomicTaskProposal],
+    items: list[InvestigationQuestion] | list[AtomicTaskProposal] | list[ProbeTaskProposal],
     known_targets: set[str], known_principals: set[str], known_hypotheses: frozenset[str],
 ) -> None:
     for item in items:
@@ -302,3 +304,222 @@ async def apply_necessity_adjustments(
             applied.append(str(updated.task_id))
         return applied
     return await state.transaction(adjust)
+
+
+class ProbeTaskProposal(BaseModel):
+    """A bounded purpose proposal, not a second Task or mandatory question entity."""
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+    task_key: str = Field(min_length=1)
+    objective: str = Field(min_length=1)
+    title: str = Field(min_length=1)
+    role_id: str = Field(min_length=1)
+    target_node_ids: list[str] = Field(min_length=1)
+    principal_refs: list[str] = Field(default_factory=list)
+    completion_criteria: list[CompletionCriterion] = Field(min_length=1)
+    evidence_ids: list[str] = Field(default_factory=list)
+    hypothesis_revisions: dict[str, int] = Field(default_factory=dict)
+    required: bool = False
+    required_reason: str | None = None
+    goal_required_hypothesis_ids: list[str] = Field(default_factory=list)
+    source_task_id: str | None = None
+    source_result_id: str | None = None
+    source_question_id: str | None = None
+    probe_limits: ProbeLimits | None = None
+
+    @model_validator(mode="after")
+    def _purpose(self):
+        if not all(value.strip() for value in (self.task_key, self.objective, self.title,
+                                               self.role_id, *self.target_node_ids)):
+            raise ValueError("probe purpose and references must be nonblank")
+        if self.required and not (self.required_reason or "").strip():
+            raise ValueError("goal-required probe needs an explicit reason")
+        return self
+
+
+class HypothesisProbeProposal(BaseModel):
+    """One planner judgment; may only update candidates or register discovery probes."""
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+    updates: list[HypothesisUpdate] = Field(default_factory=list)
+    tasks: list[ProbeTaskProposal] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _identities(self):
+        ids = [item.hypothesis.hypothesis_id for item in self.updates]
+        keys = [item.task_key for item in self.tasks]
+        if not (ids or keys) or len(set(ids)) != len(ids) or len(set(keys)) != len(keys):
+            raise ValueError("empty or repeated candidate/probe proposal identity")
+        return self
+
+
+class _CandidateReviewView:
+    """Existing proof checker sees the proposed verdict without first committing it."""
+
+    def __init__(self, service, candidate):
+        self.service, self.candidate = service, candidate
+
+    async def get_hypothesis(self, identity):
+        if identity == self.candidate.hypothesis_id:
+            return self.candidate
+        return await self.service.get_hypothesis(identity)
+
+    def __getattr__(self, name):
+        return getattr(self.service, name)
+
+
+def validate_probe_subjects(proposal, *, known_targets, known_principals, known_hypotheses):
+    """Reuse criterion/subject rules without manufacturing question entities."""
+    _validate_subjects(proposal.tasks, known_targets, known_principals,
+                       frozenset(known_hypotheses))
+
+
+async def register_probe_tasks(
+    deps, *, proposal_id: str, proposal: HypothesisProbeProposal, expected_revision: int,
+    expected_binding_hash: str, graph_read: dict[str, str], known_targets: set[str],
+    known_principals: set[str], max_tasks: int,
+    task_read: dict[str, str] | None = None,
+    planner_judgment: dict | None = None,
+) -> dict:
+    """Validated v2 admission; defaults still use the existing planner until plan5c/d.
+
+    graph_read is the caller's snapshot of every consumed graph subject. Replays
+    read the original receipt before CAS; unrelated sibling nodes are not gated.
+    """
+    from redteam.attack_graph.identity import hypothesis_node_id
+    from redteam.attack_graph.service import AttackGraphService
+    from redteam.orchestration.central_state import check_evidence
+    from redteam.orchestration.completion import validate_result_claims
+    from redteam.orchestration.coordination import StateConflict
+    from redteam.orchestration.evidence_validity import capture_validity
+
+    proposal = HypothesisProbeProposal.model_validate(proposal.model_dump())
+    known_hypotheses = {
+        item.hypothesis.hypothesis_id for item in proposal.updates
+    } | {identity for task in proposal.tasks for identity in task.hypothesis_revisions}
+    validate_probe_subjects(proposal, known_targets=known_targets,
+                            known_principals=known_principals, known_hypotheses=known_hypotheses)
+    state = deps.central_state
+    if not proposal_id.strip() or max_tasks < 1 or len(proposal.tasks) > max_tasks:
+        raise StateConflict("probe_registration_identity_or_count_invalid")
+    request_hash = content_hash(proposal)
+    previous = await state.transaction(
+        lambda tx: tx.probe_registration(proposal_id, request_hash), write=False,
+    )
+    if previous is not None:
+        return previous
+    mission_id = await state.transaction(lambda tx: tx.binding()[0], write=False)
+    mission = await state.get_mission(mission_id)
+    if mission is None:
+        raise StateConflict("planning_mission_missing")
+    refs = {ref for task in proposal.tasks for ref in task.evidence_ids}
+    subjects = {ref for task in proposal.tasks for ref in task.target_node_ids}
+    for update in proposal.updates:
+        candidate = update.hypothesis
+        subjects.update(candidate.target_node_ids)
+        subjects.update(str(hypothesis_node_id(ref)) for ref in candidate.source_hypothesis_ids)
+        if update.expected_revision is not None:
+            subjects.add(str(hypothesis_node_id(candidate.hypothesis_id)))
+        if set(candidate.target_node_ids) - known_targets or (
+            set(candidate.principal_refs) - known_principals
+        ):
+            raise StateConflict("candidate_subject_not_registered")
+        refs.update(candidate.supporting_evidence_ids)
+        refs.update(candidate.refuting_evidence_ids)
+        if update.review_evidence_id:
+            refs.add(update.review_evidence_id)
+    for item in proposal.tasks:
+        definition = deps.agents.definition(AgentId(item.role_id))
+        if definition is None or not definition.schedulable or deps.agents.get(
+            AgentId(item.role_id)
+        ) is None:
+            raise StateConflict("probe_role_not_executable")
+        if set(item.target_node_ids) - known_targets or set(item.principal_refs) - known_principals:
+            raise StateConflict("probe_subject_not_registered")
+        subjects.update(str(hypothesis_node_id(ref)) for ref in item.hypothesis_revisions
+                        if ref not in {u.hypothesis.hypothesis_id for u in proposal.updates})
+    if subjects - graph_read.keys():
+        raise StateConflict("probe_related_read_set_incomplete")
+    source_tasks = {task.source_task_id for task in proposal.tasks if task.source_task_id}
+    if source_tasks - (task_read or {}).keys():
+        raise StateConflict("probe_source_read_set_incomplete")
+    checked = await check_evidence(
+        deps.evidence_store, run_id=state.run_id, engagement_id=state.engagement_id,
+        evidence_ids=sorted(refs),
+    )
+    service = AttackGraphService(deps.graph_store)
+    validity_read = None
+    verdicts = [u for u in proposal.updates if u.hypothesis.status in {"confirmed", "rejected"}]
+    if verdicts:
+        validity_read, errors = await capture_validity(deps, sorted(refs), graph_service=service)
+        if errors:
+            raise StateConflict("candidate_evidence_not_current")
+    for update in verdicts:
+        candidate = update.hypothesis
+        kind = "hypothesis_confirmed" if candidate.status == "confirmed" else "hypothesis_refuted"
+        errors = await validate_result_claims(
+            criteria=[CompletionCriterion(kind=kind, description=candidate.description,
+                                          hypothesis_id=candidate.hypothesis_id)],
+            evidence_ids=[*candidate.supporting_evidence_ids, *candidate.refuting_evidence_ids,
+                          *([update.review_evidence_id] if update.review_evidence_id else [])],
+            target_node_ids=candidate.target_node_ids, principal_refs=candidate.principal_refs,
+            evidence_store=deps.evidence_store,
+            graph_service=_CandidateReviewView(service, candidate), run_id=state.run_id,
+            path_store=getattr(deps, "path_store", None), mission_id=str(mission.mission_id),
+            task_graph_store=state, work_store=getattr(deps, "work_store", None),
+        )
+        if errors:
+            raise StateConflict("candidate_verdict_unproven")
+    policy_limits = getattr(getattr(deps, "specialist_policy", None), "probe_limits", None)
+    for item in proposal.tasks:
+        if policy_limits is not None and item.probe_limits is not None and (
+            item.probe_limits.max_actions > policy_limits.max_actions
+            or item.probe_limits.max_model_requests > policy_limits.max_model_requests
+        ):
+            raise StateConflict("probe_override_exceeds_profile_limits")
+    tasks = [MissionTask(
+        task_id=TaskId("task_" + content_hash([state.run_id, proposal_id, item.task_key])),
+        mission_id=mission.mission_id, title=item.title, objective=item.objective,
+        assigned_agent=AgentId(item.role_id), status=TaskStatus.READY,
+        investigation_contract_version=2, completion_contract_version=2,
+        probe_limits=item.probe_limits or policy_limits,
+        completion_criteria=item.completion_criteria, principal_refs=item.principal_refs,
+        required=item.required,
+        goal_required_hypothesis_ids=[HypothesisId(ref)
+                                      for ref in item.goal_required_hypothesis_ids],
+        related_attack_graph_node_ids=[GraphNodeId(ref) for ref in item.target_node_ids],
+        related_hypothesis_ids=[HypothesisId(ref) for ref in item.hypothesis_revisions],
+        hypothesis_revisions=item.hypothesis_revisions,
+        evidence_ids=[EvidenceId(ref) for ref in item.evidence_ids],
+        source_task_id=TaskId(item.source_task_id) if item.source_task_id else None,
+        source_result_id=item.source_result_id,
+        source_question_id=item.source_question_id,
+        created_at=mission.created_at, updated_at=mission.created_at,
+        provenance=Provenance(source="planner:probe", metadata={
+            "proposal_id": proposal_id, "required_reason": item.required_reason,
+        }),
+    ) for item in proposal.tasks]
+    notifications = [EventEnvelope(
+        event_id=EventId("evt_" + content_hash([proposal_id, str(task.task_id), "created"])),
+        event_type=EventType.TASK_CREATED, run_id=RunId(state.run_id),
+        engagement_id=state.engagement_id, timestamp=mission.created_at,
+        source="orchestration.specialist_tasks", correlation_id=state.run_id,
+        payload={"task_id": str(task.task_id), "proposal_id": proposal_id,
+                 "producer": "planner", "investigation_contract_version": 2},
+    ) for task in tasks]
+    if proposal.updates:
+        notifications.append(EventEnvelope(
+            event_id=EventId("evt_" + content_hash([proposal_id, "candidate_updates"])),
+            event_type="HypothesisJudgmentCommitted", run_id=RunId(state.run_id),
+            engagement_id=state.engagement_id, timestamp=mission.created_at,
+            source="orchestration.specialist_tasks", correlation_id=state.run_id,
+            payload={"proposal_id": proposal_id, "producer": "planner",
+                     "hypothesis_ids": [u.hypothesis.hypothesis_id for u in proposal.updates]},
+        ))
+    return await state.transaction(lambda tx: tx.register_hypothesis_probes(
+        proposal_id, request_hash, updates=proposal.updates, tasks=tasks, checked=checked,
+        expected_revision=expected_revision, expected_binding_hash=expected_binding_hash,
+        graph_read=graph_read, notifications=notifications, validity_read=validity_read,
+        task_read=task_read,
+        planner_judgment=planner_judgment,
+    ))

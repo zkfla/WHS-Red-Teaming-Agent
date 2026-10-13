@@ -2,14 +2,16 @@
 
 ## Current runtime
 
-The default runtime uses one central SQLite database and a bounded planner with
-two independent workers. The planner proposes investigations; workers choose
-tools using native ReAct (`MODEL → TOOLS → SETTLE`). Results and intermediate
-evidence can trigger replanning before another worker finishes.
+The default runtime uses one central SQLite database, a candidate planner and
+two independent instances of a common verification worker. The planner records
+vulnerability candidates and short probe purposes; workers choose tools using
+native ReAct (`MODEL → TOOLS → SETTLE`) and return observations for another
+planner judgment.
 
-Select a specialist profile and a shared LLM request policy explicitly. The
-Web/API and Recon profile is `config/agents/native-specialists-web.yaml`.
-Roles describe available expertise; several workers can use the same role.
+New CLI and web Runs select `config/agents/native-probes.yaml` when no profile
+override is supplied. A shared LLM request policy is still required. The common
+worker uses the selected catalog and trusted resources for Web/API, Recon and
+Mobile work; those domains are not separate scheduling queues.
 Changing a profile or operative limit cannot force-resume an existing Run.
 See [the runtime guide](docs/agent/orchestration.md) and
 [central state contract](docs/contracts/central-state.md).
@@ -71,8 +73,9 @@ Analysis) versus what's real and wired up (Web/API, Recon).
 
 ```text
 User/Operator -> Engagement Config (Scope/ROE/Limits)
-              -> Planner -> investigation Tasks -> bounded InstanceDriver workers
-                 Each worker: MODEL -> TOOLS -> SETTLE
+              -> Candidate planner -> candidates -> short probe Tasks
+              -> bounded common workers: MODEL -> TOOLS -> SETTLE
+              -> result/original evidence -> candidate planner
               -> Engagement Control Plane (Scope/ROE/Policy/RateLimit/Budget/Approval/Audit) [mandatory gate]
               -> Capability Layer (ToolGateway -> MCPToolRegistry -> MCPAdapter)
               -> Execution Substrate (MCP Server containers)
@@ -229,11 +232,11 @@ Full rules: `instruction.md` section 20, `docs/architecture/dependency-rules.md`
 
 ## How to Add an Agent
 
-1. Provide the role's definition, prompt and output contract through the existing
-   agent package/registry and component assembly.
-2. Select the role in the specialist profile, with catalog-based tool selection
-   and explicit request/concurrency limits.
-3. Let `InstanceDriver` instantiate workers for registered investigation Tasks.
+1. Register the capability and its schemas through the existing catalog/provider
+   assembly, including readiness and trusted reference resources where needed.
+2. Select it for the common worker through profile metadata with explicit
+   request/concurrency limits; do not add a domain queue to the central loop.
+3. Let `InstanceDriver` instantiate common workers for registered probe Tasks.
    Shared state belongs to central transactions; each SDK thread holds only its
    own continuation and original execution references.
 4. Keep tool execution in the existing admission/Control/gateway/result flow.
@@ -285,12 +288,11 @@ read-only commands read durable state directly. The default runtime uses the
 central Mission/investigation/execution/graph database with two workers.
 Evidence, Audit, Approval and SDK checkpoints remain separate original stores;
 report files are exports. `status`, `findings` and `report` query current central
-state even when a Run is suspended or still executing. The required specialist
-profile and shared request policy are operator selections; see
+state even when a Run is suspended or still executing. The candidate/common-worker
+profile is the new-Run default; the shared request policy remains an operator selection. See
 [Central state](docs/contracts/central-state.md#plan2d-completion-cleanup-reports-and-default-cli).
 
 ```bash
-export REDTEAM_SPECIALIST_PROFILE=config/agents/native-specialists-web.yaml
 export REDTEAM_LLM_REQUEST_POLICY_JSON='{"mode":"bounded","max_requests":50,"max_concurrent_requests":2}'
 redteam run engagement.yaml --workers 2 --state-db data/orchestration/state.sqlite3
 redteam resume <run-id> engagement.yaml --state-db data/orchestration/state.sqlite3
@@ -302,6 +304,10 @@ retaining the original execution and any occupied resources. Stop closes new
 admission and drains within the configured timeout; uncertain calls retain their
 resources and are never silently replayed. Resume validates the original scope,
 profile, limits, checkpoints, approvals, evidence and usage.
+
+Set `REDTEAM_SPECIALIST_PROFILE` only to select another compatible profile.
+Changing from a stored specialist/atomizer profile to the candidate profile
+requires a new Run; status and report commands remain read-only for old originals.
 
 Resource waits automatically continue the original call when another actor
 releases its resource/capacity, preserving IDs and the original budget charge.

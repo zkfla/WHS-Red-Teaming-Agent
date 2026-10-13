@@ -288,6 +288,26 @@ async def test_explicit_matching_id_is_accepted() -> None:
     assert control_plane.resolved == [("appr_exact", ApprovalStatus.APPROVED, "tester")]
 
 
+async def test_multiple_pending_approvals_require_and_accept_an_exact_id() -> None:
+    console, lines, _gateway, _intent_store, _tasks, control_plane = await _console()
+    console.set_pending_approval("appr_first")
+    console.set_pending_approval("appr_second")
+
+    await console.handle_line("approve")
+    assert control_plane.resolved == []
+    assert any("multiple actions" in line for line in lines)
+
+    await console.handle_line("approve appr_second")
+    assert control_plane.resolved == [
+        ("appr_second", ApprovalStatus.APPROVED, "tester")
+    ]
+
+    await console.handle_line("deny appr_first")
+    assert control_plane.resolved[-1] == (
+        "appr_first", ApprovalStatus.REJECTED, "tester"
+    )
+
+
 # --- misc ---------------------------------------------------------------
 
 

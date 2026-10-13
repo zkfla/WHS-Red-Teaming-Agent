@@ -27,7 +27,7 @@ target_action_policies: []
 external_text_policy:
   prohibited_patterns: []
 execution_budget:
-  max_actions: 20000
+  max_actions: 200
   max_tool_calls: null
   max_duration_seconds: null
 rate_limit_policy:

@@ -95,6 +95,11 @@ async def run(args: argparse.Namespace) -> int:
                   f"{execution['state']}, wait={execution.get('wait_reason')}, "
                   f"approval={execution.get('approval_ref')}, job={execution.get('job_ref')}")
     print(f"Evidence recorded: {report.evidence_count}")
+    if report.candidates:
+        candidate_counts: dict[str, int] = {}
+        for candidate in report.candidates:
+            candidate_counts[candidate.status] = candidate_counts.get(candidate.status, 0) + 1
+        print(f"Candidates: {dict(sorted(candidate_counts.items()))}")
     print(f"Findings: {report.finding_count}")
     if report.pending_approval_id:
         approvals = ApprovalService(FilesystemApprovalStore(args.approval_dir))

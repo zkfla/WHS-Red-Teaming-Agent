@@ -12,8 +12,7 @@ from redteam.core.contracts.events import EventType
 from redteam.core.contracts.mission import Provenance
 from redteam.core.enums import AgentPhase, MissionStatus
 from redteam.core.ids import EngagementId, MissionId, RunId, new_id
-from redteam.orchestration.central_results import RESULT_UPDATED
-from redteam.orchestration.central_runtime import ACTOR_RETURNED, CentralEventBus, process_controls
+from redteam.orchestration.central_runtime import CentralEventBus, process_controls
 from redteam.orchestration.cognition import DecisionFailure, ReasoningHalted
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.coordination import StateConflict
@@ -154,15 +153,7 @@ class CentralRun:
         }:
             return await self.settle(self.runtime)
         planner, wake = SpecialistPlanner(self.deps), asyncio.Event()
-        kinds = {
-            RESULT_UPDATED,
-            ACTOR_RETURNED,
-            EventType.GRAPH_UPDATED,
-            EventType.EVIDENCE_CREATED,
-            EventType.EVIDENCE_VALIDITY_CHANGED,
-            EventType.TASK_COMPLETED,
-            EventType.OPERATOR_INTENT_APPLIED,
-        }
+        kinds = planner.wake_events()
         updates = EventWakeup(
             run_id=self.runtime.run_id, engagement_id=self.runtime.engagement_id, event_types=kinds
         )
@@ -437,12 +428,20 @@ class CentralRun:
                                 "AND kind='planner_termination' AND identity=?",
                                 (tx.run_id, tx.run_id),
                             ).fetchone()
-                            return (json.loads(row[0]) if row else None,
-                                    goal_snapshot(tx, include_assessment=False))
-                        proposal, (_, tasks, stamp) = await state.transaction(judgment, write=False)
+                            proposal = json.loads(row[0]) if row else None
+                            fresh_candidates = (
+                                proposal is None or "candidate_inputs" not in proposal
+                                or proposal["candidate_inputs"] == tx.hypothesis_candidate_inputs()
+                            )
+                            return (proposal, goal_snapshot(tx, include_assessment=False),
+                                    fresh_candidates)
+                        proposal, (_, tasks, stamp), fresh_candidates = await state.transaction(
+                            judgment, write=False,
+                        )
                         history = await state.list_executions()
                         if (proposal and proposal["termination"] == "exhausted"
                                 and proposal["inputs"] == stamp
+                                and fresh_candidates
                                 and not any(unsafe(item) for item in history)
                                 and not any(task.status.value in {"ready", "pending", "running"}
                                             for task in tasks)):
@@ -476,8 +475,17 @@ class CentralRun:
             mission = await state.get_mission(self.runtime.mission_id)
         usage = await state.request_ledger().snapshot(str(self.runtime.run_id))
         history = await state.list_executions()
-        pending_approval = next((item.approval_ref for item in history
-                                 if item.wait_reason and item.approval_ref), None)
+        pending_approval = (
+            next(
+                (item.approval_ref for item in history
+                 if item.wait_reason and item.approval_ref),
+                None,
+            )
+            if mission.status not in {
+                MissionStatus.COMPLETED, MissionStatus.CANCELLED, MissionStatus.FAILED,
+            }
+            else None
+        )
         final = final.model_copy(update={
             "termination_reason": reason, "mission_status": mission.status,
             "phase": AgentPhase.FAILED if reason == TerminationReason.PLANNING_ERROR

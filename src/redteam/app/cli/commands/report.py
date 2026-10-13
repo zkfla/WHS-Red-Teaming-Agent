@@ -120,6 +120,21 @@ def _render_markdown(report: TerminalReportProjection) -> str:
             lines += ["- Resource effects unavailable for tools: "
                       + ", ".join(report.cleanup_unmapped_tools)]
         lines += [""]
+    if report.candidates:
+        lines += ["## Vulnerability candidates", ""]
+        for candidate in report.candidates:
+            lines += [
+                f"- {candidate.hypothesis_id}: status={candidate.status}; "
+                f"revision={candidate.revision}; probe tasks={candidate.probe_task_ids or []}",
+                f"  - {candidate.description}",
+                f"  - supporting={candidate.supporting_evidence_ids}; "
+                f"refuting={candidate.refuting_evidence_ids}",
+            ]
+        lines += [
+            "- Candidate judgment is separate from Task completion, Finding verification, "
+            "and Mission completion.",
+            "",
+        ]
     if report.llm_request_accounting is not None:
         usage = report.llm_request_accounting
         policy = usage.get("policy") or {}

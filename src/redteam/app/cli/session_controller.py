@@ -101,7 +101,11 @@ class SessionController:
         self.phase = SessionPhase.IDLE
         self.binding: BindingRef | None = None
         self.last_binding: BindingRef | None = None
-        self.pending_approval: str | None = None
+        # ApprovalRequired events can arrive from several independent workers.
+        # Keep every exact ID for the current Run; ``pending_approval`` remains
+        # as a compatibility view for terminal callers that can show one item.
+        self._pending_approvals: OrderedDict[str, str | None] = OrderedDict()
+        self._resolved_approvals: set[str] = set()
         self.activity = "자연어로 질문하거나 조사를 요청하세요."
         self.receipts: OrderedDict[str, InputReceipt] = OrderedDict()
         self.snapshots: OrderedDict[str, str] = OrderedDict()
@@ -130,6 +134,73 @@ class SessionController:
     @property
     def input_binding(self):
         return self.binding or self.last_binding
+
+    @property
+    def pending_approvals(self) -> tuple[str, ...]:
+        return tuple(self._pending_approvals)
+
+    @property
+    def pending_approval(self) -> str | None:
+        return next(iter(self._pending_approvals), None)
+
+    @pending_approval.setter
+    def pending_approval(self, value: object | None) -> None:
+        """Compatibility setter for older single-approval callers/tests."""
+        self._pending_approvals.clear()
+        if value:
+            self._pending_approvals[str(value)] = None
+
+    def add_pending_approval(self, approval_id: object, *, run_id: object | None = None) -> None:
+        value = str(approval_id)
+        if not value or value in self._resolved_approvals:
+            return
+        bound_run = str(run_id) if run_id else None
+        existing = self._pending_approvals.get(value)
+        self._pending_approvals[value] = existing or bound_run
+        setter = getattr(self.operator, "set_pending_approval", None)
+        if callable(setter):
+            setter(value)
+        self.frontend.invalidate()
+
+    def replace_pending_approvals(
+        self, approval_ids: list[str] | tuple[str, ...], *, run_id: object | None = None
+    ) -> None:
+        bound_run = str(run_id) if run_id else None
+        self._pending_approvals = OrderedDict(
+            (str(value), bound_run)
+            for value in approval_ids
+            if value and str(value) not in self._resolved_approvals
+        )
+        replace = getattr(self.operator, "replace_pending_approvals", None)
+        if callable(replace):
+            replace(self.pending_approvals)
+        self.frontend.invalidate()
+
+    def remove_pending_approval(self, approval_id: object, *, resolved: bool = False) -> None:
+        value = str(approval_id)
+        self._pending_approvals.pop(value, None)
+        if resolved:
+            self._resolved_approvals.add(value)
+        clearer = getattr(self.operator, "clear_pending_approval", None)
+        if callable(clearer):
+            clearer(value)
+        self.frontend.invalidate()
+
+    def clear_pending_approvals(self, *, reset_resolved: bool = False) -> None:
+        self._pending_approvals.clear()
+        if reset_resolved:
+            self._resolved_approvals.clear()
+        clearer = getattr(self.operator, "clear_pending_approval", None)
+        if callable(clearer):
+            clearer()
+        self.frontend.invalidate()
+
+    def is_pending_approval(self, approval_id: object, run_id: object | None = None) -> bool:
+        value = str(approval_id)
+        if value not in self._pending_approvals:
+            return False
+        expected_run = self._pending_approvals[value]
+        return run_id is None or expected_run is None or expected_run == str(run_id)
 
     @property
     def pending_count(self) -> int:
@@ -534,6 +605,7 @@ class SessionController:
             self.stopping = False
             self.recent_events.clear()
             self.terminal_event_reason = None
+            self.clear_pending_approvals(reset_resolved=True)
             self.binding = BindingRef(receipt.envelope.input_id, uuid4().hex)
             self.active_receipt = receipt
             self.set_phase(SessionPhase.STARTING, "실행 설정과 scope 확인 중")
@@ -605,17 +677,19 @@ class SessionController:
         self.last_binding = binding
         self.binding = None
         self.run_task = None
-        self.pending_approval = (
-            str(final.pending_approval_id)
-            if final is not None and getattr(final, "pending_approval_id", None)
-            else None
-        )
+        if view.outcome == "suspended":
+            if final is not None and getattr(final, "pending_approval_id", None):
+                self.add_pending_approval(final.pending_approval_id, run_id=binding.run_id)
+        else:
+            # A stopped/completed/failed Run can retain approval records for
+            # audit, but they are no longer actionable in this session.
+            self.clear_pending_approvals()
         receipt.state = "handled"
         phase = (
-            SessionPhase.WAITING_APPROVAL
-            if view.reason == "approval_pending"
-            else SessionPhase.PAUSED
+            SessionPhase.PAUSED
             if view.reason == "operator_paused"
+            else SessionPhase.WAITING_APPROVAL
+            if view.outcome == "suspended" and self.pending_approval
             else SessionPhase.IDLE
         )
         self.set_phase(phase, "입력 대기 — 현재 결과를 질문하거나 새 조사를 요청하세요.")
@@ -647,7 +721,11 @@ class SessionController:
                 return
             if kind in {"approve", "deny"}:
                 value = value or env.approval_id
-                if not value or value != env.approval_id or value != self.pending_approval:
+                if (
+                    not value
+                    or value != env.approval_id
+                    or not self.is_pending_approval(value, env.binding.run_id)
+                ):
                     self._receipt(receipt, "not_applied", "승인 대상이 변경되었습니다.")
                     return
             self.binding = BindingRef(env.input_id, uuid4().hex, self.last_binding.run_id)
@@ -674,6 +752,8 @@ class SessionController:
         self.binding = replace(self.binding, run_id=str(event.run_id))
         kind = getattr(event, "event_type", "")
         payload = getattr(event, "payload", {})
+        if kind == "ApprovalRequired" and payload.get("approval_id"):
+            self.add_pending_approval(payload["approval_id"], run_id=event.run_id)
         if kind == "RunFinished":
             self.terminal_event_reason = payload.get("termination_reason")
         if kind in {
@@ -690,10 +770,13 @@ class SessionController:
         if self.phase == SessionPhase.STARTING:
             self.set_phase(SessionPhase.RUNNING, "조사 진행 중")
 
-    def suspended(self, final) -> None:
-        self.pending_approval = (
-            str(final.pending_approval_id) if final.pending_approval_id else None
+    def suspended(self, final, approval_ids: list[str] | tuple[str, ...] | None = None) -> None:
+        approvals = (
+            tuple(approval_ids)
+            if approval_ids is not None
+            else ((str(final.pending_approval_id),) if final.pending_approval_id else ())
         )
+        self.replace_pending_approvals(approvals, run_id=final.run_id)
         self.set_phase(
             SessionPhase.WAITING_APPROVAL if self.pending_approval else SessionPhase.PAUSED,
             f"승인 필요: {self.pending_approval} · approve <ID> / deny <ID>"
@@ -702,7 +785,7 @@ class SessionController:
         )
 
     def resumed(self) -> None:
-        self.pending_approval = None
+        self.clear_pending_approvals()
         self.set_phase(SessionPhase.RUNNING, "실행 상태 확인 중")
 
     async def _mutate(self, receipt: InputReceipt, kind: str, value: str) -> None:
@@ -729,9 +812,14 @@ class SessionController:
                     "원래 Run에 전달되지 않음 — 종료/변경된 문맥입니다. 후속 조사는 /new <요청>",
                 )
                 return
+            run_id = self.binding.run_id
             if kind in {"approve", "deny"}:
                 approval = value or env.approval_id
-                if not approval or approval != env.approval_id or approval != self.pending_approval:
+                if (
+                    not approval
+                    or approval != env.approval_id
+                    or not self.is_pending_approval(approval, run_id)
+                ):
                     self._receipt(
                         receipt,
                         "not_applied",
@@ -743,7 +831,6 @@ class SessionController:
                 return
             receipt.state = "dispatched"
             operator = self.operator
-            run_id = self.binding.run_id
 
             async def dispatch():
                 if kind in {"approve", "deny"} and self.approval_verifier is not None:
@@ -758,6 +845,8 @@ class SessionController:
         try:
             applied, reason = await asyncio.wait_for(asyncio.shield(task), DISPATCH_TIMEOUT)
             self._receipt(receipt, "handled" if applied else "not_applied", reason)
+            if applied and kind in {"approve", "deny"}:
+                self.remove_pending_approval(value, resolved=True)
             if kind == "stop" and applied:
                 self.stopping = True
         except (Exception, asyncio.CancelledError) as exc:
@@ -793,7 +882,6 @@ class SessionController:
                             "늦은 응답 확인: " + reason,
                         )
         self.operator = None
-        self.pending_approval = None
 
     async def close(self) -> None:
         self.closing.set()

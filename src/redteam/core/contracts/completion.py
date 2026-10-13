@@ -48,14 +48,20 @@ def criterion_id(criterion: CompletionCriterion) -> str:
 
 def completion_contract_hash(task: Any) -> str:
     """Purpose contract only; runtime status, ownership and revision are excluded."""
-    return _digest({
+    purpose = {
         "version": task.completion_contract_version,
         "objective": task.objective.strip(),
         "criteria": sorted(criterion_id(item) for item in task.completion_criteria),
         "targets": sorted(map(str, task.related_attack_graph_node_ids)),
         "principals": sorted(set(task.principal_refs)),
         "hypotheses": sorted(map(str, task.related_hypothesis_ids)),
-    })
+    }
+    if getattr(task, "investigation_contract_version", 1) == 2:
+        purpose["investigation_version"] = 2
+        purpose["hypothesis_revisions"] = dict(task.hypothesis_revisions)
+        if task.probe_limits is not None:
+            purpose["probe_limits"] = task.probe_limits.model_dump(mode="json")
+    return _digest(purpose)
 
 
 def completion_conditions(task: Any) -> list[dict[str, Any]]:

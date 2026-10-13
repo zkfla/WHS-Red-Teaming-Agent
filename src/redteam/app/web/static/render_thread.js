@@ -1,5 +1,6 @@
 import { h } from "./dom.js";
 import { RECEIPT, VERDICT } from "./labels.js";
+import { pendingApprovalIds } from "./store.js";
 import { badge, emptyState, icon, replaceLive, textValue, timestamp } from "./ui.js";
 
 function author(time) {
@@ -52,7 +53,9 @@ function actionEntry(entry, store) {
 }
 
 function approvalEntry(entry, store, handlers) {
-  const pending = store.state?.pending_approval === entry.approval_id;
+  const pending = pendingApprovalIds(store).includes(entry.approval_id);
+  const stopped = !pending && store.state?.termination_reason === "operator_stopped"
+    && store.state?.binding?.run_id === entry.run_id;
   const action = store.actions.get(entry.action_id);
   return h("div", { class: `card approval${pending ? " pending" : ""}` },
     h("div", { class: "card-heading" }, icon("shield"), h("h3", { text: pending ? "다음 단계를 진행하려면 승인이 필요해요" : "승인 요청 기록" })),
@@ -63,7 +66,9 @@ function approvalEntry(entry, store, handlers) {
     pending ? h("div", { class: "row" },
       h("button", { type: "button", class: "btn primary", "data-focus": `review:${entry.key}`, onClick: () => handlers.inspect("approval") }, "검토하고 결정", icon("chevron")),
       h("button", { type: "button", class: "btn", text: "거부", disabled: store.incompatible || !entry.run_id, "data-focus": `deny:${entry.key}`, onClick: () => handlers.decide(entry, "deny") }))
-      : h("p", { class: "note", text: "이미 처리되었거나 더 이상 대기 중이 아닙니다." }));
+      : h("p", { class: "note", text: stopped
+        ? "Run이 중단되어 이 요청은 더 이상 실행할 수 없습니다."
+        : "처리되었거나 더 이상 실행 가능한 대기 요청이 아닙니다." }));
 }
 
 function findingEntry(entry) {

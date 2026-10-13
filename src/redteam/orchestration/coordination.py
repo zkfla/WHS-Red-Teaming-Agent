@@ -33,6 +33,10 @@ class StateConflict(PathVersionConflict):
     """A reviewed snapshot no longer describes the canonical state."""
 
 
+class PlanningInputsChanged(StateConflict):
+    """A related planner input changed after its captured decision snapshot."""
+
+
 def content_hash(value: Any) -> str:
     if hasattr(value, "model_dump"):
         value = value.model_dump(mode="json")

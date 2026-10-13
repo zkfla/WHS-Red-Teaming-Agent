@@ -93,6 +93,20 @@ def test_native_completion_has_no_reasoning_field():
     assert not hasattr(NativeCompletion(tool_calls=(), text="hi"), "reasoning")
 
 
+@pytest.mark.parametrize(
+    ("usage", "expected"),
+    [
+        ({"total_tokens": 9}, 9),
+        ({"input_tokens": 5, "output_tokens": 3}, 8),
+        ({"prompt_tokens": 7, "completion_tokens": 4}, 11),
+        ({"input_tokens": 5}, None),
+        ({"prompt_tokens": 7, "completion_tokens": True}, None),
+    ],
+)
+def test_provider_usage_shapes_are_counted_without_partial_estimates(usage, expected):
+    assert adapter._extract_total_tokens(SimpleNamespace(usage=usage)) == expected
+
+
 async def test_chat_valid_calls_preserved_with_usage(monkeypatch):
     message = _chat_message(
         "go", calls=[_chat_call("call_1", "lookup", '{"q": "a"}')]

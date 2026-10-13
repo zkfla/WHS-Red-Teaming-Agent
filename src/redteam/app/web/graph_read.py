@@ -13,7 +13,10 @@ from pathlib import Path
 from typing import Any
 
 from redteam.app.web.graph_model import GraphRaw, build_graph
+from redteam.attack_graph.predicates import facts_of
 from redteam.core.contracts.execution import TaskExecution
+from redteam.core.contracts.graph import Hypothesis
+from redteam.core.enums import GraphNodeType
 from redteam.orchestration.central_state import CentralStateStore, CentralTransaction
 from redteam.orchestration.coordination import CoordinationError, StateConflict
 
@@ -57,6 +60,8 @@ def _collect(tx: CentralTransaction) -> GraphRaw:
                               strict=True)) for row in activations],
         llm_requests=_request_rows(tx, "llm_request"),
         planner_judgment=json.loads(judgment[0]) if judgment else None,
+        hypotheses=[Hypothesis.model_validate(facts_of(node.properties))
+                    for node in tx.graph.query(node_type=GraphNodeType.HYPOTHESIS)],
         evidence_count=db.execute(
             "SELECT COUNT(*) FROM state_evidence_refs WHERE run_id=?", (run,),
         ).fetchone()[0],

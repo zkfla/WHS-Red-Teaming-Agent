@@ -286,7 +286,7 @@ class SessionHost:
     def decide_approval(self, approval_id: str, decision: str, run_id: str) -> str:
         """Forward an explicit click. Controller and runner re-verify the ledger."""
         controller = self._controller()
-        if controller.pending_approval != approval_id:
+        if not controller.is_pending_approval(approval_id, run_id):
             raise Rejected("approval_changed")
         binding = controller.input_binding
         if binding is None or str(binding.run_id) != run_id:

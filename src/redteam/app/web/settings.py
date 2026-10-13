@@ -21,10 +21,14 @@ from typing import Any
 import yaml
 
 from redteam.app.cli._shared import DEFAULT_ENV_PATH, env_file_is_gitignored, write_env_var
-from redteam.core.config import LLMConfig, OrchestrationConfig
+from redteam.core.config import (
+    DEFAULT_SPECIALIST_PROFILE_PATH,
+    LLMConfig,
+    OrchestrationConfig,
+)
 
 PROVIDER = "litellm"
-PROFILE_DIR = Path("config/agents")
+PROFILE_DIR = Path(DEFAULT_SPECIALIST_PROFILE_PATH).parent
 STATE_PATH = Path("data/web/settings.json")
 
 ENV_PROVIDER = "REDTEAM_LLM_PROVIDER"
@@ -33,6 +37,7 @@ ENV_KEY_VAR = "REDTEAM_LLM_API_KEY_ENV_VAR"
 ENV_PROFILE = "REDTEAM_SPECIALIST_PROFILE"
 ENV_POLICY = "REDTEAM_LLM_REQUEST_POLICY_JSON"
 DEFAULT_KEY_VAR = "LLM_API_KEY"
+DEFAULT_PROFILE_ID = Path(DEFAULT_SPECIALIST_PROFILE_PATH).stem
 
 _MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,199}$")
 _KEY = re.compile(r"^[^\s\x00-\x1f\x7f]{1,4096}$")
@@ -103,7 +108,11 @@ class SettingsStore:
     def _selected_profile_id(self) -> str | None:
         raw = self.env.get(ENV_PROFILE)
         if not raw:
-            return None
+            return (
+                DEFAULT_PROFILE_ID
+                if self._profile_path(DEFAULT_PROFILE_ID) is not None
+                else None
+            )
         for item in self.profiles():
             if self._profile_path(item["id"]) == raw:
                 return item["id"]
@@ -137,7 +146,7 @@ class SettingsStore:
             found.append({"field": "model", "code": "missing"})
         if not (model or "").startswith("chatgpt/") and not self.env.get(self._key_var()):
             found.append({"field": "api_key", "code": "missing"})
-        if not self.env.get(ENV_PROFILE):
+        if self._selected_profile_id() is None:
             found.append({"field": "profile_id", "code": "missing"})
         if not self.env.get(ENV_POLICY):
             found.append({"field": "llm_request_policy", "code": "missing"})

@@ -330,7 +330,12 @@ class AgentLoopRunner:
         )
 
     async def _run_state(self, runtime: RuntimeState, graph_state: GraphState) -> RuntimeState:
-        with llm_request_scope(str(runtime.run_id), runtime.work_owner):
+        task = await self._deps.central_state.get_task(str(runtime.active_task_id))
+        with llm_request_scope(
+            str(runtime.run_id), runtime.work_owner,
+            task_id=(str(task.task_id)
+                     if task is not None and task.probe_limits is not None else None),
+        ):
             return await self._run_scoped_state(runtime, graph_state)
 
     async def _run_scoped_state(

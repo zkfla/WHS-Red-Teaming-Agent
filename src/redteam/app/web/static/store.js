@@ -20,6 +20,13 @@ export function createStore() {
   };
 }
 
+export function pendingApprovalIds(store) {
+  const values = store.state?.pending_approvals;
+  if (Array.isArray(values)) return [...new Set(values.filter((value) => typeof value === "string" && value))];
+  const legacy = store.state?.pending_approval;
+  return typeof legacy === "string" && legacy ? [legacy] : [];
+}
+
 function upsert(store, key, patch) {
   const current = store.entries.get(key);
   const next = { ...(current || { key }), ...patch };

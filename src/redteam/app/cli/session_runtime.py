@@ -175,6 +175,7 @@ async def run_session(
             )
             if code:
                 return RunResult(previous, code, "승인 응답 확인 실패 — 기록을 확인하세요.")
+            controller.remove_pending_approval(approval_id, resolved=True)
         finals = []
         projection = SessionProjection(
             controller, verbose=verbose, sink=getattr(frontend, "event_sink", None)

@@ -104,7 +104,10 @@ def check_integrity(nodes: list[GraphNode], edges: list[GraphEdge]) -> Integrity
                 report.ungrounded_findings.append(
                     f"{facts.get('finding_id', node_id)}: verified without evidence"
                 )
-        if node.type == GraphNodeType.HYPOTHESIS and facts.get("status") == "open":
+        if node.type == GraphNodeType.HYPOTHESIS and (
+            facts.get("status") == "open" or (facts.get("contract_version") == 2
+            and facts.get("status") not in {"confirmed", "rejected"})
+        ):
             report.unresolved_hypotheses.append(str(facts.get("hypothesis_id", node_id)))
 
     for item in collect(nodes).outstanding:

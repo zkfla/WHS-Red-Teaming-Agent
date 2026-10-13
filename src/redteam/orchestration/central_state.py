@@ -25,6 +25,7 @@ from redteam.core.contracts.engagement import EngagementScope
 from redteam.core.contracts.events import EventEnvelope, EventType
 from redteam.core.contracts.evidence import EvidenceRecord
 from redteam.core.contracts.execution import ExecutionState, TaskExecution
+from redteam.core.contracts.graph import Hypothesis, HypothesisUpdate
 from redteam.core.contracts.mission import (
     InvestigationResult,
     MissionPlan,
@@ -38,7 +39,12 @@ from redteam.core.enums import ApprovalStatus, MissionStatus, OperatorIntentType
 from redteam.core.ids import EngagementId, EvidenceId, MissionId, OperatorIntentId, RunId
 from redteam.core.ports.evidence_store import EvidenceStore
 from redteam.core.tool_binding import execution_fingerprint
-from redteam.orchestration.coordination import CoordinationError, StateConflict, content_hash
+from redteam.orchestration.coordination import (
+    CoordinationError,
+    PlanningInputsChanged,
+    StateConflict,
+    content_hash,
+)
 from redteam.orchestration.execution_journal import checked_receipt, preserved_result
 from redteam.orchestration.llm_requests import (
     RequestAdmissionError,
@@ -452,10 +458,27 @@ class CentralTransaction:
             source = self.get_task(str(task.source_task_id))
             if (source is None or source.result is None
                     or source.result.result_id != task.source_result_id
-                    or task.source_question_id not in {
+                    or (task.source_question_id is not None and task.source_question_id not in {
                         q.question_id for q in source.result.questions
-                    }):
+                    })):
                 raise StateConflict("follow_up_source_missing_or_mismatched")
+        if task.investigation_contract_version == 2:
+            from redteam.attack_graph.identity import hypothesis_node_id
+            from redteam.attack_graph.predicates import facts_of
+
+            for identity, revision in task.hypothesis_revisions.items():
+                node = self.graph.get_local_node(hypothesis_node_id(identity))
+                candidate = Hypothesis.model_validate(facts_of(node.properties)) if node else None
+                if candidate is None or candidate.contract_version != 2 or (
+                    candidate.revision != revision
+                ):
+                    raise StateConflict("probe_candidate_revision_changed")
+                if set(map(str, task.related_attack_graph_node_ids)) - set(
+                    candidate.target_node_ids
+                ):
+                    raise StateConflict("probe_target_outside_candidate")
+                if set(task.principal_refs) - set(candidate.principal_refs):
+                    raise StateConflict("probe_principal_outside_candidate")
         payload = task.model_dump_json(
             exclude={"dependency_task_ids", "parent_task_id", "priority"},
         )
@@ -472,6 +495,23 @@ class CentralTransaction:
         if task is None or task.occupant_owner != owner or task.ownership_version != version:
             raise StateConflict("stale_task_ownership")
         return task
+
+    def probe_usage(self, task_id: str) -> dict:
+        """Read existing execution and model reservation rows, never reset per actor."""
+        task = self.get_task(task_id)
+        if task is None:
+            raise StateConflict("probe_task_missing")
+        actions = self.db.execute(
+            "SELECT count(*) FROM state_executions WHERE run_id=? AND task_id=?",
+            (self.run_id, task_id),
+        ).fetchone()[0]
+        requests = self.db.execute(
+            "SELECT count(*) FROM state_requests WHERE run_id=? AND kind='llm_request' "
+            "AND json_extract(payload,'$.task_id')=? "
+            "AND json_extract(payload,'$.state')!='released'", (self.run_id, task_id),
+        ).fetchone()[0]
+        return {"actions": actions, "model_requests": requests,
+                "limits": task.probe_limits.model_dump() if task.probe_limits else None}
 
     def register_batch(
         self, request_id: str, tasks: Sequence[MissionTask], *,
@@ -504,6 +544,143 @@ class CentralTransaction:
         ))
         return saved
 
+    def probe_registration(self, identity: str, request_hash: str) -> dict | None:
+        """Exact receipt identity, stored on the existing Run request ledger."""
+        self.binding()
+        row = self.db.execute(
+            "SELECT payload FROM state_requests WHERE run_id=? "
+            "AND kind='hypothesis_probe_registration' AND identity=?", (self.run_id, identity),
+        ).fetchone()
+        if row is None:
+            return None
+        payload = json.loads(row[0])
+        if payload["request_hash"] != request_hash:
+            raise StateConflict("registration_request_identity_conflict")
+        if any(self.get_task(identity) is None for identity in payload["task_ids"]):
+            raise StateConflict("registration_original_task_missing")
+        return payload
+
+    def register_hypothesis_probes(
+        self, request_id: str, request_hash: str, *, updates: Sequence[HypothesisUpdate],
+        tasks: Sequence[MissionTask], checked: Sequence[CheckedEvidence],
+        expected_revision: int, expected_binding_hash: str, graph_read: Mapping[str, str],
+        notifications: Sequence[EventEnvelope], validity_read: Any = None,
+        task_read: Mapping[str, str] | None = None,
+        planner_judgment: dict | None = None,
+    ) -> dict:
+        """Candidate changes, native Tasks, checked refs, receipt and outbox commit once."""
+        from redteam.attack_graph.hypotheses import hypothesis_purpose
+        from redteam.attack_graph.identity import hypothesis_node_id
+        from redteam.core.ids import GraphNodeId
+
+        previous = self.probe_registration(request_id, request_hash)
+        if previous is not None:
+            return previous
+        self.check_planning_inputs(expected_revision, expected_binding_hash, graph_read, task_read)
+        if planner_judgment is not None:
+            self.check_planner_inventory(planner_judgment)
+        if validity_read is not None:
+            validity_read.check(self)
+        self.add_evidence_refs(checked)
+        inspected = {str(item.record.evidence_id): item.record for item in checked}
+        revisions = {}
+        for update in updates:
+            candidate = update.hypothesis
+            refs = [*candidate.supporting_evidence_ids, *candidate.refuting_evidence_ids]
+            if update.review_evidence_id:
+                refs.append(update.review_evidence_id)
+            self._require_refs(refs)
+            if any(self.graph.get_local_node(GraphNodeId(identity)) is None
+                   for identity in candidate.target_node_ids):
+                raise StateConflict("candidate_target_missing")
+            if any(self.graph.get_local_node(hypothesis_node_id(identity)) is None
+                   for identity in candidate.source_hypothesis_ids):
+                raise StateConflict("candidate_source_missing")
+            if candidate.status in {"confirmed", "rejected"}:
+                record = inspected.get(update.review_evidence_id or "")
+                meta = record.metadata if record else {}
+                expected_outcome = "success" if candidate.status == "confirmed" else "refuted"
+                if (update.expected_revision is None or meta.get("record_kind") != "review_receipt"
+                        or meta.get("public") is not True or meta.get("admission") != "final"
+                        or meta.get("hypothesis_id") != candidate.hypothesis_id
+                        or meta.get("hypothesis_outcome", meta.get("outcome")) != expected_outcome
+                        or str(meta.get("verdict", "")).lower() == "unknown"
+                        or meta.get("candidate_revision") != update.expected_revision
+                        or meta.get("candidate_purpose_hash") != content_hash(
+                            hypothesis_purpose(candidate))):
+                    raise StateConflict("candidate_verdict_receipt_unbound")
+            node = self.graph.save_hypothesis(update, now=datetime.now(timezone.utc))
+            revisions[candidate.hypothesis_id] = node.properties["facts"]["revision"]
+        saved = self.register_batch(request_id, tasks, checked=checked) if tasks else []
+        for envelope in notifications:
+            self.queue(envelope)
+        receipt = {"request_hash": request_hash, "task_ids": [str(task.task_id) for task in saved],
+                   "candidate_revisions": revisions, "contract_version": 2}
+        self.db.execute("INSERT INTO state_requests VALUES(?,?,?,?)", (
+            self.run_id, "hypothesis_probe_registration", request_id, json.dumps(receipt),
+        ))
+        if planner_judgment is not None:
+            self.finish_hypothesis_judgment(request_id, planner_judgment)
+        return receipt
+
+    def check_planning_inputs(self, revision, binding, graph_read, task_read=None) -> None:
+        from redteam.core.ids import GraphNodeId
+
+        if self.admit().revision != revision or self.binding()[1] != binding:
+            raise PlanningInputsChanged("planning_goal_or_binding_changed")
+        if any(content_hash(self.graph.get_local_node(GraphNodeId(identity))) != expected
+               for identity, expected in graph_read.items()):
+            raise PlanningInputsChanged("candidate_related_graph_changed")
+        if any(content_hash(self.get_task(identity)) != expected
+               for identity, expected in (task_read or {}).items()):
+            raise PlanningInputsChanged("probe_related_result_changed")
+
+    def hypothesis_planner_cursor(self) -> int | None:
+        row = self.db.execute(
+            "SELECT payload FROM state_requests WHERE run_id=? "
+            "AND kind='hypothesis_planner_cursor' AND identity=?", (self.run_id, self.run_id),
+        ).fetchone()
+        return json.loads(row[0])["sequence"] if row else None
+
+    def hypothesis_candidate_inputs(self) -> dict:
+        from redteam.attack_graph.predicates import facts_of
+        from redteam.core.enums import GraphNodeType
+
+        return {facts_of(node.properties)["hypothesis_id"]: content_hash(facts_of(node.properties))
+                for node in self.graph.query(node_type=GraphNodeType.HYPOTHESIS)}
+
+    def check_planner_inventory(self, judgment: dict) -> None:
+        if judgment["termination"] == "continue":
+            return  # Candidate-local judgments do not fence unrelated siblings.
+        if set(judgment["candidate_inventory"]) != self.hypothesis_candidate_inputs().keys() or (
+            set(judgment["task_inventory"]) != {str(task.task_id) for task in self.list_tasks()}
+        ):
+            raise PlanningInputsChanged("planning_terminal_inventory_changed")
+
+    def finish_hypothesis_judgment(self, identity: str, judgment: dict) -> None:
+        """Same commit as candidates/Tasks; coalesce only consumed outbox inputs."""
+        from redteam.orchestration.central_completion import goal_snapshot
+
+        self.admit()
+        payload = redact_secret_material(judgment)
+        self.db.execute("INSERT INTO state_requests VALUES(?,?,?,?)", (
+            self.run_id, "hypothesis_planner_pass", identity, json.dumps(payload),
+        ))
+        self.db.execute(
+            "INSERT INTO state_requests VALUES(?,'hypothesis_planner_cursor',?,?) "
+            "ON CONFLICT(run_id,kind,identity) DO UPDATE SET payload=excluded.payload",
+            (self.run_id, self.run_id, json.dumps({"sequence": payload["sequence"]})),
+        )
+        termination = {"termination": payload["termination"], "reason": payload["reason"],
+                       "resume_conditions": payload["resume_conditions"],
+                       "candidate_inputs": self.hypothesis_candidate_inputs(),
+                       "inputs": goal_snapshot(self, include_assessment=False)[2]}
+        self.db.execute(
+            "INSERT INTO state_requests VALUES(?,'planner_termination',?,?) "
+            "ON CONFLICT(run_id,kind,identity) DO UPDATE SET payload=excluded.payload",
+            (self.run_id, self.run_id, json.dumps(termination)),
+        )
+
     def update_task(
         self, task: MissionTask, *, owner: str, version: int, expected_hash: str,
         checked: Sequence[CheckedEvidence] = (),
@@ -513,6 +690,8 @@ class CentralTransaction:
         previous = self._owned(str(task.task_id), owner, version)
         task = task.redacted_copy()
         if (content_hash(previous) != expected_hash or task.mission_id != previous.mission_id
+                or task.investigation_contract_version != previous.investigation_contract_version
+                or task.probe_limits != previous.probe_limits
                 or task.occupant_owner != owner or task.ownership_version != version
                 or task.status != previous.status
                 or task.blocking_reason != previous.blocking_reason
@@ -766,7 +945,10 @@ class CentralTransaction:
         """An intermediate result stays on its running Task, without a question queue."""
         self.admit()
         task = self._owned(task_id, owner, version)
-        if task.status is not TaskStatus.RUNNING or content_hash(task) != expected_hash:
+        allowed = {TaskStatus.RUNNING}
+        if task.investigation_contract_version == 2:
+            allowed.add(TaskStatus.BLOCKED)
+        if task.status not in allowed or content_hash(task) != expected_hash:
             raise StateConflict("task_result_inputs_changed")
         result = InvestigationResult.model_validate(redact_secret_material(
             result.model_dump(mode="json"),
@@ -779,6 +961,11 @@ class CentralTransaction:
                                   "updated_at": datetime.now(timezone.utc)}))
 
     def _check_result_lineage(self, task: MissionTask, result: InvestigationResult) -> None:
+        if task.investigation_contract_version == 2:
+            if result.contract_version != 2 or set(result.hypothesis_ids) - set(
+                task.related_hypothesis_ids
+            ):
+                raise StateConflict("probe_result_contract_or_subject_changed")
         if task.result is None:
             return
         if task.result.result_id != result.result_id:
@@ -787,6 +974,12 @@ class CentralTransaction:
         proposed = {q.question_id: q for q in result.questions}
         if any(proposed.get(identity) != question for identity, question in previous.items()):
             raise StateConflict("original_result_question_changed")
+        if task.investigation_contract_version == 2 and (
+            set(task.result.evidence_ids) - set(result.evidence_ids)
+            or set(task.result.observations) - set(result.observations)
+            or set(task.result.limitations) - set(result.limitations)
+        ):
+            raise StateConflict("original_probe_observation_removed")
 
     def activation_count(self) -> int:
         return self.db.execute("SELECT count(*) FROM state_activations WHERE run_id=?",
@@ -1141,6 +1334,10 @@ class CentralTransaction:
             if execution_identity_hash(previous) != execution_identity_hash(execution):
                 raise StateConflict("execution_identity_conflict")
             return previous
+        if task.probe_limits is not None and self.probe_usage(str(task.task_id))[
+            "actions"
+        ] >= task.probe_limits.max_actions:
+            raise StateConflict("probe_action_limit_exhausted")
         mission = self.admit()
         if execution.goal_revision != mission.revision:
             raise StateConflict("execution_goal_revision_changed")
@@ -1380,6 +1577,16 @@ class _RequestTransaction:
         # Reasoning for the owned final review still uses the shared ledger;
         # task assignment/provider admission is closed independently.
         self.tx.admit(settlement=True)
+
+    def admit_probe_request(self, task_id: str, rows: Sequence[dict]) -> None:
+        task = self.tx.get_task(task_id)
+        if task is None or task.probe_limits is None:
+            raise RequestAdmissionError("probe_request_task_unbound")
+        if task.status is not TaskStatus.RUNNING:
+            raise RequestAdmissionError("probe_task_not_running")
+        charged = sum(row.get("task_id") == task_id and row["state"] != "released" for row in rows)
+        if charged >= task.probe_limits.max_model_requests:
+            raise RequestAdmissionError("probe_model_request_limit_exhausted")
 
 
 class _RequestRecords(MutableMapping[tuple[str, str], Any]):

@@ -11,7 +11,6 @@ async def test_web_generated_policy_starts_the_real_builtin_mcp_servers(tmp_path
     environment = {
         "REDTEAM_LLM_PROVIDER": "litellm",
         "REDTEAM_LLM_MODEL": "fixture/not-called",
-        "REDTEAM_SPECIALIST_PROFILE": "config/agents/native-specialists-web.yaml",
         "REDTEAM_LLM_REQUEST_POLICY_JSON":
             '{"mode":"bounded","max_requests":5,"max_concurrent_requests":1}',
     }
@@ -20,6 +19,9 @@ async def test_web_generated_policy_starts_the_real_builtin_mcp_servers(tmp_path
     with environment_context(environment):
         await launcher.prepare()
     config = launcher.build_config()
+    assert config.orchestration.specialist_profile_path.endswith(
+        "config/agents/native-probes.yaml"
+    )
     assert config.capability.mcp_servers == ["web-http", "recon-passive"]
     assert config.engagement.scope.allowed_hosts == ["127.0.0.1:8443"]
     assert config.engagement.metadata["web_policy"]["mode"] == "site"

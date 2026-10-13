@@ -2,10 +2,11 @@ from datetime import datetime, timezone
 
 import pytest
 
+from redteam.attack_graph.hypotheses import prepare_hypothesis_update
 from redteam.attack_graph.service import AttackGraphService
 from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
 from redteam.core.contracts.evidence import EvidenceRecord
-from redteam.core.contracts.graph import Finding
+from redteam.core.contracts.graph import Finding, Hypothesis, HypothesisUpdate
 from redteam.core.enums import AgentPhase, EvidenceSourceType
 from redteam.core.ids import AgentId, EngagementId, EvidenceId, GraphNodeId, RunId
 from redteam.orchestration.candidates.models import PriorityScore
@@ -43,6 +44,51 @@ async def test_empty_terminal_projection_is_releaseable_and_read_only() -> None:
     assert projection.ready_for_release is True
     assert projection.finding_count == 0
     assert await graph.list_findings() == []
+
+
+async def test_candidate_projection_is_not_a_finding_or_mission_verdict() -> None:
+    from redteam.app.cli.commands.report import _render_markdown
+
+    store = InMemoryAttackGraphStore()
+    await store.add_node(prepare_hypothesis_update(
+        None,
+        HypothesisUpdate(hypothesis=Hypothesis(
+            hypothesis_id="candidate-a",
+            description="Authorization may be missing",
+            contract_version=2,
+            target_node_ids=["host:example.invalid"],
+            reason="Verify one response",
+        )),
+        now=datetime.now(timezone.utc),
+        run_id="run",
+    ))
+    projection = await ReportingAgent().project(
+        RuntimeState(
+            run_id=RunId("run"), engagement_id=EngagementId("eng"),
+            phase=AgentPhase.FINISHED, termination_reason="investigation_held",
+        ),
+        graph=AttackGraphService(store),
+        evidence_store=FakeEvidenceStore(),
+        work_store=InMemoryWorkStore(),
+    )
+
+    assert projection.finding_count == 0 and projection.mission is None
+    assert projection.candidates[0].model_dump() == {
+        "hypothesis_id": "candidate-a",
+        "description": "Authorization may be missing",
+        "status": "open",
+        "revision": 1,
+        "confidence": 0.0,
+        "reason": "Verify one response",
+        "target_node_ids": ["host:example.invalid"],
+        "supporting_evidence_ids": [],
+        "refuting_evidence_ids": [],
+        "source_hypothesis_ids": [],
+        "probe_task_ids": [],
+    }
+    markdown = _render_markdown(projection)
+    assert "Vulnerability candidates" in markdown
+    assert "separate from Task completion" in markdown
 
 
 async def test_reporting_preserves_operational_diagnostic_in_json_and_markdown() -> None:

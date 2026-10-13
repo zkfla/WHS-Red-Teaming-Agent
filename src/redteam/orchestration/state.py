@@ -115,6 +115,8 @@ class RuntimeState(BaseModel):
     mission_status: MissionStatus | None = None
 
     active_hypothesis_id: HypothesisId | None = None
+    # Immutable worker input in its checkpoint, never a second candidate authority.
+    probe_hypotheses: dict[str, dict[str, Any]] | None = None
     pending_action_id: ActionId | None = None
     pending_approval_id: ApprovalId | None = None
 

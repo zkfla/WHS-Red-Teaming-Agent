@@ -431,6 +431,10 @@ class AttackGraphService:
             if hypothesis is None:
                 updated = None
                 return current
+            if hypothesis.contract_version == 2:
+                from redteam.attack_graph.hypotheses import HypothesisConflict
+
+                raise HypothesisConflict("candidate_write_requires_revisioned_admission")
             updated = hypothesis.model_copy(update={
                 "status": status,
                 "confidence": hypothesis.confidence if confidence is None else confidence,

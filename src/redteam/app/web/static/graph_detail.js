@@ -19,13 +19,15 @@ function planner(view) {
   return [badge(PLANNER[p.state] || UNKNOWN), h("h3", { text: "Planner" }),
     p.inputs.goal ? h("p", { class: "gdetail-summary", text: p.inputs.goal }) : null, rows([
     ["상태", PLANNER[p.state]], ["판단 단계", p.stage], ["깨운 이벤트", p.trigger],
-    ["목표", p.inputs.goal], ["증거 수", p.inputs.evidence], ["조사 Task 수", p.inputs.tasks],
+    ["목표", p.inputs.goal], ["후보 수", p.inputs.candidates], ["증거 수", p.inputs.evidence],
+    ["검증 Task 수", p.inputs.tasks],
     ["미해결 질문 수", p.inputs.open_questions],
     ["직전 판단", p.last_judgment && p.last_judgment.termination],
     ["직전 판단 사유", p.last_judgment && p.last_judgment.reason],
     ["등록한 Task(누적)", p.tasks_registered],
     ["모델 요청", `${p.usage.requests}건 · 진행 ${p.usage.in_flight} · 토큰 ${p.usage.known_tokens}`],
-    ["운영자 안내", p.guidance_in_input ? "플래너 입력에 포함" : "플래너 판단 입력에 포함되지 않음"],
+    ["운영자 안내", p.guidance_in_input === true ? "플래너 입력에 포함" :
+      p.guidance_in_input === false ? "플래너 판단 입력에 포함되지 않음" : UNKNOWN],
   ]), h("p", { class: "note", text: "저장되지 않는 값은 '알 수 없음'으로 표시합니다." })];
 }
 
@@ -37,10 +39,26 @@ function task(view, id) {
     h("div", { class: "gdetail-summary" }, h("strong", { text: "완료 조건" }),
       h("p", { class: "note", text: t.completion.join(" / ") })), rows([
     ["상태", TASK[t.status]], ["담당 역할", t.role], ["현재 워커", t.worker || "없음"],
+    ["후속 검증 출처", t.source_task_id || "없음"],
+    ["출처 결과", t.source_result_id || "없음"],
     ["막힌 사유", t.blocking_reason || "없음"],
     ["대기", t.wait ? `${WAIT[t.wait.reason] || t.wait.reason}${t.wait.approval_ref ? ` · 승인 ${t.wait.approval_ref}` : ""}` : "없음"],
     ["증거 수", t.evidence], ["결과", t.has_result ? "저장됨" : "아직 없음"],
   ]), h("h4", { text: "기록" }), timeline(view, id)];
+}
+
+function candidate(view, id) {
+  const c = (view.candidates || []).find((item) => item.hypothesis_id === id);
+  if (!c) return [h("p", { class: "note", text: "이 후보는 더 이상 목록에 없습니다." })];
+  return [badge(c.status), h("h3", { text: c.description }),
+    h("p", { class: "gdetail-id", text: c.hypothesis_id }), rows([
+      ["현재 판단", c.status], ["개정", c.revision], ["신뢰도", c.confidence],
+      ["판단 사유", c.reason], ["대상", c.target_node_ids.join(", ")],
+      ["검증 작업", c.task_ids.join(", ") || "없음"],
+      ["지지 증거", c.supporting_evidence_ids.join(", ") || "없음"],
+      ["반대 증거", c.refuting_evidence_ids.join(", ") || "없음"],
+      ["출처 후보", c.source_hypothesis_ids.join(", ") || "없음"],
+    ]), h("p", { class: "note", text: "후보 판단은 Task 완료, Finding, Mission 판정과 별개입니다." })];
 }
 
 function worker(view, id) {
@@ -73,6 +91,7 @@ export function renderDetail(root, view, selected) {
   if (!view || !view.available) body = [h("p", { class: "note", text: "상세를 볼 수 없습니다." })];
   else if (selected === "planner") body = planner(view);
   else if (selected === "origin") body = origin(view);
+  else if (selected && selected.startsWith("candidate:")) body = candidate(view, selected.slice(10));
   else if (selected && selected.startsWith("task:")) body = task(view, selected.slice(5));
   else if (selected && selected.startsWith("worker:")) body = worker(view, selected.slice(7));
   else body = [h("p", { class: "note", text: "노드를 선택하면 상세가 여기에 표시됩니다." })];

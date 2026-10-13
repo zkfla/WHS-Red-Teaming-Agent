@@ -65,7 +65,7 @@ from redteam.orchestration.analysis import (
     hypothesis_status_for_assessment,
 )
 from redteam.orchestration.coordination import content_hash
-from redteam.orchestration.diagnostics import diagnostic_for_exception
+from redteam.orchestration.diagnostics import DecisionDiagnostic, diagnostic_for_exception
 from redteam.orchestration.evidence_access import raw_from_metadata
 from redteam.orchestration.findings import FindingPromoter, PromotionRequest
 from redteam.orchestration.local_tools import (
@@ -859,6 +859,23 @@ class GraphRecordingHandler:
         engagement_id = str(getattr(runtime, "engagement_id", "") or "").strip()
         if store is None or not run_id:
             return LocalToolResult(ok=False, error="recording needs store and run")
+        state = getattr(context.deps, "central_state", None)
+        active_task_id = getattr(runtime, "active_task_id", None)
+        task = (await state.get_task(str(active_task_id))
+                if state is not None and active_task_id else None)
+        if task is not None and task.probe_limits is not None and (
+            recording.hypotheses or any(
+                item.hypothesis_id not in task.hypothesis_revisions for item in recording.findings
+            )
+        ):
+            diagnostic = DecisionDiagnostic(
+                code="probe_candidate_change_requires_planner", stage="native_local_tool",
+                kind="validation", retryable=False,
+                summary="Return new candidate proposals as feedback. Only admitted candidates "
+                        "may use claim review during this probe.",
+            )
+            return LocalToolResult(ok=False, error=diagnostic.feedback(),
+                                   payload={"diagnostic": diagnostic.model_dump(mode="json")})
         service = self._graph
         if service is None:
             graph_store = getattr(getattr(context, "deps", None), "graph_store", None)
@@ -1091,9 +1108,13 @@ class GraphRecordingHandler:
             hypothesis_id = str(created["hypothesis_id"])
         stored_hypothesis = await service.get_hypothesis(hypothesis_id)
         if stored_hypothesis is None or (
-            stored_hypothesis.metadata.get("target_node_id") != target
+            (stored_hypothesis.contract_version == 1
+             and stored_hypothesis.metadata.get("target_node_id") != target)
+            or (stored_hypothesis.contract_version == 2
+                and target not in stored_hypothesis.target_node_ids)
         ):
             return _refused_entry(base, "hypothesis claim or target differs", "finding_id")
+        reviewed_hypothesis = stored_hypothesis.model_copy(deep=True)
         for ref in refs:
             source = await store.get(ref)
             if _posthoc_source_gap(source, raw_from_metadata(source.metadata)) is not None:
@@ -1129,6 +1150,11 @@ class GraphRecordingHandler:
                     "reference_hypothesis": {
                         "hypothesis_id": hypothesis_id,
                         "description": stored_hypothesis.description,
+                        **({"premise": reviewed_hypothesis.premise,
+                            "target_node_ids": reviewed_hypothesis.target_node_ids,
+                            "principal_refs": reviewed_hypothesis.principal_refs,
+                            "candidate_revision": reviewed_hypothesis.revision}
+                           if reviewed_hypothesis.contract_version == 2 else {}),
                     },
                 },
                 evidence_ids=list(refs),
@@ -1177,6 +1203,7 @@ class GraphRecordingHandler:
                 action_id=str(action_id),
                 invocation_id=str(invocation_id),
                 target_node_id=target,
+                candidate=reviewed_hypothesis,
             )
         except Exception:
             receipt = None
@@ -1191,6 +1218,13 @@ class GraphRecordingHandler:
                 "review": review_summary,
             }
         new_evidence_ids.append(str(receipt.evidence_id))
+        if reviewed_hypothesis.contract_version == 2:
+            return {
+                **base, "hypothesis_id": hypothesis_id, "target_node_id": target,
+                "receipt_id": str(receipt.evidence_id), "finding_id": None,
+                "status": "reviewed", "reason": "candidate judgment belongs to the planner",
+                "review": review_summary,
+            }
         # Only this matching claim is resolved, after its receipt is durable.
         try:
             if assessment.hypothesis_outcome not in ("success", "refuted"):
@@ -1394,4 +1428,3 @@ def graph_recording_contribution() -> Contribution:
         contribution_id=GRAPH_RECORD_CONTRIBUTION_ID,
         factory=factory,
     )
-

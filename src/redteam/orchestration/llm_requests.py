@@ -200,7 +200,9 @@ class RunRequestLedger:
             except CoordinationError as exc:
                 raise RequestAdmissionError("llm_run_not_admitted") from exc
 
-    async def reserve(self, run_id: str, *, owner: str, kind: str) -> str:
+    async def reserve(
+        self, run_id: str, *, owner: str, kind: str, task_id: str | None = None,
+    ) -> str:
         if any(not isinstance(value, str) or not value.strip() for value in (run_id, owner, kind)):
             raise RequestAdmissionError("llm_request_scope_invalid")
         request_id = new_id("llm_request")
@@ -214,6 +216,11 @@ class RunRequestLedger:
             if self._cooldown(tx, run_id, policy) > 0:
                 raise RequestAdmissionError("llm_provider_cooldown_active")
             rows = self._rows(tx, run_id)
+            if task_id is not None:
+                guard = getattr(tx, "admit_probe_request", None)
+                if guard is None:
+                    raise RequestAdmissionError("probe_request_admission_not_bound")
+                guard(task_id, rows)
             charged = sum(row["state"] != "released" for row in rows)
             if policy.max_requests is not None and charged >= policy.max_requests:
                 raise RequestAdmissionError("run_llm_request_limit_exhausted")
@@ -223,6 +230,7 @@ class RunRequestLedger:
             tx.records[("llm_request", request_id)] = {
                 "request_id": request_id, "run_id": run_id, "owner": owner,
                 "kind": kind, "state": "reserved", "total_tokens": None,
+                **({"task_id": task_id} if task_id is not None else {}),
             }
             return request_id
         return await self._change(run_id, change)

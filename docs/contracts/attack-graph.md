@@ -97,3 +97,36 @@ default backend selection remains unchanged.
 Neo4j or another graph DB is out of scope for this stage
 (instruction.md section 21) but can be added later by implementing
 `AttackGraphStore` and wiring it in `redteam.app.bootstrap.build_runtime_deps`.
+## Revisioned investigation candidates (plan5a)
+
+Candidate hypotheses use `Hypothesis.contract_version=2` in the existing
+Engagement-scoped graph. The shared fields include target/principal references,
+premise, supporting/refuting original evidence references, source hypotheses,
+current judgment reason and a code-owned revision. Status values are `open`,
+`held`, `inconclusive`, `confirmed`, and `rejected` (a refuted candidate). Confidence
+alone grants no verdict. Version 1 records, including legacy status strings,
+remain readable with their original serialization.
+
+New candidates expect absence; updates expect the current revision. An explicit
+expectation of zero can upgrade a v1 hypothesis without converting existing Runs.
+Accepted writes increment the revision, replace current candidate facts independently
+of worker-local steps, retain original evidence references and record TARGETS
+relations. Source hypotheses preserve candidate lineage without imposing a DAG.
+The existing knowledge projection exposes these typed references and revisions.
+
+Ordinary graph upsert/merge and legacy `record_hypothesis`/`resolve_hypothesis`
+cannot overwrite managed candidate facts. Writes go through central candidate/probe
+admission, checking the relevant read set and references. Generic deletion also
+retains managed candidate identities; a closed/held judgment remains readable.
+The storage participant
+does not commit independently. Confirmed/rejected judgments require the existing
+independent original-result/claim/validity proof plus a final public review receipt
+bound to `candidate_revision` and `candidate_purpose_hash` (claim, premise, targets
+and principals). `append_posthoc_claim_receipt(candidate=...)` binds the reviewed
+snapshot; v2 common recording returns the review to the planner rather than
+silently resolving the candidate or creating a Finding. Worker observations,
+failed requests, missing prerequisites and UNKNOWN do not create a final verdict.
+
+The integrity report treats v2 held/inconclusive candidates as unresolved. Goal
+completion only requires the candidates explicitly named by v2 goal-required
+contracts; historical v1 task semantics remain unchanged.

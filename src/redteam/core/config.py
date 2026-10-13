@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
@@ -51,6 +52,17 @@ from redteam.core.environment import (
     planning_provider_env_raw as _planning_provider_env_raw,
 )
 from redteam.core.ids import EngagementId
+
+# Repository/package deployment contract for new Runs.  Operators may still
+# select another current profile explicitly, but an absent environment value
+# must not fall back to the retired specialist/atomizer flow.
+_SOURCE_AGENT_DIR = Path(__file__).resolve().parents[3] / "config" / "agents"
+_INSTALLED_AGENT_DIR = Path(sys.prefix) / "share" / "redteam" / "agents"
+DEFAULT_AGENT_PROFILE_DIR = (
+    _SOURCE_AGENT_DIR if (_SOURCE_AGENT_DIR / "native-probes.yaml").is_file()
+    else _INSTALLED_AGENT_DIR
+)
+DEFAULT_SPECIALIST_PROFILE_PATH = str(DEFAULT_AGENT_PROFILE_DIR / "native-probes.yaml")
 
 
 class EngagementConfig(BaseModel):
@@ -163,7 +175,9 @@ class OrchestrationConfig(BaseModel):
     central_state_path: str = Field(default="data/orchestration/state.sqlite3", min_length=1)
     max_workers: int = Field(default=2, ge=1)
     llm_request_policy: LLMRequestPolicy | None = None
-    specialist_profile_path: str | None = Field(default=None, min_length=1, max_length=4096)
+    specialist_profile_path: str | None = Field(
+        default=DEFAULT_SPECIALIST_PROFILE_PATH, min_length=1, max_length=4096
+    )
     code_fixture_policy_path: str | None = Field(default=None, min_length=1, max_length=4096)
     tool_timeout_seconds: float = Field(default=10.0, gt=0, le=600)
     resource_wait_timeout_seconds: float = Field(default=30.0, gt=0, le=600)

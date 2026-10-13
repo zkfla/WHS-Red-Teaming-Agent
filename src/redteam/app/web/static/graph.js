@@ -5,7 +5,7 @@ import { GRAPH_UNAVAILABLE, describeError } from './labels.js';
 import { renderDetail } from './graph_detail.js';
 import { drawEdges } from './graph_lines.js';
 import { connectedPath, COLUMNS, graphLayout } from './graph_layout.js';
-import { originNode, plannerNode, taskNodes, workerNodes } from './graph_nodes.js';
+import { candidateNodes, originNode, plannerNode, taskNodes, workerNodes } from './graph_nodes.js';
 import { emptyState, replaceLive } from './ui.js';
 
 const POLL_MS = 5000;
@@ -80,14 +80,14 @@ export function setupGraph(onView = () => {}) {
     if (selected && !layout.positions.has(selected)) selected = null;
     $('graph-detail-panel').hidden = !selected;
     note.textContent = view.mission?.termination_reason ? `조사 종료 · ${view.mission.termination_reason}`
-      : `작업 ${view.tasks.length}개 · 워커 ${view.workers.length}개 · 증거 ${view.origin.evidence}건`;
-    const nodes = [plannerNode(view, selected, pick), ...taskNodes(view, selected, pick), ...workerNodes(view, selected, pick), originNode(view, selected, pick)];
+      : `후보 ${(view.candidates || []).length}개 · 검증 작업 ${view.tasks.length}개 · 워커 ${view.workers.length}개 · 증거 ${view.origin.evidence}건`;
+    const nodes = [plannerNode(view, selected, pick), ...candidateNodes(view, selected, pick), ...taskNodes(view, selected, pick), ...workerNodes(view, selected, pick), originNode(view, selected, pick)];
     for (const node of nodes) {
       const position = layout.positions.get(node.dataset.node);
       node.style.left = `${position.x}px`;
       node.style.top = `${position.y}px`;
     }
-    const headings = ['계획 · 판단', '조사 작업', '실행 워커', '증거 · 발견사항'].map((text, index) => {
+    const headings = ['계획 · 판단', '취약점 후보', '검증 작업', '실행 워커', '증거 · 발견사항'].map((text, index) => {
       const label = h('span', { class: 'graph-lane-title', text });
       label.style.left = `${COLUMNS[index]}px`;
       return label;

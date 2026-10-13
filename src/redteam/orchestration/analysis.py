@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 from redteam.attack_graph.identity import node_id_for_target
 from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.evidence import EvidenceRecord
+from redteam.core.contracts.graph import Hypothesis
 from redteam.core.contracts.tool import ToolResult
 from redteam.core.convert import digest_payload
 from redteam.core.enums import EvidenceSourceType, Verdict
@@ -1532,6 +1533,7 @@ async def append_posthoc_claim_receipt(
     action_id: str | None = None,
     invocation_id: str | None = None,
     target_node_id: str | None = None,
+    candidate: Hypothesis | None = None,
 ) -> Any | None:
     """Final-admission receipt for a posthoc common-recording review.
 
@@ -1629,6 +1631,13 @@ async def append_posthoc_claim_receipt(
         "refuting_evidence_ids": refuting,
         "covered_principals": covered_principals,
     }
+    if candidate is not None and candidate.contract_version == 2:
+        from redteam.attack_graph.hypotheses import hypothesis_purpose
+
+        if candidate.hypothesis_id != hypothesis_id or candidate.revision < 1:
+            return None
+        payload["candidate_revision"] = candidate.revision
+        payload["candidate_purpose_hash"] = content_hash(hypothesis_purpose(candidate))
     receipt = EvidenceRecord(
         evidence_id=EvidenceId(new_id("ev")),
         run_id=RunId(run_id),

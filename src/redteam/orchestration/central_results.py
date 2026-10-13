@@ -31,7 +31,8 @@ class ResultPublication(BaseModel):
 
 
 def result_for(
-    task, *, outcome, summary, evidence_ids, questions=(), receipt_id=None, hypothesis_ids=()
+    task, *, outcome, summary, evidence_ids, questions=(), receipt_id=None, hypothesis_ids=(),
+    observations=(), limitations=(),
 ):
     prior = task.result
     retained = {question.question_id: question for question in prior.questions} if prior else {}
@@ -46,9 +47,14 @@ def result_for(
         evidence_ids=list(dict.fromkeys([*(prior.evidence_ids if prior else []), *evidence_ids])),
         questions=list(retained.values()),
         hypothesis_ids=list(
-            dict.fromkeys([*(prior.hypothesis_ids if prior else []), *hypothesis_ids])
+            dict.fromkeys([*(prior.hypothesis_ids if prior else []), *hypothesis_ids,
+                           *(task.related_hypothesis_ids
+                             if task.investigation_contract_version == 2 else [])])
         ),
         completion_receipt_id=receipt_id,
+        contract_version=task.investigation_contract_version,
+        observations=list(dict.fromkeys([*(prior.observations if prior else []), *observations])),
+        limitations=list(dict.fromkeys([*(prior.limitations if prior else []), *limitations])),
     )
 
 
@@ -123,11 +129,17 @@ async def publish_result_handler(tool_input, context):
     token = await runtime_token(deps, runtime)
     publication = ResultPublication.model_validate(tool_input)
     result = publication.result
-    if result.outcome == "confirmed" or result.finding_node_ids or result.completion_receipt_id:
-        return LocalToolResult(
-            ok=False, error="positive results require the existing settlement review"
-        )
     task = await deps.central_state.get_task(str(runtime.active_task_id))
+    if result.contract_version != task.investigation_contract_version:
+        return LocalToolResult(ok=False, error="result contract does not match the current task")
+    if (result.outcome == "confirmed"
+            or (result.contract_version == 2 and result.outcome == "refuted")
+            or result.finding_node_ids or result.completion_receipt_id):
+        return LocalToolResult(
+            ok=False, error=("reviewed probe outcomes require the existing settlement review"
+                             if result.contract_version == 2 else
+                             "positive results require the existing settlement review"),
+        )
     from redteam.attack_graph.service import AttackGraphService
 
     service = AttackGraphService(deps.graph_store)
@@ -141,6 +153,8 @@ async def publish_result_handler(tool_input, context):
         evidence_ids=result.evidence_ids,
         questions=result.questions,
         hypothesis_ids=result.hypothesis_ids,
+        observations=result.observations,
+        limitations=result.limitations,
     )
     if result.result_id != merged.result_id:
         # The producer chooses the first result identity; thereafter it is stable.
@@ -160,10 +174,12 @@ def register_result_tool(registry):
         LocalToolDescriptor(
             tool_id="task.publish_result",
             contribution_id="central-investigation-result",
-            version="1",
+            version="2",
             description="Publish an intermediate investigation result and its follow-up questions "
             "while retaining the task. Cite preserved originals. Confirmed results require "
-            "task.settle review. Follow-ups refer to this task/result/question triple.",
+            "task.settle review. Probe contract v2 refutations also require review; outcomes "
+            "describe this probe purpose, never the candidate verdict. Probe follow-ups may "
+            "refer to the source task/result without a question; legacy follow-ups use the triple.",
             input_schema=ResultPublication.model_json_schema(),
         ),
         publish_result_handler,

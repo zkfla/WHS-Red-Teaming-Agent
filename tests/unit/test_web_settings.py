@@ -52,6 +52,25 @@ def test_missing_fields_are_listed_by_name(store):
     assert store.summary()["ready"] is False
 
 
+def test_repository_web_settings_select_candidate_profile_by_default(tmp_path):
+    from pathlib import Path
+
+    env = {
+        ENV_PROVIDER: "litellm",
+        ENV_MODEL: "chatgpt/test-model",
+        ENV_POLICY: '{"mode":"bounded","max_requests":5,"max_concurrent_requests":1}',
+    }
+    current = SettingsStore(
+        env=env,
+        state_path=tmp_path / "settings.json",
+        profile_dir=Path(__file__).parents[2] / "config" / "agents",
+        env_path=tmp_path / ".env",
+    )
+    assert current.problems() == []
+    assert current.summary()["profile_id"] == "native-probes"
+    assert ENV_PROFILE not in env
+
+
 def test_profiles_list_ids_and_labels_and_skip_broken_files(store):
     assert store.profiles() == [
         {"id": "alpha", "label": "alpha-profile"},

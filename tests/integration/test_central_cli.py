@@ -217,3 +217,48 @@ async def test_default_application_assembles_only_central_domain_store(tmp_path,
     ).fetchone()[0]), write=False)
     legacy_paths = {"work_path", "task_graph_path", "attack_graph_path", "operator_intent_path"}
     assert not legacy_paths.intersection(stored["settings"])
+
+
+async def test_default_application_assembles_candidate_planner_and_common_worker(tmp_path):
+    from redteam.app.bootstrap import build_application
+    from redteam.core.config import AppConfig, EngagementConfig
+    from redteam.core.contracts.llm_policy import LLMRequestPolicy
+    from redteam.llm.fake import FakeLLMClient
+    from tests.integration.test_central_development import engagement
+
+    raw = engagement()
+    config = AppConfig(
+        engagement=EngagementConfig.model_validate(
+            raw.model_dump(exclude={"engagement_id", "created_at"})
+        ),
+        orchestration=OrchestrationConfig(
+            llm_request_policy=LLMRequestPolicy(mode="bounded", max_requests=8),
+            central_state_path=str(tmp_path / "state.sqlite3"),
+        ),
+    )
+    llm = FakeLLMClient()
+    tools = OriginalProtocolDouble(gateway())
+    _, deps = await build_application(
+        config,
+        llm=llm,
+        tool_gateway=tools,
+        tool_catalog=tools.catalog,
+        evidence_dir=tmp_path / "evidence",
+        audit_dir=tmp_path / "audit",
+        approval_dir=tmp_path / "approvals",
+    )
+
+    assert deps.specialist_policy.probe_limits is not None
+    assert deps.settings.specialist_profile_path.endswith("config/agents/native-probes.yaml")
+    assert [str(item.agent_id) for item in deps.agents.definitions() if item.schedulable] == [
+        "probe-worker"
+    ]
+    assert deps.agent_prompts is not None
+    assert deps.agent_prompts.binding("hypothesis_planning").role_id == "planner"
+    with pytest.raises(ValueError, match="binding_missing"):
+        deps.agent_prompts.binding("task_atomization")
+    from redteam.orchestration.specialist_planner import specialist_planning_inputs
+
+    assert specialist_planning_inputs(deps)["schema_version"] == 3
+    assert deps.component_binding.specialist_fingerprint is not None
+    assert llm.requests == [] and tools.inner.invocations == []

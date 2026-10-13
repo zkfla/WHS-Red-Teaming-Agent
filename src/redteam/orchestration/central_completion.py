@@ -64,7 +64,7 @@ def goal_snapshot(tx, *, include_assessment=True):
     # Cleanup obligations and hypotheses actually required by the delegated
     # contracts. Unrelated observations/hypotheses may change during review.
     required = {str(hypothesis_node_id(str(identity))) for task in tasks if task.required
-                for identity in task.related_hypothesis_ids}
+                for identity in task.goal_hypothesis_ids()}
     graph = []
     prefix = tx.engagement_id + "\x1f"
     for identity, payload in tx.db.execute(
@@ -137,7 +137,7 @@ async def goal_inputs(deps, runtime, *, graph_service=None, validity_reads=None)
     from redteam.orchestration.code_artifacts import fixture_cleanup_blockers
     errors.extend(await fixture_cleanup_blockers(deps, runtime))
     required_hypotheses = {str(identity) for task in tasks if task.required
-                           for identity in task.related_hypothesis_ids}
+                           for identity in task.goal_hypothesis_ids()}
     integrity = await graph.integrity_report()
     if required_hypotheses.intersection(integrity.unresolved_hypotheses):
         errors.append("goal_required_hypotheses_unresolved")

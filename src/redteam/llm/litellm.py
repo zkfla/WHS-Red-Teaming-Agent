@@ -171,9 +171,25 @@ def _extract_total_tokens(response: Any) -> int | None:
     if usage is None:
         return None
     total = _chunk_field(usage, "total_tokens")
-    if isinstance(total, bool) or not isinstance(total, int) or total < 0:
-        return None
-    return total
+    if type(total) is int and total >= 0:
+        return total
+    # LiteLLM/provider SDK combinations do not always populate total_tokens.
+    # Accept the two public usage shapes only when both halves are present;
+    # a partial count remains unknown rather than silently under-counting.
+    for input_key, output_key in (
+        ("input_tokens", "output_tokens"),
+        ("prompt_tokens", "completion_tokens"),
+    ):
+        input_tokens = _chunk_field(usage, input_key)
+        output_tokens = _chunk_field(usage, output_key)
+        if (
+            type(input_tokens) is int
+            and input_tokens >= 0
+            and type(output_tokens) is int
+            and output_tokens >= 0
+        ):
+            return input_tokens + output_tokens
+    return None
 
 
 # Native tool-calling normalization. Both transports (plain ``acompletion``

@@ -11,6 +11,7 @@ from typing import Any
 
 from redteam.app.cli.display import safe_text
 from redteam.core.contracts.execution import ExecutionState, TaskExecution
+from redteam.core.contracts.graph import Hypothesis
 from redteam.core.contracts.mission import MissionPlan, MissionTask
 
 PLANNER_OWNER = "specialist_planning"
@@ -32,6 +33,7 @@ class GraphRaw:
     activations: list[dict[str, Any]]
     llm_requests: list[dict[str, Any]]
     planner_judgment: dict[str, Any] | None
+    hypotheses: list[Hypothesis]
     evidence_count: int
     event_counts: dict[str, int]
     events: list[dict[str, Any]] = field(default_factory=list)  # newest first
@@ -81,6 +83,7 @@ def _planner(raw: GraphRaw) -> dict[str, Any]:
         "inputs": {
             "goal": _text(raw.mission.objective if raw.mission else None, 300),
             "evidence": raw.evidence_count,
+            "candidates": sum(item.contract_version == 2 for item in raw.hypotheses),
             "tasks": len(raw.tasks),
             "tasks_by_status": by_status,
             "open_questions": None,
@@ -90,8 +93,12 @@ def _planner(raw: GraphRaw) -> dict[str, Any]:
             "reason": _text(judgment.get("reason"), 300),
         },
         "tasks_registered": raw.event_counts.get("TaskCreated"),
-        # Checked against the planner's input assembly (see the guard test), not assumed.
-        "guidance_in_input": False,
+        # New candidate judgments persist candidate_inputs; that stored marker
+        # proves the operator-intent-aware contract was used. Before a judgment,
+        # or for historical schema-2 records, the read model does not guess.
+        "guidance_in_input": (
+            True if judgment is not None and "candidate_inputs" in judgment else None
+        ),
         "usage": _usage(planner_requests),
     }
 
@@ -163,6 +170,27 @@ def _task(task: MissionTask, workers: list[dict[str, Any]], raw: GraphRaw) -> di
         "required": task.required,
         "evidence": len(task.evidence_ids),
         "has_result": task.result is not None,
+        "candidate_ids": list(task.related_hypothesis_ids),
+        "source_task_id": str(task.source_task_id) if task.source_task_id else None,
+        "source_result_id": task.source_result_id,
+    }
+
+
+def _candidate(candidate: Hypothesis, tasks: list[MissionTask]) -> dict[str, Any]:
+    related = [str(task.task_id) for task in tasks
+               if candidate.hypothesis_id in task.related_hypothesis_ids]
+    return {
+        "hypothesis_id": candidate.hypothesis_id,
+        "description": safe_text(candidate.description, limit=240),
+        "status": candidate.status,
+        "confidence": candidate.confidence,
+        "revision": candidate.revision,
+        "reason": _text(candidate.reason, 240),
+        "target_node_ids": list(candidate.target_node_ids),
+        "supporting_evidence_ids": list(candidate.supporting_evidence_ids),
+        "refuting_evidence_ids": list(candidate.refuting_evidence_ids),
+        "source_hypothesis_ids": list(candidate.source_hypothesis_ids),
+        "task_ids": related,
     }
 
 
@@ -179,8 +207,22 @@ def _event(row: dict[str, Any]) -> dict[str, Any]:
 def build_graph(raw: GraphRaw) -> dict[str, Any]:
     workers = [_worker(a, raw) for a in raw.activations]
     tasks = [_task(t, workers, raw) for t in raw.tasks]
-    edges = [{"from": "planner", "to": f"task:{t['task_id']}", "kind": "registered"}
-             for t in tasks]
+    candidates = [_candidate(item, raw.tasks) for item in raw.hypotheses
+                  if item.contract_version == 2]
+    candidate_ids = {item["hypothesis_id"] for item in candidates}
+    edges = [{"from": "planner", "to": f"candidate:{c['hypothesis_id']}",
+              "kind": "judged"} for c in candidates]
+    edges += [{"from": f"candidate:{source}",
+               "to": f"candidate:{candidate['hypothesis_id']}", "kind": "derived"}
+              for candidate in candidates for source in candidate["source_hypothesis_ids"]
+              if source in candidate_ids]
+    edges += [{"from": f"candidate:{candidate}", "to": f"task:{t['task_id']}",
+               "kind": "probed_by"}
+              for t in tasks for candidate in t["candidate_ids"] if candidate in candidate_ids]
+    edges += [{"from": f"task:{t['source_task_id']}", "to": f"task:{t['task_id']}",
+               "kind": "followup"} for t in tasks if t["source_task_id"]]
+    edges += [{"from": "planner", "to": f"task:{t['task_id']}", "kind": "registered"}
+              for t in tasks if not candidate_ids.intersection(t["candidate_ids"])]
     edges += [{"from": f"task:{w['task_id']}", "to": f"worker:{w['instance_id']}",
                "kind": "held_by" if w["launch_stage"] != "returned" else "returned"}
               for w in workers]
@@ -195,6 +237,7 @@ def build_graph(raw: GraphRaw) -> dict[str, Any]:
             "termination_reason": _text(raw.mission.termination_reason, 80),
         },
         "planner": _planner(raw),
+        "candidates": candidates,
         "tasks": tasks,
         "workers": workers,
         "origin": {
@@ -202,8 +245,7 @@ def build_graph(raw: GraphRaw) -> dict[str, Any]:
             "graph_updates": raw.event_counts.get("GraphUpdated", 0),
             "findings": raw.event_counts.get("FindingCreated", 0),
             "verified_findings": raw.event_counts.get("FindingVerified", 0),
-            # Hypotheses live in the graph store, which this read does not open.
-            "hypotheses": None,
+            "hypotheses": len(candidates),
         },
         "usage": {**_usage(raw.llm_requests), "budget_remaining": raw.budget_remaining},
         "edges": edges,

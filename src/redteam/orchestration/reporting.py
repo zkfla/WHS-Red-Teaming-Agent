@@ -162,6 +162,22 @@ class MissionCriterionProjection(BaseModel):
     evidence_count: int = 0
 
 
+class CandidateProjection(BaseModel):
+    """Current candidate judgment; distinct from Task, Finding and Mission state."""
+
+    hypothesis_id: str
+    description: str
+    status: str
+    revision: int = 0
+    confidence: float = 0.0
+    reason: str | None = None
+    target_node_ids: list[str] = Field(default_factory=list)
+    supporting_evidence_ids: list[str] = Field(default_factory=list)
+    refuting_evidence_ids: list[str] = Field(default_factory=list)
+    source_hypothesis_ids: list[str] = Field(default_factory=list)
+    probe_task_ids: list[str] = Field(default_factory=list)
+
+
 class MissionProjection(BaseModel):
     """Additive Mission view; absent on reports stored before this existed."""
 
@@ -416,6 +432,7 @@ class TerminalReportProjection(BaseModel):
     evidence_count: int
     work_status_counts: dict[str, int] = Field(default_factory=dict)
     findings: list[FindingProjection] = Field(default_factory=list)
+    candidates: list[CandidateProjection] = Field(default_factory=list)
     evidence_ids: list[EvidenceId] = Field(default_factory=list)
     integrity_blockers: list[str] = Field(default_factory=list)
     unresolved_hypotheses: list[str] = Field(default_factory=list)
@@ -477,6 +494,8 @@ class ReportingAgent:
 
         integrity = await graph.integrity_report()
         cleanup = await graph.cleanup_report()
+        hypotheses = [item for item in await graph.list_hypotheses()
+                      if item.contract_version == 2]
         unresolved = list(integrity.unresolved_hypotheses)
         if required_hypothesis_ids is None:
             required_unresolved = list(unresolved)
@@ -522,6 +541,7 @@ class ReportingAgent:
             for item in findings
         ]
         mission = None
+        candidate_tasks: dict[str, list[str]] = {}
         reuse_support: set[str] = set()
         if task_store is not None:
             plan = await _resolve_mission(task_store, runtime)
@@ -529,6 +549,9 @@ class ReportingAgent:
                 reuse_support.update(str(identity) for result in plan.criterion_results
                                      if result.met for identity in result.evidence_ids)
                 tasks = await task_store.list_tasks(mission_id=plan.mission_id)
+                for task in tasks:
+                    for identity in task.related_hypothesis_ids:
+                        candidate_tasks.setdefault(str(identity), []).append(str(task.task_id))
                 mission = _project_mission(
                     plan,
                     tasks,
@@ -648,6 +671,19 @@ class ReportingAgent:
             evidence_count=len(evidence),
             work_status_counts=dict(sorted(status_counts.items())),
             findings=projected_findings,
+            candidates=[CandidateProjection(
+                hypothesis_id=item.hypothesis_id,
+                description=redact_text(item.description),
+                status=item.status,
+                revision=item.revision,
+                confidence=item.confidence,
+                reason=redact_text(item.reason) if item.reason else None,
+                target_node_ids=list(item.target_node_ids),
+                supporting_evidence_ids=list(item.supporting_evidence_ids),
+                refuting_evidence_ids=list(item.refuting_evidence_ids),
+                source_hypothesis_ids=list(item.source_hypothesis_ids),
+                probe_task_ids=sorted(candidate_tasks.get(item.hypothesis_id, [])),
+            ) for item in hypotheses],
             evidence_ids=[item.evidence_id for item in evidence],
             integrity_blockers=integrity.blocking,
             unresolved_hypotheses=unresolved,

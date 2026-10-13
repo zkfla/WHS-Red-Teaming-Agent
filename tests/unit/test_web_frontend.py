@@ -50,7 +50,20 @@ def test_binding_publishes_the_initial_state_once():
     assert kinds(log) == ["state"]  # unchanged state is not republished
     state = log.tail()[0]["data"]
     assert state["phase"] == "idle" and state["engagement"] == "eng"
-    assert state["pending_approval"] is None and state["binding"] is None
+    assert state["pending_approval"] is None and state["pending_approvals"] == []
+    assert state["binding"] is None
+
+
+def test_state_publishes_every_live_pending_approval():
+    log = EventLog()
+    frontend = WebFrontend(log)
+    controller = controller_for(frontend)
+    controller.add_pending_approval("APR-1", run_id="run-A")
+    controller.add_pending_approval("APR-2", run_id="run-A")
+
+    state = [item["data"] for item in log.tail() if item["kind"] == "state"][-1]
+    assert state["pending_approval"] == "APR-1"
+    assert state["pending_approvals"] == ["APR-1", "APR-2"]
 
 
 def test_bind_calls_the_host_hook_with_the_controller():

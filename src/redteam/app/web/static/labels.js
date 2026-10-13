@@ -82,7 +82,7 @@ export const FIELD = {
   provider: "LLM 제공자",
   model: "LLM 모델",
   api_key: "API 키",
-  profile_id: "전문가 프로필",
+  profile_id: "에이전트 프로필",
   llm_request_policy: "LLM 요청 한도",
   max_requests: "LLM 요청 상한",
   max_concurrent_requests: "동시 요청 수",

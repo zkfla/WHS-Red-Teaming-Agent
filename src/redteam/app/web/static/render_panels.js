@@ -1,6 +1,6 @@
 import { $, h, replace } from "./dom.js";
 import { HOST, PHASE, RECEIPT } from "./labels.js";
-import { runList } from "./store.js";
+import { pendingApprovalIds, runList } from "./store.js";
 import { badge, dot, emptyState, icon, replaceLive, textValue } from "./ui.js";
 
 const ACTIVE = new Set(["starting", "running", "waiting_approval", "paused"]);
@@ -29,7 +29,7 @@ export function renderTop(store) {
   replace($("session-strip"),
     h("span", { class: "strip-state" }, icon("pulse"), label),
     h("span", { class: "strip-description", text: store.state?.activity || (store.host.state === "needs_engagement" ? "새 조사를 만들거나 기존 조사를 선택하세요." : "조사 상태와 실행 기록을 이곳에서 확인합니다.") }),
-    store.state?.pending_approval ? badge("검토 필요", "wait") : null);
+    pendingApprovalIds(store).length ? badge("검토 필요", "wait") : null);
 }
 
 export function renderSide(store, streamLabel, handlers) {
@@ -41,7 +41,7 @@ export function renderSide(store, streamLabel, handlers) {
     : h("li", { class: "side-empty", text: "조사 요청이 여기에 모입니다." }));
   $("env-session").textContent = HOST[store.host.state] || store.host.state;
   $("env-stream").textContent = streamLabel;
-  const count = store.state?.pending_approval ? 1 : 0;
+  const count = pendingApprovalIds(store).length;
   $("approval-count").textContent = String(count);
   $("approval-count").hidden = count === 0;
 }
@@ -70,22 +70,24 @@ export function renderComposer(store) {
 }
 
 function approvalPanel(store, handlers) {
-  const pending = store.state?.pending_approval;
-  const entry = pending ? store.entries.get(`apr:${pending}`) : null;
-  if (!pending) return [emptyState("shield", "대기 중인 승인이 없습니다", "검토가 필요한 요청이 생기면 이곳에 표시됩니다.")];
-  const action = entry ? store.actions.get(entry.action_id) : null;
-  return [h("div", { class: "approval-review" },
-    h("div", { class: "section-heading" }, h("h3", { text: "실행 요청 검토" }), badge("승인 대기", "wait")),
-    h("p", { class: "note mono", text: pending }),
-    action ? h("div", { class: "code", text: `${action.operation}\n${textValue(action.target)}`.trim() }) : null,
-    h("h4", { text: "승인이 필요한 이유" }),
-    entry?.reasons.length ? h("ul", { class: "review-reasons" }, entry.reasons.map((reason) => h("li", {}, icon("shield"), h("span", { text: textValue(reason) }))))
-      : h("p", { class: "note", text: "추가 검토 정보를 기다리고 있습니다." }),
-    h("p", { class: "approval-scope", text: "이 요청 한 건에만 적용됩니다. 승인 대상과 Run은 처리 직전에 다시 확인합니다." }),
-    entry ? h("div", { class: "approval-buttons" },
-      h("button", { type: "button", class: "btn primary", text: "승인 · 이번 1회", "data-focus": `approve:${pending}`, disabled: store.incompatible || !entry.run_id, onClick: () => handlers.decide(entry, "approve") }),
-      h("button", { type: "button", class: "btn", text: "거부", "data-focus": `reject:${pending}`, disabled: store.incompatible || !entry.run_id, onClick: () => handlers.decide(entry, "deny") }))
-      : h("p", { class: "note", text: "승인 요청의 Run 정보를 아직 받지 못했습니다." }))];
+  const pending = pendingApprovalIds(store);
+  if (!pending.length) return [emptyState("shield", "대기 중인 승인이 없습니다", "검토가 필요한 요청이 생기면 이곳에 표시됩니다.")];
+  return pending.map((approvalId) => {
+    const entry = store.entries.get(`apr:${approvalId}`);
+    const action = entry ? store.actions.get(entry.action_id) : null;
+    return h("div", { class: "approval-review" },
+      h("div", { class: "section-heading" }, h("h3", { text: "실행 요청 검토" }), badge("승인 대기", "wait")),
+      h("p", { class: "note mono", text: approvalId }),
+      action ? h("div", { class: "code", text: `${action.operation}\n${textValue(action.target)}`.trim() }) : null,
+      h("h4", { text: "승인이 필요한 이유" }),
+      entry?.reasons.length ? h("ul", { class: "review-reasons" }, entry.reasons.map((reason) => h("li", {}, icon("shield"), h("span", { text: textValue(reason) }))))
+        : h("p", { class: "note", text: "추가 검토 정보를 기다리고 있습니다." }),
+      h("p", { class: "approval-scope", text: "이 요청 한 건에만 적용됩니다. 승인 대상과 Run은 처리 직전에 다시 확인합니다." }),
+      entry ? h("div", { class: "approval-buttons" },
+        h("button", { type: "button", class: "btn primary", text: "승인 · 이번 1회", "data-focus": `approve:${approvalId}`, disabled: store.incompatible || !entry.run_id, onClick: () => handlers.decide(entry, "approve") }),
+        h("button", { type: "button", class: "btn", text: "거부", "data-focus": `reject:${approvalId}`, disabled: store.incompatible || !entry.run_id, onClick: () => handlers.decide(entry, "deny") }))
+        : h("p", { class: "note", text: "승인 요청의 Run 정보를 아직 받지 못했습니다." }));
+  });
 }
 
 export function renderInspector(store, handlers) {

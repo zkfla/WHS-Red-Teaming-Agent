@@ -206,6 +206,56 @@ async def test_controls_bypass_chat_and_stale_approval_does_not_resolve_next_req
         assert not s.conversation.release.is_set()
 
 
+async def test_live_approval_events_keep_multiple_exact_requests_actionable():
+    async with session() as s:
+        await start(s)
+        for approval_id in ("approval-A", "approval-B"):
+            s.c.observe(
+                SimpleNamespace(
+                    run_id="run-A",
+                    event_type="ApprovalRequired",
+                    payload={"approval_id": approval_id},
+                )
+            )
+
+        assert s.c.pending_approvals == ("approval-A", "approval-B")
+        s.c.submit("deny approval-B", approval_id="approval-B")
+        await s.c.controls.join()
+
+        assert s.operator.calls == [("deny", "approval-B")]
+        assert s.c.pending_approvals == ("approval-A",)
+
+
+async def test_stopped_run_does_not_restore_a_pending_approval_from_final_state():
+    async with session() as s:
+        async def stopped(objective, controller):
+            controller.observe(
+                SimpleNamespace(
+                    run_id="run-stop",
+                    event_type="ApprovalRequired",
+                    payload={"approval_id": "approval-stale"},
+                )
+            )
+            return RunResult(
+                SimpleNamespace(
+                    run_id="run-stop",
+                    phase=SimpleNamespace(value="finished"),
+                    termination_reason="operator_stopped",
+                    pending_approval_id="approval-stale",
+                    mission_status=None,
+                    actions_executed=0,
+                    recent_observations=[],
+                )
+            )
+
+        s.c.runner = stopped
+        s.c.submit("/new stop test")
+        await s.c.join_inputs()
+
+        assert s.c.pending_approvals == ()
+        assert s.c.phase is SessionPhase.IDLE
+
+
 async def test_failure_result_once_and_session_accepts_next_question():
     async with session() as s:
 
