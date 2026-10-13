@@ -10,8 +10,9 @@ from pathlib import Path
 from redteam.attack_graph.service import AttackGraphService
 from redteam.core.contracts.events import EventType
 from redteam.core.contracts.mission import Provenance
-from redteam.core.enums import AgentPhase, MissionStatus
+from redteam.core.enums import AgentPhase, ApprovalStatus, MissionStatus
 from redteam.core.ids import EngagementId, MissionId, RunId, new_id
+from redteam.core.ports.control_plane import DurableControlRecovery
 from redteam.orchestration.central_runtime import CentralEventBus, process_controls
 from redteam.orchestration.cognition import DecisionFailure, ReasoningHalted
 from redteam.orchestration.context import RuntimeDeps
@@ -475,17 +476,16 @@ class CentralRun:
             mission = await state.get_mission(self.runtime.mission_id)
         usage = await state.request_ledger().snapshot(str(self.runtime.run_id))
         history = await state.list_executions()
-        pending_approval = (
-            next(
-                (item.approval_ref for item in history
-                 if item.wait_reason and item.approval_ref),
-                None,
-            )
-            if mission.status not in {
-                MissionStatus.COMPLETED, MissionStatus.CANCELLED, MissionStatus.FAILED,
-            }
-            else None
-        )
+        pending_approval = None
+        if (mission.status not in {
+            MissionStatus.COMPLETED, MissionStatus.CANCELLED, MissionStatus.FAILED,
+        } and isinstance(self.deps.control_plane, DurableControlRecovery)):
+            for item in history:
+                if item.wait_reason and item.approval_ref:
+                    approval = await self.deps.control_plane.inspect_approval(item.approval_ref)
+                    if approval is not None and approval.status is ApprovalStatus.PENDING:
+                        pending_approval = item.approval_ref
+                        break
         final = final.model_copy(update={
             "termination_reason": reason, "mission_status": mission.status,
             "phase": AgentPhase.FAILED if reason == TerminationReason.PLANNING_ERROR
@@ -501,6 +501,10 @@ class CentralRun:
     async def resume(self, *, instance_id=None, transfer_owner=True):
         """Original actor recovery through the same bounded InstanceDriver."""
         from redteam.orchestration.central_completion import unsafe
+        from redteam.orchestration.central_recovery import recovery_diagnostic
+        if (self.runtime.planning_diagnostic is not None
+                and self.runtime.planning_diagnostic.stage == "execution_reconciliation"):
+            self.runtime = self.runtime.model_copy(update={"planning_diagnostic": None})
         state = self.deps.central_state
         if instance_id is not None:
             terminal = await terminal_selected_runtime(state, self.runtime, instance_id)
@@ -536,6 +540,7 @@ class CentralRun:
             instance_ids=selected,
         )
         items = []
+        recovery_errors = False
         for row in inventory:
             identity = row["instance_id"]
             if instance_id is not None and str(instance_id) != identity:
@@ -551,6 +556,12 @@ class CentralRun:
             )
             if outcome.ready:
                 items.append((recovered, None))
+            elif outcome.errors:
+                # Preserve the structured cause on the root result/report too.
+                recovery_errors = True
+                self.runtime = self.runtime.model_copy(update={
+                    "planning_diagnostic": recovery_diagnostic(outcome.errors),
+                })
         if instance_id is not None and not any(row["instance_id"] == str(instance_id)
                                                for row in inventory):
             raise ValueError("central_original_instance_missing")
@@ -587,8 +598,9 @@ class CentralRun:
                          else AgentPhase.FINISHED,
                 "termination_reason": TerminationReason.INVESTIGATION_HELD,
                 "mission_status": mission.status,
+                "planning_diagnostic": self.runtime.planning_diagnostic,
             })
-        if any(unsafe(item) for item in await state.list_executions()):
+        if recovery_errors or any(unsafe(item) for item in await state.list_executions()):
             return await self.settle(self.runtime.model_copy(update={
                 "phase": AgentPhase.FINISHED,
                 "termination_reason": TerminationReason.INVESTIGATION_HELD,

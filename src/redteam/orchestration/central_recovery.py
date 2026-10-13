@@ -8,10 +8,12 @@ from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.execution import ExecutionRecoveryAnswer, ExecutionState
 from redteam.core.contracts.tool import ToolInvocation, execution_outcome_uncertain
 from redteam.core.enums import AgentPhase, PolicyVerdict
+from redteam.core.ports.control_plane import DurableControlRecovery
 from redteam.orchestration.agents.base import PlanStep
 from redteam.orchestration.central_runtime import commit_result, runtime_token, tool_limit
 from redteam.orchestration.central_state import check_evidence, check_execution_receipt
 from redteam.orchestration.coordination import StateConflict
+from redteam.orchestration.diagnostics import DecisionDiagnostic
 from redteam.orchestration.execution_collection import collect_execution_original
 from redteam.orchestration.execution_journal import (
     ExecutionReceiptError,
@@ -183,12 +185,64 @@ async def reconcile_originals(deps, runtime, *, snapshot=None):
     executions = await deps.central_state.list_executions(task_id=str(runtime.active_task_id))
     inventory = {str(item.invocation_id): item for item in executions}
     if snapshot is not None:
+        records = None
         for call in snapshot.values.get("native_calls", []):
             if call.completed or call.dispatch is None:
                 continue
-            identity = str(call.dispatch.invocation.invocation_id)
-            if identity not in inventory:
-                outcome.errors[identity] = "checkpoint_call_has_no_original_intent"
+            invocation = call.dispatch.invocation
+            if invocation is None:
+                outcome.errors[call.call_id] = "checkpoint_call_has_no_bound_invocation"
+                continue
+            identity = str(invocation.invocation_id)
+            if identity in inventory:
+                continue
+            # Native preparation binds every sibling before tools_node admits
+            # any of them. A sibling after an approval wait has not crossed
+            # Control or the submission journal yet. Absence of a SQL row alone
+            # is insufficient: any durable admission/receipt keeps it held.
+            try:
+                proposal, step = call.dispatch.proposal, call.dispatch.plan_step
+                context = invocation.execution_context
+                if (proposal.run_id != runtime.run_id
+                        or proposal.engagement_id != runtime.engagement_id
+                        or proposal.instance_id != runtime.instance_id
+                        or proposal.agent_id != runtime.current_agent
+                        or invocation.run_id != proposal.run_id
+                        or invocation.action_id != proposal.action_id
+                        or context.run_id != runtime.run_id
+                        or context.engagement_id != runtime.engagement_id
+                        or context.instance_id != runtime.instance_id
+                        or context.agent_id != proposal.agent_id
+                        or context.approved_target != proposal.target
+                        or invocation.tool_id != proposal.tool_id
+                        or invocation.tool_id != step.tool_id
+                        or invocation.arguments != proposal.arguments
+                        or invocation.arguments != step.arguments
+                        or invocation.operation != proposal.operation
+                        or invocation.operation != step.operation
+                        or invocation.binding_mode != proposal.binding_mode
+                        or invocation.binding_mode != step.binding_mode
+                        or proposal.target != step.resolved_target()
+                        or step.model_tool_call_id != call.call_id
+                        or step.mission_task_id != str(runtime.active_task_id)):
+                    raise StateConflict("checkpoint_prepared_call_identity_mismatch")
+                if records is None:
+                    records = await deps.evidence_store.list_for_run(runtime.run_id)
+                if (call.evidence_ids or call.feedback.get("approval_id") or any(
+                    record.invocation_id == invocation.invocation_id
+                    or record.action_id == proposal.action_id for record in records
+                )):
+                    raise StateConflict("checkpoint_call_has_no_original_intent")
+                if not isinstance(deps.control_plane, DurableControlRecovery):
+                    raise StateConflict("durable_control_recovery_not_bound")
+                if await deps.control_plane.recorded_decision(proposal) is not None:
+                    raise StateConflict("checkpoint_call_has_no_original_intent")
+                # It remains a prepared proposal. The normal tools_node path
+                # must still admit it and preserve its original IDs/arguments.
+            except Exception as exc:
+                outcome.errors[identity] = (
+                    str(exc) if isinstance(exc, StateConflict) else type(exc).__name__
+                )
     for execution in executions:
         identity = str(execution.invocation_id)
         try:
@@ -212,6 +266,10 @@ async def reconcile_originals(deps, runtime, *, snapshot=None):
                 continue
             if execution.state is ExecutionState.PENDING:
                 # Waits are safe original intents, never ordinary assignment.
+                if execution.approval_ref and await deps.control_plane.inspect_approval(
+                    execution.approval_ref,
+                ) is None:
+                    raise StateConflict("original_approval_missing")
                 continue
             original = await collect_original(deps, execution, submission)
             if original is None:
@@ -235,3 +293,14 @@ async def reconcile_originals(deps, runtime, *, snapshot=None):
                                         else str(exc) if isinstance(exc, StateConflict)
                                         else type(exc).__name__)
     return outcome
+
+
+def recovery_diagnostic(errors: dict[str, str]) -> DecisionDiagnostic:
+    """Public cause without changing the original actor checkpoint identity."""
+    return DecisionDiagnostic(
+        code="central_execution_recovery_held", stage="execution_reconciliation",
+        kind="validation", retryable=False,
+        summary="Original execution records could not be verified; recovery is held.",
+        validation_issues=[{"location": identity, "reason": reason}
+                           for identity, reason in list(errors.items())[:10]],
+    )

@@ -186,7 +186,7 @@ async def active_query_probe(
     if profile is None:
         raise ToolInputError("unknown target_ref")
     validate_path(profile, path)
-    if query_key not in profile.allowed_query_keys.get(path, []):
+    if not profile.allows_query_key(path, query_key):
         raise ToolInputError("query key outside configured allowlist")
 
     target = await resolve_target(policy, target_ref)

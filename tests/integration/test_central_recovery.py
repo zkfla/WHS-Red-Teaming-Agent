@@ -49,6 +49,102 @@ async def start(selection, llm, count=1, *, registration_prefix="registration"):
     return results
 
 
+@pytest.mark.parametrize("second_decision", [ApprovalStatus.APPROVED, ApprovalStatus.REJECTED])
+async def test_approval_batch_resumes_prepared_sibling_without_replaying_first(second_decision):
+    llm, tools = FakeLLMClient(), gateway(risk="high")
+    async with build_central_development(
+        engagement(), llm=llm, tools=tools, settings=limits()[1],
+    ) as selection:
+        await register(selection)
+        task, = await selection.deps.central_state.list_tasks()
+        llm.native_responses_by_task[str(task.task_id)] = [
+            discover(TOOL), turn(inspect("first"), inspect("second", account="b")),
+            NativeCompletion(text="Original responses inspected", total_tokens=1),
+        ]
+        workers = await ready_workers(selection.deps, selection.runtime)
+        outcomes = [event async for event in selection.driver.drive(workers)]
+        original = outcomes[0].runtime
+        runner = selection.driver.runner_for(original)
+        snapshot = await runner._latest_snapshot()
+        planned = [call.dispatch.invocation for call in snapshot.values["native_calls"]]
+        assert len(planned) == 2 and len(await selection.deps.central_state.list_executions()) == 1
+        assert tools.invocations == []
+        await selection.deps.control_plane.resolve_approval(
+            original.pending_approval_id, ApprovalStatus.APPROVED, "fixture:operator",
+        )
+        recovered, proof = await selection.driver.recover_central_instance(
+            original, transfer_owner=False,
+        )
+        assert proof.ready, proof.errors
+        second_wait = await runner.resume_recovered(recovered)
+        assert len(tools.invocations) == 1
+        assert tools.invocations[0].invocation_id == planned[0].invocation_id
+        assert second_wait.pending_approval_id != original.pending_approval_id
+        second = await selection.deps.central_state.get_execution(str(planned[1].invocation_id))
+        assert second.approval_ref == second_wait.pending_approval_id
+        await selection.deps.control_plane.resolve_approval(
+            second_wait.pending_approval_id, second_decision, "fixture:operator",
+        )
+        recovered, proof = await selection.driver.recover_central_instance(
+            second_wait, transfer_owner=False,
+        )
+        assert proof.ready, proof.errors
+        await runner.resume_recovered(recovered)
+        assert [call.invocation_id for call in tools.invocations] == [
+            call.invocation_id for call in planned[:2 if second_decision is ApprovalStatus.APPROVED
+                                                 else 1]
+        ]
+        assert await selection.remaining_budget() == (
+            4 if second_decision is ApprovalStatus.APPROVED else 5
+        )
+
+
+@pytest.mark.parametrize("corruption", ["missing_intent", "prepared_identity", "admitted_sibling"])
+async def test_recovery_does_not_treat_damaged_originals_as_prepared_calls(corruption):
+    from redteam.core.contracts.policy import ControlContext
+    llm, tools = FakeLLMClient(), gateway(risk="high")
+    async with build_central_development(
+        engagement(), llm=llm, tools=tools, settings=limits()[1],
+    ) as selection:
+        await register(selection)
+        task, = await selection.deps.central_state.list_tasks()
+        llm.native_responses_by_task[str(task.task_id)] = [
+            discover(TOOL), turn(inspect("first"), inspect("second", account="b")),
+        ]
+        workers = await ready_workers(selection.deps, selection.runtime)
+        outcomes = [event async for event in selection.driver.drive(workers)]
+        original = outcomes[0].runtime
+        runner = selection.driver.runner_for(original)
+        snapshot = await runner._latest_snapshot()
+        if corruption == "missing_intent":
+            execution, = await selection.deps.central_state.list_executions()
+            def remove(tx):
+                for table in ("state_execution_resources", "state_executions"):
+                    tx.db.execute("DELETE FROM " + table + " WHERE run_id=? AND invocation_id=?",
+                                  (tx.run_id, str(execution.invocation_id)))
+            await selection.deps.central_state.transaction(remove)
+        elif corruption == "prepared_identity":
+            calls = snapshot.values["native_calls"]
+            calls[1].dispatch.invocation = calls[1].dispatch.invocation.model_copy(update={
+                "arguments": {"host": "unit.local", "account": "changed"},
+            })
+            await runner._graph.aupdate_state(runner.config(), {"native_calls": calls},
+                                             as_node="settle")
+        else:
+            proposal = snapshot.values["native_calls"][1].dispatch.proposal
+            await selection.deps.control_plane.evaluate(
+                proposal, ControlContext(engagement_id=original.engagement_id,
+                                         selected_tool_id=proposal.tool_id),
+            )
+        _, proof = await selection.driver.recover_central_instance(original, transfer_owner=False)
+        assert not proof.ready and proof.errors
+        assert tools.invocations == []
+        final = await selection.resume(transfer_owner=False)
+        assert final.planning_diagnostic.code == "central_execution_recovery_held"
+        assert final.planning_diagnostic.validation_issues
+        assert tools.invocations == []
+
+
 async def test_multiple_exact_approvals_deny_transfer_and_stale_owner():
     llm, tools = FakeLLMClient(), gateway(risk="high")
     async with build_central_development(
@@ -92,6 +188,9 @@ async def test_multiple_exact_approvals_deny_transfer_and_stale_owner():
 
 
 async def test_original_job_status_and_result_continue_without_resubmission():
+    from unittest.mock import AsyncMock
+
+    from redteam.app.cli.commands.run import wait_for_central_suspensions
     llm, tools, jobs = FakeLLMClient(), gateway(resource=True), DevelopmentJobs()
     async with build_central_development(
         engagement(), llm=llm, tools=tools, settings=limits()[1], jobs=jobs,
@@ -121,6 +220,11 @@ async def test_original_job_status_and_result_continue_without_resubmission():
         assert not settled.resource_execution_pending and settled.resource_lease_until == 0
         assert len(jobs.submissions) == 1 and tools.invocations == []
         assert await selection.remaining_budget() == 5
+        selection.resume = AsyncMock(side_effect=AssertionError("terminal job was polled again"))
+        assert await wait_for_central_suspensions(
+            selection, result, input_live=lambda: True, echo=lambda text: None,
+        ) is result
+        selection.resume.assert_not_awaited()
 
 
 async def test_competing_recovery_of_one_epoch_succeeds_once():

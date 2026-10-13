@@ -18,10 +18,10 @@ from typing import Literal
 from urllib.parse import urlsplit
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
 
 from redteam.capability.server_roles import role_operations, role_spec
-from redteam.capability.servers.config import ServerPolicy
+from redteam.capability.servers.config import ServerPolicy, SessionProfile, TargetProfile
 from redteam.capability.settings import environment_prefix
 from redteam.core.config import EngagementConfig, load_engagement_config
 from redteam.core.contracts.action import ActionProposal
@@ -48,9 +48,29 @@ class SessionAccess(BaseModel):
     expected_access: Literal["allow", "deny", "unspecified"] = "unspecified"
 
 
+def validate_session_access(
+    ref: str, session: SessionProfile, access: SessionAccess, profile: TargetProfile,
+) -> None:
+    """Shared credential/path validation for declaration preview and deployment."""
+    if session.bearer_env and (
+        session.bearer_env in {"HOME", "PATH", "SHELL", "USER", "LOGNAME", "TMPDIR"}
+        or session.bearer_env.startswith(("PYTHON", "DYLD_", "LD_", "REDTEAM_"))
+    ):
+        raise ValueError("deployment_reserved_credential_environment_name")
+    if not _REF.fullmatch(ref) or not _REF.fullmatch(session.principal_ref):
+        raise ValueError("deployment_invalid_session_or_principal_ref")
+    if len(set(access.paths)) != len(access.paths) or any(
+        not profile.allows_path(path) for path in access.paths
+    ):
+        raise ValueError("deployment_session_paths_not_approved")
+    if session.allowed_paths is not None and set(session.allowed_paths) != set(access.paths):
+        raise ValueError("deployment_session_paths_disagree")
+
+
 class DeploymentSpec(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     version: Literal[1] = 1
+    request_permissions: Literal["read_only", "testing"] = "read_only"
     policy: ServerPolicy
     host_bindings: dict[str, str] = Field(min_length=1, max_length=30)
     session_access: dict[str, SessionAccess] = Field(default_factory=dict, max_length=60)
@@ -82,30 +102,25 @@ class DeploymentSpec(BaseModel):
                 raise ValueError("deployment_exact_concrete_paths_required")
             if len(set(profile.allowed_paths)) != len(profile.allowed_paths):
                 raise ValueError("deployment_duplicate_path")
-            if set(profile.allowed_methods) - {"GET", "HEAD", "OPTIONS"} or any(
+            if self.request_permissions == "read_only" and (
+                set(profile.allowed_methods) - {"GET", "HEAD", "OPTIONS"} or any(
                 set(methods) - {"GET", "HEAD", "OPTIONS"}
                 for methods in profile.allowed_path_methods.values()
+                )
             ):
                 raise ValueError("deployment_readonly_methods_required")
         for ref, access in self.session_access.items():
             session = self.policy.sessions[ref]
-            if session.bearer_env and (
-                session.bearer_env in {"HOME", "PATH", "SHELL", "USER", "LOGNAME", "TMPDIR"}
-                or session.bearer_env.startswith(("PYTHON", "DYLD_", "LD_", "REDTEAM_"))
-            ):
-                raise ValueError("deployment_reserved_credential_environment_name")
             profile = self.policy.targets[session.target_ref]
-            if not _REF.fullmatch(ref) or not _REF.fullmatch(session.principal_ref):
-                raise ValueError("deployment_invalid_session_or_principal_ref")
-            if len(set(access.paths)) != len(access.paths) or any(
-                not profile.allows_path(path) for path in access.paths
-            ):
-                raise ValueError("deployment_session_paths_not_approved")
-            if session.allowed_paths is not None and set(session.allowed_paths) != set(
-                access.paths
-            ):
-                raise ValueError("deployment_session_paths_disagree")
+            validate_session_access(ref, session, access, profile)
         return self
+
+    @model_serializer(mode="wrap")
+    def compatible_payload(self, handler):
+        value = handler(self)
+        if self.request_permissions == "read_only":
+            value.pop("request_permissions", None)
+        return value
 
     def server_policy(self) -> ServerPolicy:
         value = self.policy.model_dump(mode="json")
@@ -132,6 +147,14 @@ class DeploymentSpec(BaseModel):
                 "allowed_path_methods": profile.allowed_path_methods,
                 "allowed_query_keys": profile.allowed_query_keys,
                 "allowed_request_headers": profile.allowed_request_headers,
+                **{key: value for key, value in profile.model_dump().items() if key in {
+                    "allow_all_query_keys", "allowed_global_query_keys",
+                    "allow_all_request_headers", "request_body_enabled", "response_body_max_chars",
+                }},
+                **({key: getattr(profile, key) for key in (
+                    "allow_all_query_keys", "allowed_global_query_keys",
+                    "allow_all_request_headers", "request_body_enabled", "response_body_max_chars",
+                )} if self.request_permissions == "testing" else {}),
                 "sessions": [
                     {
                         **item,

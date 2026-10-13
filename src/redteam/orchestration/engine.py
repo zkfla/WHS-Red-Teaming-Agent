@@ -1012,6 +1012,7 @@ class InvestigationEngine:
             "engagement_constraints": {
                 "description": redact_sensitive_text(self.deps.engagement.description),
                 "mcp_targets": self.deps.engagement.metadata.get("mcp_targets", {}),
+                "web_policy": self.deps.engagement.metadata.get("web_policy", {}),
                 "scope": self.deps.engagement.scope.model_dump(mode="json"),
                 "rules_of_engagement": [
                     item.model_dump(mode="json")

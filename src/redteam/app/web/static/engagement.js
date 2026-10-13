@@ -44,7 +44,7 @@ export function setupEngagement(afterSave) {
     confirmScope = h("input", { type: "checkbox", onchange: refreshSave });
     confirmWide = preview.scope_expanded ? h("input", { type: "checkbox", onchange: refreshSave }) : null;
     nodes.push(h("label", { class: "check" }, confirmScope, "위 범위가 허용된 점검 대상임을 확인했습니다."));
-    if (confirmWide) nodes.push(h("label", { class: "check" }, confirmWide, "범위가 넓어지는 변경임을 확인했습니다."));
+    if (confirmWide) nodes.push(h("label", { class: "check" }, confirmWide, "대상 범위 또는 실행 권한이 넓어지는 변경임을 확인했습니다."));
     return nodes;
   }
 
@@ -54,9 +54,20 @@ export function setupEngagement(afterSave) {
     if (current.id === "review") nodes.push(...reviewBody());
     else {
       const byName = new Map(model.fields.map((f) => [f.name, f]));
-      current.fields.forEach((name) => nodes.push(fieldNode(byName.get(name), draft, () => {
-        if (name === "web_policy_mode") paint();
+      if (current.id === "permissions") nodes.push(h("p", { class: "note", text:
+        "전체 허용은 지정 대상의 지원되는 웹 요청에 적용됩니다. 대상 범위·실행 예산·승인 규칙은 유지됩니다. Kali 대상 통신과 인증 계정은 별도로 설정합니다." }));
+      const customOnly = new Set(["web_methods", "web_query_keys", "web_all_query_keys",
+        "web_request_headers", "web_all_request_headers", "web_request_body"]);
+      current.fields.filter((name) => {
+        if (current.id === "permissions" && draft.web_policy_mode === "manual") return false;
+        if (customOnly.has(name)) return draft.web_permissions === "custom";
+        if (name === "kali_network_policy_path") return draft.kali_network_mode === "configured";
+        return true;
+      }).forEach((name) => nodes.push(fieldNode(byName.get(name), draft, (rebuild) => {
+        if (rebuild || ["web_policy_mode", "web_permissions", "kali_network_mode"].includes(name)) paint();
       })));
+      if (current.id === "permissions" && draft.web_policy_mode === "manual") nodes.push(
+        h("p", { text: "기존 MCP 설정을 사용합니다. 자동 정책을 선택하면 요청 권한을 지정할 수 있습니다." }));
     }
     replace(body, nodes);
     $("eng-prev").disabled = index === 0;
@@ -152,6 +163,9 @@ export function setupEngagement(afterSave) {
     // explicit in the review the operator confirms, rather than an invisible default.
     if (draft.web_policy_mode == null) draft.web_policy_mode = "site";
     if (draft.web_paths == null) draft.web_paths = [];
+    if (draft.web_permissions == null) draft.web_permissions = "read_only";
+    if (draft.web_response_body_chars == null) draft.web_response_body_chars = 4096;
+    if (draft.kali_network_mode == null) draft.kali_network_mode = "closed";
     index = 0;
     preview = null;
     paint();

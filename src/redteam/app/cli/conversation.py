@@ -47,6 +47,10 @@ Do not combine a request for a different investigation with current guidance.
 Questions are read-only. If an instruction refers to an ended investigation,
 clarify whether a follow-up is wanted; do not silently start a new investigation.
 The supplied input binding is authoritative; never invent or change a run ID.
+Tool availability is distinct from execution permission. A configured server or a shell
+prepared at Run startup is not a discovered live tool. An empty tools list with availability
+state configured_unverified or not_inspected means discovery has not happened, not that MCP
+is absent. Use the supplied policy constraints; do not claim connectivity or permission.
 """
 
 
@@ -108,6 +112,7 @@ class ConversationAssistant:
         engagement_name: str,
         scope: list[str],
         tools: list[str] | None = None,
+        tool_availability: dict | None = None,
         session_context: str = "No previous run in this session.",
         run_active: bool = False,
         prefer_execute: bool = False,
@@ -127,6 +132,7 @@ class ConversationAssistant:
             "engagement": redact_sensitive_text(engagement_name),
             "scope": list(scope[:20]),
             "tools": tool_labels[:40],
+            "tool_availability": tool_availability or {"state": "not_inspected"},
             "run_active": bool(run_active),
             "session_context": redact_sensitive_text(session_context)[:3000],
             "user_message": safe_message,
