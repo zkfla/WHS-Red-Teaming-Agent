@@ -121,6 +121,15 @@ async def test_split_loop_success_two_asks_and_dispatch(tmp_path):
         questions = llm.atom_inputs[0].get("questions", [])
         assert {q["question_id"] for q in questions} == {"q1", "q2"}
         assert (await session.status())["usage"]["spent"] == 2
+        stored_pass = await session.deps.central_state.transaction(
+            lambda tx: json.loads(tx.db.execute(
+                "SELECT payload FROM state_requests WHERE run_id=? "
+                "AND kind='hypothesis_planner_pass'",
+                (str(session.runtime.run_id),),
+            ).fetchone()[0]), write=False,
+        )
+        assert {q["question_id"] for q in stored_pass["questions"]} == {"q1", "q2"}
+        assert stored_pass["atomization"]["coverage"] == {"q1": ["t1"], "q2": ["t2"]}
         for identity in ids:
             llm.native_responses_by_task[identity] = [discover(TOOL), turn(inspect("probe"))]
         results = await drive(session)
