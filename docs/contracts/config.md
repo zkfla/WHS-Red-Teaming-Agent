@@ -133,10 +133,12 @@ for first-use requirements and isolation constraints.
 
 ## LLM providers: `litellm` and `opencode-go`
 
-`LLMConfig` has exactly three fields (`provider`, `default_model`,
-`api_key_env_var`) read from `REDTEAM_LLM_PROVIDER` / `REDTEAM_LLM_MODEL` /
-`REDTEAM_LLM_API_KEY_ENV_VAR` -- selecting the Go adapter needs no new
-variable and no multi-profile system (zero schema change).
+`LLMConfig` selects `provider`, `default_model`, `api_key_env_var` and optional
+`reasoning_effort` from `REDTEAM_LLM_PROVIDER` / `REDTEAM_LLM_MODEL` /
+`REDTEAM_LLM_API_KEY_ENV_VAR` / `REDTEAM_LLM_REASONING_EFFORT`.
+The model prefix selects a downstream provider through LiteLLM; OpenCode Go
+continues to use its existing protocol selection. No per-model allowlist is
+introduced.
 
 - `REDTEAM_LLM_PROVIDER=opencode-go` with an explicit SDK-qualified model:
   `REDTEAM_LLM_MODEL=openai/<id>`, `openai/responses/<id>`, or
@@ -157,3 +159,53 @@ variable and no multi-profile system (zero schema change).
   quality -- there is no live paid testing.
 - Resume: a run records a secret-free connection fingerprint; resuming with a
   changed Go connection is refused before any new request or replay.
+
+### Reasoning effort
+
+Unset or empty effort keeps the provider default and preserves the historical
+configuration serialization and connection identity. Explicit `none` is a
+request to disable reasoning where the selected model supports it. The common
+vocabulary is `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`; accepted
+levels and their native interpretation depend on the selected provider/model.
+Unknown settings are rejected; unsupported API parameters remain explicit errors.
+Selecting a level does not imply every model accepts it.
+
+The configured value applies to conversation, planner, atomizer, reviews and
+worker calls through the same assembled LLM client. It changes the existing
+secret-free connection identity when explicit, so a stored Run cannot silently
+resume with a different effort. Start a new Run for a changed effort.
+
+CLI setup asks for effort after the model, or reads the existing environment.
+The web settings dialog provides provider and effort selection, saves non-secret
+choices, and permits returning effort to the provider default. Environment values
+take precedence over saved web choices on restart. API keys remain write-only.
+
+Wire semantics follow the existing SDK and protocol contracts, verified against
+the installed LiteLLM implementation and its
+[reasoning documentation](https://docs.litellm.ai/docs/reasoning_content) and
+[Anthropic effort documentation](https://docs.litellm.ai/docs/providers/anthropic_effort).
+Configuration and mocked wire tests are separate from a live provider acceptance
+test; no paid provider calls are implied by offline validation.
+
+Chat requests carry `reasoning_effort`; Responses requests use the SDK's native
+`reasoning.effort` mapping. OpenCode Messages requests merge `output_config.effort`
+with the structured format instead of replacing it. The adapter derives thinking
+mode/budget from the selected SDK provider configuration and requests omitted
+display when that native thinking contract applies. For custom models missing
+from the SDK catalog, mapped protocol fields are forwarded explicitly; the API
+still determines which capabilities the actual model accepts. An enabled SDK
+`drop_params` is rejected for explicit effort because it can silently remove the
+setting, including when the global flag overrides a per-call false value.
+
+Native tool rounds retain only opaque encrypted provider continuation in the
+existing assistant history/checkpoint. The LLM adapter owns capture and replay;
+the orchestration loop echoes the shared `NativeCompletion.continuation` field
+without interpreting provider names. The core contract requires JSON blocks,
+at most 16 blocks and 1 MiB of encoded payload. Malformed continuation fails
+explicitly instead of being silently dropped. This adds no separate cache or
+state store; the empty default preserves older completion objects.
+
+For Anthropic, [omitted thinking](https://platform.claude.com/docs/en/build-with-claude/thinking)
+returns an empty thinking field with an encrypted signature that must be replayed
+unchanged. Plaintext thinking is rejected rather than scrubbed into a forged
+signed block. Provider-specific availability remains an API concern.
