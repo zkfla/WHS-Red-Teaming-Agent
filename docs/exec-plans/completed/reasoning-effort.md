@@ -87,3 +87,9 @@ One SDK/Pydantic ReadOnly warning was emitted in installed-SDK runs. The pre-exi
 ## Completion criteria and commits
 
 Required functionality is verified, accepted review blockers are resolved, and no live acceptance claim is made. Phase commits: 24ac464d configuration/CLI; 53471d42 web; 25d7fb82 checkpoint continuation; a6ce8ff2 provider effort/encrypted replay/CI tests; be003df1 first-startup web reference repair. Documentation is committed separately after final validation. Normal push targets origin/dev; no force push or branch switch.
+
+### Concurrent remote update integration
+
+The first normal push was rejected because origin/dev advanced to bd23265a (PR #34, DB error fixes). Root fetched and inspected the 32-file incoming change, then normally merged it as 84ea1a5c without conflicts or stashing/deleting user changes. Config documentation and UI labels auto-merged additively. The incoming permission/approval/recovery changes are separate from LLM effort identity and native continuation. Opus independently confirmed that resume recovery still follows the existing original-binding preflight and that engagement permissions do not overwrite provider/effort settings. No concrete semantic conflict remained.
+
+Post-merge verification: 225 relevant tests PASS (89.10 seconds), full Ruff PASS, full mypy PASS across 774 files. Exact adapter wire paths had no incoming modifications. Wheel/source build was repeated after integration. Broad 4079-test results above are pre-merge and are not presented as a post-merge full-suite run.
