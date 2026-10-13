@@ -2,11 +2,12 @@
 
 ## Current runtime
 
-The default runtime uses one central SQLite database, a candidate planner and
-two independent instances of a common verification worker. The planner records
-vulnerability candidates and short probe purposes; workers choose tools using
-native ReAct (`MODEL → TOOLS → SETTLE`) and return observations for another
-planner judgment.
+The default runtime uses one central SQLite database, a candidate planner,
+a task atomizer and two independent instances of a common verification worker.
+The planner proposes investigation strategy, candidate changes and questions;
+the atomizer divides those questions into short probes while retaining their
+subjects and completion conditions. Workers choose tools using native ReAct
+(`MODEL → TOOLS → SETTLE`) and return observations for another planner judgment.
 
 New CLI and web Runs select `config/agents/native-probes.yaml` when no profile
 override is supplied. A shared LLM request policy is still required. The common

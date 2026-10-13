@@ -867,9 +867,11 @@ resource and actual request/action/time budgets remain authoritative.
 
 `config/agents/native-probes.yaml` is the default schema-3 assembly: one
 schedulable executor definition, multiple independent worker instances, existing
-conversation/evidence/code review seams and a `hypothesis_planning` stage without
-an atomizer. CLI configuration uses it when no profile environment override is
-present, and the web settings UI selects it by default. The profile connects to
+conversation/evidence/code review seams and separate `hypothesis_planning` /
+`task_atomization` stages. The original single-stage profile is retained in
+`native-probes-legacy.yaml`. CLI configuration uses the split default when no
+profile environment override is present, and the web settings UI selects it by
+default. The profile connects to
 the candidate planner loop through the existing central assembly.
 Tests may also register v2 probes directly through the existing central admission.
 Schema-2 profiles retain their original serialized policy and prompt fingerprints.
@@ -916,11 +918,12 @@ state and explicit model/tool/job doubles, without paid or target calls.
 
 ## Candidate planner feedback (plan5c)
 
-The explicit schema-3 profile uses `hypothesis_planning` and the versioned
-`hypothesis-planner.md` prompt. One structured judgment proposes candidate updates,
+The original schema-3 profile uses `hypothesis_planning` and the versioned
+`hypothesis-planner.md` prompt. Its single judgment proposes candidate updates,
 short probe purposes and a reasoned continue/held/exhausted/goal-review proposal.
-There is no atomizer request. New `hypothesis_id` values in absence-expecting
-updates are local proposal keys; code issues durable IDs and resolves probe
+This original path remains supported without an atomizer stage. New
+`hypothesis_id` values in absence-expecting updates are local proposal keys;
+code issues durable IDs and resolves probe
 references before existing candidate/Task admission. Existing IDs and expected
 revisions come from the captured snapshot. Observation tasks need no candidate.
 
@@ -953,8 +956,8 @@ held/exhausted judgments also fence the current work/candidate inventory; exhaus
 reporting rechecks its original candidate facts and existing goal input stamp.
 Periodic reconciliation reads the outbox cursor without a model busy loop.
 
-Schema-2 profiles remain readable and retain their serialized identities; the
-new default never invokes their strategy/atomizer stages. The probe profile's
+Schema-2 profiles remain readable and retain their serialized identities. The
+default v3 does not reuse the schema-2 strategy/atomizer output contracts. The probe profile's
 version, prompts and planning-input schema are bound into the existing Run and
 checkpoint fingerprints. A stored schema-2 Run is not resumed under schema-3
 meaning; changing the selection requires a new Run. Read-only status/report
@@ -968,8 +971,9 @@ doubles, and do not establish successful live vulnerability discovery.
 New CLI and web Runs resolve the normal configuration default through the same
 profile loader used by explicit selections. The selected catalog, generated web
 policy, scope, provider readiness and shared worker/request limits continue into
-the common-worker assembly. The default stage map has no `task_atomization` and
-no specialized schedulable role; evidence/claim/task/goal reviews and code
+the common-worker assembly. The default stage map binds `hypothesis_planning`
+and `task_atomization` to distinct nonschedulable roles while retaining one
+common schedulable worker role; evidence/claim/task/goal reviews and code
 generation/review remain explicit nonschedulable model stages.
 
 The read-only web graph projects current v2 candidates from the existing central
@@ -979,6 +983,35 @@ and related probe Task IDs separately from Findings and Mission status. No UI
 database or duplicated candidate authority is introduced. Historical `web.md`,
 `mobile.md`, `planner.md` and `atomizer.md` files remain because schema-2 profile
 identities still reference them; they are not consumers in the default path.
+
+## Split v3 strategy and task atomization
+
+The new default v3 planner proposes candidate updates and investigation questions.
+Its output contract does not include executable probe Tasks. The separate atomizer
+receives the captured context, strategy questions and code-issued candidate IDs
+with their proposed revisions, and produces probe Tasks tied to plan-local question
+IDs. These question IDs are not original result question IDs and must not replace
+`source_question_id` lineage.
+
+Every question has one or more resulting Tasks. Subject sets and completion
+conditions remain covered without introducing foreign subjects; candidate revisions,
+goal-required meaning and source Task/result/question references are retained.
+The atomizer chooses declared ready roles and bounded purposes, not prescribed tool
+sequences. It cannot edit candidate judgments or independently grant admission.
+
+Both model stages use the same DecisionBudget and existing Run accounting. Captured
+inputs remain fixed, with stop/time/request admission checked before each model
+request. The existing final `register_probe_tasks` transaction commits candidate
+updates, atomized Tasks and the consumed planner cursor together. Its related read
+set covers both stages. Failed atomization, changed related inputs or stopped Runs
+leave the original candidate/Task state unchanged; attempted requests remain charged.
+Held/update-only strategies skip unnecessary atomizer calls.
+
+The public Run policy derives `probe_atomization` from the selected schema-3 stage
+map. Its false default is omitted from serialized old policies. The original v2
+and single-stage v3 implementations and prompts remain available, and old Run
+fingerprints are never silently converted to the split workflow. No new SQL table,
+approval store or execution queue is introduced.
 
 Resource effects distinguish an absent declaration (`None`) from an explicit
 empty declaration (`[]`). Confirmed creation/removal uses original evidence;

@@ -1,15 +1,16 @@
 # Current orchestration runtime
 
-The default application runs a main planner and bounded native workers over
+The default application runs a main planner, a task atomizer and bounded native workers over
 `data/orchestration/state.sqlite3`. The configured default is two workers.
-The specialist profile and shared LLM request policy must be selected explicitly;
-missing configuration is an error, not a switch to a test double.
+New CLI/web Runs select `config/agents/native-probes.yaml` unless overridden.
+A shared LLM request policy is still required; missing configuration is an error.
 
 ## Flow and ownership
 
 ```text
 operator goal + criteria + scope
-    -> main planner: propose investigation questions and Tasks
+    -> main planner: propose strategy, candidate changes and investigation questions
+    -> task atomizer: divide questions into bounded probe Tasks
     -> central Task registration and atomic owner/generation claim
     -> InstanceDriver: independent SDK thread per worker instance
     -> MODEL -> TOOLS -> SETTLE
@@ -24,7 +25,7 @@ Task ID, role ID and instance ID are separate. Multiple workers may share a role
 or investigate the same evidence. Only replay of the same original registration
 or execution identity is idempotent; changed content under that identity fails.
 
-The planner makes strategy/atomization judgments without provider tools. Each
+The planner and atomizer make separate judgments without provider tools. Each
 worker chooses tools through the actual role/catalog contracts. Registration,
 readiness, permission, successful execution and a supported conclusion are
 separate checks. Evidence/tool output is data, never an instruction or approval.
@@ -34,6 +35,24 @@ actors and isolates SDK continuations. `central_state` owns Tasks, owner generat
 executions, outbox, operator intents and shared model accounting. `central_runtime`
 connects the existing Control/gateway/evidence/result owners to short transactions.
 Models, provider calls, evidence inspection and drain never hold a SQL transaction.
+
+In the default v3 profile, the planner cannot output executable Tasks. The
+atomizer consumes its questions and the same captured evidence/candidate state;
+it cannot change the planner's candidate judgments. Every question must be covered,
+with its subjects, completion conditions and original follow-up references
+preserved. A Task remains an investigation purpose; neither role prescribes a
+tool-call queue. Assignment belongs to the central scheduler.
+
+Both judgments share one decision budget and the Run request ledger. Candidate
+changes and the atomized Tasks are committed together after the original snapshot
+checks. An unsuccessful atomizer does not leave partly registered candidates or
+Tasks, although model requests already made remain charged. Update-only and held
+planner judgments do not require an atomizer request.
+
+Existing v2 planner/atomizer code and the original single-planner v3 code remain
+available. `config/agents/native-probes-legacy.yaml` retains the previous v3 profile
+and prompt identity. Existing Runs require their original selection and fingerprint;
+changing an old Run to the new default does not force a resume.
 
 ## Parallel execution and replanning
 
