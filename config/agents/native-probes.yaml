@@ -1,9 +1,11 @@
 # Default candidate-planner/common-worker assembly for new CLI and web Runs.
 # These deployment selectors can be narrowed/replaced through the existing profile
 # selection contract; they never grant scope or execution permission.
+# Split-stage v3 default (planner + distinct atomizer). Single-stage v3 compat for
+# old Runs/tests lives in native-probes-legacy.yaml (compat only, not a feature).
 schema_version: '3'
 profile_id: native-probes
-version: '4'
+version: '5'
 common: {path: prompts/common.md, version: '2', contract_version: '1'}
 probe_limits: {max_actions: 4, max_model_requests: 8}
 max_instances: 2
@@ -30,7 +32,17 @@ roles:
       capabilities: []
       tool_selection: {}
       context_profile: {profile_id: hypothesis_planning}
-    prompt: {path: prompts/hypothesis-planner.md, version: '1'}
+    prompt: {path: prompts/hypothesis-strategy.md, version: '1'}
+  - definition:
+      agent_id: probe-atomizer
+      role: atomization
+      name: Probe task atomizer
+      schedulable: false
+      provider_id: specialist:atomization
+      capabilities: []
+      tool_selection: {}
+      context_profile: {profile_id: atomization}
+    prompt: {path: prompts/probe-atomizer.md, version: '1'}
   - definition:
       agent_id: probe-worker
       role: probe_execution
@@ -62,6 +74,7 @@ roles:
     prompt: {path: prompts/code.md, version: '2'}
 stages:
   hypothesis_planning: planner
+  task_atomization: probe-atomizer
   native_action: probe-worker
   conversation_decide: conversation
   analysis_verify: research-evidence
