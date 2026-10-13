@@ -23,17 +23,28 @@ import yaml
 from redteam.app.cli._shared import DEFAULT_ENV_PATH, env_file_is_gitignored, write_env_var
 from redteam.core.config import (
     DEFAULT_SPECIALIST_PROFILE_PATH,
+    REASONING_EFFORTS,
     LLMConfig,
     OrchestrationConfig,
+    normalize_reasoning_effort,
 )
 from redteam.core.environment import OrchestrationEnvInput
+from redteam.llm.opencode_go_config import (
+    OPENCODE_GO_API_KEY_ENV_VAR,
+    is_go_provider,
+)
+from redteam.llm.opencode_go_config import (
+    validate_model as _validate_go_model,
+)
 
 PROVIDER = "litellm"
+SUPPORTED_PROVIDERS = frozenset({"litellm", "opencode-go"})
 PROFILE_DIR = Path(DEFAULT_SPECIALIST_PROFILE_PATH).parent
 STATE_PATH = Path("data/web/settings.json")
 
 ENV_PROVIDER = "REDTEAM_LLM_PROVIDER"
 ENV_MODEL = "REDTEAM_LLM_MODEL"
+ENV_EFFORT = "REDTEAM_LLM_REASONING_EFFORT"
 ENV_KEY_VAR = "REDTEAM_LLM_API_KEY_ENV_VAR"
 ENV_PROFILE = "REDTEAM_SPECIALIST_PROFILE"
 ENV_POLICY = "REDTEAM_LLM_REQUEST_POLICY_JSON"
@@ -47,7 +58,16 @@ _MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,199}$")
 _KEY = re.compile(r"^[^\s\x00-\x1f\x7f]{1,4096}$")
 _KEY_VAR = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 _ALLOWED = frozenset(
-    {"model", "api_key", "persist_key", "profile_id", "max_requests", "max_concurrent_requests"}
+    {
+        "model",
+        "api_key",
+        "persist_key",
+        "profile_id",
+        "max_requests",
+        "max_concurrent_requests",
+        "provider",
+        "reasoning_effort",
+    }
 )
 _REQUEST_LIMIT = (1, 1_000_000)
 _CONCURRENT_LIMIT = (1, 64)
@@ -70,6 +90,18 @@ def _integer(value: Any, field: str, bounds: tuple[int, int]) -> int:
     return value
 
 
+def _key_var_for(env: Any) -> str:
+    if not hasattr(env, "get"):
+        return DEFAULT_KEY_VAR
+    name = env.get(ENV_KEY_VAR)
+    if isinstance(name, str) and _KEY_VAR.match(name):
+        return name
+    provider = env.get(ENV_PROVIDER)
+    if is_go_provider(provider if isinstance(provider, str) else None):
+        return OPENCODE_GO_API_KEY_ENV_VAR
+    return DEFAULT_KEY_VAR
+
+
 class SettingsStore:
     def __init__(
         self,
@@ -83,6 +115,7 @@ class SettingsStore:
         self.state_path = state_path
         self.profile_dir = profile_dir
         self.env_path = env_path
+        self._key_var_explicit = ENV_KEY_VAR in self.env
 
     # -- profiles -------------------------------------------------------
 
@@ -94,11 +127,14 @@ class SettingsStore:
         except OSError:
             return listing
         for path in files:
-            label = path.stem
+            label: str = path.stem
             try:
                 loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
-                if isinstance(loaded, dict) and isinstance(loaded.get("profile_id"), str):
-                    label = loaded["profile_id"][:80]
+                profile_id = loaded.get("profile_id") if isinstance(loaded, dict) else None
+                if isinstance(profile_id, str) and profile_id != path.stem:
+                    label = profile_id[:80] + " (" + path.stem + ")"
+                elif isinstance(profile_id, str):
+                    label = profile_id[:80]
             except (OSError, yaml.YAMLError):
                 continue
             listing.append({"id": path.stem, "label": label})
@@ -135,19 +171,46 @@ class SettingsStore:
         return loaded if isinstance(loaded, dict) else None
 
     def _key_var(self) -> str:
-        name = self.env.get(ENV_KEY_VAR) or DEFAULT_KEY_VAR
-        return name if _KEY_VAR.match(name) else DEFAULT_KEY_VAR
+        return _key_var_for(self.env)
+
+    def _effort(self) -> str | None:
+        raw = self.env.get(ENV_EFFORT)
+        if raw is None:
+            return None
+        if not isinstance(raw, str) or not raw.strip():
+            return None
+        try:
+            return normalize_reasoning_effort(raw)
+        except ValueError:
+            return None
+
+    def _effort_valid(self) -> bool:
+        raw = self.env.get(ENV_EFFORT)
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            return True
+        try:
+            normalize_reasoning_effort(raw)
+        except ValueError:
+            return False
+        return True
 
     def problems(self) -> list[dict[str, str]]:
         found: list[dict[str, str]] = []
         provider = self.env.get(ENV_PROVIDER)
         if not provider:
             found.append({"field": "provider", "code": "missing"})
-        elif provider != PROVIDER:
+        elif provider not in SUPPORTED_PROVIDERS:
             found.append({"field": "provider", "code": "unsupported"})
         model = self.env.get(ENV_MODEL)
         if not model:
             found.append({"field": "model", "code": "missing"})
+        elif is_go_provider(provider) and isinstance(model, str):
+            try:
+                _validate_go_model(model)
+            except ValueError:
+                found.append({"field": "model", "code": "invalid"})
+        if not self._effort_valid():
+            found.append({"field": "reasoning_effort", "code": "invalid"})
         if not (model or "").startswith("chatgpt/") and not self.env.get(self._key_var()):
             found.append({"field": "api_key", "code": "missing"})
         if self._selected_profile_id() is None:
@@ -170,6 +233,8 @@ class SettingsStore:
         return {
             "model": self.env.get(ENV_MODEL) or None,
             "provider": self.env.get(ENV_PROVIDER) or None,
+            "reasoning_effort": self._effort(),
+            "reasoning_effort_options": sorted(REASONING_EFFORTS),
             "api_key_set": bool(self.env.get(self._key_var())),
             "api_key_env_var": self._key_var(),
             "profile_id": self._selected_profile_id(),
@@ -189,10 +254,32 @@ class SettingsStore:
             return
         if not isinstance(saved, dict):
             return
+        key_var = saved.get("api_key_env_var")
+        if isinstance(key_var, str) and _KEY_VAR.match(key_var):
+            if ENV_KEY_VAR not in self.env:
+                self.env[ENV_KEY_VAR] = key_var
+                self._key_var_explicit = True
+        provider = saved.get("provider")
+        if isinstance(provider, str) and provider in SUPPORTED_PROVIDERS:
+            self.env.setdefault(ENV_PROVIDER, provider)
         model = saved.get("model")
         if isinstance(model, str) and _MODEL.match(model):
             self.env.setdefault(ENV_MODEL, model)
-            self.env.setdefault(ENV_PROVIDER, PROVIDER)
+            if ENV_PROVIDER not in self.env:
+                self.env.setdefault(ENV_PROVIDER, PROVIDER)
+        current_provider = self.env.get(ENV_PROVIDER)
+        if ENV_KEY_VAR not in self.env and is_go_provider(
+            current_provider if isinstance(current_provider, str) else None
+        ):
+            self.env.setdefault(ENV_KEY_VAR, OPENCODE_GO_API_KEY_ENV_VAR)
+        effort = saved.get("reasoning_effort")
+        if isinstance(effort, str) and effort.strip():
+            try:
+                normalized = normalize_reasoning_effort(effort)
+            except ValueError:
+                normalized = None
+            if normalized is not None:
+                self.env.setdefault(ENV_EFFORT, normalized)
         profile = saved.get("profile_id")
         if isinstance(profile, str):
             path = self._profile_path(profile)
@@ -241,15 +328,72 @@ class SettingsStore:
                 raise SettingsError("body", "unknown_field")
         updates: dict[str, str] = {}
         saved: dict[str, Any] = {}
+        removals: list[str] = []
+        saved_removals: list[str] = []
         current = self._policy() or {}
 
+        if "provider" in payload:
+            provider = payload["provider"]
+            if not isinstance(provider, str) or provider not in SUPPORTED_PROVIDERS:
+                raise SettingsError("provider", "unsupported")
+            updates[ENV_PROVIDER] = provider
+            saved["provider"] = provider
+        if "reasoning_effort" in payload:
+            raw_effort = payload["reasoning_effort"]
+            if raw_effort is None or (isinstance(raw_effort, str) and not raw_effort.strip()):
+                removals.append(ENV_EFFORT)
+                saved_removals.append("reasoning_effort")
+            elif isinstance(raw_effort, str):
+                try:
+                    normalized = normalize_reasoning_effort(raw_effort)
+                except ValueError:
+                    raise SettingsError("reasoning_effort", "invalid") from None
+                if normalized is None:
+                    removals.append(ENV_EFFORT)
+                    saved_removals.append("reasoning_effort")
+                else:
+                    updates[ENV_EFFORT] = normalized
+                    saved["reasoning_effort"] = normalized
+            else:
+                raise SettingsError("reasoning_effort", "invalid")
         if "model" in payload:
             model = payload["model"]
             if not isinstance(model, str) or not _MODEL.match(model):
                 raise SettingsError("model", "invalid")
             updates[ENV_MODEL] = model
-            updates[ENV_PROVIDER] = PROVIDER
             saved["model"] = model
+            if "provider" not in payload and not self.env.get(ENV_PROVIDER):
+                updates[ENV_PROVIDER] = PROVIDER
+                saved["provider"] = PROVIDER
+        candidate_provider_name = updates.get(ENV_PROVIDER, self.env.get(ENV_PROVIDER))
+        old_ref = self.env.get(ENV_KEY_VAR)
+        prior_ref: str | None = self._read_saved().get("api_key_env_var")
+        if not (isinstance(prior_ref, str) and _KEY_VAR.match(prior_ref)):
+            prior_ref = None
+        if (
+            isinstance(old_ref, str)
+            and _KEY_VAR.match(old_ref)
+            and (self._key_var_explicit or old_ref == prior_ref)
+        ):
+            explicit_ref: str | None = old_ref
+        else:
+            explicit_ref = prior_ref
+        if explicit_ref is not None:
+            if old_ref != explicit_ref:
+                updates[ENV_KEY_VAR] = explicit_ref
+            saved["api_key_env_var"] = explicit_ref
+        else:
+            new_derived = (
+                OPENCODE_GO_API_KEY_ENV_VAR
+                if is_go_provider(
+                    candidate_provider_name
+                    if isinstance(candidate_provider_name, str)
+                    else None
+                )
+                else DEFAULT_KEY_VAR
+            )
+            updates[ENV_KEY_VAR] = new_derived
+            saved_removals.append("api_key_env_var")
         if "profile_id" in payload:
             profile = payload["profile_id"]
             path = self._profile_path(profile) if isinstance(profile, str) else None
@@ -286,11 +430,33 @@ class SettingsStore:
 
         candidate = dict(self.env)
         candidate.update(updates)
+        for name in removals:
+            candidate.pop(name, None)
+        candidate_provider = candidate.get(ENV_PROVIDER)
+        candidate_model = candidate.get(ENV_MODEL)
+        candidate_is_go = is_go_provider(
+            candidate_provider if isinstance(candidate_provider, str) else None
+        )
+        if candidate_is_go and ("model" in payload or "provider" in payload):
+            if not isinstance(candidate_model, str) or not candidate_model:
+                raise SettingsError("model", "missing")
+            try:
+                _validate_go_model(candidate_model)
+            except ValueError:
+                raise SettingsError("model", "invalid") from None
+        candidate_key_var = _key_var_for(candidate)
         if key is not None:
-            candidate[self._key_var()] = key
+            candidate[candidate_key_var] = key
         if candidate.get(REMOVED_MAX_RETRIES_ENV):
             raise SettingsError("max_retries", "removed")
-        if updates.get(ENV_POLICY) or updates.get(ENV_PROFILE) or updates.get(ENV_MODEL):
+        if (
+            updates.get(ENV_POLICY)
+            or updates.get(ENV_PROFILE)
+            or updates.get(ENV_MODEL)
+            or updates.get(ENV_PROVIDER)
+            or updates.get(ENV_EFFORT)
+            or removals
+        ):
             try:
                 if candidate.get(ENV_PROVIDER):
                     LLMConfig.from_environment(candidate)
@@ -300,19 +466,25 @@ class SettingsStore:
 
         overridden = sorted(
             name for name in updates if self.env.get(name) not in (None, updates[name])
-        )
+        ) + sorted(name for name in removals if self.env.get(name) is not None)
         # Persist before committing so a storage failure leaves the process unchanged.
         try:
-            if saved:
-                self._save({**self._read_saved(), **saved})
+            if saved or saved_removals:
+                merged = {**self._read_saved(), **saved}
+                for key_name in saved_removals:
+                    merged.pop(key_name, None)
+                self._save(merged)
             if persist and key is not None:
-                write_env_var(self.env_path, self._key_var(), key)
+                write_env_var(self.env_path, candidate_key_var, key)
         except OSError:
             raise SettingsError("storage", "write_failed") from None
         for name, value in updates.items():
             self.env[name] = value
+        for name in removals:
+            self.env.pop(name, None)
         if key is not None:
-            self.env[self._key_var()] = key
+            self.env[candidate_key_var] = key
+        self._key_var_explicit = explicit_ref is not None
         return {
             "key_persisted": bool(persist and key is not None),
             "env_gitignored": (

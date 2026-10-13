@@ -16,7 +16,17 @@ export function setupSettings(getStore, afterApply) {
     const settings = getStore().settings;
     error.textContent = "";
     $("settings-intro").textContent = intro(settings);
+    dialog.style.maxHeight = "calc(100vh - 48px)";
+    dialog.style.overflow = "auto";
     $("s-model").value = settings && settings.model ? settings.model : "";
+    $("s-provider").value = settings && settings.provider ? settings.provider : "litellm";
+    const effortLevels = (settings && settings.reasoning_effort_options) || [];
+    const effortSelect = $("s-effort");
+    replace(effortSelect, h("option", { value: "", text: "모델 기본값" }),
+      effortLevels.map((level) => h("option", { value: level, text: level })));
+    effortSelect.value = settings && settings.reasoning_effort ? settings.reasoning_effort : "";
+    $("s-provider").dataset.initial = $("s-provider").value;
+    effortSelect.dataset.initial = effortSelect.value;
     $("s-key").value = "";
     $("s-persist").checked = false;
     $("s-max").value = settings && settings.max_requests ? settings.max_requests : "";
@@ -32,6 +42,7 @@ export function setupSettings(getStore, afterApply) {
       profiles.map((p) => h("option", { value: p.id, text: p.label })));
     select.value = settings && settings.profile_id ? settings.profile_id : "";
     if (!dialog.open) dialog.showModal();
+    dialog.scrollTop = 0;
   }
 
   function collect() {
@@ -42,6 +53,12 @@ export function setupSettings(getStore, afterApply) {
     const conc = $("s-conc").value.trim();
     const key = $("s-key").value;
     if (model) payload.model = model;
+    const provider = $("s-provider").value;
+    if (provider && provider !== $("s-provider").dataset.initial) payload.provider = provider;
+    const effort = $("s-effort").value;
+    if (effort !== ($("s-effort").dataset.initial || "")) {
+      payload.reasoning_effort = effort || "";
+    }
     if (profile) payload.profile_id = profile;
     if (max) payload.max_requests = Number(max);
     if (conc) payload.max_concurrent_requests = Number(conc);
