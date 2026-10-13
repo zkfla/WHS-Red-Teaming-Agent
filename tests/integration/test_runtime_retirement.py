@@ -94,6 +94,34 @@ async def test_planner_can_judge_new_results_after_four_strategies():
         assert usage["spent"] < 100
 
 
+async def test_task_created_during_idle_tick_is_launched_before_driver_exits():
+    engagement, settings = limits(requests=100)
+    llm = FakeLLMClient()
+    async with build_central_development(
+        engagement, llm=llm, tools=gateway(), settings=settings,
+    ) as session:
+        registered = False
+        async def completed_planner_tick():
+            nonlocal registered
+            if not registered:
+                registered = True
+                task_id, = await register(session, "during-idle-check")
+                llm.native_responses_by_task[task_id] = [
+                    NativeCompletion(text="More investigation needed", total_tokens=1),
+                ]
+                # The planner committed after replenish observed an empty queue.
+                await session.deps.event_bus.flush()
+            return None
+
+        outcomes = []
+        async for result in session.driver.drive_ready_tasks(
+            session.runtime, max_instances=2, on_wakeup=completed_planner_tick,
+        ):
+            outcomes.append(result)
+        assert len(outcomes) == 1
+        assert (await session.deps.central_state.list_tasks())[0].occupant_owner is not None
+
+
 async def test_missing_creation_declaration_cannot_become_goal_success(tmp_path):
     tools = gateway()
     tools.responses[0] = DevelopmentResponse(
@@ -105,4 +133,3 @@ async def test_missing_creation_declaration_cannot_become_goal_success(tmp_path)
         assert "resource_effects_unmapped_cleanup_unverified" in await review(session, llm, refs)
         mission = await session.deps.central_state.get_mission(session.runtime.mission_id)
         assert mission.status is MissionStatus.ACTIVE
-

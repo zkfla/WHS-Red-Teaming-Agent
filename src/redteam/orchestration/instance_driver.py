@@ -904,12 +904,14 @@ class InstanceDriver:
                     deadline = datetime.now(timezone.utc) + timedelta(
                         seconds=self._settings.resource_wait_timeout_seconds,
                     )
-                if not pending and deadline is None:
-                    break
                 if deadline is not None and deadline.tzinfo is None:
                     raise ValueError("driver_wakeup_timezone_required")
                 if wake is not None and wake.is_set():
-                    continue  # callback/event admitted work; re-read canonical Tasks
+                    # A planner can commit while replenish/tick awaits. Consume
+                    # that hint before declaring the empty queue quiescent.
+                    continue
+                if not pending and deadline is None:
+                    break
                 timeout = (max(0.0, (deadline - datetime.now(timezone.utc)).total_seconds())
                            if deadline is not None else None)
                 waking = asyncio.create_task(wake.wait()) if wake is not None else None
