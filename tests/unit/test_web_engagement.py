@@ -235,7 +235,9 @@ async def test_nothing_is_active_until_an_investigation_is_created_or_selected(s
     snapshot = (await stack.client.get("/api/v1/snapshot")).json()
     assert snapshot["engagement"] == {"active": None, "status": None, "items": []}
     form = (await stack.client.get("/api/v1/engagement")).json()
-    assert [s["id"] for s in form["steps"]] == ["basic", "scope", "limits", "budget"]
+    assert [s["id"] for s in form["steps"]] == [
+        "basic", "scope", "permissions", "limits", "budget",
+    ]
     assert form["status"]["exists"] is False
 
     refused = await call(

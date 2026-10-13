@@ -21,7 +21,13 @@ from typing import Any
 from pydantic import ValidationError
 
 from redteam.app.cli.display import safe_text
-from redteam.app.web.engagement import SCOPE_FIELDS, EngagementError, coerce_field, parse_draft
+from redteam.app.web.engagement import (
+    SCOPE_FIELDS,
+    WEB_PERMISSION_FIELDS,
+    EngagementError,
+    coerce_field,
+    parse_draft,
+)
 from redteam.app.web.settings import SettingsStore
 from redteam.core.config import LLMConfig
 from redteam.core.ports.llm import LLMClient, LLMProviderFailure
@@ -124,7 +130,7 @@ class InterviewService:
             base_scope=_scope_values(base),
             touched=self._clock(),
             web_options={key: value for key, value in base.model_dump().items()
-                         if key in {"web_policy_mode", "web_paths"}},
+                         if key in {"web_policy_mode", "web_paths", *WEB_PERMISSION_FIELDS}},
             target_origins=explicit_target_origins(
                 ",".join(getattr(base, "web_origins", [])), address_list=True,
             ) if getattr(base, "web_origins", []) else {},

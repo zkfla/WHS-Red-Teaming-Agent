@@ -203,6 +203,22 @@ and settlement reject entry; duplicate/lost notifications cannot authorize it.
 An unverified original checkpoint is retained for review, not replaced. After
 quiescence or restart, explicit resume uses the existing recovery contract.
 
+Native batches prepare every call before admitting the first. After an approval
+wait, later prepared siblings may have no execution row yet. Recovery checks their
+Run/actor/action/tool/arguments/task binding and requires no admission, evidence
+receipt or checkpoint execution marker for that identity. They retain their original
+IDs and pass through ordinary Control and submission recording when continued.
+A missing execution row with any durable admission/receipt stays held; it is never
+reclassified as a fresh call or sent to the provider again.
+
+Interactive waiting inspects the authoritative approval status and displays only
+pending approvals. Unchanged pending approvals never trigger actor recovery.
+Resolved decisions resume once per changed wait state; resources/jobs are polled
+at the configured reconciliation interval. Terminal job references are not waits.
+Permanent recovery errors are exposed through the existing structured diagnostic
+and stop automatic retry. Accounting restoration remains conservative and is
+logged at DEBUG, not presented as repeated user-facing progress.
+
 `resume --instance ID` validates and resumes only that original actor. Terminal
 selections return from current central records without opening an SDK thread;
 foreign checkpoints/LLM owners, READY siblings and whole-goal settlement are not

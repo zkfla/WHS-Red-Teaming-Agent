@@ -129,6 +129,21 @@ async def start(s):
     await asyncio.wait_for(s.started.wait(), 2)
 
 
+async def test_idle_chat_receives_declared_tool_context_without_starting_a_run():
+    async with session() as s:
+        s.c.tool_context_loader = lambda: {
+            "tools": [], "tool_availability": {
+                "state": "configured_unverified", "servers": [{"server_id": "selected"}],
+            },
+        }
+        s.c.submit("MCP 목록 알려줘")
+        await s.c.queue.join()
+        assert s.conversation.calls[-1][1]["tool_availability"]["servers"] == [
+            {"server_id": "selected"},
+        ]
+        assert not s.calls and not s.operator.calls
+
+
 async def test_routing_questions_guidance_and_new_investigation_have_distinct_effects():
     async with session() as s:
         await start(s)

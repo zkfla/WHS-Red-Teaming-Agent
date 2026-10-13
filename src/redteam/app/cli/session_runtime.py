@@ -237,6 +237,13 @@ async def run_session(
         )
         return request is not None and str(request.run_id) == run_id
 
+    def tool_context():
+        from redteam.app.cli.tool_context import configured_tool_context, live_tool_context
+        if built is not None:
+            return live_tool_context(built[1].tool_catalog, built[0])
+        current = config.model_copy(update={"engagement": session.engagement_config})
+        return configured_tool_context(current)
+
     controller = SessionController(
         console=console,
         frontend=frontend,
@@ -248,6 +255,7 @@ async def run_session(
         slash_handler=slash,
         resume_runner=resume_runner,
         context_loader=refresh_context,
+        tool_context_loader=tool_context,
         approval_verifier=verify_approval,
         commands=[c.name for c in interactive_commands.COMMANDS],
         command_help={c.name: c.description for c in interactive_commands.COMMANDS},

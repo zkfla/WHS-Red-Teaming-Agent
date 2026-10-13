@@ -14,20 +14,28 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
 
 from redteam.app.mcp_deployment import DeploymentBinding, synchronize_deployment
 from redteam.capability.deployment import (
     DeploymentSpec,
+    SessionAccess,
     check_origin_scope,
     connection_environment,
     deployment_metadata,
     digest,
     encoded,
     provision,
+    validate_session_access,
 )
 from redteam.capability.server_roles import role_spec
-from redteam.capability.servers.config import ServerPolicy, TargetProfile
+from redteam.capability.servers.config import (
+    HTTPMethod,
+    ServerPolicy,
+    SessionProfile,
+    TargetProfile,
+    read_methods,
+)
 from redteam.capability.settings import MCPServerSettings, mcp_server_ids_from_environment
 from redteam.core.config import EngagementConfig, load_engagement_config
 from redteam.core.environment import env_snapshot
@@ -36,12 +44,45 @@ WEB_POLICY_KEY = "web_policy"
 DEPLOYMENT_KEYS = frozenset({"mcp_deployment", "mcp_targets", "target_refs", "auth_sessions"})
 
 
+class WebSessionSelection(BaseModel):
+    """Credential references only; never passwords/tokens supplied to a model."""
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    session_ref: str = Field(pattern=r"^[A-Za-z0-9_.-]{1,80}$")
+    principal_ref: str = Field(pattern=r"^[A-Za-z0-9_.-]{1,80}$")
+    origin: str
+    paths: list[str] = Field(min_length=1, max_length=100)
+    bearer_env: str | None = None
+    storage_state_path: str | None = None
+    expected_access: Literal["allow", "deny", "unspecified"] = "unspecified"
+
+
+_PERMISSION_DEFAULTS = {
+    "permissions": "read_only", "methods": ["GET", "HEAD", "OPTIONS"],
+    "query_keys": [], "allow_all_query_keys": False, "request_headers": [],
+    "allow_all_request_headers": False, "request_body_enabled": False,
+    "response_body_max_chars": 0, "sessions": [], "kali_network_mode": "inherit",
+    "kali_network_policy_path": None, "kali_network_policy_sha256": None,
+}
+
+
 class WebPolicySelection(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     version: Literal[1] = 1
     mode: Literal["site", "paths"]
     origins: list[str] = Field(min_length=1, max_length=30)
     paths: list[str] = Field(default_factory=list, max_length=100)
+    permissions: Literal["read_only", "custom", "full"] = "read_only"
+    methods: list[HTTPMethod] = Field(default_factory=read_methods)
+    query_keys: list[str] = Field(default_factory=list, max_length=100)
+    allow_all_query_keys: bool = False
+    request_headers: list[str] = Field(default_factory=list, max_length=100)
+    allow_all_request_headers: bool = False
+    request_body_enabled: bool = False
+    response_body_max_chars: int = Field(default=0, ge=0, le=16384)
+    sessions: list[WebSessionSelection] = Field(default_factory=list, max_length=60)
+    kali_network_mode: Literal["inherit", "closed", "configured"] = "inherit"
+    kali_network_policy_path: str | None = None
+    kali_network_policy_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
 
     @model_validator(mode="after")
     def explicit_subjects(self):
@@ -59,20 +100,147 @@ class WebPolicySelection(BaseModel):
         TargetProfile.valid_paths(self.paths)
         if any(any(char in path for char in "*{}") for path in self.paths):
             raise ValueError("literal_paths_required")
+        if self.permissions == "read_only" and (
+            self.methods != ["GET", "HEAD", "OPTIONS"] or self.query_keys
+            or self.allow_all_query_keys or self.request_headers or self.allow_all_request_headers
+            or self.request_body_enabled
+        ):
+            raise ValueError("read_only_permissions_have_no_request_overrides")
+        if self.kali_network_mode == "configured":
+            if not self.kali_network_policy_path or not self.kali_network_policy_sha256:
+                raise ValueError("kali_network_policy_required")
+            if not Path(self.kali_network_policy_path).is_absolute():
+                raise ValueError("kali_network_policy_absolute_path_required")
+        elif self.kali_network_policy_path or self.kali_network_policy_sha256:
+            raise ValueError("kali_network_policy_not_selected")
+        if len({session.session_ref for session in self.sessions}) != len(self.sessions):
+            raise ValueError("duplicate_session_ref")
+        if any(session.origin not in self.origins for session in self.sessions):
+            raise ValueError("session_origin_not_selected")
+        # Declaration validation needs neither a fabricated network nor a DNS/tool call.
+        for origin in self.origins:
+            self.target_profile(origin)
+        bindings = {urlsplit(origin).hostname: self.target_ref(origin) for origin in self.origins}
+        sessions, access = self.session_bindings(bindings)
+        for selection in self.sessions:
+            ref = selection.session_ref
+            validate_session_access(ref, sessions[ref], access[ref],
+                                    self.target_profile(selection.origin))
         return self
+
+    @model_serializer(mode="wrap")
+    def compatible_payload(self, handler):
+        value = handler(self)
+        for key, default in _PERMISSION_DEFAULTS.items():
+            if value.get(key) == default:
+                value.pop(key, None)
+        return value
+
+    def target_profile(self, origin: str) -> TargetProfile:
+        full = self.permissions == "full"
+        methods: list[HTTPMethod] = (
+            ["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"] if full else self.methods
+        )
+        return TargetProfile(
+            origin=origin, allowed_paths=self.paths, allow_all_paths=self.mode == "site",
+            response_body_max_chars=self.response_body_max_chars,
+            allowed_methods=methods,
+            allow_all_query_keys=full or self.allow_all_query_keys,
+            allowed_global_query_keys=[] if full else self.query_keys,
+            allow_all_request_headers=full or self.allow_all_request_headers,
+            allowed_request_headers=[] if full else self.request_headers,
+            request_body_enabled=(True if self.permissions == "read_only"
+                                  else full or self.request_body_enabled),
+        )
 
     def spec(self, networks: list[str]) -> DeploymentSpec:
         targets, bindings = {}, {}
         for origin in self.origins:
             host = urlsplit(origin).hostname
             assert host is not None
-            ref = "target_" + hashlib.sha256(origin.encode()).hexdigest()[:16]
-            targets[ref] = TargetProfile(
-                origin=origin, allowed_paths=self.paths, allow_all_paths=self.mode == "site",
-            )
+            ref = self.target_ref(origin)
+            targets[ref] = self.target_profile(origin)
             bindings[host] = ref
-        return DeploymentSpec(policy=ServerPolicy(targets=targets, allowed_networks=networks),
-                              host_bindings=bindings)
+        sessions, access = self.session_bindings(bindings)
+        return DeploymentSpec(
+            request_permissions="read_only" if self.permissions == "read_only" else "testing",
+            policy=ServerPolicy(targets=targets, allowed_networks=networks, sessions=sessions),
+            host_bindings=bindings, session_access=access,
+        )
+
+    @staticmethod
+    def target_ref(origin: str) -> str:
+        return "target_" + hashlib.sha256(origin.encode()).hexdigest()[:16]
+
+    def session_bindings(self, bindings):
+        sessions, access = {}, {}
+        for session in self.sessions:
+            host = urlsplit(session.origin).hostname
+            assert host is not None
+            sessions[session.session_ref] = SessionProfile(
+                target_ref=bindings[host], principal_ref=session.principal_ref,
+                bearer_env=session.bearer_env, storage_state_path=session.storage_state_path,
+                allowed_paths=session.paths,
+            )
+            access[session.session_ref] = SessionAccess(
+                paths=session.paths, expected_access=session.expected_access,
+            )
+        return sessions, access
+
+
+def validate_kali_network_policy(path: str, origins: list[str], expected_sha256=None):
+    """Use the existing gate, with no additional destinations or package mirrors."""
+    from redteam.capability.shell_assembly import build_gated_provider_config
+    if not Path(path).is_absolute():
+        raise ValueError("kali_network_policy_absolute_path_required")
+    content = Path(path).read_bytes()
+    fingerprint = digest(content)
+    if expected_sha256 and fingerprint != expected_sha256:
+        raise ValueError("kali_network_policy_changed")
+    provider = build_gated_provider_config(path, policy_bytes=content)
+    assert provider is not None
+    hosts = {urlsplit(origin).hostname for origin in origins}
+    if not provider.network_policy.registry.targets or (
+        set(provider.network_policy.registry.targets) - hosts
+        or provider.network_policy.registry.mirrors or provider.network_policy.install_proxy
+    ):
+        raise ValueError("kali_network_policy_outside_selected_targets")
+    return fingerprint, provider
+
+
+def permissions_expand(before: WebPolicySelection, after: WebPolicySelection) -> bool:
+    """Compare effective permissions, not the UI preset name or unused form values."""
+    left = before.target_profile(before.origins[0])
+    right = after.target_profile(after.origins[0])
+    if set(right.allowed_methods) - set(left.allowed_methods):
+        return True
+    if not left.allow_all_query_keys and (
+        right.allow_all_query_keys
+        or set(right.allowed_global_query_keys) - set(left.allowed_global_query_keys)
+    ):
+        return True
+    if not left.allow_all_request_headers and (
+        right.allow_all_request_headers
+        or set(right.allowed_request_headers) - set(left.allowed_request_headers)
+    ):
+        return True
+    if (right.request_body_enabled and not left.request_body_enabled
+            or right.response_body_max_chars > left.response_body_max_chars):
+        return True
+    original_sessions = {session.session_ref: session for session in before.sessions}
+    for session in after.sessions:
+        original = original_sessions.get(session.session_ref)
+        if original is None or set(session.paths) - set(original.paths) or any(
+            getattr(session, key) != getattr(original, key) for key in (
+                "origin", "principal_ref", "bearer_env", "storage_state_path",
+            )
+        ):
+            return True
+    return after.kali_network_mode != "closed" and any(
+        getattr(before, key) != getattr(after, key) for key in (
+            "kali_network_mode", "kali_network_policy_path", "kali_network_policy_sha256",
+        )
+    )
 
 
 async def _networks(selection: WebPolicySelection, config: EngagementConfig) -> list[str]:
@@ -173,4 +341,32 @@ async def prepare_web_deployment(path: Path) -> dict[str, str]:
             generated = load_engagement_config(provision(spec, config, output))
             binding = DeploymentBinding.model_validate(generated.metadata["mcp_deployment"])
         EngagementStore(path).install_deployment(config, generated.metadata)
-    return deployment_environment(spec, binding)
+    environment = deployment_environment(spec, binding)
+    if selection.kali_network_mode == "closed":
+        environment["REDTEAM_GATED_NETWORK_POLICY_PATH"] = ""
+    elif selection.kali_network_mode == "configured":
+        assert selection.kali_network_policy_path is not None
+        fingerprint, provider = validate_kali_network_policy(
+            selection.kali_network_policy_path, selection.origins,
+            expected_sha256=selection.kali_network_policy_sha256,
+        )
+        from redteam.capability.servers.network import resolve_target
+        # Pin each registry name to that exact selected host, never merely a broad scope CIDR.
+        for host, ips in provider.network_policy.registry.targets.items():
+            target = await resolve_target(spec.policy, spec.host_bindings[host])
+            if set(ips) - set(target.addresses):
+                raise ValueError("kali_network_policy_address_mismatch")
+        destination = Path(binding.policy_path).parent / ("kali-network-" + fingerprint + ".json")
+        content = Path(selection.kali_network_policy_path).read_bytes()
+        if digest(content) != fingerprint:
+            raise ValueError("kali_network_policy_changed")
+        if destination.exists():
+            if digest(destination.read_bytes()) != fingerprint:
+                raise ValueError("kali_network_policy_snapshot_changed")
+        else:
+            import os
+            fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(content)
+        environment["REDTEAM_GATED_NETWORK_POLICY_PATH"] = str(destination)
+    return environment
