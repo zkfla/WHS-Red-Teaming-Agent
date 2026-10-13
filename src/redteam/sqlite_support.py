@@ -27,6 +27,15 @@ def retirement_path(path: str | Path) -> Path:
 
 def read_storage_retirement(path: str | Path) -> dict | None:
     marker = retirement_path(path)
+    if os.name == "nt":
+        # Windows Run ownership is supported, but source migration markers use
+        # a POSIX private-inode contract. Ordinary unmarked stores can run;
+        # marked sources stay fenced rather than weakening marker validation.
+        try:
+            marker.lstat()
+        except FileNotFoundError:
+            return None
+        raise StorageRetiredError("migration_retirement_marker_unsupported_platform")
     try:
         fd = os.open(marker, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
     except FileNotFoundError:

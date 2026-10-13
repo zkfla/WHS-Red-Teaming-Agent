@@ -3,7 +3,7 @@
 # selection contract; they never grant scope or execution permission.
 schema_version: '3'
 profile_id: native-probes
-version: '3'
+version: '4'
 common: {path: prompts/common.md, version: '2', contract_version: '1'}
 probe_limits: {max_actions: 4, max_model_requests: 8}
 max_instances: 2
@@ -36,8 +36,8 @@ roles:
       role: probe_execution
       name: Common verification worker
       provider_id: native:probe
-      capabilities: [web, api, recon, mobile]
-      tool_selection: {capability_tags: [web, api, recon, mobile]}
+      capabilities: [web, api, recon, mobile, analysis]
+      tool_selection: {capability_tags: [web, api, recon, mobile, analysis]}
       context_profile: {profile_id: probe_execution}
     prompt: {path: prompts/worker.md, version: '2'}
   - definition:

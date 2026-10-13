@@ -7,13 +7,15 @@ branching: the returned adapter plugs into the existing generic
 builtin_adapters seam (capability/bootstrap._build_gateway) and the
 program_source fills the existing RuntimeDeps.shell_programs port.
 
-A None policy path means disabled: this returns None and callers skip the
-shell wiring, leaving an honest catalog without shell tools.
+The pure builder treats a None policy path as disabled. Execution callers
+use the async preparation entry point to prepare a managed default; inspection
+callers never launch Docker or build images.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
 
 from redteam.capability.settings import MCPConfigurationError
 from redteam.capability.shell_adapter import BuiltinShellAdapter
@@ -39,9 +41,13 @@ class ShellRuntime:
     descriptors: list[ToolDescriptor] = field(default_factory=list)
     concurrency: dict[str, int] = field(default_factory=dict)
     output_limits: dict[str, int] = field(default_factory=dict)
+    environment_fingerprint: str | None = None
 
 
-def build_shell_runtime(policy_path: str | None) -> ShellRuntime | None:
+def build_shell_runtime(
+    policy_path: str | None, *, policy: ShellWorkroomPolicy | None = None,
+    program_manifest_path: str | None = None,
+) -> ShellRuntime | None:
     """Build the shell provider from an operator policy path, or None.
 
     None (undeclared REDTEAM_SHELL_POLICY_PATH) means disabled and yields
@@ -50,15 +56,18 @@ def build_shell_runtime(policy_path: str | None) -> ShellRuntime | None:
     callers report a config error instead of silently running without
     the operator-requested shell provider.
     """
-    if policy_path is None:
+    if policy_path is None and policy is None:
         return None
     try:
-        policy = load_shell_workroom_policy(policy_path)
+        if policy is None:
+            assert policy_path is not None
+            policy = load_shell_workroom_policy(policy_path)
+        policy.validate_image()
     except (OSError, ValueError) as exc:
         raise MCPConfigurationError(
             f"shell workroom policy invalid ({policy_path}): {exc}"
         ) from exc
-    descriptors, adapter = build_shell_entries(policy)
+    descriptors, adapter = build_shell_entries(policy, program_manifest_path=program_manifest_path)
     program_source = adapter.program_source
     return ShellRuntime(
         policy=policy,
@@ -68,3 +77,32 @@ def build_shell_runtime(policy_path: str | None) -> ShellRuntime | None:
         concurrency={SHELL_SERVER_ID: policy.max_jobs},
         output_limits=dict(shell_server_output_limits(policy)),
     )
+
+
+async def prepare_shell_runtime(
+    policy_path: str | None, *, auto_setup: bool = True,
+    progress: Callable[[str], None] | None = None,
+    expected_fingerprint: str | None = None,
+) -> ShellRuntime | None:
+    """Prepare Docker only at execution startup, then use the pure assembly.
+
+    Manual mode preserves the prior policy-only behavior. Inspection callers
+    continue using build_shell_runtime and never launch or build anything.
+    """
+    if not auto_setup:
+        if expected_fingerprint is not None:
+            raise MCPConfigurationError(
+                "This run requires its prepared execution environment; "
+                "enable REDTEAM_SHELL_AUTO_SETUP to resume it."
+            )
+        return build_shell_runtime(policy_path)
+    from redteam.capability.shell_preparation import prepare_shell_policy
+
+    prepared = await prepare_shell_policy(
+        policy_path, progress=progress, expected_fingerprint=expected_fingerprint,
+    )
+    runtime = build_shell_runtime(
+        None, policy=prepared.policy, program_manifest_path=prepared.manifest_path,
+    )
+    assert runtime is not None
+    return replace(runtime, environment_fingerprint=prepared.fingerprint)

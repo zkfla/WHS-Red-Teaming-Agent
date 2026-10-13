@@ -181,6 +181,7 @@ async def _run_central(args, config, *, mcp_stack, on_finished=None,
         _, deps = await build(
             config, max_steps=None, mcp_stack=mcp_stack, central_state=state,
             original_stores=original["storage_refs"], original_settings=selected,
+            original_component_binding=original.get("component_binding"),
             component_registry=component_registry,
         )
         if session_channel is not None:
@@ -345,6 +346,7 @@ async def _run_collect_central(args, config, *, mcp_stack, component_registry=No
         _, deps = await build(
             config, max_steps=None, mcp_stack=mcp_stack, central_state=state,
             original_stores=original["storage_refs"], original_settings=selected,
+            original_component_binding=original.get("component_binding"),
             component_registry=component_registry,
         )
         probe_checkpoint = Path(original["storage_refs"]["checkpoints"]).is_file()

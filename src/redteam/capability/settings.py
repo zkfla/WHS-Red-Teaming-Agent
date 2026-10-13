@@ -277,6 +277,24 @@ def mcp_server_ids_from_environment(
 
 
 SHELL_POLICY_ENV_VAR = "REDTEAM_SHELL_POLICY_PATH"
+SHELL_AUTO_SETUP_ENV_VAR = "REDTEAM_SHELL_AUTO_SETUP"
+
+
+def automatic_shell_setup_from_environment(
+    *, source: Mapping[str, str] | None = None
+) -> bool:
+    """Execution-only default preparation; false preserves manual setup."""
+    from redteam.core.environment import env_snapshot
+
+    raw = env_snapshot(source).get(SHELL_AUTO_SETUP_ENV_VAR)
+    if raw is None:
+        return True
+    try:
+        return TypeAdapter(bool).validate_python(raw.strip())
+    except ValidationError:
+        raise MCPConfigurationError(
+            "REDTEAM_SHELL_AUTO_SETUP must be true or false"
+        ) from None
 
 
 def shell_policy_path_from_environment(

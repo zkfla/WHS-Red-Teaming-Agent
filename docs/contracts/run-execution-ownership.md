@@ -45,13 +45,28 @@ Coordinator는 이 공개 port만 사용하며 `atomic_scope()` 문자열을 해
 | 저장소 | 구현과 범위 |
 | --- | --- |
 | Memory | 같은 backend의 실행 Run 집합을 기존 lock 아래 변경. 실행 중에는 상태 lock을 계속 잡지 않음. 프로세스 간 보장은 없음 |
-| SQLite | canonical DB 경로 옆의 Run hash companion 파일에 POSIX `flock(LOCK_EX\|LOCK_NB)`. 같은 로컬 DB를 공유하는 독립 연결·프로세스에 적용 |
+| SQLite / POSIX | canonical DB 경로 옆의 Run hash companion 파일에 `flock(LOCK_EX\|LOCK_NB)`. 같은 로컬 DB를 공유하는 독립 연결·프로세스에 적용 |
+| SQLite / Windows | 같은 companion 파일을 `CreateFileW`의 공유 없는 비상속 handle로 보유. 경쟁 open은 즉시 거절하며 보유 중 파일 삭제·교체도 차단. scope 종료·프로세스 종료 때 handle 해제 |
 | Custom | 동일한 배타성/정리 계약을 제공하는 선택적 port가 필요. 미지원 기능을 Memory로 조용히 대체하지 않음 |
 
-SQLite 소유권은 로컬 POSIX 파일 시스템을 전제로 한다. 파일 descriptor는 exec로
+POSIX SQLite 소유권은 로컬 POSIX 파일 시스템을 전제로 한다. 파일 descriptor는 exec로
 상속되지 않으며 파일은 private regular inode이어야 한다. symlink, hardlink,
 디렉터리, FIFO 또는 타인 읽기/쓰기 권한을 가진 companion은 거절한다.
 저장소/플랫폼 장애도 명확히 거절한다. 획득 과정에 await/thread 취소 창을 만들지 않는다.
+
+Windows는 운영자가 관리하는 로컬 파일 시스템과 저장 디렉터리의 Windows ACL을
+전제로 한다. POSIX mode bits를 Windows 접근 권한으로 해석하지 않는다. handle로
+disk 파일·단일 hardlink를 확인하고 reparse point·디렉터리를 거절한다. 기존 파일을
+truncate하거나 잠금 파일을 삭제하지 않는다. Linux 컨테이너와 Windows 호스트가
+같은 DB를 동시에 조립하는 등 서로 다른 OS의 잠금 방식 간 배타성은 보장하지 않는다.
+Windows CLI에서 판단/조정하고 Docker에서 도구를 실행하는 구성은 조립자가 하나이므로
+이 교차 OS 조립에 해당하지 않는다. 이 변경은 다른 파일 저장소의 Windows 호환성이나
+Docker 도구 실행 준비까지 보장하지 않는다.
+
+중앙 SQLite 저장소와 레거시 이관 검사도 같은 `run_storage_ownership` 함수를
+사용한다. 읽기 전용 검사(`create=False`)는 없는 companion을 생성하지 않는다.
+Windows에서 POSIX private-inode 계약의 이관 마커가 발견되면 저장소 실행을
+거절한다. 마커가 없는 일반 중앙 저장소의 소유권은 Windows handle 경로를 사용한다.
 
 파일은 해제 후에도 남겨 둔다. 실행 중 파일을 삭제·교체하면 새 inode가 생겨 소유권이
 둘로 갈라질 수 있기 때문이다. 유지보수 삭제는 모든 관련 프로세스가 종료된 별도
@@ -82,7 +97,10 @@ Mobile/브라우저·분산 실행의 검증은 별도 PRD 항목으로 남는�
 
 `test_run_execution_ownership.py`는 Memory/SQLite 배타성·독립 Run·정상 종료·취소,
 canonical 경로, unsafe inode와 미지원 backend를 검증한다. 별도 PID의 정상 종료,
-SIGTERM, SIGKILL 뒤 소유권 확보가 가능하되 미확정 Work와 요청 계량이 그대로인지 확인한다.
+terminate/kill 뒤 소유권 확보가 가능하되 미확정 Work와 요청 계량이 그대로인지 확인한다.
+Windows에서는 live companion 삭제/교체 차단·경로 대소문자 별칭·unsafe handle 검증도
+확인한다. POSIX inode/mode/FIFO 검사는 POSIX에서, Windows sharing 검사는 Windows에서
+수행하며 필요한 symlink 생성 권한이 없으면 해당 사례만 skip한다.
 
 `test_specialist_run_ownership.py`는 public 전문 start와 CLI cohort 재개를 사용해
 경쟁 시 계획/claim/reconcile/Control 복원보다 먼저 거절되는지 검증한다.

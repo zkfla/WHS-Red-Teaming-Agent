@@ -690,6 +690,14 @@ async def bind_run_metadata(deps, *, before_bind=None):
             "execution_budget": deps.engagement.execution_budget.model_dump(mode="json"),
         },
     }
+    binding = deps.component_binding
+    if binding is not None and (
+        binding.llm_connection_fingerprint is not None
+        or binding.execution_environment_fingerprint is not None
+    ):
+        # New optional provider identity remains readable before transports are
+        # rebuilt. Absent identities keep historical central metadata unchanged.
+        metadata["component_binding"] = binding.model_dump(mode="json")
     artifact_store = getattr(deps, "artifact_store", None)
     fixture_runner = getattr(deps, "code_fixture_runner", None)
     if artifact_store is not None:

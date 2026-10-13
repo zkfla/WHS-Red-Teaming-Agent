@@ -34,6 +34,46 @@ jobs:
       - run: docker compose -f deploy/compose/docker-compose.yml config -q
       - run: docker compose -f deploy/compose/finance-lab.yml config -q
 
+  llm-protocols:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python-version: "3.10"
+          - os: windows-latest
+            python-version: "3.14"
+    env:
+      LITELLM_LOCAL_MODEL_COST_MAP: "True"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: python -m pip install -e ".[dev,agent,llm]" "litellm>=1.104.0"
+      - name: Require the SDK in this protocol verification job
+        run: python -c "import litellm"
+      - name: Check SDK wire formats, request ownership and connection recovery offline
+        shell: bash
+        run: |
+          umask 077
+          python -m pytest -q \
+          tests/unit/test_llm_opencode_go.py \
+          tests/unit/test_config_opencode_go.py \
+          tests/unit/test_request_scope.py \
+          tests/unit/test_llm_connection_fingerprint.py \
+          tests/integration/test_llm_connection_resume.py \
+          tests/unit/test_llm_chatgpt_streaming.py \
+          tests/unit/test_llm_native_tools.py \
+          tests/unit/test_llm_usage.py \
+          tests/unit/test_shared_llm_requests.py \
+          tests/unit/test_run_execution_ownership.py \
+          tests/unit/test_shell_preparation.py \
+          tests/unit/test_cli_shell_preparation.py \
+          tests/integration/test_execution_environment_resume.py
+
   mcp-container:
     runs-on: ubuntu-latest
     steps:

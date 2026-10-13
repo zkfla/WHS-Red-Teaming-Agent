@@ -726,6 +726,124 @@ async def test_shell_executes_through_generic_gateway_with_fresh_instance(tmp_pa
     assert input_digest
 
 
+async def test_cli_run_build_executes_shell_with_fresh_run_identity(monkeypatch, tmp_path):
+    """ACTUAL CLI-run proof: run.build composition -> gateway -> shell binder.
+
+    Drives the real ``commands/run.py::build`` (env -> settings -> loader ->
+    assembly -> build_application -> gateway) with a fresh (run_id,
+    instance_id) pair minted the way app.bootstrap mints one for a CLI run.
+    Only the Docker boundary is doubled (an instance-level workroom double
+    on the production adapter); the binder and gateway are production code.
+    """
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+
+    from redteam.app.cli._shared import load_app_config_for_run
+    from redteam.app.cli.commands import run as run_command
+    from redteam.capability.shell_workroom import ExecResult, workroom_key_for
+    from redteam.core.contracts.tool import ExecutionContext, ToolInvocation
+    from redteam.core.tool_binding import SELECTED_TOOL
+    from redteam.llm.fake import FakeLLMClient
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("REDTEAM_MCP_SERVERS", raising=False)
+    monkeypatch.setenv(SHELL_POLICY_ENV_VAR, _policy_file(tmp_path))
+    monkeypatch.setenv("REDTEAM_LLM_PROVIDER", "litellm")
+    monkeypatch.setenv("REDTEAM_LLM_MODEL", "gpt-4o-mini")
+    engagement_path = tmp_path / "engagement.yaml"
+    engagement_path.write_text(
+        'name: "Shell CLI Proof"\n'
+        "scope:\n"
+        '  allowed_hosts: ["a.local"]\n'
+        "execution_budget:\n"
+        "  max_actions: 1\n"
+        "rate_limit_policy:\n"
+        "  max_actions_per_minute: 10\n"
+        "approval_policy:\n"
+        "  require_approval_for: []\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    async def _fake_exec(key, language, script, timeout_seconds=None, exec_tag=None,
+                         *, invocation_id=None, input_digest=None,
+                         retain_record=True, extra_env=None):
+        calls.append((key, language, script, exec_tag, invocation_id, input_digest))
+        return ExecResult(
+            exit_code=0, stdout="cli-proof", stderr="", timed_out=False,
+            truncated=False, duration_ms=1, workroom_key=key,
+            container_name="fake-cli-container",
+        )
+
+    async def _probe_true():
+        return True
+
+    real_prepare_shell_runtime = run_command.prepare_shell_runtime
+
+    async def _build_with_doubled_workroom(policy_path, **kwargs):
+        runtime = await real_prepare_shell_runtime(policy_path, **kwargs)
+        if runtime is not None:
+            runtime.adapter._workroom = SimpleNamespace(
+                exec_script=_fake_exec, probe=_probe_true,
+            )
+        return runtime
+
+    monkeypatch.setattr(run_command, "prepare_shell_runtime", _build_with_doubled_workroom)
+    real_build_application = run_command.build_application
+
+    async def _build_with_fake_llm(config, **kwargs):
+        kwargs.setdefault("llm", FakeLLMClient())
+        return await real_build_application(config, **kwargs)
+
+    monkeypatch.setattr(run_command, "build_application", _build_with_fake_llm)
+    monkeypatch.setenv("REDTEAM_LLM_REQUEST_POLICY_JSON",
+                       '{"mode":"bounded","max_requests":5}')
+    config = load_app_config_for_run(str(engagement_path))
+    engagement, deps = await run_command.build(config, max_steps=1)
+    assert deps.shell_programs is not None
+    from redteam.attack_graph.service import AttackGraphService
+    from redteam.core.ids import MissionId
+    from redteam.orchestration.agents.tool_access import eligible_role_tool_ids
+    from redteam.orchestration.coordination import content_hash
+    from redteam.orchestration.engagement_planner import plan_mission
+    from redteam.orchestration.seed import seed_from_engagement
+    from redteam.orchestration.specialist_planner import specialist_planning_inputs
+
+    mission = plan_mission(engagement, MissionId(new_id("mission")),
+                           now=datetime.now(timezone.utc))
+    await deps.central_state.create_mission(mission)
+    await deps.central_state.bind_run(
+        str(mission.mission_id), scope=engagement.scope,
+        binding_hash=content_hash(specialist_planning_inputs(deps)),
+    )
+    await seed_from_engagement(AttackGraphService(deps.graph_store), engagement,
+                               run_id=RunId(deps.central_state.run_id))
+    worker = deps.agent_prompts.binding("native_action").role_id
+    assert "analysis.shell_run" in await eligible_role_tool_ids(deps, worker)
+    run_id = RunId(new_id("run"))
+    instance_id = AgentInstanceId(new_id("instance"))
+    invocation = ToolInvocation(
+        invocation_id=InvocationId("inv-shell-cli-proof"),
+        action_id=ActionId("action-shell-cli-proof"),
+        run_id=run_id,
+        tool_id=ToolId("analysis.shell_run"),
+        binding_mode=SELECTED_TOOL,
+        arguments={"language": "bash", "script": "echo cli"},
+        execution_context=ExecutionContext(
+            engagement_id=engagement.engagement_id,
+            run_id=run_id,
+            instance_id=instance_id,
+        ),
+        created_at=datetime.now(timezone.utc),
+    )
+    result = await deps.tool_gateway.invoke(invocation)
+    assert result.success is True
+    assert result.output["workroom_key"] == workroom_key_for(str(run_id), str(instance_id))
+    assert len(calls) == 1
+    _key, _language, _script, exec_tag, invocation_id_seen, input_digest = calls[0]
+    assert exec_tag == "inv-shell-cli-proof"
+    assert invocation_id_seen == "inv-shell-cli-proof"
+    assert input_digest
 
 
 async def test_shell_binder_rejects_foreign_key_without_executing(tmp_path):

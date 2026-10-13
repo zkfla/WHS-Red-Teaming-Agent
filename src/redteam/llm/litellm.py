@@ -560,12 +560,14 @@ class LiteLLMClient:
         model: str,
         api_key: str | None = None,
         num_retries: int = 0,
+        use_responses_api: bool = False,
         **default_kwargs: Any,
     ) -> None:
         self._model = model
         self._api_key = api_key
         self._num_retries = num_retries
         self._default_kwargs = default_kwargs
+        self._use_responses_api = bool(use_responses_api)
 
         import litellm
 
@@ -576,6 +578,11 @@ class LiteLLMClient:
         # from the local device-flow cache.
         _, provider, _, _ = litellm.get_llm_provider(model)
         self._is_chatgpt_subscription = provider == _CHATGPT_PROVIDER
+        # The ChatGPT subscription already owns the Responses route, so an
+        # explicit API-key Responses selection never overrides it.
+        self._use_responses_api = self._use_responses_api and (
+            not self._is_chatgpt_subscription
+        )
         if self._is_chatgpt_subscription:
             # Reuse the SDK's current OpenAI text-model catalog instead of
             # maintaining another list of model names. These aliases describe
@@ -624,8 +631,13 @@ class LiteLLMClient:
         system: str | None = None,
         **kwargs: Any,
     ) -> str:
-        if self._is_chatgpt_subscription:
-            return await self._chatgpt_stream_text(messages, system=system, kwargs=kwargs)
+        if self._is_chatgpt_subscription or self._use_responses_api:
+            return await self._responses_text(
+                messages,
+                system=system,
+                kwargs=kwargs,
+                default_stream=self._is_chatgpt_subscription,
+            )
 
         import litellm
 
@@ -673,15 +685,21 @@ class LiteLLMClient:
                 f"{json.dumps(response_schema)}"
             )
             augmented_system = f"{system}\n\n{json_instruction}" if system else json_instruction
-            text = await self._chatgpt_stream_text(
+            text = await self._responses_text(
                 messages,
                 system=augmented_system,
                 kwargs=kwargs,
                 text_format=_native_responses_format(response_schema),
+                default_stream=True,
             )
             # The subscription streaming route surfaces text only, so the
             # request cost is unknown rather than zero.
             return StructuredCompletion(value=text, total_tokens=None)
+
+        if self._use_responses_api:
+            return await self._responses_structured_single_shot(
+                messages, response_schema, system=system, kwargs=kwargs
+            )
 
         import litellm
 
@@ -750,7 +768,7 @@ class LiteLLMClient:
         for message in messages:
             if not isinstance(message, dict):
                 raise ValueError("complete_native messages must be dicts")
-        if self._is_chatgpt_subscription:
+        if self._is_chatgpt_subscription or self._use_responses_api:
             return await self._responses_complete_native(
                 messages, tools, system=system, kwargs=kwargs
             )
@@ -819,7 +837,7 @@ class LiteLLMClient:
         call_kwargs.pop("response_format", None)
         call_kwargs.pop("text", None)
         call_kwargs.pop("text_format", None)
-        call_kwargs.setdefault("stream", True)
+        call_kwargs.setdefault("stream", self._is_chatgpt_subscription)
         streaming = bool(call_kwargs.get("stream"))
         tools_param = _responses_tools_param(tools)
         if tools_param is not None:
@@ -849,7 +867,7 @@ class LiteLLMClient:
                 return _build_native_completion(
                     calls=calls,
                     text=text,
-                    total_tokens=None,
+                    total_tokens=_extract_total_tokens(response),
                     missing_call_id=missing_id,
                     missing_tool_name=missing_name,
                 )
@@ -858,6 +876,65 @@ class LiteLLMClient:
             raise
         except Exception as exc:
             raise _normalize_provider_error(exc) from exc
+
+    async def _responses_structured_single_shot(
+        self,
+        messages: list[dict[str, Any]],
+        response_schema: dict[str, Any],
+        *,
+        system: str | None,
+        kwargs: dict[str, Any],
+    ) -> StructuredCompletion:
+        """API-key Responses structured call: non-streaming, strict
+        completed-only status handling, schema carried in text.format
+        alongside an explicit JSON instruction, plus this request's own
+        provider usage.
+        """
+        import litellm
+
+        json_instruction = (
+            "Respond with a single JSON object only -- no prose, no "
+            f"markdown fences -- matching this JSON Schema: "
+            f"{json.dumps(response_schema)}"
+        )
+        augmented_system = f"{system}\n\n{json_instruction}" if system else json_instruction
+        converted = _responses_input_from_chat(messages)
+        call_kwargs: dict[str, Any] = self._call_kwargs(kwargs)
+        call_kwargs.pop("messages", None)
+        call_kwargs.pop("previous_response_id", None)
+        call_kwargs.pop("tools", None)
+        call_kwargs.pop("response_format", None)
+        call_kwargs.pop("text", None)
+        call_kwargs.pop("text_format", None)
+        call_kwargs.setdefault("stream", False)
+        call_kwargs["text"] = {"format": _native_responses_format(response_schema)}
+        try:
+            response = await litellm.aresponses(
+                model=self._model,
+                input=converted,
+                instructions=augmented_system,
+                api_key=self._api_key,
+                **call_kwargs,
+            )
+        except LLMProviderFailure:
+            raise
+        except Exception as exc:
+            raise _normalize_provider_error(exc) from exc
+        try:
+            status = _chunk_field(response, "status")
+            if status != "completed":
+                raise _stream_protocol_failure()
+            text = _responses_output_text(response)
+            if not text:
+                raise _stream_protocol_failure()
+        except LLMProviderFailure:
+            raise
+        except Exception as exc:
+            raise _normalize_provider_error(exc) from exc
+        return StructuredCompletion(
+            value=text,
+            total_tokens=_extract_total_tokens(response),
+        )
 
     async def _accumulate_responses_stream_native(self, response: Any) -> NativeCompletion:
         """Accumulate text plus function-call items from a Responses stream."""
@@ -972,13 +1049,14 @@ class LiteLLMClient:
             missing_tool_name=missing_name,
         )
 
-    async def _chatgpt_stream_text(
+    async def _responses_text(
         self,
         messages: list[dict[str, Any]],
         *,
         system: str | None,
         kwargs: dict[str, Any],
         text_format: dict[str, Any] | None = None,
+        default_stream: bool = True,
     ) -> str:
         """``chatgpt/`` subscription models only — see the module docstring
         for why this bypasses ``acompletion()``. ``system`` becomes the
@@ -991,9 +1069,10 @@ class LiteLLMClient:
 
         call_kwargs: dict[str, Any] = self._call_kwargs(kwargs)
         call_kwargs.pop("messages", None)
-        # Streaming is this route's contract: delta accumulation below needs the
-        # iterator, while an explicit caller opt-out is still respected.
-        call_kwargs.setdefault("stream", True)
+        # The ChatGPT subscription streams by contract; an API-key Responses
+        # call defaults to the non-streaming form. An explicit caller choice is
+        # honored on either route.
+        call_kwargs.setdefault("stream", default_stream)
         streaming = bool(call_kwargs.get("stream"))
         if text_format is not None:
             call_kwargs["text"] = {"format": text_format}

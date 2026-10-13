@@ -1223,10 +1223,12 @@ class ShellWorkroomManager:
         policy: ShellWorkroomPolicy,
         *,
         process_factory: ProcessFactory = asyncio.create_subprocess_exec,
+        program_manifest_path: str | None = None,
     ) -> None:
         policy.validate_image()
         self._policy = policy
         self._process_factory = process_factory
+        self._program_manifest_path = program_manifest_path
         self._known: dict[str, str] = {}
         self._ensure_lock = asyncio.Lock()
         self._admission: ExecutionAdmission | None = None
@@ -1280,8 +1282,7 @@ class ShellWorkroomManager:
         not kill the container side; that is ``kill_tagged_exec`` work.
         """
         process = await self._process_factory(
-            self._policy.docker_binary,
-            *argv,
+            *self._policy.docker_command(*argv),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -2616,7 +2617,7 @@ class ShellWorkroomManager:
         ``shell_manifest_unreadable`` on a missing or corrupt file and
         ``shell_image_manifest_mismatch`` on a provenance mismatch.
         """
-        path = manifest_path or default_program_manifest_path()
+        path = manifest_path or self._program_manifest_path or default_program_manifest_path()
         try:
             with open(path, encoding="utf-8") as handle:
                 manifest = json.load(handle)

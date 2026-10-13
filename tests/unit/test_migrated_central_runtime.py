@@ -34,7 +34,8 @@ async def test_explicit_adapter_preserves_originals_and_refuses_entered_sdk(tmp_
         original_engagement = Engagement.model_validate({
             **inputs["engagement"], "created_at": "2026-01-01T00:00:00Z",
         })
-        policy = SimpleNamespace(max_instances=2, model_dump=lambda **_: inputs["specialists"])
+        policy = SimpleNamespace(max_instances=2, probe_limits=None,
+                                 model_dump=lambda **_: inputs["specialists"])
         state.original_store_paths = {
             "evidence": str(request.references["evidence"]),
             "audit": str(request.references["audit"]),

@@ -110,10 +110,11 @@ def build_shell_adapter(
     policy: ShellWorkroomPolicy,
     *,
     execution_admission=None,
+    program_manifest_path: str | None = None,
 ) -> BuiltinShellAdapter:
     # TASK-005 admission hook; None keeps the unrestricted closed path.
     policy.validate_image()
-    workroom = ShellWorkroomManager(policy)
+    workroom = ShellWorkroomManager(policy, program_manifest_path=program_manifest_path)
     if execution_admission is not None:
         workroom.set_execution_admission(execution_admission)
     return BuiltinShellAdapter(policy, workroom=workroom)
@@ -123,9 +124,13 @@ def build_shell_entries(
     policy: ShellWorkroomPolicy,
     *,
     execution_admission=None,
+    program_manifest_path: str | None = None,
 ) -> tuple[list[ToolDescriptor], BuiltinShellAdapter]:
     # Gateway seam; passes the admission hook through.
-    adapter = build_shell_adapter(policy, execution_admission=execution_admission)
+    adapter = build_shell_adapter(
+        policy, execution_admission=execution_admission,
+        program_manifest_path=program_manifest_path,
+    )
     descriptors = build_shell_descriptors(policy)
     validate_shell_descriptors(descriptors, policy)
     return descriptors, adapter

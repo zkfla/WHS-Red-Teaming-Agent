@@ -6,8 +6,16 @@ import argparse
 import json
 from pathlib import Path
 
+import pytest
+
 from redteam.app.cli._shared import EXIT_CONFIG_ERROR, EXIT_OK
 from redteam.app.cli.commands import validate as validate_command
+
+
+@pytest.fixture(autouse=True)
+def explicit_runtime_budget(monkeypatch):
+    monkeypatch.setenv("REDTEAM_LLM_REQUEST_POLICY_JSON",
+                       '{"mode":"bounded","max_requests":10}')
 
 
 def _write(tmp_path: Path, name: str, text: str) -> Path:

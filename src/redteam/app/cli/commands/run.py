@@ -34,7 +34,7 @@ import os
 import sys
 from collections.abc import Callable
 from contextlib import AsyncExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
@@ -55,11 +55,12 @@ from redteam.app.cli._shared import (
 from redteam.app.cli.conversation import ConversationAssistant, catalog_tool_labels
 from redteam.capability.settings import (
     MCPConfigurationError,
+    automatic_shell_setup_from_environment,
     gated_network_policy_path_from_environment,
     shell_policy_path_from_environment,
 )
 from redteam.capability.shell_assembly import build_gated_provider_config
-from redteam.capability.shell_runtime import build_shell_runtime
+from redteam.capability.shell_runtime import prepare_shell_runtime
 from redteam.core.config import AppConfig
 from redteam.core.contracts.events import EventEnvelope, EventType
 from redteam.core.enums import ApprovalStatus, OperatorIntentType
@@ -792,6 +793,7 @@ async def build(
     central_state=None,
     original_stores=None,
     original_settings=None,
+    original_component_binding=None,
 ) -> tuple[Any, RuntimeDeps]:
     """Phase 1 of the shared core (section 17): config -> live
     ``(Engagement, RuntimeDeps)``, via the canonical
@@ -801,11 +803,30 @@ async def build(
     underway -- exactly what ``run()`` below does, unchanged from
     before this was split out.
     """
-    # Builtin shell provider: one capability-owned assembly shared with
-    # resume/tools. None means disabled (honest catalog without shell tools);
-    # an invalid policy raises MCPConfigurationError for the config-error path.
-    # Resolved before the empty-catalog warning so a shell-only run does not warn.
-    shell_runtime = build_shell_runtime(shell_policy_path_from_environment())
+    execution_fingerprint = None
+    if original_stores is not None:
+        from redteam.llm.opencode_go_config import llm_connection_fingerprint_for_config
+        from redteam.orchestration.component_binding import RuntimeComponentBinding
+        from redteam.orchestration.coordination import StateConflict
+
+        original_binding = (
+            RuntimeComponentBinding.model_validate(original_component_binding)
+            if original_component_binding is not None else None
+        )
+        expected_connection = (
+            original_binding.llm_connection_fingerprint if original_binding else None
+        )
+        if expected_connection != llm_connection_fingerprint_for_config(config.llm):
+            raise StateConflict("central_original_llm_connection_changed")
+        execution_fingerprint = (
+            original_binding.execution_environment_fingerprint if original_binding else None
+        )
+    shell_runtime = await prepare_shell_runtime(
+        shell_policy_path_from_environment(),
+        auto_setup=(automatic_shell_setup_from_environment()
+                    if original_stores is None or execution_fingerprint is not None else False),
+        progress=eprint, expected_fingerprint=execution_fingerprint,
+    )
     gated_provider_config = build_gated_provider_config(
         gated_network_policy_path_from_environment()
     )
@@ -852,12 +873,18 @@ async def build(
         })
         if "artifacts" in original_stores:
             component_options["artifact_dir"] = original_stores["artifacts"]
-    return await build_application(
+    engagement, deps = await build_application(
         config,
         orchestration_settings=orchestration_settings,
         mcp_stack=mcp_stack,
         **component_options,
     )
+    if shell_runtime is not None and shell_runtime.environment_fingerprint is not None:
+        assert deps.component_binding is not None
+        deps = replace(deps, component_binding=deps.component_binding.model_copy(update={
+            "execution_environment_fingerprint": shell_runtime.environment_fingerprint,
+        }))
+    return engagement, deps
 
 
 async def execute(

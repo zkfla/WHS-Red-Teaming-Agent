@@ -7,39 +7,15 @@ import json
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
 from typing import Any
 
 from redteam.core.ports.agent_prompts import AgentPrompts
 from redteam.core.ports.llm import LLMProviderFailure, StructuredCompletion
+from redteam.core.request_scope import RequestScope, current_request_scope, llm_request_scope
 from redteam.orchestration.llm_requests import RequestAdmissionError, RunRequestLedger
 
-
-@dataclass(frozen=True)
-class RequestScope:
-    run_id: str
-    owner: str
-    task_id: str | None = None
-
-
-_scope: ContextVar[RequestScope | None] = ContextVar("llm_request_scope", default=None)
-
-
-@contextmanager
-def llm_request_scope(run_id: str, owner: str, *, task_id: str | None = None) -> Iterator[None]:
-    parent = _scope.get()
-    if task_id is None and parent is not None and parent.run_id == run_id:
-        task_id = parent.task_id
-    token = _scope.set(RequestScope(run_id, owner, task_id))
-    try:
-        yield
-    finally:
-        _scope.reset(token)
-
-
-def current_request_scope() -> RequestScope | None:
-    """Read-only lifecycle identity for coordinated writes; never prompt data."""
-    return _scope.get()
+__all__ = ["RequestScope", "current_request_scope", "llm_request_scope", "RunMeteredLLM",
+           "configure_request_metering", "llm_request_guard", "current_request_guard"]
 
 
 _guard: ContextVar[Callable[[], Awaitable[None]] | None] = ContextVar(
@@ -96,7 +72,7 @@ class RunMeteredLLM:
             return await self._call_admitted(method, **kwargs)
 
     async def _call_admitted(self, method: str, **kwargs: Any) -> Any:
-        scope = _scope.get()
+        scope = current_request_scope()
         if scope is None:
             raise RequestAdmissionError("llm_request_run_scope_missing")
         call = getattr(self.client, method, None)
