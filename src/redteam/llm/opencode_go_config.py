@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from redteam import __version__ as _package_version
+from redteam.core.contracts.llm_config import normalize_reasoning_effort
 
 __all__ = [
     "OPENCODE_GO_PROVIDER",
@@ -102,31 +103,45 @@ def parse_model(model: str) -> GoModel:
 
 
 def llm_connection_fingerprint_for_config(llm_config: Any) -> str | None:
-    """Secret-free Go connection fingerprint for binding and resume.
+    """Secret-free connection fingerprint for binding and resume.
 
     Canonical form is a sorted, compact JSON object so the value is stable
     and independent of a string-join convention. Only the credential
     REFERENCE (the env var name) is included -- never the key value, and
-    never the session id.
+    never the session id. An explicit ``reasoning_effort`` joins the
+    record; unset effort keeps the historical record byte-identical.
+    ``litellm`` with explicit effort gets its own identity (``None`` when
+    unset); any other provider stays ``None``.
     """
     provider = getattr(llm_config, "provider", None) or ""
-    if (not isinstance(provider, str)) or (provider.strip() != OPENCODE_GO_PROVIDER):
+    if not isinstance(provider, str):
+        return None
+    name = provider.strip()
+    if name == "litellm":
+        # Local import keeps this module import-light for bootstrap/CLI;
+        # the LiteLLM canonical lives in exactly one place.
+        from redteam.llm.reasoning_effort import (
+            litellm_connection_fingerprint_for_config as _litellm_fingerprint,
+        )
+
+        return _litellm_fingerprint(llm_config)
+    if name != OPENCODE_GO_PROVIDER:
         return None
     model = getattr(llm_config, "default_model", "") or ""
     parsed = parse_model(model)
     credential = getattr(llm_config, "api_key_env_var", "") or ""
-    canonical = json.dumps(
-        {
-            "v": "v1",
-            "endpoint": parsed.endpoint,
-            "protocol": parsed.prefix,
-            "model": model.strip(),
-            "credential": credential,
-            "ua": USER_AGENT,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
+    record: dict[str, Any] = {
+        "v": "v1",
+        "endpoint": parsed.endpoint,
+        "protocol": parsed.prefix,
+        "model": model.strip(),
+        "credential": credential,
+        "ua": USER_AGENT,
+    }
+    effort = normalize_reasoning_effort(getattr(llm_config, "reasoning_effort", None))
+    if effort is not None:
+        record["reasoning_effort"] = effort
+    canonical = json.dumps(record, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 

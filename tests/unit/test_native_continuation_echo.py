@@ -182,4 +182,3 @@ def test_signed_sdk_call_id_echoed_exactly_unchanged():
     assert not hasattr(completion, "thought")
     assert not hasattr(completion, "reasoning")
     assert "thought" not in completion.tool_calls[0].__dict__
-

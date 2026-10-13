@@ -44,6 +44,7 @@ from redteam.llm.opencode_go_config import (
 from redteam.llm.opencode_go_config import (
     parse_model as parse_model,
 )
+from redteam.llm.reasoning_effort import apply_messages_effort, litellm_default_kwargs
 
 if TYPE_CHECKING:
     from redteam.core.config import LLMConfig
@@ -112,6 +113,7 @@ class OpenCodeGoClient:
         client: LiteLLMClient,
         fingerprint: str,
         user_agent: str = USER_AGENT,
+        reasoning_effort: str | None = None,
     ) -> None:
         self._provider = provider
         self._model = model
@@ -121,6 +123,9 @@ class OpenCodeGoClient:
         self._client = client
         self._fingerprint = fingerprint
         self._user_agent = user_agent
+        from redteam.core.contracts.llm_config import normalize_reasoning_effort
+
+        self._reasoning_effort = normalize_reasoning_effort(reasoning_effort)
         self._client_identity = uuid.uuid4().hex
 
     @property
@@ -171,6 +176,10 @@ class OpenCodeGoClient:
             headers[_AUTH_HEADER] = "Bearer " + self._api_key
         merged = dict(kwargs)
         merged["extra_headers"] = headers
+        if self._protocol == "messages" and self._reasoning_effort is not None:
+            merged["output_config"] = apply_messages_effort(
+                merged.get("output_config"), self._reasoning_effort
+            )
         return merged
 
     def _structured_kwargs(
@@ -178,10 +187,15 @@ class OpenCodeGoClient:
     ) -> dict[str, Any]:
         call_kwargs = self._call_kwargs(kwargs)
         if self._protocol == "messages":
-            call_kwargs["output_config"] = {}
-            call_kwargs["output_config"]["format"] = {}
-            call_kwargs["output_config"]["format"]["type"] = "json_schema"
-            call_kwargs["output_config"]["format"]["schema"] = response_schema
+            merged = apply_messages_effort(
+                call_kwargs.get("output_config"), self._reasoning_effort
+            )
+            fmt = merged.get("format")
+            fmt_dict = dict(fmt) if isinstance(fmt, dict) else {}
+            fmt_dict["type"] = "json_schema"
+            fmt_dict["schema"] = response_schema
+            merged["format"] = fmt_dict
+            call_kwargs["output_config"] = merged
         return call_kwargs
 
     async def complete(self, *, messages, system=None, **kwargs) -> str:
@@ -233,7 +247,9 @@ def build(config: LLMConfig) -> OpenCodeGoClient:
             "opencode-go requires an API key: set " + str(env_var),
         )
     _require_litellm()
+    effort_kwargs = litellm_default_kwargs(getattr(config, "reasoning_effort", None))
     inner_kwargs: dict[str, Any] = {"api_base": parsed.endpoint}
+    inner_kwargs.update(effort_kwargs)
     if parsed.protocol == "responses":
         inner = LiteLLMClient(
             parsed.sdk_model, api_key, num_retries=0, use_responses_api=True, **inner_kwargs
@@ -245,4 +261,5 @@ def build(config: LLMConfig) -> OpenCodeGoClient:
     return OpenCodeGoClient(
         provider=provider, model=model, protocol=parsed.protocol,
         endpoint=parsed.endpoint, api_key=api_key, client=inner, fingerprint=fingerprint,
+        reasoning_effort=getattr(config, "reasoning_effort", None),
     )

@@ -312,6 +312,7 @@ async def test_subscription_stream_accumulates_calls_and_ignores_reasoning():
         yield {"type": "response.completed"}
 
     client = LiteLLMClient.__new__(LiteLLMClient)
+    client._reasoning_effort = None
     result = await client._accumulate_responses_stream_native(stream())
     assert result.protocol_error is None
     assert result.text == "public note"
@@ -332,6 +333,7 @@ async def test_subscription_stream_missing_id_reports_protocol_error():
         yield {"type": "response.completed"}
 
     client = LiteLLMClient.__new__(LiteLLMClient)
+    client._reasoning_effort = None
     result = await client._accumulate_responses_stream_native(stream())
     assert result.tool_calls == ()
     assert result.protocol_error == NATIVE_PROTOCOL_MISSING_CALL_ID
@@ -345,6 +347,7 @@ async def test_subscription_stream_without_completed_is_provider_failure():
                "item_id": "m1", "content_index": 0, "delta": "hi"}
 
     client = LiteLLMClient.__new__(LiteLLMClient)
+    client._reasoning_effort = None
     with pytest.raises(LLMProviderFailure):
         await client._accumulate_responses_stream_native(stream())
 

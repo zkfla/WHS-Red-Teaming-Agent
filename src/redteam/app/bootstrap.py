@@ -171,7 +171,12 @@ def build_llm_client(config: LLMConfig) -> LLMClient:
     if config.provider == "litellm":
         from redteam.llm.litellm import LiteLLMClient
 
-        return LiteLLMClient(model=config.default_model, api_key=config.resolve_api_key())
+        return LiteLLMClient(
+            model=config.default_model,
+            api_key=config.resolve_api_key(),
+            reasoning_effort=config.reasoning_effort,
+            api_key_env_var=config.api_key_env_var,
+        )
     from redteam.llm.opencode_go_config import (
         OPENCODE_GO_PROVIDER,
     )
