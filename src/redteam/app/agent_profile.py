@@ -64,8 +64,21 @@ class SpecialistProfile(BaseModel):
                 raise ValueError("specialist_profile_v2_cannot_enable_probes")
         elif self.schema_version == "3":
             required.add("hypothesis_planning")
-            if self.probe_limits is None or "task_atomization" in self.stages:
+            if "task_atomization" in self.stages and self.probe_limits is None:
+                raise ValueError("probe_profile_atomizer_requires_probe_limits")
+            if self.probe_limits is None:
                 raise ValueError("probe_profile_limits_or_stages_invalid")
+            if "task_atomization" in self.stages:
+                atomizer_id = self.stages["task_atomization"]
+                if atomizer_id == self.stages.get("hypothesis_planning"):
+                    raise ValueError("probe_profile_atomizer_must_be_separate")
+                atomizer = next(
+                    (role for role in self.roles
+                     if str(role.definition.agent_id) == atomizer_id),
+                    None,
+                )
+                if atomizer is None or atomizer.definition.schedulable:
+                    raise ValueError("probe_profile_atomizer_must_be_non_schedulable")
             executors = [role for role in self.roles if role.definition.schedulable]
             if len(executors) != 1 or self.stages.get("native_action") != str(
                 executors[0].definition.agent_id
@@ -130,7 +143,12 @@ class LoadedSpecialists:
 
     def run_policy(self) -> SpecialistRunPolicy:
         return SpecialistRunPolicy(
-            fingerprint=self.fingerprint, **self.profile.model_dump(include={
+            fingerprint=self.fingerprint,
+            probe_atomization=(
+                self.profile.schema_version == "3"
+                and "task_atomization" in self.profile.stages
+            ),
+            **self.profile.model_dump(include={
                 "max_instances", "max_activations", "max_tasks_per_strategy",
                 "max_strategy_revisions",
                 "probe_limits",

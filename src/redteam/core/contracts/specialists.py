@@ -1,6 +1,6 @@
 """Run lifecycle limits selected by a trusted specialist profile."""
 
-from pydantic import BaseModel, ConfigDict, Field, model_serializer
+from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
 
 
 class ProbeLimits(BaseModel):
@@ -19,10 +19,19 @@ class SpecialistRunPolicy(BaseModel):
     max_tasks_per_strategy: int = Field(ge=1, strict=True)
     max_strategy_revisions: int = Field(ge=1, strict=True)
     probe_limits: ProbeLimits | None = None
+    probe_atomization: bool = False
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         result = handler(self)
         if self.probe_limits is None:
             result.pop("probe_limits", None)
+        if self.probe_atomization is False:
+            result.pop("probe_atomization", None)
         return result
+
+    @model_validator(mode="after")
+    def _require_limits_for_atomization(self):
+        if self.probe_atomization and self.probe_limits is None:
+            raise ValueError("probe_atomization_requires_probe_limits")
+        return self

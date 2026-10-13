@@ -20,6 +20,15 @@ from redteam.orchestration.diagnostics import DecisionDiagnostic
 from redteam.orchestration.engine import InvestigationEngine
 from redteam.orchestration.knowledge_validation import known_principals, known_target_ids
 from redteam.orchestration.metered_llm import llm_request_scope
+from redteam.orchestration.probe_atomization import (
+    HypothesisPlanDraft,
+    TaskAtomizationDraft,
+    bind_candidate_updates,
+    bind_plan,
+    build_atomizer_input,
+    needs_atomization,
+    validate_atomized_tasks,
+)
 from redteam.orchestration.specialist_tasks import (
     HypothesisProbeProposal,
     ProbeTaskProposal,
@@ -86,7 +95,7 @@ def capture_snapshot(tx):
 
 def bind_decision(decision, snapshot, *, issued, targets, principals, roles, max_tasks, limits):
     """Resolve local references and validate purpose inputs without mutating originals."""
-    updates, tasks = [], []
+    tasks = []
     names = [update.hypothesis.hypothesis_id for update in decision.updates]
     if not decision.reason.strip() or any(
         not value.strip() for value in decision.resume_conditions
@@ -96,29 +105,11 @@ def bind_decision(decision, snapshot, *, issued, targets, principals, roles, max
         raise HypothesisProposalError("new_work_requires_continue_judgment")
     if len(set(names)) != len(names) or len(decision.tasks) > max_tasks:
         raise HypothesisProposalError("candidate_identity_or_task_count_invalid")
-    for update in decision.updates:
-        draft = update.hypothesis
-        identity = draft.hypothesis_id
-        current = snapshot.candidates.get(identity)
-        if update.expected_revision is None:
-            if current is not None or draft.status in {"confirmed", "rejected"}:
-                raise HypothesisProposalError("new_candidate_requires_local_key_and_open_judgment")
-            if identity not in issued:
-                issued[identity] = new_id("hyp")
-            identity = issued[identity]
-        elif current is None or current.revision != update.expected_revision:
-            raise HypothesisProposalError("candidate_expected_revision_not_in_snapshot")
-        if set(draft.target_node_ids) - targets or set(draft.principal_refs) - principals:
-            raise HypothesisProposalError("candidate_subject_not_registered")
-        if set(draft.source_hypothesis_ids) - snapshot.candidates.keys():
-            raise HypothesisProposalError("candidate_sources_must_reference_existing_snapshots")
-        if draft.status == "held" and not decision.resume_conditions:
-            raise HypothesisProposalError("held_candidate_requires_resume_conditions")
-        updates.append(update.model_copy(update={"hypothesis": draft.model_copy(update={
-            "hypothesis_id": identity,
-            "metadata": {**draft.metadata, **({"resume_conditions": decision.resume_conditions}
-                                              if draft.status == "held" else {})},
-        })}))
+    updates = bind_candidate_updates(
+        decision.updates, snapshot, issued=issued, targets=targets,
+        principals=principals, resume_conditions=decision.resume_conditions,
+        error=HypothesisProposalError,
+    )
     versions = {identity: candidate.revision for identity, candidate in snapshot.candidates.items()}
     versions.update({update.hypothesis.hypothesis_id: (update.expected_revision or 0) + 1
                      for update in updates})
@@ -173,11 +164,13 @@ def bind_decision(decision, snapshot, *, issued, targets, principals, roles, max
     return proposal
 
 
-def related_reads(decision, proposal, snapshot, records):
+def related_reads(decision, proposal, snapshot, records, *, questions=(), issued=None):
     hypotheses = set(decision.reviewed_hypothesis_ids)
     tasks = set(decision.reviewed_task_ids)
     subjects = set()
     evidence = set()
+    new = ({update.hypothesis.hypothesis_id for update in proposal.updates
+            if update.expected_revision is None} if proposal is not None else set())
     if proposal is not None:
         for update in proposal.updates:
             candidate = update.hypothesis
@@ -188,14 +181,21 @@ def related_reads(decision, proposal, snapshot, records):
             evidence.update([*candidate.supporting_evidence_ids, *candidate.refuting_evidence_ids])
             if update.review_evidence_id:
                 evidence.add(update.review_evidence_id)
-        new = {update.hypothesis.hypothesis_id for update in proposal.updates
-               if update.expected_revision is None}
         for task in proposal.tasks:
             hypotheses.update(set(task.hypothesis_revisions) - new)
             subjects.update(task.target_node_ids)
             evidence.update(task.evidence_ids)
             if task.source_task_id:
                 tasks.add(task.source_task_id)
+    for question in questions:
+        revisions = ({issued.get(identity, identity): revision
+                      for identity, revision in question.hypothesis_revisions.items()}
+                     if issued is not None else dict(question.hypothesis_revisions))
+        hypotheses.update(set(revisions) - new)
+        subjects.update(question.target_node_ids)
+        evidence.update(question.evidence_ids)
+        if question.source_task_id:
+            tasks.add(question.source_task_id)
     if decision.termination != "continue":
         # A global stop/exhaustion judgment consumed all current work, not one candidate.
         hypotheses.update(snapshot.candidates)
@@ -256,6 +256,11 @@ async def advance_hypotheses(planner, runtime, schema):
     })
     payload["knowledge"].pop("hypotheses", None)  # Captured candidate objects above own this input.
     issued = {}
+    if getattr(planner.policy, "probe_atomization", False) is True:
+        return await _advance_split(
+            planner, runtime, schema, snapshot, engine, budget, payload,
+            targets, principals, roles, records,
+        )
 
     def bind(raw):
         decision = HypothesisDecision.model_validate(raw)
@@ -302,13 +307,24 @@ async def advance_hypotheses(planner, runtime, schema):
                 "issued_candidate_ids": issued, "graph_read": graph_read, "task_read": task_read,
                 "candidate_inventory": sorted(snapshot.candidates),
                 "task_inventory": sorted(snapshot.tasks)}
+    return await _finalize_hypothesis_pass(
+        deps, snapshot, budget, identity=identity, proposal=proposal, judgment=judgment,
+        graph_read=graph_read, task_read=task_read, targets=targets, principals=principals,
+        max_tasks=planner.policy.max_tasks_per_strategy,
+    )
+
+
+async def _finalize_hypothesis_pass(deps, snapshot, budget, *, identity, proposal, judgment,
+                                    graph_read, task_read, targets, principals, max_tasks):
+    """One commit path for legacy and split judgments: single CAS or judgment-only write."""
+    state = deps.central_state
     try:
         if proposal is not None:
             receipt = await register_probe_tasks(
                 deps, proposal_id=identity, proposal=proposal,
                 expected_revision=snapshot.mission.revision, expected_binding_hash=snapshot.binding,
                 graph_read=graph_read, task_read=task_read, known_targets=targets,
-                known_principals=principals, max_tasks=planner.policy.max_tasks_per_strategy,
+                known_principals=principals, max_tasks=max_tasks,
                 planner_judgment=judgment,
             )
             identities = receipt["task_ids"]
@@ -336,3 +352,157 @@ async def advance_hypotheses(planner, runtime, schema):
         )) from exc
     await deps.event_bus.flush()
     return identities
+
+
+_SPLIT_PLAN_SYSTEM = (
+    "Propose candidate updates and investigation questions in one judgment, never worker tasks. "
+    "New updates use a proposal-local hypothesis_id and expected_revision=null; code issues the "
+    "persistent ID. Questions may reference that key with revision=1. Existing updates use "
+    "captured IDs and expected revisions; questions use the resulting revision. Questions carry "
+    "only the investigation purpose -- objective, subjects, completion criteria, related "
+    "candidate revisions, evidence and source refs, and the required meaning -- never a worker "
+    "role or tool-call order. Question IDs are local to this plan. Identify "
+    "reviewed_task_ids/reviewed_hypothesis_ids actually consumed. Source followups cite the "
+    "captured Task/result pair, without inventing a question. Observations and Task outcome are "
+    "not candidate verdicts. Final verdicts require an independent public review receipt for "
+    "that exact candidate revision/purpose. No candidates initially means a useful scoped "
+    "observation or reasoned hold. Same evidence can support another useful probe. Never "
+    "prescribe tool-call order, invent subjects or overwrite active work. Held/exhausted "
+    "judgments must explain reconsideration conditions; goal success remains a separate "
+    "completion gate."
+)
+
+
+_SPLIT_ATOMIZE_SYSTEM = (
+    "Decompose each planned question into probe tasks. Reference each task to its plan-local "
+    "question_id and preserve that question's subjects, completion criteria, candidate "
+    "revisions, required meaning and source refs on every task. A task's subjects must stay "
+    "within its question; together the tasks must cover the question's subjects and every "
+    "completion criterion exactly. Keep a paired-comparison criterion as one condition on one "
+    "task, never split the condition itself. Use only ready roles, captured subjects and the "
+    "candidate revisions from the plan, including the issued IDs for new candidates. Never "
+    "prescribe tool-call order, invent subjects or overwrite active work."
+)
+
+
+async def _advance_split(planner, runtime, schema, snapshot, engine, budget, payload,
+                         targets, principals, roles, records):
+    """Two asks on ONE DecisionBudget: questions first, then probe tasks, one CAS commit.
+
+    Empty/held/update-only plans skip the atomizer (no second request). A
+    stage-handoff failure propagates without any state write; requests already
+    consumed stay charged to the shared Run ledger.
+    """
+    deps = planner.deps
+    issued: dict[str, str] = {}
+
+    def bind_stage_one(raw):
+        draft = HypothesisPlanDraft.model_validate(raw)
+        updates, questions, versions = bind_plan(
+            draft, snapshot, issued=issued, targets=targets, principals=principals,
+            max_tasks=planner.policy.max_tasks_per_strategy,
+        )
+        return draft, updates, questions, versions
+
+    def validate_plan(raw):
+        try:
+            bind_stage_one(raw)
+        except (ValueError, SpecialistProposalError) as exc:
+            raise DecisionValidationError(DecisionDiagnostic(
+                code=getattr(exc, "code", "hypothesis_proposal_invalid"),
+                stage="hypothesis_planning", kind="validation",
+                retryable=True, summary="Use captured subjects, candidate revisions and original "
+                "source results. A new candidate key is local to this proposal; questions carry "
+                "purpose only, never worker tasks. Empty judgments need a termination reason "
+                "and resume_conditions.",
+            )) from exc
+
+    with llm_request_scope(str(runtime.run_id), "hypothesis_planning"):
+        plan_raw = await planner.client.ask(
+            stage="hypothesis_planning", payload=payload, budget=budget,
+            response_schema=schema(HypothesisPlanDraft.model_json_schema()),
+            validate_response=validate_plan, before_call=engine.guard_reasoning,
+            system=_SPLIT_PLAN_SYSTEM,
+        )
+    draft, updates, questions, versions = bind_stage_one(plan_raw)
+    identity = new_id("planner_pass")
+    if updates is not None and needs_atomization(draft, questions):
+        atom_payload = redact_secret_material(build_atomizer_input(
+            payload, plan=draft, updates=updates, questions=questions,
+            issued=issued, versions=versions,
+        ))
+
+        def validate_tasks(raw):
+            try:
+                parsed = TaskAtomizationDraft.model_validate(raw)
+                validate_atomized_tasks(
+                    parsed.tasks, questions=questions, issued=issued, versions=versions,
+                    targets=targets, principals=principals, roles=roles,
+                    limits=planner.policy.probe_limits, snapshot=snapshot,
+                    max_tasks=planner.policy.max_tasks_per_strategy,
+                )
+            except (ValueError, SpecialistProposalError) as exc:
+                raise DecisionValidationError(DecisionDiagnostic(
+                    code=getattr(exc, "code", "hypothesis_proposal_invalid"),
+                    stage="task_atomization", kind="validation",
+                    retryable=True, summary="Cover every planned question with at least one "
+                    "probe task. Preserve each question's subjects, completion criteria, "
+                    "candidate revisions, required meaning and source refs; keep a "
+                    "paired-comparison criterion as one condition on one task.",
+                )) from exc
+
+        with llm_request_scope(str(runtime.run_id), "hypothesis_planning"):
+            tasks_raw = await planner.client.ask(
+                stage="task_atomization", payload=atom_payload, budget=budget,
+                response_schema=schema(TaskAtomizationDraft.model_json_schema()),
+                validate_response=validate_tasks, before_call=engine.guard_reasoning,
+                system=_SPLIT_ATOMIZE_SYSTEM,
+            )
+        parsed = TaskAtomizationDraft.model_validate(tasks_raw)
+        atom_tasks = validate_atomized_tasks(
+            parsed.tasks, questions=questions, issued=issued, versions=versions,
+            targets=targets, principals=principals, roles=roles,
+            limits=planner.policy.probe_limits, snapshot=snapshot,
+            max_tasks=planner.policy.max_tasks_per_strategy,
+        )
+        decision = HypothesisDecision(
+            updates=draft.updates, tasks=atom_tasks,
+            reviewed_task_ids=draft.reviewed_task_ids,
+            reviewed_hypothesis_ids=draft.reviewed_hypothesis_ids,
+            reason=draft.reason, termination=draft.termination,
+            resume_conditions=draft.resume_conditions,
+        )
+        proposal = bind_decision(
+            decision, snapshot, issued=issued, targets=targets, principals=principals,
+            roles=roles, max_tasks=planner.policy.max_tasks_per_strategy,
+            limits=planner.policy.probe_limits,
+        )
+        coverage = {
+            question.question_id: [task.task_key for task in parsed.tasks
+                                   if task.question_id == question.question_id]
+            for question in questions
+        }
+        atomization = {"question_ids": [question.question_id for question in questions],
+                       "coverage": coverage, "skipped": None}
+    else:
+        decision = draft
+        proposal = (HypothesisProbeProposal(updates=updates, tasks=[])
+                    if updates is not None else None)
+        atomization = {"question_ids": [question.question_id for question in questions],
+                       "coverage": {},
+                       "skipped": ("update_only_no_questions" if updates is not None
+                                   else "held_or_empty")}
+    graph_read, task_read = related_reads(
+        decision, proposal, snapshot, records, questions=questions, issued=issued,
+    )
+    judgment = {**decision.model_dump(mode="json"), "sequence": snapshot.sequence,
+                "issued_candidate_ids": issued, "graph_read": graph_read, "task_read": task_read,
+                "candidate_inventory": sorted(snapshot.candidates),
+                "task_inventory": sorted(snapshot.tasks),
+                "questions": [question.model_dump(mode="json") for question in questions],
+                "atomization": atomization}
+    return await _finalize_hypothesis_pass(
+        deps, snapshot, budget, identity=identity, proposal=proposal, judgment=judgment,
+        graph_read=graph_read, task_read=task_read, targets=targets, principals=principals,
+        max_tasks=planner.policy.max_tasks_per_strategy,
+    )
