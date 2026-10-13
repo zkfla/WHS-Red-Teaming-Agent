@@ -47,6 +47,16 @@ def read_methods() -> list[HTTPMethod]:
     return ["GET", "HEAD", "OPTIONS"]
 
 
+def valid_query_key(key: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}", key))
+
+
+def valid_request_header(name: str) -> bool:
+    return bool(re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", name)) and (
+        name not in PROTECTED_HEADERS and not name.startswith(("proxy-", "x-forwarded-"))
+    )
+
+
 class TargetProfile(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -59,15 +69,18 @@ class TargetProfile(BaseModel):
     mutable_json_fields: dict[str, list[str]] = Field(default_factory=dict)
     allowed_query_keys: dict[str, list[str]] = Field(default_factory=dict)
     allowed_request_headers: list[str] = Field(default_factory=list)
+    allow_all_query_keys: bool = False
+    allowed_global_query_keys: list[str] = Field(default_factory=list, max_length=100)
+    allow_all_request_headers: bool = False
+    request_body_enabled: bool = True  # Historical JSON callers retain their contract.
+    response_body_max_chars: int = Field(default=0, ge=0, le=16384)
 
     @field_validator("allowed_request_headers")
     @classmethod
     def valid_headers(cls, values: list[str]) -> list[str]:
         lowered = [name.lower() for name in values]
         if any(
-            not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", name)
-            or name in PROTECTED_HEADERS
-            or name.startswith(("proxy-", "x-forwarded-"))
+            not valid_request_header(name)
             for name in lowered
         ) or len(set(lowered)) != len(lowered):
             raise ValueError("invalid, protected or duplicate request header")
@@ -109,7 +122,7 @@ class TargetProfile(BaseModel):
             raise ValueError("query rules must reference allowed paths")
         for keys in self.allowed_query_keys.values():
             if len(set(keys)) != len(keys) or any(
-                not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}", key) for key in keys
+                not valid_query_key(key) for key in keys
             ):
                 raise ValueError("invalid or duplicate query key")
         if set(self.allowed_path_methods) - allowed:
@@ -128,7 +141,24 @@ class TargetProfile(BaseModel):
                 or any(not field or len(field) > 100 for field in fields)
             ):
                 raise ValueError("mutable JSON field lists must be non-empty and unique")
+        if not self.allowed_methods or len(set(self.allowed_methods)) != len(self.allowed_methods):
+            raise ValueError("method lists must be non-empty and unique")
+        if len(set(self.allowed_global_query_keys)) != len(self.allowed_global_query_keys) or any(
+            not valid_query_key(key) for key in self.allowed_global_query_keys
+        ):
+            raise ValueError("invalid or duplicate global query key")
         return self
+
+    def allows_query_key(self, path: str, key: str) -> bool:
+        return valid_query_key(key) and (
+            self.allow_all_query_keys or key in self.allowed_global_query_keys
+            or key in self.allowed_query_keys.get(path, [])
+        )
+
+    def allows_request_header(self, name: str) -> bool:
+        return valid_request_header(name) and (
+            self.allow_all_request_headers or name in self.allowed_request_headers
+        )
 
     def allows_path(self, path: str) -> bool:
         """Whole-origin permission still accepts only literal local URL paths."""
@@ -145,6 +175,14 @@ class TargetProfile(BaseModel):
         payload = handler(self)
         if not self.allow_all_paths:
             payload.pop("allow_all_paths", None)
+        # New permissions must not change bytes/digests of existing policies.
+        for name, default in {
+            "allow_all_query_keys": False, "allowed_global_query_keys": [],
+            "allow_all_request_headers": False, "request_body_enabled": True,
+            "response_body_max_chars": 0,
+        }.items():
+            if payload.get(name) == default:
+                payload.pop(name, None)
         return payload
 
 

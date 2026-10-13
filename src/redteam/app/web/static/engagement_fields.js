@@ -12,6 +12,7 @@ export function parseList(text) {
 }
 
 function capabilityBox(def, draft, onChange) {
+  if (draft[def.name] == null && Array.isArray(def.default)) draft[def.name] = [...def.default];
   const chosen = new Set(draft[def.name] || []);
   return h("fieldset", { class: "choices" },
     h("legend", { text: def.label }),
@@ -30,13 +31,48 @@ function capabilityBox(def, draft, onChange) {
         option)));
 }
 
+function sessionBox(def, draft, onChange) {
+  const sessions = draft.web_sessions || (draft.web_sessions = []);
+  const origins = draft.allowed_hosts || [];
+  return h("fieldset", { class: "choices" }, h("legend", { text: def.label }),
+    h("p", { class: "note", text: "비밀번호·토큰 값 대신 환경변수 이름 또는 로그인 상태 파일을 지정하세요. 실제 로그인 여부는 실행 시 확인됩니다." }),
+    sessions.map((session, index) => h("fieldset", {},
+      h("legend", { text: `계정 ${index + 1}` }),
+      [
+        ["session_ref", "Session 이름"], ["principal_ref", "사용자 이름 (권한 비교용)"],
+        ["origin", "대상 사이트 URL"], ["paths", "인증을 사용할 경로 (쉼표로 구분)"],
+        ["bearer_env", "Bearer 토큰 환경변수 이름"],
+        ["storage_state_path", "로그인 상태 파일의 절대 경로 (Bearer와 둘 중 하나)"],
+      ].map(([key, label]) => h("label", {}, label,
+        h("input", { type: "text", autocomplete: "off",
+          value: key === "paths" ? listText(session.paths) : session[key] || "",
+          oninput: (event) => {
+            session[key] = key === "paths" ? parseList(event.target.value) : event.target.value.trim() || null;
+            onChange();
+          } }))),
+      h("button", { type: "button", text: "계정 제거", onclick: () => {
+        sessions.splice(index, 1); onChange(true);
+      } }))),
+    h("button", { type: "button", text: "계정 추가", onclick: () => {
+      sessions.push({ session_ref: "", principal_ref: "", origin: origins.length === 1 ? origins[0] : "",
+        paths: draft.web_policy_mode === "paths" ? [...(draft.web_paths || [])] : ["/"],
+        bearer_env: null, storage_state_path: null, expected_access: "unspecified" });
+      onChange(true);
+    } }));
+}
+
 export function fieldNode(def, draft, onChange) {
+  if (def.name === "web_sessions") return sessionBox(def, draft, onChange);
   if (def.choices) {
     if (draft[def.name] == null) draft[def.name] = def.default;
     const control = h("select", { name: def.name,
       onchange: (event) => {
         draft[def.name] = event.target.value;
         if (def.name === "web_policy_mode" && event.target.value !== "paths") draft.web_paths = [];
+        if (def.name === "web_policy_mode" && event.target.value === "manual") {
+          draft.web_permissions = "read_only"; draft.web_sessions = [];
+          draft.kali_network_mode = "inherit"; draft.kali_network_policy_path = null;
+        }
         onChange();
       },
     }, def.choices.map((choice) => h("option", {

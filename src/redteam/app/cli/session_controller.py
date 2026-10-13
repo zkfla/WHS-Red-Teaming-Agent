@@ -47,6 +47,7 @@ class SessionController:
         slash_handler=None,
         resume_runner=None,
         context_loader=None,
+        tool_context_loader=None,
         approval_verifier=None,
         commands=(),
         command_help=None,
@@ -76,6 +77,7 @@ class SessionController:
         self.slash_handler = slash_handler
         self.resume_runner = resume_runner
         self.context_loader = context_loader
+        self.tool_context_loader = tool_context_loader
         self.approval_verifier = approval_verifier
         self.active_receipt: InputReceipt | None = None
         self.commands = sorted(
@@ -451,6 +453,7 @@ class SessionController:
             )
         for attempt in range(2):
             revision = self.context_loader() if self.context_loader else None
+            tool_context = self.tool_context_loader() if self.tool_context_loader else {}
             route = self.router.route
             if self._same(bound) and self.operator is not None:
                 bound_route = getattr(self.operator, "route_conversation", None)
@@ -462,6 +465,7 @@ class SessionController:
                 active=self._same(bound),
                 engagement_name=self.engagement_name,
                 scope=self.scope,
+                **tool_context,
             )
             latest = self.context_loader() if self.context_loader else None
             if latest == revision:

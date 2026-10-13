@@ -938,7 +938,7 @@ class DefaultControlPlane:
         )
         rate_limiter.rehydrate(window_actions)
 
-        logger.info(
+        logger.debug(
             "rehydrated control accounting for engagement %s: actions=%d tool_calls=%d",
             normalized_id,
             budget.consumed,

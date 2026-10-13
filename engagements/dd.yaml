@@ -49,15 +49,17 @@ metadata:
     origins:
     - http://127.0.0.1:80
     paths: []
+    permissions: full
+    response_body_max_chars: 4000
   target_refs:
     127.0.0.1:80: target_e79d0b65276c07c7
+  mcp_deployment:
+    source_path: /Users/yuyechan/folder/claude/REDRED/WHS-Red-Teaming-Agent/engagements/dd.mcp/eb9e8b70fab614c2727bd4188094e17914275f7dbf9887e3a770107667028125/deployment.json
+    source_sha256: 12449e39087546adb5d78b8a690ec6bd665b709c1a3c9e500776513868b87558
+    policy_path: /Users/yuyechan/folder/claude/REDRED/WHS-Red-Teaming-Agent/engagements/dd.mcp/eb9e8b70fab614c2727bd4188094e17914275f7dbf9887e3a770107667028125/policy.json
+    policy_sha256: a67c53539e60a9f40e410ff43cede35edea963543d7e531246d6c68b303e9e92
   auth_sessions:
     127.0.0.1:80: []
-  mcp_deployment:
-    source_path: /Users/yuyechan/folder/claude/REDRED/WHS-Red-Teaming-Agent/engagements/dd.mcp/e9c8db75d8a92c603680fb68b059dff500da0291e106b4492dc4806f2e3ff75a/deployment.json
-    source_sha256: 7743ddfec60dc75ee033c902138b6b948c7fb86c280eec293b34eb3a3f833cad
-    policy_path: /Users/yuyechan/folder/claude/REDRED/WHS-Red-Teaming-Agent/engagements/dd.mcp/e9c8db75d8a92c603680fb68b059dff500da0291e106b4492dc4806f2e3ff75a/policy.json
-    policy_sha256: be7beaf9bd00e1f077836bac1d3d3ded13f88df1acb51a5e348169b6da99d51a
   mcp_targets:
     target_e79d0b65276c07c7:
       host: 127.0.0.1
@@ -68,8 +70,17 @@ metadata:
       - GET
       - HEAD
       - OPTIONS
+      - POST
+      - PUT
+      - PATCH
+      - DELETE
       allowed_path_methods: {}
       allowed_query_keys: {}
       allowed_request_headers: []
+      allow_all_query_keys: true
+      allow_all_request_headers: true
+      response_body_max_chars: 4000
+      allowed_global_query_keys: []
+      request_body_enabled: true
       sessions: []
       verification: operator_declared_not_login_verified

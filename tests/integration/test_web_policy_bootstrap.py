@@ -1,13 +1,16 @@
 """Actual local stdio initialization/discovery only: no LLM or target calls."""
 
+import pytest
+
 from redteam.app.web.host import RealLauncher
 from redteam.capability.bootstrap import open_mcp_tool_gateway
 from redteam.core.environment import env_snapshot, environment_context
 from tests.unit.test_web_policy import save
 
 
-async def test_web_generated_policy_starts_the_real_builtin_mcp_servers(tmp_path):
-    store = save(tmp_path / "lab.yaml")
+@pytest.mark.parametrize("permissions", ["read_only", "custom", "full"])
+async def test_web_generated_policy_starts_the_real_builtin_mcp_servers(tmp_path, permissions):
+    store = save(tmp_path / "lab.yaml", web_permissions=permissions)
     environment = {
         "REDTEAM_LLM_PROVIDER": "litellm",
         "REDTEAM_LLM_MODEL": "fixture/not-called",
@@ -31,4 +34,6 @@ async def test_web_generated_policy_starts_the_real_builtin_mcp_servers(tmp_path
         descriptors = gateway.all_descriptors()
         assert {tool.server_id for tool in descriptors} == {"web-http", "recon-passive"}
         assert {tool.tool_name for tool in descriptors} >= {"http_request", "http_probe"}
+        http = next(tool for tool in descriptors if tool.tool_name == "http_request")
+        assert "form_body" in http.input_schema["properties"]
     assert env_snapshot() == original
