@@ -12,6 +12,7 @@ SDK exception types.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
@@ -213,6 +214,51 @@ def _clean_native_argument_error(value: Any) -> str | None:
         return value
     return NATIVE_ARG_INVALID_ARGUMENTS
 
+# Opaque provider-owned continuation blocks carried without interpretation.
+NATIVE_MAX_CONTINUATION_BLOCKS = 16
+NATIVE_MAX_CONTINUATION_BYTES = 1048576
+# 1 MiB bounds checkpoint growth without blocking max-effort long signatures,
+# which can exceed the public-text budget. This is a checkpoint-safety bound,
+# not a model-catalog limit, and there is no feature toggle for it.
+
+
+def _check_continuation_json_keys(value: Any) -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValueError("continuation keys must be strings")
+            _check_continuation_json_keys(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _check_continuation_json_keys(item)
+
+
+def _clean_native_continuation(value: Any) -> tuple[dict[str, Any], ...]:
+    # Opaque blocks; no provider branching here.
+    if value is None:
+        return ()
+    if isinstance(value, list):
+        value = tuple(value)
+    if not isinstance(value, tuple):
+        raise ValueError("bad continuation")
+    if len(value) > NATIVE_MAX_CONTINUATION_BLOCKS:
+        raise ValueError("continuation exceeds block limit")
+    cleaned: list[dict[str, Any]] = []
+    total = 0
+    for block in value:
+        if not isinstance(block, dict):
+            raise ValueError("continuation must be tuple of dicts")
+        _check_continuation_json_keys(block)
+        try:
+            payload = json.dumps(block, ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("continuation must be JSON-shaped") from exc
+        total += len(payload.encode("utf-8"))
+        cleaned.append(json.loads(payload))
+    if total > NATIVE_MAX_CONTINUATION_BYTES:
+        raise ValueError("continuation exceeds size limit")
+    return tuple(cleaned)
+
 
 @dataclass(frozen=True)
 class NativeToolSpec:
@@ -256,11 +302,15 @@ class NativeToolCall:
 @dataclass(frozen=True)
 class NativeCompletion:
     """Normalized native model response: tool calls plus public text."""
+    # continuation carries opaque provider-owned blocks unchanged to the next
+    # request. Empty by default so older runs stay compatible. repr=False keeps
+    # ciphertext out of logs; block meaning is owned by the SDK adapter.
 
     tool_calls: tuple[NativeToolCall, ...] = ()
     text: str = ""
     total_tokens: int | None = None
     protocol_error: str | None = None
+    continuation: tuple[dict[str, Any], ...] = field(default=(), repr=False)
 
     def __post_init__(self) -> None:
         calls = self.tool_calls
@@ -277,6 +327,9 @@ class NativeCompletion:
         )
         object.__setattr__(
             self, "protocol_error", _clean_native_protocol_error(self.protocol_error)
+        )
+        object.__setattr__(
+            self, "continuation", _clean_native_continuation(self.continuation)
         )
 
 
