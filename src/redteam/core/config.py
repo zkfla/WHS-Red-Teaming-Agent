@@ -23,7 +23,15 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    TypeAdapter,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from redteam.core.contracts.engagement import (
     ApprovalPolicy,
@@ -34,6 +42,12 @@ from redteam.core.contracts.engagement import (
     RateLimitPolicy,
     RuleOfEngagement,
     TargetActionPolicy,
+)
+from redteam.core.contracts.llm_config import (
+    REASONING_EFFORTS as REASONING_EFFORTS,
+)
+from redteam.core.contracts.llm_config import (
+    normalize_reasoning_effort as normalize_reasoning_effort,
 )
 from redteam.core.contracts.llm_policy import LLMRequestPolicy
 from redteam.core.environment import (
@@ -100,6 +114,21 @@ class LLMConfig(BaseModel):
     provider: str = "litellm"  # Production requires the real LLM adapter.
     default_model: str = "gpt-4o-mini"
     api_key_env_var: str = "LLM_API_KEY"
+    #: Optional provider-requested reasoning effort; None keeps the default.
+    reasoning_effort: str | None = None
+
+    @field_validator("reasoning_effort", mode="before")
+    @classmethod
+    def _validate_reasoning_effort(cls, value: object) -> str | None:
+        return normalize_reasoning_effort(value)
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        # Unset effort is omitted so historical identities stay byte-identical.
+        result = handler(self)
+        if self.reasoning_effort is None:
+            result.pop("reasoning_effort", None)
+        return result
 
     def resolve_api_key(self) -> str | None:
         return os.environ.get(self.api_key_env_var)
@@ -139,6 +168,9 @@ class LLMConfig(BaseModel):
         api_key_env_var = vals.get("api_key_env_var")
         if api_key_env_var:
             kwargs["api_key_env_var"] = api_key_env_var
+        reasoning_effort = vals.get("reasoning_effort")
+        if reasoning_effort is not None:
+            kwargs["reasoning_effort"] = reasoning_effort
         return cls(**kwargs)
 
 

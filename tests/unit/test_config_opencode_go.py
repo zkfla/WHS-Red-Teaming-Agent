@@ -47,6 +47,7 @@ _MANAGED_ENV_VARS = (
     "REDTEAM_PLANNING_PROVIDER",
     "REDTEAM_SHELL_POLICY_PATH",
     "REDTEAM_GATED_NETWORK_POLICY_PATH",
+    "REDTEAM_LLM_REASONING_EFFORT",
 )
 
 
@@ -279,7 +280,7 @@ async def test_onboarding_default_empty_choice_stays_litellm(
 ) -> None:
     env_file = _onboarding(monkeypatch, tmp_path)
     llm_config, _, _, _ = await interactive._ensure_runtime_config(
-        _ScriptedConsole(["", "gpt-4o-mini"])
+        _ScriptedConsole(["", "gpt-4o-mini", ""])
     )
     assert llm_config.provider == "litellm"
     assert llm_config.default_model == "gpt-4o-mini"
@@ -295,7 +296,7 @@ async def test_onboarding_go_writes_opencode_api_key_reference(
 ) -> None:
     env_file = _onboarding(monkeypatch, tmp_path)
     llm_config, _, _, _ = await interactive._ensure_runtime_config(
-        _ScriptedConsole(["opencode-go", "openai/gpt-test-1"])
+        _ScriptedConsole(["opencode-go", "openai/gpt-test-1", ""])
     )
     assert llm_config.provider == "opencode-go"
     assert llm_config.api_key_env_var == OPENCODE_GO_API_KEY_ENV_VAR == "OPENCODE_API_KEY"
@@ -312,7 +313,7 @@ async def test_onboarding_preserves_existing_api_key_env_var(
     os.environ["REDTEAM_LLM_API_KEY_ENV_VAR"] = "MY_CUSTOM_KEY"
     env_file = _onboarding(monkeypatch, tmp_path)
     llm_config, _, _, _ = await interactive._ensure_runtime_config(
-        _ScriptedConsole(["opencode-go", "anthropic/claude-test"])
+        _ScriptedConsole(["opencode-go", "anthropic/claude-test", ""])
     )
     assert llm_config.api_key_env_var == "MY_CUSTOM_KEY"
     content = env_file.read_text(encoding="utf-8")
@@ -325,7 +326,7 @@ async def test_onboarding_go_rejects_bad_shape_then_accepts(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _isolated_env: None
 ) -> None:
     _onboarding(monkeypatch, tmp_path)
-    console = _ScriptedConsole(["opencode-go", "gpt-6-luna", "openai/responses/gpt-ok"])
+    console = _ScriptedConsole(["opencode-go", "gpt-6-luna", "openai/responses/gpt-ok", ""])
     llm_config, _, _, _ = await interactive._ensure_runtime_config(console)
     assert llm_config.default_model == "openai/responses/gpt-ok"
     assert "invalid REDTEAM_LLM_MODEL" in " ".join(console.transcript)
@@ -335,7 +336,7 @@ async def test_onboarding_unknown_provider_reprompts_to_default(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _isolated_env: None
 ) -> None:
     _onboarding(monkeypatch, tmp_path)
-    console = _ScriptedConsole(["watson", "", "gpt-4o-mini"])
+    console = _ScriptedConsole(["watson", "", "gpt-4o-mini", ""])
     llm_config, _, _, _ = await interactive._ensure_runtime_config(console)
     assert llm_config.provider == "litellm"
     assert "Choose 'litellm'" in " ".join(console.transcript)

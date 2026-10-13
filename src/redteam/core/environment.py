@@ -67,6 +67,9 @@ class LLMEnvInput(_SnapshotSettings):
     api_key_env_var: str | None = Field(
         default=None, validation_alias="REDTEAM_LLM_API_KEY_ENV_VAR"
     )
+    reasoning_effort: str | None = Field(
+        default=None, validation_alias="REDTEAM_LLM_REASONING_EFFORT"
+    )
 
 
 class OrchestrationEnvInput(_SnapshotSettings):
@@ -227,6 +230,7 @@ def llm_env_values(source: Mapping[str, str] | None = None) -> dict[str, str | N
         "provider": raw["provider"],
         "model": raw["model"],
         "api_key_env_var": raw["api_key_env_var"],
+        "reasoning_effort": raw["reasoning_effort"],
     }
 
 
