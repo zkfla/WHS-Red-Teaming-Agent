@@ -565,9 +565,8 @@ class GatedWindowExtension(ExecutionAdmission):
         failure is always reported truthfully as refusal. The daemon session
         travels via docker exec -e (client env never crosses containers).
         """
-        docker_binary = self.manager.policy.docker_binary
         proc = await asyncio.create_subprocess_exec(
-            docker_binary, "exec", "-i",
+            *self.manager.policy.docker_command("exec", "-i"),
             "-e", "GATE_DAEMON_SESSION=" + window.daemon_session_id,
             window.container_tag,
             "gate-daemon", "--window", window.grant.window_id,

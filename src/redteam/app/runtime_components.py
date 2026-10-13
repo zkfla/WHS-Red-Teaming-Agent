@@ -34,6 +34,7 @@ from redteam.orchestration.component_binding import (
     RESULT_MAPPERS_COMPONENT,
     VERIFIER_COMPONENT,
     ComponentBindingError,
+    ComponentMismatchError,
     ComponentProfile,
     ComponentRegistration,
     ComponentRegistry,
@@ -190,14 +191,20 @@ def binding_for_resume(
     *,
     registry: ComponentRegistry | None = None,
     extensions: ExtensionAssembly | None = None,
+    llm_connection_fingerprint: str | None = None,
 ) -> RuntimeComponentBinding:
     """Return the binding to rebuild a run from.
 
     A missing record is a legacy checkpoint and resumes as builtin. An
-    unknown id or version, or changed component ids, is an error. There
-    is no fallback to another version or to the defaults.
+    unknown id or version, changed component ids, or a changed LLM
+    connection fingerprint is an error. There is no fallback to another
+    version or to the defaults.
     """
     if stored is None:
+        if llm_connection_fingerprint is not None:
+            raise ComponentMismatchError(
+                "stored run predates the recorded LLM connection.",
+            )
         return builtin_component_binding()
     active = registry if registry is not None else default_component_registry()
     active.resolve_binding(stored)
@@ -216,6 +223,10 @@ def binding_for_resume(
             assembly.resolve("planning", stored.planning_provider_id)
         except ExtensionAssemblyError as exc:
             raise ComponentBindingError(str(exc)) from exc
+    if stored.llm_connection_fingerprint != llm_connection_fingerprint:
+        raise ComponentMismatchError(
+            "stored LLM connection differs from the current connection.",
+        )
     return stored
 
 

@@ -34,6 +34,7 @@ from redteam.capability.shell_workroom import _CONTAINER_PATH as _OWNER_PATH  # 
 HERE = Path(__file__).resolve().parent
 PACKAGES_FILE = HERE / "packages.txt"
 DOCKERFILE = HERE / "Dockerfile"
+DOCKER_COMMAND = ("docker",)
 DEFAULT_MANIFEST = HERE / "program-manifest.json"
 BASE_IMAGE_REF = "kalilinux/kali-rolling:latest"
 RELEASE = "kali-rolling"
@@ -100,13 +101,13 @@ def read_packages():
 def docker_inspect_id(ref):
     """Local immutable image ID for a reference; raises when absent."""
     out = subprocess.check_output(
-        ["docker", "inspect", "--format", "{{.Id}}", ref], text=True)
+        [*DOCKER_COMMAND, "inspect", "--format", "{{.Id}}", ref], text=True)
     return out.strip()
 
 
 def run_probe(image, packages):
     """One ephemeral offline container; script arrives via argv, no shell."""
-    cmd = ["docker", "run", "--rm", "--network", "none", "--cap-drop", "ALL",
+    cmd = [*DOCKER_COMMAND, "run", "--rm", "--network", "none", "--cap-drop", "ALL",
            "--security-opt", "no-new-privileges", "--user", "65532:65532",
            image, "python3", "-c", PROBE_SCRIPT, json.dumps(packages)]
     out = subprocess.check_output(cmd, text=True, timeout=180)
@@ -120,7 +121,7 @@ def apt_source_from_image(image):
     for path in ("/etc/apt/sources.list.d/kali.sources", "/etc/apt/sources.list"):
         try:
             out = subprocess.check_output(
-                ["docker", "run", "--rm", "--network", "none", "--cap-drop", "ALL",
+                [*DOCKER_COMMAND, "run", "--rm", "--network", "none", "--cap-drop", "ALL",
                  "--user", "65532:65532", image, "cat", path],
                 text=True, timeout=60, stderr=subprocess.DEVNULL)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
@@ -168,14 +169,20 @@ def component_index(mirror):
     return found, note
 
 def main():
+    global DOCKER_COMMAND
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image", default="shell-workroom:t003-draft")
     parser.add_argument("--base-digest", default=None,
                         help="pinned base-image digest from the image build record")
     parser.add_argument("--output", default=str(DEFAULT_MANIFEST))
+    parser.add_argument("--docker-binary", default="docker")
+    parser.add_argument("--docker-context", default=None)
     parser.add_argument("--offline", action="store_true",
                         help="read installed packages only; do not fetch mirror indices")
     args = parser.parse_args()
+    DOCKER_COMMAND = (args.docker_binary,)
+    if args.docker_context is not None:
+        DOCKER_COMMAND += ("--context", args.docker_context)
 
     packages = read_packages()
     print("requested packages: " + str(len(packages)), flush=True)

@@ -32,6 +32,7 @@ import argparse
 import logging
 from collections.abc import Callable
 from contextlib import AsyncExitStack
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any
 
@@ -48,11 +49,12 @@ from redteam.app.cli._shared import (
 from redteam.app.runtime_components import binding_for_resume
 from redteam.capability.settings import (
     MCPConfigurationError,
+    automatic_shell_setup_from_environment,
     gated_network_policy_path_from_environment,
     shell_policy_path_from_environment,
 )
 from redteam.capability.shell_assembly import build_gated_provider_config
-from redteam.capability.shell_runtime import build_shell_runtime
+from redteam.capability.shell_runtime import prepare_shell_runtime
 from redteam.core.config import AppConfig
 from redteam.core.contracts.events import EventType
 from redteam.core.ids import RunId
@@ -218,8 +220,13 @@ async def _run(
     # profile id/version or changed component ids fail here. A missing
     # record is a legacy checkpoint and resumes as builtin.
     try:
-        stored_binding = binding_for_resume(hint.component_binding, registry=component_registry)
-    except ComponentBindingError as exc:
+        from redteam.llm.opencode_go_config import llm_connection_fingerprint_for_config
+
+        stored_binding = binding_for_resume(
+            hint.component_binding, registry=component_registry,
+            llm_connection_fingerprint=llm_connection_fingerprint_for_config(config.llm),
+        )
+    except (ComponentBindingError, ValueError) as exc:
         eprint(
             f"ERROR: stored component profile for run {args.run_id} is not "
             f"registered: {exc} -- refusing to resume."
@@ -241,6 +248,9 @@ async def _run(
             mcp_stack=mcp_stack,
             component_profile=selection_of(stored_binding),
             component_registry=component_registry,
+            **({"execution_environment_fingerprint":
+                stored_binding.execution_environment_fingerprint}
+               if stored_binding.execution_environment_fingerprint is not None else {}),
         )
     except MCPConfigurationError as exc:
         eprint(f"ERROR: MCP configuration invalid: {exc}")
@@ -381,6 +391,7 @@ async def build_resume_application(
     mcp_stack: AsyncExitStack | None = None,
     component_profile: ComponentProfile | None = None,
     component_registry: ComponentRegistry | None = None,
+    execution_environment_fingerprint: str | None = None,
 ) -> tuple[Any, RuntimeDeps]:
     """Rebuild the canonical runtime for a durable resume.
 
@@ -388,9 +399,13 @@ async def build_resume_application(
     run's original ``engagement_id`` and durable orchestration settings, so
     the Control Plane and Attack Graph namespace line up with the checkpoint.
     """
-    # Same shell assembly as run.build (None means disabled; invalid policy
-    # raises MCPConfigurationError for the config-error path).
-    shell_runtime = build_shell_runtime(shell_policy_path_from_environment())
+    shell_runtime = await prepare_shell_runtime(
+        shell_policy_path_from_environment(),
+        # Unrecorded legacy runs retain their original manual provider selection.
+        auto_setup=(automatic_shell_setup_from_environment()
+                    if execution_environment_fingerprint is not None else False),
+        progress=eprint, expected_fingerprint=execution_environment_fingerprint,
+    )
     gated_provider_config = build_gated_provider_config(
         gated_network_policy_path_from_environment()
     )
@@ -422,13 +437,19 @@ async def build_resume_application(
         # ONLY when the operator network policy is configured (absent means
         # closed): the composition root validates the same builtin adapter.
         component_options["gated_shell"] = (shell_runtime, gated_provider_config)
-    return await build_application(
+    engagement, deps = await build_application(
         config,
         engagement_id=engagement_id,
         orchestration_settings=settings,
         mcp_stack=mcp_stack,
         **component_options,
     )
+    if shell_runtime is not None and shell_runtime.environment_fingerprint is not None:
+        assert deps.component_binding is not None
+        deps = replace(deps, component_binding=deps.component_binding.model_copy(update={
+            "execution_environment_fingerprint": shell_runtime.environment_fingerprint,
+        }))
+    return engagement, deps
 
 
 class _CohortRefused(ValueError):
@@ -570,8 +591,13 @@ async def _run_cohort(
             return EXIT_FAILURE
 
     try:
-        stored_binding = binding_for_resume(binding_raw, registry=component_registry)
-    except ComponentBindingError as exc:
+        from redteam.llm.opencode_go_config import llm_connection_fingerprint_for_config
+
+        stored_binding = binding_for_resume(
+            binding_raw, registry=component_registry,
+            llm_connection_fingerprint=llm_connection_fingerprint_for_config(config.llm),
+        )
+    except (ComponentBindingError, ValueError) as exc:
         eprint(f"ERROR: stored component profile for run {run_id} is not registered: {exc}")
         return EXIT_FAILURE
     config = config.model_copy(
@@ -590,6 +616,9 @@ async def _run_cohort(
                 mcp_stack=mcp_stack,
                 component_profile=selection_of(stored_binding),
                 component_registry=component_registry,
+                **({"execution_environment_fingerprint":
+                    stored_binding.execution_environment_fingerprint}
+                   if stored_binding.execution_environment_fingerprint is not None else {}),
             )
             return await _drive_cohort(
                 args, engagement, deps, settings, identities,

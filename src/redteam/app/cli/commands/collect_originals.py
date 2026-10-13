@@ -86,7 +86,12 @@ async def run(
                 or specialists.fingerprint != hint.component_binding.specialist_fingerprint
                 or settings.llm_request_policy != hint.llm_request_policy):
             raise StateConflict("activation_configuration_changed_new_run_required")
-        binding = binding_for_resume(hint.component_binding, registry=component_registry)
+        from redteam.llm.opencode_go_config import llm_connection_fingerprint_for_config
+
+        binding = binding_for_resume(
+            hint.component_binding, registry=component_registry,
+            llm_connection_fingerprint=llm_connection_fingerprint_for_config(config.llm),
+        )
         config = config.model_copy(update={
             "extensions": list(binding.extension_entry_points),
             "planning_provider": binding.planning_provider_id,
@@ -102,6 +107,8 @@ async def run(
             _, deps = await build_resume_application(
                 config, engagement_id=hint.engagement_id, settings=settings, mcp_stack=stack,
                 component_profile=selection_of(binding), component_registry=component_registry,
+                **({"execution_environment_fingerprint": binding.execution_environment_fingerprint}
+                   if binding.execution_environment_fingerprint is not None else {}),
             )
             driver = InstanceDriver(deps, settings=settings)
             body_error: BaseException | None = None

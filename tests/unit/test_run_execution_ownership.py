@@ -61,6 +61,7 @@ async def test_exception_and_cancellation_release_only_process_ownership(tmp_pat
         assert len(await w.tasks.list_tasks()) == 2
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX symlink storage contract")
 async def test_sqlite_canonical_symlink_path_has_the_same_owner(tmp_path):
     w = await world(tmp_path, "sqlite")
     alias = tmp_path / "database-alias.sqlite"
@@ -72,6 +73,7 @@ async def test_sqlite_canonical_symlink_path_has_the_same_owner(tmp_path):
 
 
 @pytest.mark.parametrize("unsafe", ["symlink", "hardlink", "public", "directory", "fifo"])
+@pytest.mark.skipif(os.name != "posix", reason="POSIX inode and permission contract")
 async def test_sqlite_rejects_unsafe_companion_inodes(tmp_path, unsafe):
     w = await world(tmp_path, "sqlite")
     key = hashlib.sha256(RUN.encode()).hexdigest()
@@ -101,9 +103,57 @@ async def test_companion_inode_is_retained_between_owners(tmp_path):
     async with w.coordinator.exclusive_run(RUN):
         (lock,) = tmp_path.glob(".*.lock")
         before = lock.stat()
-        assert before.st_mode & 0o077 == 0
+        if os.name == "posix":
+            assert before.st_mode & 0o077 == 0
     async with sqlite_coordinator(w.db).exclusive_run(RUN):
         assert lock.stat().st_ino == before.st_ino
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows file sharing contract")
+async def test_windows_live_companion_cannot_be_removed_or_replaced(tmp_path):
+    w = await world(tmp_path, "sqlite")
+    async with w.coordinator.exclusive_run(RUN):
+        (lock,) = tmp_path.glob(".*.lock")
+        with pytest.raises(PermissionError):
+            lock.unlink()
+        with pytest.raises(PermissionError):
+            lock.rename(tmp_path / "replacement.lock")
+    async with sqlite_coordinator(w.db).exclusive_run(RUN):
+        assert lock.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows case-insensitive path contract")
+async def test_windows_path_case_does_not_fork_ownership(tmp_path):
+    w = await world(tmp_path, "sqlite")
+    async with w.coordinator.exclusive_run(RUN):
+        with pytest.raises(CoordinationError, match="^run_execution_already_owned$"):
+            async with sqlite_coordinator(str(w.db).upper()).exclusive_run(RUN):
+                pytest.fail("same canonical database cannot have two owners")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows companion handle validation")
+@pytest.mark.parametrize("unsafe", ["hardlink", "directory", "symlink"])
+async def test_windows_rejects_unsafe_companion_without_changing_target(tmp_path, unsafe):
+    w = await world(tmp_path, "sqlite")
+    key = hashlib.sha256(RUN.encode()).hexdigest()
+    lock = w.db.with_name(f".{w.db.name}.run-{key}.lock")
+    target = tmp_path / "unrelated-file"
+    target.write_bytes(b"unchanged")
+    if unsafe == "hardlink":
+        os.link(target, lock)
+    elif unsafe == "directory":
+        lock.mkdir()
+    else:
+        try:
+            lock.symlink_to(target)
+        except OSError as exc:
+            if exc.winerror == 1314:
+                pytest.skip("Windows symlink creation privilege unavailable")
+            raise
+    with pytest.raises(CoordinationError, match="^run_execution_storage_(unsafe|unavailable)$"):
+        async with w.coordinator.exclusive_run(RUN):
+            pytest.fail("unsafe companion cannot confer ownership")
+    assert target.read_bytes() == b"unchanged"
 
 
 async def test_custom_backend_without_ownership_fails_closed_only_when_requested():
@@ -121,7 +171,7 @@ async def test_custom_backend_without_ownership_fails_closed_only_when_requested
 
 async def test_unsupported_platform_does_not_silently_use_memory_ownership(tmp_path, monkeypatch):
     w = await world(tmp_path, "sqlite")
-    monkeypatch.setattr("redteam.orchestration.state_backend.os.name", "nt")
+    monkeypatch.setattr("redteam.orchestration.state_backend.os.name", "unsupported")
     with pytest.raises(CoordinationError, match="^run_execution_backend_unsupported$"):
         async with w.coordinator.exclusive_run(RUN):
             pytest.fail("durable mode must not downgrade to a process-local guard")
@@ -165,7 +215,8 @@ async def test_different_pid_ownership_and_exit_do_not_reset_unknown_accounting(
     )
     try:
         assert child.stdout is not None
-        assert await asyncio.wait_for(child.stdout.readline(), timeout=5) == b"owned\n"
+        # This includes a fresh Python/SDK import, not just the nonblocking lock.
+        assert (await asyncio.wait_for(child.stdout.readline(), timeout=30)).strip() == b"owned"
         assert child.pid != os.getpid()
         with pytest.raises(CoordinationError, match="^run_execution_already_owned$"):
             async with w.coordinator.exclusive_run(RUN):

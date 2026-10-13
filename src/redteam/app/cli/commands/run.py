@@ -34,7 +34,7 @@ import os
 import sys
 from collections.abc import Callable
 from contextlib import AsyncExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
@@ -55,11 +55,12 @@ from redteam.app.cli._shared import (
 from redteam.app.cli.conversation import ConversationAssistant, catalog_tool_labels
 from redteam.capability.settings import (
     MCPConfigurationError,
+    automatic_shell_setup_from_environment,
     gated_network_policy_path_from_environment,
     shell_policy_path_from_environment,
 )
 from redteam.capability.shell_assembly import build_gated_provider_config
-from redteam.capability.shell_runtime import build_shell_runtime
+from redteam.capability.shell_runtime import prepare_shell_runtime
 from redteam.core.config import AppConfig
 from redteam.core.contracts.events import EventEnvelope, EventType
 from redteam.core.enums import ApprovalStatus, OperatorIntentType
@@ -771,11 +772,10 @@ async def build(
     underway -- exactly what ``run()`` below does, unchanged from
     before this was split out.
     """
-    # Builtin shell provider: one capability-owned assembly shared with
-    # resume/tools. None means disabled (honest catalog without shell tools);
-    # an invalid policy raises MCPConfigurationError for the config-error path.
-    # Resolved before the empty-catalog warning so a shell-only run does not warn.
-    shell_runtime = build_shell_runtime(shell_policy_path_from_environment())
+    shell_runtime = await prepare_shell_runtime(
+        shell_policy_path_from_environment(),
+        auto_setup=automatic_shell_setup_from_environment(), progress=eprint,
+    )
     gated_provider_config = build_gated_provider_config(
         gated_network_policy_path_from_environment()
     )
@@ -810,12 +810,18 @@ async def build(
         # ONLY when the operator network policy is configured (absent means
         # closed): the composition root validates the same builtin adapter.
         component_options["gated_shell"] = (shell_runtime, gated_provider_config)
-    return await build_application(
+    engagement, deps = await build_application(
         config,
         orchestration_settings=orchestration_settings,
         mcp_stack=mcp_stack,
         **component_options,
     )
+    if shell_runtime is not None and shell_runtime.environment_fingerprint is not None:
+        assert deps.component_binding is not None
+        deps = replace(deps, component_binding=deps.component_binding.model_copy(update={
+            "execution_environment_fingerprint": shell_runtime.environment_fingerprint,
+        }))
+    return engagement, deps
 
 
 async def execute(

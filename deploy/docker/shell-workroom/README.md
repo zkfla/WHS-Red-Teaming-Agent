@@ -6,6 +6,42 @@ involved: the adapter speaks the internal `MCPAdapter` protocol and the
 gateway serves the four `analysis.shell_*` tools like any other catalog
 entry.
 
+## Automatic CLI preparation
+
+`redteam run` (including investigations started in the interactive CLI)
+prepares the default Kali environment before assembling the runtime. It
+checks Docker, starts an installed but stopped Docker Desktop on Windows,
+waits for a Linux engine, then builds the image if necessary. If Docker is
+not installed, it reports the official installation instructions rather
+than downloading or installing it. First-use Desktop license, WSL or
+permission prompts still need the operator; readiness has a bounded wait.
+
+The prepared image is pinned to its immutable ID. A matching program
+manifest is generated from that image and passed to discovery. Subsequent
+runs reuse the prepared environment. Suspended runs record an environment
+fingerprint and restore that exact image, manifest and Docker context;
+missing cached records or images cause a continuity error rather than a
+replacement build. Source updates do not silently upgrade this default.
+There is no automatic image/cache cleanup or refresh command.
+
+`REDTEAM_SHELL_POLICY_PATH` selects an operator policy instead of the
+default. `REDTEAM_SHELL_AUTO_SETUP=false` keeps manual setup and suppresses
+automatic Desktop startup/building. Legacy runs without a recorded
+environment retain their original manual selection on resume.
+
+`redteam validate` and `redteam tools list` do not start Desktop or build
+images. Validation labels default preparation as pending execution rather
+than claiming live readiness. Tool inspection shows explicitly configured
+tools; the automatic default is assembled during investigation startup.
+Automatic setup respects named Docker contexts and never starts a local
+Desktop to repair an unavailable remote daemon. A raw `DOCKER_HOST`
+override requires manual setup or an explicitly configured Docker context.
+
+The workroom's existing resource limits, per-instance ownership, job
+recovery and network admission remain in force. Image building requires
+package downloads; this does not grant investigation scripts network
+access. Target access still requires the configured gated network policy.
+
 ## Hard invariants (do not relax here)
 
 - Local execution creates containers with `--network none`. There is no

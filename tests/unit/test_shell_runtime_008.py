@@ -864,17 +864,17 @@ async def test_cli_run_build_executes_shell_with_fresh_run_identity(monkeypatch,
     async def _probe_true():
         return True
 
-    real_build_shell_runtime = run_command.build_shell_runtime
+    real_prepare_shell_runtime = run_command.prepare_shell_runtime
 
-    def _build_with_doubled_workroom(policy_path):
-        runtime = real_build_shell_runtime(policy_path)
+    async def _build_with_doubled_workroom(policy_path, **kwargs):
+        runtime = await real_prepare_shell_runtime(policy_path, **kwargs)
         if runtime is not None:
             runtime.adapter._workroom = SimpleNamespace(
                 exec_script=_fake_exec, probe=_probe_true,
             )
         return runtime
 
-    monkeypatch.setattr(run_command, "build_shell_runtime", _build_with_doubled_workroom)
+    monkeypatch.setattr(run_command, "prepare_shell_runtime", _build_with_doubled_workroom)
     real_build_application = run_command.build_application
 
     async def _build_with_fake_llm(config, **kwargs):

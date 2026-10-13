@@ -203,7 +203,7 @@ class SqliteStateBackend:
 
     @asynccontextmanager
     async def exclusive_run(self, run_id: str) -> AsyncIterator[None]:
-        """Local POSIX ownership across independent connections/processes.
+        """Local OS ownership across independent connections/processes.
 
         Keep a private companion inode beside the canonical SQLite database;
         never unlink it (a replacement inode would split ownership). No SQLite
@@ -211,15 +211,23 @@ class SqliteStateBackend:
         scope, never stored claims, request accounting or unknown executions.
         Acquisition has no await/thread cancellation window.
         """
+        if os.name not in {"nt", "posix"}:
+            raise CoordinationError("run_execution_backend_unsupported")
+        database = self._tasks._path.resolve()
+        key = hashlib.sha256(run_id.encode()).hexdigest()
+        lock_path = database.with_name(f".{database.name}.run-{key}.lock")
+        if os.name == "nt":
+            from redteam.orchestration.windows_run_ownership import exclusive_companion
+
+            with exclusive_companion(lock_path):
+                yield
+            return
         if os.name != "posix" or not hasattr(os, "O_NOFOLLOW"):
             raise CoordinationError("run_execution_backend_unsupported")
         try:
             fcntl = importlib.import_module("fcntl")
         except ImportError as exc:
             raise CoordinationError("run_execution_backend_unsupported") from exc
-        database = self._tasks._path.resolve()
-        key = hashlib.sha256(run_id.encode()).hexdigest()
-        lock_path = database.with_name(f".{database.name}.run-{key}.lock")
         try:
             fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW
                          | os.O_CLOEXEC | os.O_NONBLOCK, 0o600)

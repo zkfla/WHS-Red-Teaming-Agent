@@ -71,6 +71,13 @@ where = ["src"]
 [tool.setuptools.package-data]
 redteam = ["capability/reference_data/*.json", "capability/reference_data/*.yaml", "capability/reference_data/templates/*.md"]
 
+[tool.setuptools.data-files]
+"share/redteam/shell-workroom" = [
+    "deploy/docker/shell-workroom/Dockerfile",
+    "deploy/docker/shell-workroom/packages.txt",
+    "deploy/docker/shell-workroom/generate-manifest.py",
+]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
