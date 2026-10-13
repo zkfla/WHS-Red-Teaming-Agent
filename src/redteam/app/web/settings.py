@@ -26,6 +26,7 @@ from redteam.core.config import (
     LLMConfig,
     OrchestrationConfig,
 )
+from redteam.core.environment import OrchestrationEnvInput
 
 PROVIDER = "litellm"
 PROFILE_DIR = Path(DEFAULT_SPECIALIST_PROFILE_PATH).parent
@@ -38,6 +39,9 @@ ENV_PROFILE = "REDTEAM_SPECIALIST_PROFILE"
 ENV_POLICY = "REDTEAM_LLM_REQUEST_POLICY_JSON"
 DEFAULT_KEY_VAR = "LLM_API_KEY"
 DEFAULT_PROFILE_ID = Path(DEFAULT_SPECIALIST_PROFILE_PATH).stem
+REMOVED_MAX_RETRIES_ENV = str(
+    OrchestrationEnvInput.model_fields["max_retries"].validation_alias
+)
 
 _MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,199}$")
 _KEY = re.compile(r"^[^\s\x00-\x1f\x7f]{1,4096}$")
@@ -150,6 +154,8 @@ class SettingsStore:
             found.append({"field": "profile_id", "code": "missing"})
         if not self.env.get(ENV_POLICY):
             found.append({"field": "llm_request_policy", "code": "missing"})
+        if self.env.get(REMOVED_MAX_RETRIES_ENV):
+            found.append({"field": "max_retries", "code": "removed"})
         if not found:
             try:
                 LLMConfig.from_environment(self.env)
@@ -282,6 +288,8 @@ class SettingsStore:
         candidate.update(updates)
         if key is not None:
             candidate[self._key_var()] = key
+        if candidate.get(REMOVED_MAX_RETRIES_ENV):
+            raise SettingsError("max_retries", "removed")
         if updates.get(ENV_POLICY) or updates.get(ENV_PROFILE) or updates.get(ENV_MODEL):
             try:
                 if candidate.get(ENV_PROVIDER):

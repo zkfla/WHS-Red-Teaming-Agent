@@ -11,6 +11,7 @@ from redteam.app.web.settings import (
     ENV_POLICY,
     ENV_PROFILE,
     ENV_PROVIDER,
+    REMOVED_MAX_RETRIES_ENV,
     SettingsError,
     SettingsStore,
 )
@@ -170,6 +171,16 @@ def test_chatgpt_models_do_not_require_an_api_key(store):
     store.apply({"model": "chatgpt/some-model", "profile_id": "alpha",
                  "max_requests": 5, "max_concurrent_requests": 1})
     assert store.problems() == []
+
+
+def test_removed_retry_environment_setting_has_an_actionable_problem(store):
+    complete(store)
+    store.env[REMOVED_MAX_RETRIES_ENV] = "3"
+
+    assert store.problems() == [{"field": "max_retries", "code": "removed"}]
+    with pytest.raises(SettingsError) as caught:
+        store.apply({"max_requests": 10})
+    assert (caught.value.field, caught.value.code) == ("max_retries", "removed")
 
 
 def test_apply_reports_values_it_overrode_from_the_environment(store):
