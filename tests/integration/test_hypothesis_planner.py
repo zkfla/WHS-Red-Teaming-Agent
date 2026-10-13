@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from contextlib import asynccontextmanager
 
 import pytest
 
@@ -15,7 +16,17 @@ from redteam.orchestration.cognition import DecisionFailure
 from redteam.orchestration.hypothesis_planner import PLANNING_INVALIDATED
 from redteam.orchestration.specialist_planner import SpecialistPlanner
 from tests.integration.test_central_development import TARGET, TOOL, discover, inspect, turn
-from tests.integration.test_probe_workers import drive, register, selection
+from tests.integration.test_probe_workers import PROFILE, drive, register
+from tests.integration.test_probe_workers import selection as probe_selection
+
+
+@asynccontextmanager
+async def selection(tmp_path, **kwargs):
+    """Keep the original single-judgment feedback contract explicitly exercised."""
+    async with probe_selection(
+        tmp_path, profile=PROFILE.with_name("native-probes-legacy.yaml"), **kwargs,
+    ) as selected:
+        yield selected
 
 
 def probe(key="observe", *, candidate=None, revision=1, source=None):

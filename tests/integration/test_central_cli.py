@@ -256,8 +256,10 @@ async def test_default_application_assembles_candidate_planner_and_common_worker
     ]
     assert deps.agent_prompts is not None
     assert deps.agent_prompts.binding("hypothesis_planning").role_id == "planner"
-    with pytest.raises(ValueError, match="binding_missing"):
-        deps.agent_prompts.binding("task_atomization")
+    assert deps.specialist_policy.probe_atomization
+    assert deps.agent_prompts.binding("task_atomization").role_id != (
+        deps.agent_prompts.binding("hypothesis_planning").role_id
+    )
     from redteam.orchestration.specialist_planner import specialist_planning_inputs
 
     assert specialist_planning_inputs(deps)["schema_version"] == 3

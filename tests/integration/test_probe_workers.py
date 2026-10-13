@@ -45,10 +45,10 @@ PROFILE = Path(__file__).parents[2] / "config/agents/native-probes.yaml"
 
 
 @asynccontextmanager
-async def selection(tmp_path, *, tools=None, llm=None, jobs=None):
+async def selection(tmp_path, *, tools=None, llm=None, jobs=None, profile=PROFILE):
     original, configured = limits()
     original.metadata["success_criteria"] = ["Assess the original response"]
-    configured = configured.with_overrides(specialist_profile_path=str(PROFILE))
+    configured = configured.with_overrides(specialist_profile_path=str(profile))
     config = AppConfig(engagement=EngagementConfig.model_validate(
         original.model_dump(exclude={"engagement_id", "created_at"}),
     ))
