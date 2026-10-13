@@ -5,6 +5,8 @@ WORKDIR /app
 RUN useradd --create-home --uid 10001 mcp
 COPY pyproject.toml README.md ./
 COPY src ./src
+COPY config/agents ./config/agents
+COPY deploy/docker/shell-workroom ./deploy/docker/shell-workroom
 RUN pip install --no-cache-dir ".[agent]"
 USER mcp
 ENTRYPOINT ["python", "-m", "redteam.capability.servers"]
