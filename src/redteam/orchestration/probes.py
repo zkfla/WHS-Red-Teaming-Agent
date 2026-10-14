@@ -13,6 +13,11 @@ from redteam.orchestration.state import TerminationReason
 
 PROBE_SYSTEM = """
 Execute only this bounded probe purpose using the selected role's registered tools.
+Completion diagnostics describe their cause_scope, owner and repair_condition.
+Correct model_input when possible. Preserve originals and diagnostic references in
+an unresolved return for runtime_contract or unknown support that you cannot repair;
+target calls and repeated reads do not fix runtime contracts. Current execution waits
+come from execution_history, not historical diagnostic messages.
 Choose methods yourself; there is no mandatory tool sequence or domain handoff.
 Related candidates are immutable admitted snapshots, not permission or verified findings.
 Return observations and limitations early with task.settle (inconclusive/blocked)
@@ -168,9 +173,8 @@ async def yield_probe(deps, state, reason):
     originals = await deps.central_state.list_executions(task_id=str(task.task_id))
     records = await original_records(deps, task)
     refs = [str(record.evidence_id) for record in records]
-    observations = [f"invocation={item.invocation_id}; state={item.state.value}; "
-                    f"original={item.result_evidence_id or 'uncollected'}" for item in originals]
     pending = any(unsafe(item) for item in originals) or task.status is TaskStatus.BLOCKED
+    waiting = any(item.wait_reason for item in originals)
     summary = "Probe returned preserved observations: " + reason
     proposal = CompletionProposal(
         outcome="blocked" if pending else "inconclusive", reason=summary, evidence_ids=refs,
@@ -179,10 +183,23 @@ async def yield_probe(deps, state, reason):
         evidence_store=deps.evidence_store, runtime=runtime, proposal=proposal,
         path=None, task_id=str(task.task_id),
         diagnostic=DecisionDiagnostic(code="probe_yield", stage="probe_return", kind="validation",
-                                      retryable=False, summary=reason),
+                                      retryable=False, summary=reason,
+                                      cause_scope="policy_wait" if waiting else "unknown",
+                                      owner="orchestration.probes",
+                                      repair_condition=("Resume after ledger recovery releases "
+                                                        "the original execution; do not poll the "
+                                                        "model or replay successful calls."
+                                                        if pending else
+                                                        "Reassess preserved observations within "
+                                                        "the remaining investigation budget."),
+                                      trace=[{"invocation_id": str(item.invocation_id),
+                                              "state": item.state.value,
+                                              "wait_reason": item.wait_reason,
+                                              "result_evidence_id": item.result_evidence_id}
+                                             for item in originals[-20:]]),
     )
     result = result_for(task, outcome=proposal.outcome, summary=summary,
-                        evidence_ids=[*refs, gap], observations=observations, limitations=[reason])
+                        evidence_ids=[*refs, gap], limitations=[] if pending else [reason])
     await commit_result(deps, runtime, task, result, token, final=not pending)
     if pending:
         runtime.termination_reason = runtime.termination_reason or TerminationReason.RESOURCE_WAIT

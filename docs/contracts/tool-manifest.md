@@ -77,3 +77,29 @@ Recon 결과는 관찰된 값만 구조화한다. HTTP probe는 가능한 경우
 Plane의 scope를 바꾸지 않고, 선택한 MCP 도구의 인자만 바꾼다. CLI 실행은
 engagement 동안 MCP 세션을 유지하고 종료·오류 시 닫는다. 기본 playbook의
 operation 목록은 Agent provider 구현에 따른다.
+
+## Native schema 전달과 입력 크기
+
+`LocalToolDescriptor.initial_exposure`는 기본 false이며, 발견 navigator의
+`bootstrap`과 별개다. 제공 모듈이 선언한 읽기/Task 반환 계약은 첫 요청부터
+노출한다. 현재 `evidence.read`, `task.settle`, `task.publish_result`가 선언하며
+`goal.settle`의 노출·중앙 목표 판정 책임은 바꾸지 않는다. 읽기/settlement
+contribution과 descriptor는 v3, 중간 결과 descriptor는 version 3이다.
+
+외부 도구는 현재 역할 selection·eligibility·health 검사 이후의 전체 집합을
+검토한다. `tool_discovery.NativeInputLimit`의 기본값·상한은 256KiB이며,
+양의 정수 byte 한도만 허용한다. 새 운영 설정이나 schema cache는 없다.
+전체 description/schema, 이미 필요한 local schema, 과거 assistant/tool pairing,
+최신 context, 원본 창, 실제 합성된 common/role/runtime system을 포함한
+`{messages, tools, system}`을 `ensure_ascii=False`, `allow_nan=False`, compact
+JSON으로 직렬화한 UTF-8 byte 수가 기준이다. 이는 출력 token 예산이나 모델별
+context window를 추정한 값이 아니라, 코드가 검사하는 논리 입력 envelope다.
+SDK가 추가하는 전송 envelope는 이 계산에 포함되지 않는다.
+
+전체 eligible schema가 한도 내이면 모두 제공한다. 초과하면 임의의 일부를
+고르지 않고 기존 cards/search/detail 경로와 성공한 `detail_fetched_tool_ids`
+이력을 사용한다. lookup 없는 assembly는 기존 전체 노출을 유지하되 같은
+입력 한도를 적용한다. 최종 선택된 입력도 초과하면 모델 호출 전에
+`native_input_limit_exceeded`로 중단하며 내용을 조용히 삭제하지 않는다.
+매 요청 현재 registry/schema를 읽으며 조회 이력은 실행 권한이 아니다.
+기존 인자·scope·승인·예산 검사는 실행 경계에서 그대로 수행한다.

@@ -78,10 +78,16 @@ class RunMeteredLLM:
         call = getattr(self.client, method, None)
         if call is None:
             raise RequestAdmissionError("llm_request_method_unsupported")
-        if self.prompts is not None:
-            from redteam.orchestration.prompts import instruction_selection
+        from redteam.orchestration.prompts import instruction_selection
 
+        try:
             stage, role_id = instruction_selection()
+        except ValueError:
+            if self.prompts is not None:
+                raise
+            stage, role_id = None, None
+        if self.prompts is not None:
+            assert stage is not None
             kwargs["system"] = self.prompts.compose(
                 stage, kwargs.get("system") or "", role_id=role_id,
             )
@@ -105,7 +111,7 @@ class RunMeteredLLM:
             await guard()
         kwargs["num_retries"] = 0
         request = await self.ledger.reserve(scope.run_id, owner=scope.owner, kind=method,
-                                            task_id=scope.task_id)
+                                            task_id=scope.task_id, stage=stage)
         # A failed durable dispatch update never starts the external request.
         # A possibly committed update is left reserved for explicit recovery.
         await self.ledger.dispatch(scope.run_id, request)
