@@ -64,6 +64,8 @@ Independent07 plan reviewer concrete topology finding accepted after root source
 
 Fresh independent Sol07 plan recheck CLEAR after these corrections. This clears packet design only, not measured topology, physical delivery/closure, common-worker consumption or stage completion. Source/proof execution follows named predecessor interface acceptance and exact test-owned fixture checkpoint; no global context/Run/quota mutation or fake physical substitution.
 
+User live-model selection2026-10-15: actual LLM live tests use Cat Jam Free with High effort; coding worker/coordinator assignments are unaffected. Official OpenCode Go model documentation https://dev.opencode.ai/v2/docs/console/go/ lists wire model cat-jam-free with OpenAI-compatible chat/completions (current advertised endpoint https://opencode.ai/inference/go/v1/chat/completions). This repository's opencode-go selector uses openai/cat-jam-free for CHAT, not openai/responses/ or anthropic/, with reasoning_effort=high. Existing adapter still targets its legacy /zen/go/v1 base; verify actual bounded preflight on the selected client before live target testing rather than assuming alias availability or silently changing global endpoint/config. High transmission/acceptance remains a live check, not inferred solely from model catalog. Use isolated test configuration/Run, preserve existing user settings and never print API keys; actual model/provider/request/effort and diagnostics are recorded safely. Physical scripted-model proof remains explicitly separate from this later live model verification.
+
 ## Review Log / Validation Log
 
 Pending independent plan review and actual test evidence. Record exact tests/artifacts and distinguish fake, physical provider, live LLM and Finding evidence.
