@@ -89,6 +89,8 @@ Latest user model override2026-10-15: Claude quota returned; prospective impleme
 
 Subsequent user override supersedes the half/half rule: existing Luna workers finish only their currently assigned packets; do not assign new work after those packets complete. New worker packets use anthropic/claude-haiku-5-5 XHigh exclusively. If an actual Haiku429 occurs, switch worker assignments to GPT6-Luna XHigh, preserving partial work and concrete ownership handoffs; observation timeouts or unrelated failures do not constitute this trigger. Coordinator remains Sol6.1 low and review roles unchanged. This latest rule governs the queue below, including new follow-ups after a Luna packet freeze.
 
+Latest effort correction: prospective Haiku worker assignments use High, not XHigh. Already assigned XHigh work retains its effort; root06D read-only packet handle plan7_06d_packet_haiku was dispatched XHigh before this correction and stays assigned. New Haiku-only allocation and actual429→Luna fallback remain as above. Orchestrator/review efforts unchanged.
+
 ### Atomic integration queue — latest user parallelization/atomization steering
 
 Each row delivers one reviewable result. Existing live owners retain their files; splitting a queue is not permission to send two writers into the same file. Exact interfaces, paths and negative criteria remain in the child ExecPlans. Independent read-only packet/review work runs now; source mutation follows its interface review and predecessor freeze. Root alone integrates checked commits. New eligible worker assignments use Haiku XHigh under the latest override above; do not create filler agents or interrupt existing Luna work before its current packet completes.
