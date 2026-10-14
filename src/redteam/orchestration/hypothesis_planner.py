@@ -1,7 +1,7 @@
 """One candidate/probe judgment over captured originals and existing central admission."""
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -16,7 +16,7 @@ from redteam.orchestration.central_results import RESULT_UPDATED
 from redteam.orchestration.central_runtime import event, process_controls, runtime_token
 from redteam.orchestration.cognition import DecisionFailure, DecisionValidationError
 from redteam.orchestration.coordination import PlanningInputsChanged, StateConflict, content_hash
-from redteam.orchestration.diagnostics import DecisionDiagnostic
+from redteam.orchestration.diagnostics import DecisionDiagnostic, diagnostic_for_exception
 from redteam.orchestration.engine import InvestigationEngine
 from redteam.orchestration.knowledge_validation import known_principals, known_target_ids
 from redteam.orchestration.metered_llm import llm_request_scope
@@ -64,6 +64,27 @@ class HypothesisProposalError(ValueError):
     def __init__(self, code: str):
         self.code = code
         super().__init__(code)
+
+
+def _proposal_validation_diagnostic(
+    exc: BaseException, *, stage: str, summary: str, schema: dict[str, Any],
+) -> DecisionDiagnostic:
+    """Merge diagnostic_for_exception's safe details with code-owned repair code/summary.
+
+    diagnostic_for_exception already derives validation_issues/error_type/exception_chain
+    safely (pydantic .errors() loc/type, never raw input/messages). We only need to
+    override `code` with the proposal error's own `.code` when present (preserving
+    HypothesisProposalError/SpecialistProposalError/AtomizationProposalError semantics)
+    and keep the existing human-readable repair `summary` instead of the generic one.
+    """
+    base = diagnostic_for_exception(exc, stage=stage, schema=schema)
+    code = getattr(exc, "code", None) or "hypothesis_proposal_invalid"
+    return base.model_copy(update={
+        "code": code,
+        "summary": summary,
+        "kind": "validation",
+        "retryable": True,
+    })
 
 
 @dataclass
@@ -275,12 +296,12 @@ async def advance_hypotheses(planner, runtime, schema):
         try:
             bind(raw)
         except (ValueError, SpecialistProposalError) as exc:
-            raise DecisionValidationError(DecisionDiagnostic(
-                code=getattr(exc, "code", "hypothesis_proposal_invalid"),
-                stage="hypothesis_planning", kind="validation",
-                retryable=True, summary="Use captured subjects, ready roles, candidate revisions "
+            raise DecisionValidationError(_proposal_validation_diagnostic(
+                exc, stage="hypothesis_planning",
+                summary="Use captured subjects, ready roles, candidate revisions "
                 "and original source results. A new candidate key is local to this proposal. "
                 "Empty judgments need a termination reason and resume_conditions.",
+                schema=HypothesisDecision.model_json_schema(),
             )) from exc
 
     with llm_request_scope(str(runtime.run_id), "hypothesis_planning"):
@@ -408,13 +429,13 @@ async def _advance_split(planner, runtime, schema, snapshot, engine, budget, pay
         try:
             bind_stage_one(raw)
         except (ValueError, SpecialistProposalError) as exc:
-            raise DecisionValidationError(DecisionDiagnostic(
-                code=getattr(exc, "code", "hypothesis_proposal_invalid"),
-                stage="hypothesis_planning", kind="validation",
-                retryable=True, summary="Use captured subjects, candidate revisions and original "
+            raise DecisionValidationError(_proposal_validation_diagnostic(
+                exc, stage="hypothesis_planning",
+                summary="Use captured subjects, candidate revisions and original "
                 "source results. A new candidate key is local to this proposal; questions carry "
                 "purpose only, never worker tasks. Empty judgments need a termination reason "
                 "and resume_conditions.",
+                schema=HypothesisPlanDraft.model_json_schema(),
             )) from exc
 
     with llm_request_scope(str(runtime.run_id), "hypothesis_planning"):
@@ -442,13 +463,13 @@ async def _advance_split(planner, runtime, schema, snapshot, engine, budget, pay
                     max_tasks=planner.policy.max_tasks_per_strategy,
                 )
             except (ValueError, SpecialistProposalError) as exc:
-                raise DecisionValidationError(DecisionDiagnostic(
-                    code=getattr(exc, "code", "hypothesis_proposal_invalid"),
-                    stage="task_atomization", kind="validation",
-                    retryable=True, summary="Cover every planned question with at least one "
+                raise DecisionValidationError(_proposal_validation_diagnostic(
+                    exc, stage="task_atomization",
+                    summary="Cover every planned question with at least one "
                     "probe task. Preserve each question's subjects, completion criteria, "
                     "candidate revisions, required meaning and source refs; keep a "
                     "paired-comparison criterion as one condition on one task.",
+                    schema=TaskAtomizationDraft.model_json_schema(),
                 )) from exc
 
         with llm_request_scope(str(runtime.run_id), "hypothesis_planning"):

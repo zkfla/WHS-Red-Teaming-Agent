@@ -290,12 +290,11 @@ class CentralTransaction:
         mission = self.get_mission(self.binding()[0])
         if mission is None:
             raise StateConflict("central_original_mission_missing")
-        if self.active_activation_count() or not mission.termination_reason:
+        if (self.active_activation_count() or not mission.termination_reason
+                or mission.termination_reason != termination_reason):
             # A partial settlement must not publish a terminal diagnostic or
             # fail an existing stop path whose mission has no terminal reason.
             return
-        if mission.termination_reason != termination_reason:
-            raise StateConflict("planning_diagnostic_terminal_binding_mismatch")
         payload = {
             "mission_id": str(mission.mission_id), "mission_revision": mission.revision,
             "mission_status": mission.status.value, "termination_reason": termination_reason,

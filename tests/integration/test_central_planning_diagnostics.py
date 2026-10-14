@@ -72,3 +72,25 @@ async def test_settle_cancelled_mission_without_terminal_reason_remains_valid(tm
         assert await session.deps.central_state.transaction(
             lambda tx: tx.planning_diagnostics(), write=False,
         ) == (None, [])
+
+
+async def test_stop_after_planning_error_does_not_publish_stale_diagnostic(tmp_path):
+    async with selection(tmp_path) as (session, _):
+        await session.settle(session.runtime.model_copy(update={
+            "termination_reason": TerminationReason.PLANNING_ERROR,
+            "planning_diagnostic": DecisionDiagnostic(
+                code="hypothesis_proposal_invalid", stage="hypothesis_planning",
+                kind="validation", summary="Invalid proposal.",
+            ),
+        }))
+        def cancel(tx):
+            mission = tx.get_mission(tx.binding()[0])
+            tx.update_mission(mission.model_copy(update={
+                "status": MissionStatus.CANCELLED, "revision": mission.revision + 1,
+            }), expected_revision=mission.revision)
+        await session.deps.central_state.transaction(cancel)
+        final = await session.settle(session.runtime)
+        assert final.termination_reason is TerminationReason.OPERATOR_STOPPED
+        assert await session.deps.central_state.transaction(
+            lambda tx: tx.planning_diagnostics(), write=False,
+        ) == (None, [])
