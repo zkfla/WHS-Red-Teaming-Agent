@@ -12,9 +12,13 @@ import pytest
 from redteam.attack_graph.hypotheses import hypothesis_purpose
 from redteam.attack_graph.service import AttackGraphService
 from redteam.core.enums import MissionStatus, TaskStatus
-from redteam.core.ids import EvidenceId
+from redteam.core.ids import EngagementId, EvidenceId, RunId
 from redteam.llm.fake import FakeLLMClient
-from redteam.orchestration.analysis import StructuredLLMAnalysisVerifier
+from redteam.orchestration.analysis import (
+    StructuredLLMAnalysisVerifier,
+    append_posthoc_claim_receipt,
+)
+from redteam.orchestration.central_runtime import ready_workers
 from redteam.orchestration.cognition import DecisionBudget
 from redteam.orchestration.coordination import StateConflict, content_hash
 from redteam.orchestration.graph_recording import GraphRecordingHandler
@@ -23,7 +27,7 @@ from redteam.orchestration.specialist_planner import SpecialistPlanner
 from redteam.orchestration.specialist_tasks import HypothesisProbeProposal, register_probe_tasks
 from tests.integration.test_central_development import TARGET, TOOL, discover, inspect, turn
 from tests.integration.test_hypothesis_planner import candidate, held, probe, selection
-from tests.integration.test_probe_workers import ReviewedObservationModel, drive
+from tests.integration.test_probe_workers import ReviewedObservationModel, drive, register
 
 
 class ChainLLM(ReviewedObservationModel):
@@ -209,3 +213,103 @@ async def test_observation_review_receipt_then_planner_judgment_admits_only_exac
                 evidence=[str(source.evidence_id)], review=str(receipt.evidence_id),
             ))
         assert (await service.get_hypothesis(current.hypothesis_id)).revision == 2
+
+
+async def _receipts(session):
+    records = await session.deps.evidence_store.list_for_run(session.runtime.run_id)
+    return [item for item in records if item.metadata.get("record_kind") == "review_receipt"]
+
+
+@pytest.mark.parametrize("shape", ["new_proposal", "other_candidate"])
+async def test_out_of_purpose_probe_is_refused_before_review_or_writes(tmp_path, shape):
+    async with selection(tmp_path, llm=ChainLLM([])) as (session, llm, tools):
+        state, service = session.deps.central_state, AttackGraphService(session.deps.graph_store)
+        await _commit(session, "local-open", candidate("local"))
+        await _commit(session, "other-open", candidate("other"))
+        # The probe is admitted for the local candidate only; "other" is outside its purpose.
+        task_id = await register(session, "scoped", hypotheses={"local": 1})
+        worker, = await ready_workers(session.deps, session.runtime)
+        # Claiming the worker is orchestration's own step; the refusal must leave that state alone.
+        before = (await state.get_task(task_id)).model_dump(mode="json")
+        meaning = MeaningLLM([])
+        verifier = StructuredLLMAnalysisVerifier(meaning, session.deps.evidence_store, service)
+        handler = GraphRecordingHandler(
+            evidence_store=session.deps.evidence_store, graph_service=service, verifier=verifier,
+        )
+        if shape == "new_proposal":
+            tool_input = {"hypotheses": [{"statement": "Start a different investigation"}]}
+        else:
+            tool_input = {"findings": [{
+                "statement": "The other candidate is reflected in the response",
+                "evidence_refs": [], "target_node_id": TARGET, "hypothesis_id": "other",
+            }]}
+        result = await handler(tool_input, LocalToolContext(session.deps, worker))
+        assert not result.ok
+        assert result.payload["diagnostic"]["code"] == "probe_candidate_change_requires_planner"
+        assert meaning.review_calls == 0
+        assert await _receipts(session) == []
+        assert await service.list_findings() == []
+        assert (await service.get_hypothesis("local")).revision == 1
+        assert (await service.get_hypothesis("other")).revision == 1
+        assert (await state.get_task(task_id)).model_dump(mode="json") == before
+
+
+@pytest.mark.parametrize("breach", ["run", "engagement", "unlinkable"])
+async def test_foreign_or_unlinkable_origin_never_produces_a_receipt(tmp_path, breach):
+    llm = ChainLLM([{"updates": [candidate()], "tasks": [probe(candidate="local")],
+                     "reason": "Observe the candidate's smallest uncertainty"}])
+    async with selection(tmp_path, llm=llm) as (session, llm, tools):
+        state, service = session.deps.central_state, AttackGraphService(session.deps.graph_store)
+        current, source = await _observe_candidate(session, llm)
+        task_id = source.metadata["mission_task_id"]
+        task_before = (await state.get_task(task_id)).model_dump(mode="json")
+        # A real stored copy of the preserved source, changed only in the origin under test.
+        changes = {
+            "run": {"run_id": RunId("06d-foreign-run")},
+            "engagement": {"engagement_id": EngagementId("06d-foreign-engagement")},
+            "unlinkable": {"action_id": None, "invocation_id": None},
+        }[breach]
+        cited = source.model_copy(deep=True, update={
+            "evidence_id": EvidenceId("06d-" + breach + "-origin"), **changes,
+        })
+        await session.deps.evidence_store.append(cited)
+        receipts_before = len(await _receipts(session))
+        meaning = MeaningLLM([])
+        verifier = StructuredLLMAnalysisVerifier(meaning, session.deps.evidence_store, service)
+        result = await _graph_record(session, verifier, candidate_id=current.hypothesis_id,
+                                     source=cited)
+        finding, = result.payload["findings"]
+        expected = {"run": "other run", "engagement": "other run",
+                    "unlinkable": "origin unlinkable"}[breach]
+        assert finding["status"] == "refused" and finding["reason"] == expected
+        assert finding.get("receipt_id") is None
+        assert meaning.review_calls == 0
+        # The real verifier and the real receipt producer must refuse the same cited origin.
+        claim = {"statement": "The preserved response reflects the candidate premise",
+                 "target_node_id": TARGET, "hypothesis_id": current.hypothesis_id,
+                 "principal_refs": []}
+        direct_meaning = MeaningLLM([])
+        direct = StructuredLLMAnalysisVerifier(
+            direct_meaning, session.deps.evidence_store, service,
+        )
+        assessment = await direct.verify_claim_with_budget(
+            claim=claim, evidence_ids=[str(cited.evidence_id)],
+            run_id=str(session.runtime.run_id), budget=DecisionBudget(), security_claim=True,
+        )
+        # The verifier's own origin and grounding checks refuse before any meaning call.
+        assert assessment.outcome == "unknown", assessment.reason
+        assert direct_meaning.review_calls == 0
+        receipt = await append_posthoc_claim_receipt(
+            evidence_store=session.deps.evidence_store, run_id=str(session.runtime.run_id),
+            engagement_id=str(session.runtime.engagement_id), claim=claim,
+            evidence_ids=[str(cited.evidence_id)], assessment=assessment,
+            hypothesis_id=current.hypothesis_id, action_id=str(source.action_id),
+            invocation_id=str(source.invocation_id), target_node_id=TARGET, candidate=current,
+        )
+        assert receipt is None
+        assert len(await _receipts(session)) == receipts_before
+        assert (await service.get_hypothesis(current.hypothesis_id)).revision == 1
+        assert await service.list_findings() == []
+        assert (await state.get_task(task_id)).model_dump(mode="json") == task_before
+        mission = await state.get_mission(session.runtime.mission_id)
+        assert mission.status is MissionStatus.ACTIVE
