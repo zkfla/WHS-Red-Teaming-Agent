@@ -24,6 +24,10 @@ from typing import Any, Protocol, TypedDict
 
 from redteam.capability.adapters.mcp.base import MCPCallResult
 from redteam.capability.gated_manifest import OPERATION_PURPOSE, TARGET_JOB_START_OPERATION
+from redteam.capability.gated_network_policy import (
+    EndpointRestriction,
+    GatedNetworkPolicyRequest,
+)
 from redteam.capability.gated_window import (
     GATE_SOURCE_ID,
     AllowedFlow,
@@ -341,6 +345,9 @@ class GatedExecutionPolicy:
         ext = self._extension
         if ext is None or ext.policy is None:
             return self._refusal("gated_network_unconfigured")
+        if isinstance(ext.policy, GatedNetworkPolicyRequest):
+            # An unresolved preparation request never reaches reservation or open.
+            return self._refusal("gated_sidecar_unresolved")
         holder_action = str(invocation.action_id)
         holder_invocation = str(invocation.invocation_id)
         if not holder_action or not holder_invocation:
@@ -377,6 +384,14 @@ class GatedExecutionPolicy:
         pins = ext.policy.registry.targets.get(name)
         if not pins:
             return self._refusal("gated_unknown_registry_name")
+        # The selected endpoint set only narrows the original scope; absent means legacy.
+        restriction = getattr(ext.policy, "endpoint_restriction", None)
+        protocols: tuple[str, ...] = ("tcp", "udp")
+        if isinstance(restriction, EndpointRestriction):
+            selected = restriction.protocols_for(name, port)
+            if selected is None:
+                return self._refusal("gated_endpoint_not_selected")
+            protocols = selected
         canonical: list[str] = []
         for pin in pins:
             item = _canonical_ipv4(pin)
@@ -395,7 +410,7 @@ class GatedExecutionPolicy:
         allowed = tuple(
             AllowedFlow(ip=ip, port=port, proto=proto)
             for ip in canonical
-            for proto in ("tcp", "udp")
+            for proto in protocols
         )
         return GatedRoute(
             purpose=NetworkPurpose.TARGET,
