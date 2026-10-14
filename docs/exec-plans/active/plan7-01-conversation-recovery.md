@@ -54,7 +54,11 @@ Root alone edits plans/contracts documentation and integrates commits; concrete 
 
 Initial plan created; implementation not yet claimed. Model assignment ledger is in parent plan. New findings update this document before dependent work.
 
-Plan review: Sol High approved direction conditional on explicit ROE enforceability acceptance (added stages04/05/07) and concrete ownership/interface packets (above). agy auxiliary plan review remains running; findings will be reconciled before affected stage. This does not replace final implementation review.
+Plan review: Sol High approved direction conditional on explicit ROE enforceability acceptance (added stages04/05/07) and concrete ownership/interface packets (above). agy auxiliary plan review is reconciled in the parent/source-evidence commit; accepted gaps are reflected in affected stages. This does not replace final implementation review.
+
+2026-10-14 implementation checkpoint: Retry worker and Conversation worker froze their owned changes. Distinct transport counters and unchanged request totals are implemented; ConversationError/InputReceipt retain safe structured causes and both CLI catches show safe fields. Root independently ran51 transport/time/shared tests and34 conversation/controller/WebFrontend neighboring tests, all passed; scoped Ruff and mypy7 source files pass. Configuration/injection/web projection are still being completed by Muse, so D01–D03 remain OPEN at the stage level and no whole-stage completion is claimed.
+
+Integration discovery: generic public_payload depth4 clipping can erase nested last_cause.validation_issues leaf fields if used on a full diagnostic dump. EventLog.append itself does not clean input data, so the input consumer must explicitly construct a bounded masked projection. The web consumer must prove the actual logged/snapshot projection retains effective rule/location/provider status, without globally lifting untrusted payload bounds. Pending before commit.
 
 ## Review Log / Validation Log
 
@@ -70,5 +74,14 @@ Pending independent plan review and actual test evidence. Record exact tests/art
 
 ## Completion Criteria
 
+### Independent stage review checkpoint
+
+GPT-6.1 Sol High reviewed the frozen retry and conversation packages. One MEDIUM finding is accepted: an outer ConversationAssistant whole-chain timeout created a fresh diagnostic and lost the active request count and previous schema cause. Scripted reproduction made two provider calls (invalid mode, then blocked request), but reported attempts=0 and no last cause. Repair is assigned to the original Haiku worker, limited to conversation.py and its diagnostic regression tests. Require request-local budget preservation, whole-chain deadline enforcement and cancellation propagation before stage completion. Configuration/web review follows consumer freeze; this is not the final whole-goal review.
+
 Every requirement above proven against current state, required reviews addressed, meaningful checks pass, stage commit contains scoped files, preserved user state. Move to completed only then; otherwise retain precise missing requirements and next action. Parent goal remains active until all stages including physical proof and final review/repair/test pass.
 
+
+2026-10-14 atomic retry commit: `3f934309` contains cognition.py, diagnostics.py and new transport/repair regressions only. Independent Sol review raised no retry issue. Root mixed integration run passed65 tests; configuration/time run passed33 tests after fixture corrections; ten configuration/consumer source files pass Linux Python3.10 mypy and scoped Ruff. Conversation timeout repair and web projection remain pending, so this commit does not complete stage01.
+2026-10-14 configuration commit: `c598f8f7`,13 scoped files; transport cap0/2/default5 reaches real consumers and durable identity, totals unchanged. Sol independent configuration review found no concrete correctness issue. Root33 config/time tests,86 Linux settings/binding/retry/web-settings neighboring tests, ten source mypy and Ruff pass. Windows private-POSIX-mode test alone fails on unchanged chmod semantics (85 others pass), verified on Linux without assertion relaxation.
+
+2026-10-14 conversation commit: `a2bc7671`,six scoped files. Accepted timeout MEDIUM repaired by per-call DecisionBudget and safe diagnostic counters. Sol fresh deterministic outer-timeout reproduction preserves attempts2, normal1/repair1/transport0 and schema_enum $.mode; cancellation propagates with no further requests. Inner budget timeout legitimately reports the newest llm_request_timeout; earlier schema details remain bounded trace/failure_counts. Root49 targeted conversation/runtime/controller tests, five source mypy and Ruff pass. Web input projection remains pending and this stage remains IMPLEMENTING.

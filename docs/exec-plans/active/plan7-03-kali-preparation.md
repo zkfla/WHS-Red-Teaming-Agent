@@ -58,6 +58,20 @@ Pending independent plan review and actual test evidence. Record exact tests/art
 | A02 | Pending | Pending | Pending | OPEN |
 | A03 | Pending | Pending | Pending | OPEN |
 
+## Original numbered requirement coverage
+
+The grouped rows above do not permit partial PASS. At completion, inspect each original numbered implementation requirement in docs/plans/plan7-source-20261014/plan7a.md and attach producer/consumer/test evidence independently.
+
+| Source requirement | Plan requirement | Evidence / disposition |
+|---|---|---|
+| plan7a implementation 1 | A01 | OPEN |
+| plan7a implementation 2 | A01 | OPEN |
+| plan7a implementation 3 | A02 | OPEN |
+| plan7a implementation 4 | A02 | OPEN |
+| plan7a implementation 5 | A02 | OPEN |
+| plan7a implementation 6 | A03 | OPEN |
+| plan7a implementation 7 | A03 | OPEN |
+
 ## Completion Criteria
 
 Every requirement above proven against current state, required reviews addressed, meaningful checks pass, stage commit contains scoped files, preserved user state. Move to completed only then; otherwise retain precise missing requirements and next action. Parent goal remains active until all stages including physical proof and final review/repair/test pass.

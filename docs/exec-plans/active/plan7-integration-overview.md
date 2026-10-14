@@ -59,3 +59,11 @@ Root rejected unsupported review claims: web selection already passes through re
 
 Current stage01 is IMPLEMENTING; implementation packets are in its separate ExecPlan. Other stages remain PLANNING until source reconnaissance and dependency interfaces are verified.
 
+### Initial actual worker ledger and coordination
+
+Orchestrator reports stage01 Retry running at /root/plan7_orchestrator/recon7ab_luna (Luna xhigh), Configuration at /root/plan7_orchestrator/recon7cd_muse (Muse xhigh); root bounded Conversation worker /root/plan7_conversation_haiku (Haiku xhigh) owns all conversation/session/CLI catch files. A concurrently dispatched coordinator Haiku conversation worker was immediately interrupted with no source edits; it does not own files. Worker file mutation requires this ownership ledger, not mere model registration.
+
+Research Muse worker improperly delegated three children before the no-further-delegation instruction was reinforced. Their read-only results were reconciled; dispatches are recorded, not omitted from accounting. Coordinator counts at this point: Luna2, Muse5, Haiku2 (one stood-down), plus root Haiku1. Balance later meaningful Luna/Haiku implementation packages against the extra Muse research calls; do not launch filler work solely to adjust counts. Distinguish attempted dispatch, completed work and model failure in final ledger.
+
+Research confirmed web closed/configured/inherit propagation already exists; standalone CLI saved-selection hydration and new-policy preparation remain to inspect/implement. Existing program discovery/paging/describe and shell evidence windows are reused. Current managed Kali image a85c97d7... is Kali2026.3 and matching cached manifest has19 program records including curl/nmap/sqlmap; old repository fixture manifest targets a different d9d2... image and must not be mixed with it. Kernel readiness and42 existing operator-policy/CLI-preparation tests passed; actual target packets/common-worker proof remain pending.
+
