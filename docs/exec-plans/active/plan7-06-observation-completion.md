@@ -2,7 +2,7 @@
 
 ## Status
 
-PLANNING — 2026-10-14, original Windows checkout, dev at 376b479d. User authorized implementation and stage commits; final review → repair → tests required.
+IMPLEMENTING — 2026-10-14, original Windows checkout, dev at 376b479d. User authorized implementation and stage commits; final review → repair → tests required.
 
 ## Goal and Context
 
@@ -107,3 +107,4 @@ Fresh Sol plan recheck found no remaining concrete blocker after the canonical-e
 06-C final owner decisions from fresh Sol review: completion.py owns OriginProof and diagnostics at existing original-integrity branches; evidence_validity.prove_original is a thin public entry with local import, consumers use local imports as needed to avoid eager cycle, no duplicate validator. Preserve verify_single_origin current consumer-purpose binding by default for code_artifacts and other callers; Task/goal completion opts explicitly into the new original-only proof with subject/validity/review/CAS safeguards. code_artifacts admission is not expanded or claimed covered by this packet. Existing validate_result_claims receipt/account/requested-used-session checks remain authorities and must be exercised in reuse negatives; no blanket session-equality gate or inferred restrictions. Optional-source goal mutation harness required. Fresh independent confirmation requested before06-C source mutation.
 
 Fresh Sol confirms06C interface clear after proof ownership/import direction and unchanged other-consumer default. Root authorizes06C implementation with the corrected public interface; completion.py/evidence_validity.py/semantic_completion.py/central_results.py/central_completion.py and dedicated tests only, no code_artifacts expansion. Shared central_state.py not owned while02B active; use existing public transaction reads for source CAS or explicit handoff if truly needed. Original/pre-review hash, actual review, Task/goal CAS and negative subject/session/raw/revision tests required before freeze.
+
