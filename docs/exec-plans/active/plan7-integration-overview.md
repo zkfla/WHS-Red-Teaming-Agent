@@ -70,3 +70,7 @@ Research confirmed web closed/configured/inherit propagation already exists; sta
 
 
 Stage01 completed with scoped Sol reviews, one timeout repair/recheck and root tests/type/lint/JS gates. Stage02-A is implementing after reviewed concrete packets; remaining stages and final physical proof are open. Plan01 moved to completed; this is not whole-goal completion.
+
+User steering (2026-10-14): if an actual Muse/DeepSeek429 occurs, replace coordinator with anthropic/claude-sonnet-5 Medium and use only Luna/Haiku workers at their existing XHigh effort. Before the trigger current assignments remain; after it the earlier three-model equal ratio is superseded. Exact Sonnet selector and Medium support are present in the general local model catalog. Record only safe status/model/stage evidence, stop repeated quota retries, and preserve scopes/ownership at handoff. No trigger has been confirmed at this checkpoint.
+
+Integration checkpoint: 02-A accepted and committed0a3292d3 (fresh Sol, root Linux74/type/lint); 03-S accepted and committedc5258156 (fresh Sol, root Linux61/type, worker201/lint). Stage02-B authorized after A handoff. Stage03-P authorized after S freeze;03-U authorized only pure selection/form phase until P prepared-result freeze. Full02/03 traces remain open. Stage04/05 packets are in source-backed reconnaissance,06 preliminary independent gap review; no later-stage mutation approval yet.

@@ -79,3 +79,5 @@ The grouped rows above do not permit partial PASS. At completion, inspect each o
 
 Every requirement above proven against current state, required reviews addressed, meaningful checks pass, stage commit contains scoped files, preserved user state. Move to completed only then; otherwise retain precise missing requirements and next action. Parent goal remains active until all stages including physical proof and final review/repair/test pass.
 
+
+Root pagination correction: native program.list already validates bounded offset/limit in tool_discovery._page_params, emits next_offset from _cards_payload, and applies it in program_list_handler. Provider port listing all source records does not imply the model receives all cards; no port extension is justified without an actual context bypass reproduction. Preliminary missing approval-resume claim must trace shared Control/runtime/gateway consumers, not just react.py; existing prepared ToolInvocation and dispatch IDs are visible there. No stage05 mutation is authorized until concrete disjoint packets and stage04 readiness interfaces are reviewed.
