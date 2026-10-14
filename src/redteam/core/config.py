@@ -174,6 +174,10 @@ class LLMConfig(BaseModel):
         return cls(**kwargs)
 
 
+#: Finite owner bound for accepted internal planner follow-ups per Run.
+PLANNER_REPLAN_MAX_PASSES_CEILING = 32
+
+
 class OrchestrationConfig(BaseModel):
     """실행 상한 전용 설정. 후보 생성 방식 선택지가 아니다.
 
@@ -219,6 +223,11 @@ class OrchestrationConfig(BaseModel):
     #: correction but share the same chain total and deadline. 0 disables
     #: transport retries; the cap never exceeds 5 and never widens totals.
     decision_transport_max_attempts: int = Field(default=5, ge=0, le=5)
+    #: Accepted internal planner follow-ups (replans) per Run. 0 denies them all. The
+    #: count is absolute, never refilled, and each accepted follow-up queues one wake.
+    planner_replan_max_passes: int = Field(
+        default=3, ge=0, le=PLANNER_REPLAN_MAX_PASSES_CEILING
+    )
     decision_timeout_seconds: float = Field(default=900.0, gt=0, le=3600, allow_inf_nan=False)
     llm_attempt_timeout_seconds: float = Field(default=180.0, gt=0, le=900, allow_inf_nan=False)
     #: Legacy opt-in name retained for compatibility; not a mode switch.

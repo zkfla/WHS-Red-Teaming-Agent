@@ -93,6 +93,9 @@ class OrchestrationEnvInput(_SnapshotSettings):
     decision_transport_max_attempts: str | None = Field(
         default=None, validation_alias="REDTEAM_DECISION_TRANSPORT_MAX_ATTEMPTS"
     )
+    planner_replan_max_passes: str | None = Field(
+        default=None, validation_alias="REDTEAM_PLANNER_REPLAN_MAX_PASSES"
+    )
     decision_timeout_seconds: str | None = Field(
         default=None, validation_alias="REDTEAM_DECISION_TIMEOUT_SECONDS"
     )

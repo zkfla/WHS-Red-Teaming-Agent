@@ -25,6 +25,7 @@ from redteam.orchestration.diagnostics import DecisionDiagnostic, diagnostic_for
 from redteam.orchestration.engine import InvestigationEngine
 from redteam.orchestration.knowledge_validation import known_principals, known_target_ids
 from redteam.orchestration.metered_llm import llm_request_scope
+from redteam.orchestration.planner_progress import PLANNING_INVALIDATED
 from redteam.orchestration.probe_atomization import (
     HypothesisPlanDraft,
     TaskAtomizationDraft,
@@ -42,7 +43,6 @@ from redteam.orchestration.specialist_tasks import (
     validate_probe_subjects,
 )
 
-PLANNING_INVALIDATED = "HypothesisPlanningInvalidated"
 PROBE_WAKE_EVENTS = frozenset({
     RESULT_UPDATED, EventType.EVIDENCE_VALIDITY_CHANGED, EventType.TASK_COMPLETED,
     EventType.OPERATOR_INTENT_APPLIED,
@@ -114,6 +114,17 @@ class PlanningSnapshot:
     binding: str
     sequence: int
     consumed: int | None
+
+
+def _judgment_controls(planner, roles) -> dict:
+    """Planning-time controls stored with the judgment, so its commit enforces them."""
+    return {
+        "replan_max_passes": planner.deps.settings.planner_replan_max_passes,
+        "witness_inputs": {
+            "eligible_roles": sorted(roles),
+            "require_probe_limits": planner.policy.probe_limits is not None,
+        },
+    }
 
 
 def capture_snapshot(tx):
@@ -417,7 +428,8 @@ async def advance_hypotheses(planner, runtime, schema):
     judgment = {**decision.model_dump(mode="json"), "sequence": snapshot.sequence,
                 "issued_candidate_ids": issued, "graph_read": graph_read, "task_read": task_read,
                 "candidate_inventory": sorted(snapshot.candidates),
-                "task_inventory": sorted(snapshot.tasks)}
+                "task_inventory": sorted(snapshot.tasks),
+                **_judgment_controls(planner, roles)}
     return await _finalize_hypothesis_pass(
         deps, snapshot, budget, identity=identity, proposal=proposal, judgment=judgment,
         graph_read=graph_read, task_read=task_read, targets=targets, principals=principals,
@@ -653,6 +665,7 @@ async def _advance_split(planner, runtime, schema, snapshot, engine, budget, pay
                 "issued_candidate_ids": issued, "graph_read": graph_read, "task_read": task_read,
                 "candidate_inventory": sorted(snapshot.candidates),
                 "task_inventory": sorted(snapshot.tasks),
+                **_judgment_controls(planner, roles),
                 "questions": [question.model_dump(mode="json") for question in questions],
                 "atomization": atomization}
     return await _finalize_hypothesis_pass(

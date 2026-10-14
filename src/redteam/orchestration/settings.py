@@ -11,7 +11,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, PrivateAttr, model_validator
 
-from redteam.core.config import OrchestrationConfig
+from redteam.core.config import PLANNER_REPLAN_MAX_PASSES_CEILING, OrchestrationConfig
 from redteam.core.contracts.llm_policy import LLMRequestPolicy
 
 #: The native graph has three nodes per model turn.
@@ -133,6 +133,11 @@ class OrchestrationSettings(BaseModel):
     #: wired to this global setting, so changing this value never alters
     #: conversation behavior silently.
     decision_transport_max_attempts: int = Field(default=5, ge=0, le=5)
+    #: Accepted internal planner follow-ups per Run; separate from the retired
+    #: max_no_progress_turns identity field, which never limits execution.
+    planner_replan_max_passes: int = Field(
+        default=3, ge=0, le=PLANNER_REPLAN_MAX_PASSES_CEILING
+    )
     decision_timeout_seconds: float = Field(
         default=900.0, gt=0, le=3600, allow_inf_nan=False
     )
@@ -206,6 +211,7 @@ class OrchestrationSettings(BaseModel):
             base["decision_normal_limit"] = config.decision_normal_limit
             base["decision_max_attempts"] = config.decision_max_attempts
             base["decision_transport_max_attempts"] = config.decision_transport_max_attempts
+            base["planner_replan_max_passes"] = config.planner_replan_max_passes
             base["decision_timeout_seconds"] = config.decision_timeout_seconds
             base["llm_attempt_timeout_seconds"] = config.llm_attempt_timeout_seconds
         base.update({key: value for key, value in overrides.items() if value is not None})

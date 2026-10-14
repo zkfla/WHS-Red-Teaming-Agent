@@ -20,6 +20,7 @@ from types import SimpleNamespace
 from typing import Any, TypeVar
 
 from redteam.attack_graph.stores.central import GRAPH_SCHEMA, GraphTransaction
+from redteam.core.config import PLANNER_REPLAN_MAX_PASSES_CEILING
 from redteam.core.contracts.completion import completion_contract_hash
 from redteam.core.contracts.engagement import EngagementScope
 from redteam.core.contracts.events import EventEnvelope, EventType
@@ -36,7 +37,7 @@ from redteam.core.contracts.policy import Approval
 from redteam.core.contracts.tool import ToolInvocation, ToolResult, execution_outcome_uncertain
 from redteam.core.convert import execution_input_digest
 from redteam.core.enums import ApprovalStatus, MissionStatus, OperatorIntentType, TaskStatus
-from redteam.core.ids import EngagementId, EvidenceId, MissionId, OperatorIntentId, RunId
+from redteam.core.ids import EngagementId, EventId, EvidenceId, MissionId, OperatorIntentId, RunId
 from redteam.core.ports.evidence_store import EvidenceStore
 from redteam.core.tool_binding import execution_fingerprint
 from redteam.orchestration.coordination import (
@@ -55,7 +56,15 @@ from redteam.orchestration.llm_requests import (
 from redteam.orchestration.operator_intents.models import IntentRecord, IntentStatus
 from redteam.orchestration.operator_intents.store import check_intent_update, sanitize_intent_record
 from redteam.orchestration.outbox import OutboxChange, deliver_pending
+from redteam.orchestration.planner_progress import (
+    PLANNING_INVALIDATED,
+    REPLAN_BUDGET_KIND,
+    REPLAN_REQUESTED_REASON,
+    PlannerProgressStatus,
+    replan_exhausted_diagnostic,
+)
 from redteam.orchestration.resource_conflicts import INVOCATION_RESOURCE_PREFIX
+from redteam.orchestration.settings import OrchestrationSettings
 from redteam.sqlite_support import connect, run_sqlite, run_transaction
 
 T = TypeVar("T")
@@ -710,29 +719,221 @@ class CentralTransaction:
         ):
             raise PlanningInputsChanged("planning_terminal_inventory_changed")
 
+    def planner_replan_accepted(self) -> int:
+        """Absolute accepted replans for this Run; only the judgment commit increments it."""
+        row = self.db.execute(
+            "SELECT payload FROM state_requests WHERE run_id=? AND kind=? AND identity=?",
+            (self.run_id, REPLAN_BUDGET_KIND, self.run_id),
+        ).fetchone()
+        if row is None:
+            return 0
+        accepted = json.loads(row[0]).get("accepted")
+        if isinstance(accepted, bool) or not isinstance(accepted, int) or accepted < 0:
+            raise StateConflict("planner_replan_budget_invalid")
+        return accepted
+
+    def planner_progress_status(self) -> PlannerProgressStatus | None:
+        """Typed projection of the latest judgment; None when that judgment projects none."""
+        self.binding()
+        row = self.db.execute(
+            "SELECT payload FROM state_requests WHERE run_id=? "
+            "AND kind='planner_termination' AND identity=?",
+            (self.run_id, self.run_id),
+        ).fetchone()
+        raw = json.loads(row[0]).get("progress") if row else None
+        return PlannerProgressStatus.model_validate(raw) if raw is not None else None
+
     def finish_hypothesis_judgment(self, identity: str, judgment: dict) -> None:
-        """Same commit as candidates/Tasks; coalesce only consumed outbox inputs."""
+        """Same commit as candidates/Tasks: judgment, cursor, projection and at most one wake.
+
+        Runs after the candidate writes, so an existing-work witness is admitted against the
+        canonical post-update revisions. A refusal raises before any row is written.
+        """
         from redteam.orchestration.central_completion import goal_snapshot
 
         self.admit()
         payload = redact_secret_material(judgment)
-        self.db.execute("INSERT INTO state_requests VALUES(?,?,?,?)", (
-            self.run_id, "hypothesis_planner_pass", identity, json.dumps(payload),
-        ))
+        progress = self._project_planner_progress(identity, payload)
+        self.db.execute(
+            "INSERT INTO state_requests VALUES(?,?,?,?)",
+            (
+                self.run_id,
+                "hypothesis_planner_pass",
+                identity,
+                json.dumps(payload),
+            ),
+        )
         self.db.execute(
             "INSERT INTO state_requests VALUES(?,'hypothesis_planner_cursor',?,?) "
             "ON CONFLICT(run_id,kind,identity) DO UPDATE SET payload=excluded.payload",
             (self.run_id, self.run_id, json.dumps({"sequence": payload["sequence"]})),
         )
-        termination = {"termination": payload["termination"], "reason": payload["reason"],
-                       "resume_conditions": payload["resume_conditions"],
-                       "candidate_inputs": self.hypothesis_candidate_inputs(),
-                       "inputs": goal_snapshot(self, include_assessment=False)[2]}
+        termination = {
+            "termination": payload["termination"],
+            "reason": payload["reason"],
+            "resume_conditions": payload["resume_conditions"],
+            "candidate_inputs": self.hypothesis_candidate_inputs(),
+            "inputs": goal_snapshot(self, include_assessment=False)[2],
+            "progress": progress.model_dump(mode="json") if progress is not None else None,
+        }
         self.db.execute(
             "INSERT INTO state_requests VALUES(?,'planner_termination',?,?) "
             "ON CONFLICT(run_id,kind,identity) DO UPDATE SET payload=excluded.payload",
             (self.run_id, self.run_id, json.dumps(termination)),
         )
+
+    def _project_planner_progress(
+        self,
+        identity: str,
+        payload: dict,
+    ) -> PlannerProgressStatus | None:
+        """Derive the progress kind from the judgment and the canonical state after its writes."""
+        termination = payload["termination"]
+        if termination in {"exhausted", "goal_achieved"}:
+            # The original termination and the separate completion gate stay authoritative.
+            return None
+        if termination == "replan":
+            return self._accept_replan(identity, payload)
+        # Every other kind still reports the Run's absolute replan count and its limit.
+        limit = self._replan_limit(payload)
+        accepted = self.planner_replan_accepted()
+        if termination == "held":
+            return PlannerProgressStatus(kind="held", replan_count=accepted, replan_limit=limit)
+        if payload.get("tasks") or payload.get("questions"):
+            return PlannerProgressStatus(
+                kind="work_proposed",
+                replan_count=accepted,
+                replan_limit=limit,
+            )
+        if not self._post_update_witnesses(payload):
+            raise PlanningInputsChanged("planner_existing_work_changed")
+        return PlannerProgressStatus(
+            kind="existing_work",
+            replan_count=accepted,
+            replan_limit=limit,
+        )
+
+    def _replan_limit(self, payload: dict) -> int:
+        """The trusted producer value, bounded here and equal to the Run's bound setting."""
+        limit = payload.get("replan_max_passes")
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 0 <= limit <= PLANNER_REPLAN_MAX_PASSES_CEILING
+        ):
+            raise StateConflict("planner_replan_limit_invalid")
+        if limit != self._bound_replan_limit():
+            raise StateConflict("planner_replan_limit_mismatch")
+        return limit
+
+    def _bound_replan_limit(self) -> int:
+        """The Run's cap as bound at start: stored settings normalized by the owned contract.
+
+        A historical configuration without the field normalizes to the owned default. A
+        missing or malformed configuration fails closed; no caller value is a fallback.
+        """
+        row = self.db.execute(
+            "SELECT payload FROM state_requests WHERE run_id=? "
+            "AND kind='run_configuration' AND identity=?",
+            (self.run_id, self.run_id),
+        ).fetchone()
+        if row is None:
+            raise StateConflict("planner_run_configuration_missing")
+        try:
+            stored = json.loads(row[0])
+        except ValueError:
+            raise StateConflict("planner_run_configuration_invalid") from None
+        settings = stored.get("settings") if isinstance(stored, dict) else None
+        if not isinstance(settings, dict):
+            raise StateConflict("planner_run_configuration_invalid")
+        try:
+            return OrchestrationSettings.model_validate(settings).planner_replan_max_passes
+        except ValueError:
+            raise StateConflict("planner_run_configuration_invalid") from None
+
+    def _witness_inputs(self, payload: dict) -> tuple[tuple[str, ...], bool]:
+        """Planning-time claimability inputs, validated before any witness is admitted."""
+        inputs = payload.get("witness_inputs")
+        if not isinstance(inputs, dict):
+            raise StateConflict("planner_witness_inputs_invalid")
+        roles = inputs.get("eligible_roles")
+        probe_limits = inputs.get("require_probe_limits")
+        if (
+            not isinstance(roles, list)
+            or not all(isinstance(item, str) for item in roles)
+            or not isinstance(probe_limits, bool)
+        ):
+            raise StateConflict("planner_witness_inputs_invalid")
+        return tuple(roles), probe_limits
+
+    def _accept_replan(self, identity: str, payload: dict) -> PlannerProgressStatus:
+        limit = self._replan_limit(payload)
+        accepted = self.planner_replan_accepted()
+        if accepted >= limit:
+            # Denied: no count and no wake. Candidate writes in this judgment still commit.
+            return PlannerProgressStatus(
+                kind="replan_exhausted",
+                replan_count=accepted,
+                replan_limit=limit,
+                diagnostic=replan_exhausted_diagnostic(accepted=accepted, limit=limit),
+            )
+        accepted += 1
+        self.db.execute(
+            "INSERT INTO state_requests VALUES(?,?,?,?) "
+            "ON CONFLICT(run_id,kind,identity) DO UPDATE SET payload=excluded.payload",
+            (self.run_id, REPLAN_BUDGET_KIND, self.run_id, json.dumps({"accepted": accepted})),
+        )
+        mission = self.admit()
+        self.queue(
+            EventEnvelope(
+                event_id=EventId("evt_" + content_hash([identity, REPLAN_REQUESTED_REASON])),
+                event_type=PLANNING_INVALIDATED,
+                run_id=RunId(self.run_id),
+                engagement_id=EngagementId(self.engagement_id),
+                timestamp=mission.created_at,
+                source="orchestration.planner",
+                correlation_id=self.run_id,
+                payload={
+                    "pass_id": identity,
+                    "reason_code": REPLAN_REQUESTED_REASON,
+                    "accepted_replans": accepted,
+                    "replan_limit": limit,
+                },
+            )
+        )
+        return PlannerProgressStatus(
+            kind="replan_queued",
+            replan_count=accepted,
+            replan_limit=limit,
+            cause_code=REPLAN_REQUESTED_REASON,
+        )
+
+    def _post_update_witnesses(self, payload: dict) -> set[str]:
+        """Shared claimability over the canonical post-write candidate revisions; fails closed."""
+        from redteam.attack_graph.predicates import facts_of
+        from redteam.core.enums import GraphNodeType
+        from redteam.orchestration.central_runtime import task_is_claimable
+
+        mission = self.admit()
+        revisions: dict[str, int] = {}
+        for node in self.graph.query(node_type=GraphNodeType.HYPOTHESIS):
+            facts = facts_of(node.properties)
+            if "hypothesis_id" in facts and "revision" in facts:
+                revisions[facts["hypothesis_id"]] = facts["revision"]
+        roles, require_probe_limits = self._witness_inputs(payload)
+        witnesses: set[str] = set()
+        for identity in payload.get("reviewed_task_ids", []):
+            task = self.get_task(identity)
+            if task is not None and task_is_claimable(
+                task,
+                eligible_roles=roles,
+                mission=mission,
+                require_probe_limits=require_probe_limits,
+                candidate_revisions=revisions,
+                allow_running=True,
+            ):
+                witnesses.add(identity)
+        return witnesses
 
     def update_task(
         self, task: MissionTask, *, owner: str, version: int, expected_hash: str,
@@ -1861,6 +2062,9 @@ class CentralStateStore:
 
     async def get_task(self, task_id: str) -> MissionTask | None:
         return await self.transaction(lambda tx: tx.get_task(task_id), write=False)
+
+    async def planner_progress_status(self) -> PlannerProgressStatus | None:
+        return await self.transaction(lambda tx: tx.planner_progress_status(), write=False)
 
     async def list_tasks(
         self, *, mission_id: MissionId | None = None, status: TaskStatus | None = None,

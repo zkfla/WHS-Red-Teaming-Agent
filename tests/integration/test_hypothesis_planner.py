@@ -29,6 +29,18 @@ async def selection(tmp_path, **kwargs):
         yield selected
 
 
+def _wake_reasons(tx):
+    reasons = []
+    rows = tx.db.execute(
+        "SELECT payload FROM state_outbox WHERE run_id=? ORDER BY sequence", (tx.run_id,),
+    )
+    for (raw,) in rows:
+        envelope = json.loads(raw)["envelope"]
+        if envelope["event_type"] == PLANNING_INVALIDATED:
+            reasons.append(envelope["payload"]["reason_code"])
+    return reasons
+
+
 def probe(key="observe", *, candidate=None, revision=1, source=None):
     return {
         "task_key": key, "title": "Short observation", "objective": "Observe one response",
@@ -213,10 +225,18 @@ async def test_planner_snapshot_rejects_related_updates_only(tmp_path, related):
         saved = await AttackGraphService(session.deps.graph_store).get_hypothesis("local")
         assert saved.status == ("held" if related else "open")
         assert saved.revision == 2
-        invalidated = await session.deps.central_state.transaction(
-            lambda tx: tx.latest_event_sequence([PLANNING_INVALIDATED]), write=False,
+        state = session.deps.central_state
+        reasons = await state.transaction(_wake_reasons, write=False)
+        status = await state.transaction(
+            lambda tx: tx.planner_progress_status(), write=False,
         )
-        assert bool(invalidated) is related
+        if related:
+            # The conflicting replan commits nothing; only the existing CAS retry wake remains.
+            assert reasons == ["related_planning_inputs_changed"] and status is None
+        else:
+            # The unrelated sibling leaves the accepted replan intact: one replan wake.
+            assert reasons == ["planner_replan_requested"]
+            assert (status.kind, status.replan_count) == ("replan_queued", 1)
         assert (await session.deps.central_state.get_task(source_id)).status is TaskStatus.READY
 
 
