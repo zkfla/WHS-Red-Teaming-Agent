@@ -11,7 +11,7 @@ import pytest
 from redteam.app.web.graph_read import read_graph
 from redteam.attack_graph.hypotheses import prepare_hypothesis_update
 from redteam.core.contracts.execution import ExecutionState
-from redteam.core.contracts.graph import Hypothesis, HypothesisUpdate
+from redteam.core.contracts.graph import CandidateHypothesis, HypothesisUpdate
 from redteam.core.contracts.llm_policy import LLMRequestPolicy
 from redteam.core.tool_binding import execution_fingerprint
 from redteam.evidence.stores.filesystem import FilesystemEvidenceStore
@@ -64,7 +64,7 @@ async def test_planner_state_follows_the_stored_model_request_and_judgment(tmp_p
 
 async def test_candidate_is_projected_separately_from_tasks_findings_and_mission(tmp_path):
     state, _ = await bound(tmp_path)
-    candidate = Hypothesis(
+    candidate = CandidateHypothesis(
         hypothesis_id="candidate-a",
         description="Authorization may be missing",
         status="open",

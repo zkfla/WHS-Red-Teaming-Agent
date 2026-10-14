@@ -8,8 +8,10 @@ from redteam.orchestration.diagnostics import diagnostic_for_exception
 
 
 @pytest.mark.parametrize("hypothesis,rule", [
-    ({"hypothesis_id": "local", "description": "private-proposal-marker"},
-     "candidate_update_requires_v2"),
+    ({"contract_version": 1, "hypothesis_id": "local",
+      "description": "private-proposal-marker", "target_node_ids": ["target"],
+      "reason": "public purpose"},
+     "literal_error"),
     ({"contract_version": 2, "hypothesis_id": "local",
       "description": "private-proposal-marker", "target_node_ids": ["target"],
       "reason": "public purpose", "status": "confirmed"},
@@ -22,5 +24,6 @@ def test_candidate_update_rule_is_safe_and_structured(hypothesis, rule):
         failed.value, stage="hypothesis_planning",
         schema=HypothesisUpdate.model_json_schema(),
     )
-    assert diagnostic.validation_issues == [{"rule": rule, "location": "$"}]
+    location = "$.hypothesis.contract_version" if rule == "literal_error" else "$"
+    assert diagnostic.validation_issues == [{"rule": rule, "location": location}]
     assert "private-proposal-marker" not in diagnostic.model_dump_json()
