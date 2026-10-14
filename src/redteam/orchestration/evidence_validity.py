@@ -369,7 +369,17 @@ async def assess(tool_input: dict, context: LocalToolContext) -> LocalToolResult
         projection = await refresh_validity(deps, runtime)
         result = next((p for p in projection if p.evidence_id == request.evidence_id),
                       ValidityProjection(evidence_id=request.evidence_id, status="unbound"))
-        return LocalToolResult(ok=True, payload=result.model_dump(mode="json"),
+        payload = result.model_dump(mode="json")
+        if result.status == "unbound":
+            payload["meaning"] = (
+                "No current validity binding exists; the historical observation is not refuted. "
+                "Existing original/provenance gates still apply."
+            )
+            payload["repair_condition"] = (
+                "Assess measured reuse conditions if needed; repeating a read or assessment "
+                "without new conditions does not create a binding."
+            )
+        return LocalToolResult(ok=True, payload=payload,
                                refs=(request.evidence_id,))
     except StateConflict:
         return LocalToolResult(ok=False, error="validity_state_changed_or_write_pending")

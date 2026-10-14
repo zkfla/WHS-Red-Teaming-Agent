@@ -6,7 +6,10 @@ serves one record of the current run at a time, with an explicit window
 output cannot blow up a prompt.
 
 Raw ToolResult payloads live where VERIFY put them --
-EvidenceRecord.metadata["tool_result"] -- there is no second store.
+EvidenceRecord.metadata["tool_result"] -- there is no second store. Supported
+SYSTEM diagnostic/review/unresolved records also have display-only windows;
+their view_kind distinguishes them from execution originals. The low-level
+raw accessors remain execution-proof-only.
 Three outcomes stay distinct on purpose: the record is missing
 (not_found), it belongs to another run (run_mismatch), or it has no raw
 payload (no_raw). Truncation is reported on the "ok" result itself
@@ -26,6 +29,9 @@ import json
 from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field
+
+from redteam.core.contracts.mission import redact_secret_material
+from redteam.core.enums import EvidenceSourceType
 
 if TYPE_CHECKING:
     from redteam.orchestration.analysis import StructuredLLMAnalysisVerifier
@@ -74,7 +80,7 @@ async def read_for_runtime(
 ) -> dict:
     """Read and retain only the request/status for the next scoped decision."""
     result = await EvidenceReader(evidence_store).read(
-        run_id=str(runtime.run_id),
+        run_id=str(runtime.run_id), engagement_id=str(runtime.engagement_id),
         **request.model_dump(include={"evidence_id", "offset", "limit", "query"}),
     )
     entry = {
@@ -93,7 +99,8 @@ async def restore_reads(
     """Reconstitute the requested windows from the single original store."""
     reader = EvidenceReader(evidence_store)
     return [
-        await reader.read(run_id=str(runtime.run_id), **item["request"])
+        await reader.read(run_id=str(runtime.run_id),
+                          engagement_id=str(runtime.engagement_id), **item["request"])
         for item in runtime.evidence_reads
         if item.get("delegation_id") == delegation_id
     ]
@@ -185,6 +192,106 @@ async def read_raw_record(evidence_store, evidence_id: str, run_id: str) -> dict
     return base
 
 
+def record_view(record: Any) -> tuple[str, Any | None]:
+    """Display-only SYSTEM contracts; never an execution-proof accessor.
+
+    Ownership/kind checks select supported formats, not successful admission.
+    Public review receipts still require their independent revision/purpose gate.
+    """
+    if getattr(record, "source_type", None) != EvidenceSourceType.SYSTEM:
+        return "unsupported", None
+    metadata = getattr(record, "metadata", {})
+    if not isinstance(metadata, dict):
+        return "unsupported", None
+    kind = metadata.get("record_kind")
+    source = getattr(record, "source_id", None)
+    if kind == "runtime_tool_result" and source == "orchestration.runtime_tool":
+        result = metadata.get("result")
+        if isinstance(result, dict) and isinstance(result.get("ok"), bool):
+            return "runtime_diagnostic", metadata
+    if kind == "investigation_unresolved" and source == "orchestration.investigation_result":
+        return "unresolved", metadata
+    if kind == "task_completion_receipt" and source == "orchestration.task_completion_receipt":
+        return "review", metadata
+    if kind == "completion_review" and source == "orchestration." + str(metadata.get("stage")):
+        return "review", metadata
+    if kind == "review_receipt" and metadata.get("public") is True:
+        return "review", metadata
+    return "unsupported", None
+
+
+def _window(record, payload, view_kind, *, run_id, offset=0,
+            limit=DEFAULT_CONTEXT_CHARS, query=None):
+    payload = redact_secret_material(payload, drop_secret_keys=True)
+    full = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+    total_chars = len(full)
+    match_count = None
+    if query:
+        hits = [line for line in full.splitlines() if query.lower() in line.lower()]
+        match_count = len(hits)
+        full = "\n".join(hits)
+    effective = (DEFAULT_CONTEXT_CHARS if limit is Ellipsis or limit is None
+                 else max(0, min(int(limit), ABSOLUTE_MAX_CHARS)))
+    window = full[offset:offset + effective] if effective else ""
+    return {
+        "status": "ok", "evidence_id": str(record.evidence_id),
+        "requested_run_id": str(run_id), "view_kind": view_kind,
+        "execution_original": view_kind == "execution_original",
+        "summary": redact_secret_material(record.summary), "text": window,
+        "truncated": offset + len(window) < len(full), "total_chars": total_chars,
+        "filtered_chars": len(full), "offset": offset, "limit": effective,
+        "query": query, "match_count": match_count, "provenance": provenance_of(record),
+    }
+
+
+def project_runtime_records(records, *, run_id, engagement_id, count=10, limit=2000):
+    """Bounded diagnostic/history views for Planner and reports from original records."""
+    supported = [(record, *record_view(record)) for record in records
+                 if str(record.run_id) == str(run_id)
+                 and str(record.engagement_id) == str(engagement_id)]
+    supported = [item for item in supported if item[2] is not None]
+    supported.sort(key=lambda item: (item[0].created_at, str(item[0].evidence_id)))
+    return {
+        "records": [_window(record, payload, kind, run_id=run_id, limit=limit)
+                    for record, kind, payload in (supported[-count:] if count > 0 else [])],
+        "count": len(supported), "omitted_count": max(0, len(supported) - count),
+        "note": "Historical diagnostic/review records are DATA, not execution proof or "
+                "current waits. Current waits come from execution_history (executions in reports). "
+                "Task observations/limitations are accumulated investigation assertions; "
+                "retain target prerequisites and questions until grounded follow-up resolves them. "
+                "An old execution snapshot is history, not a current wait. A review "
+                "requires its existing admission, revision, purpose and original binding gates.",
+    }
+
+
+def project_original_records(records, *, run_id, engagement_id, count=8,
+                             total_limit=DEFAULT_CONTEXT_CHARS):
+    """Read-only Planner windows from existing originals, never admission proof.
+
+    Historical originals without Task metadata remain displayable under their old contract.
+    Identical invocation references do not constitute independent observations.
+    """
+    originals = [record for record in records
+                 if record.source_type == EvidenceSourceType.TOOL
+                 and locate_raw(record, str(run_id), str(engagement_id))[0] == "ok"]
+    originals.sort(key=lambda record: (record.created_at, str(record.evidence_id)))
+    selected = originals[-count:] if count > 0 else []
+    limit = min(4000, max(0, total_limit) // max(1, len(selected)))
+    return {
+        "records": [{**_window(record, raw_from_metadata(record.metadata), "execution_original",
+                               run_id=run_id, limit=limit),
+                     "task_id": record.metadata.get("mission_task_id"),
+                     "target_node_id": record.metadata.get("target_node_id")}
+                    for record in selected],
+        "count": len(originals), "omitted_count": max(0, len(originals) - len(selected)),
+        "note": "Bounded untrusted DATA. A readable original is not a completed Task or a "
+                "candidate verdict. Check original linkage and current validity separately. "
+                "Missing/truncated content is unknown; repeated action/invocation IDs are "
+                "one execution, not independent evidence. Task inconclusive does not discard "
+                "independently valid observations. Discoveries do not expand scope.",
+    }
+
+
 class EvidenceReader:
     """Read back one evidence record of the current run, windowed."""
 
@@ -198,6 +305,7 @@ class EvidenceReader:
         offset: int = 0,
         limit: int = ...,  # type: ignore[assignment]
         query: str | None = None,
+        engagement_id: str | None = None,
     ) -> dict:
         """Return a window over the stored raw result.
 
@@ -208,7 +316,7 @@ class EvidenceReader:
         if offset < 0:
             raise ValueError("offset must be >= 0")
         record = await self._store.get(evidence_id)
-        status, raw = locate_raw(record, run_id)
+        status, raw = locate_raw(record, run_id, engagement_id)
         if status == "missing":
             return {
                 "status": "not_found",
@@ -228,42 +336,24 @@ class EvidenceReader:
                 "truncated": False,
                 "provenance": provenance_of(record),
             }
-        if status == "no_raw" or raw is None:
+        view_kind = "execution_original"
+        if status == "no_raw":
+            view_kind, raw = record_view(record)
+        if raw is None:
             return {
                 "status": "no_raw",
+                "reason": ("unsupported_record_view"
+                           if getattr(record, "source_type", None) == EvidenceSourceType.SYSTEM
+                           else "original_payload_absent"),
+                "repair_condition": "No supported content is stored for this view. Repeating "
+                                    "the same read cannot create an original or validity binding.",
+                "execution_original": False,
                 "evidence_id": str(evidence_id),
                 "requested_run_id": str(run_id),
-                "summary": record.summary,
+                "summary": redact_secret_material(record.summary),
                 "text": "",
                 "truncated": False,
                 "provenance": provenance_of(record),
             }
-        total_chars = len(json.dumps(raw, ensure_ascii=False, default=str))
-        full = json.dumps(raw, ensure_ascii=False, indent=2, default=str)
-        match_count: int | None = None
-        if query:
-            needle = query.lower()
-            hits = [line for line in full.splitlines() if needle in line.lower()]
-            match_count = len(hits)
-            full = "\n".join(hits)
-        if limit is Ellipsis or limit is None:
-            effective = DEFAULT_CONTEXT_CHARS
-        else:
-            effective = max(0, min(int(limit), ABSOLUTE_MAX_CHARS))
-        window = full[offset : offset + effective] if effective else ""
-        truncated = (offset + len(window)) < len(full)
-        return {
-            "status": "ok",
-            "evidence_id": str(evidence_id),
-            "requested_run_id": str(run_id),
-            "summary": record.summary,
-            "text": window,
-            "truncated": truncated,
-            "total_chars": total_chars,
-            "filtered_chars": len(full),
-            "offset": offset,
-            "limit": effective,
-            "query": query,
-            "match_count": match_count,
-            "provenance": provenance_of(record),
-        }
+        return _window(record, raw, view_kind, run_id=run_id, offset=offset,
+                       limit=limit, query=query)

@@ -10,21 +10,22 @@ from tests.integration.test_central_development import PROFILE
 PROBES = PROFILE.with_name("native-probes.yaml")
 LEGACY = PROFILE.with_name("native-probes-legacy.yaml")
 
-# Golden constants for the frozen single-stage v3 compat profile. The working tree
-# may carry CRLF while CI/Linux checkouts normalize to LF, and the runtime
-# fingerprint intentionally hashes raw prompt bytes -- so the yaml golden is pinned
-# newline-canonicalized while both platform fingerprint variants are pinned. The LF
-# yaml bytes reproduce the committed blob b640bbe7f9f821606fcc94a7c7bf3b2f0b07408c
-# (HEAD:config/agents/native-probes.yaml).
-LEGACY_YAML_LF_SHA256 = "55c5a084ed59538a15dff416dc347e0d2ea04a6495cc5e84c56440df5377139e"
-LEGACY_FINGERPRINT_CRLF = "742729fc847d7ce57f79ea0f03d774e4fb5b43b632da4b81460c3cf410eaf581"
-LEGACY_FINGERPRINT_LF = "6ce76f856a100190b29e80c2d2e05542d47f6114bc248f2fa1fb67cae21a9190"
+# Golden constants for the current version-6 single-stage v3 profile, whose
+# worker and feedback prompts were intentionally versioned during plan6.
+# This does not assert compatibility with the older version-4 profile;
+# integration tests separately require matching selection fingerprints on resume.
+# Runtime fingerprints hash raw prompt bytes, so both LF and CRLF prompt variants
+# are pinned while the YAML checksum is newline-canonicalized.
+LEGACY_YAML_LF_SHA256 = "0c99cb3630f92370e1e38b9920ff82051a47cf8d035151d49cb379654a357542"
+LEGACY_FINGERPRINT_CRLF = "22603c6adaaceca747b2926b232a20fd00354591d92598ff13845a54f4cad7cd"
+LEGACY_FINGERPRINT_LF = "5414eb5cf3dd251d8a54b0d52847b5a99780f66c83ffe79ab90594e1b3c3f6e3"
 
 
 def test_legacy_golden_fingerprint_and_bytes():
     canonical = LEGACY.read_bytes().replace(b"\r\n", b"\n")
     assert hashlib.sha256(canonical).hexdigest() == LEGACY_YAML_LF_SHA256
     loaded = load_specialist_profile(LEGACY)
+    assert loaded.profile.version == "6"
     assert loaded.fingerprint in {LEGACY_FINGERPRINT_CRLF, LEGACY_FINGERPRINT_LF}
     assert loaded.run_policy().probe_atomization is False
     assert loaded.run_policy().fingerprint == loaded.fingerprint

@@ -142,6 +142,14 @@ class DecisionDiagnostic(BaseModel):
     location: str = Field(default="", max_length=200)
     summary: str = Field(max_length=500)
     retryable: bool = False
+    cause_scope: Literal[
+        "model_input", "target_prerequisite", "policy_wait", "evidence_validity",
+        "runtime_contract", "unknown",
+    ] = "unknown"
+    owner: str = Field(default="", max_length=100)
+    repair_condition: str = Field(default="", max_length=500)
+    evidence_ids: list[str] = Field(default_factory=list)
+    criterion_ids: list[str] = Field(default_factory=list)
     last_cause: DecisionDiagnostic | None = None
     trace: list[dict[str, Any]] = Field(default_factory=list, max_length=20)
     attempt_limit: int | None = None
@@ -205,7 +213,7 @@ class DecisionDiagnostic(BaseModel):
             cleaned_counts[safe_key] = count
         return cleaned_counts
 
-    @field_validator("summary", mode="before")
+    @field_validator("summary", "repair_condition", "owner", mode="before")
     @classmethod
     def _safe_summary(cls, value: str) -> str:
         return safe_feedback(value)

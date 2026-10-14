@@ -34,10 +34,10 @@ from redteam.orchestration.diagnostics import DecisionDiagnostic
 from redteam.orchestration.evidence_access import raw_from_metadata
 from redteam.orchestration.expectations import Expectation, ExpectationOutcome, verdict_for
 from redteam.orchestration.session_proof import (
+    actual_account_pairs,
     actual_receipt_conflict,
     collect_actual_accounts,
     collect_actual_sessions,
-    has_actual_receipt,
 )
 
 VerificationOutcome = Literal["success", "refuted", "inconclusive", "blocked", "unknown"]
@@ -482,35 +482,15 @@ def _has_raw_account_artifact(
         cleaned = _clean_identity(args.get(key))
         if cleaned is not None:
             expected_sessions.add(cleaned)
-    raw_principals: set[str] = set()
-    # Single precedence, shared with completion: any actual receipt anywhere
-    # drops every legacy echo; inventory rows never prove use.
+    # Shared with completion: only each unit's own actual-use pair proves
+    # its account. Echoes and configured inventory never prove use.
     raw_sessions = collect_actual_sessions(metadata, raw)
     # Cross-layer actual disagreement is unprovable; fail closed outright.
     if actual_receipt_conflict(metadata, raw) is not None:
         return False
     comparison = metadata.get("session_comparison")
     comparison_dict: dict[str, Any] | None = comparison if isinstance(comparison, dict) else None
-    if comparison_dict is not None:
-        for key in ("first_principal_ref", "second_principal_ref"):
-            cleaned = _clean_identity(comparison_dict.get(key))
-            if cleaned is not None:
-                raw_principals.add(cleaned)
-    try:
-        output = raw.get("output") if isinstance(raw, dict) else None
-    except Exception:
-        output = None
-    if isinstance(output, dict):
-        for key in ("principal_ref", "first_principal_ref", "second_principal_ref"):
-            cleaned = _clean_identity(output.get(key))
-            if cleaned is not None:
-                raw_principals.add(cleaned)
-        for nested_key in ("first", "second", "authenticated", "anonymous"):
-            nested = output.get(nested_key)
-            if isinstance(nested, dict):
-                cleaned = _clean_identity(nested.get("principal_ref"))
-                if cleaned is not None:
-                    raw_principals.add(cleaned)
+    raw_principals = collect_actual_accounts(metadata, raw, expected_sessions)
     if comparison_dict is not None:
         first_principal = _clean_identity(comparison_dict.get("first_principal_ref"))
         second_principal = _clean_identity(comparison_dict.get("second_principal_ref"))
@@ -596,35 +576,8 @@ async def _session_alias_grounded(
             continue
         if _posthoc_source_gap(record, raw) is not None:
             continue
-        output = raw.get("output")
-        if not isinstance(output, dict):
-            continue
-        candidates: list[Any] = [output]
-        candidates.extend(output.get(key) for key in ("first", "second", "authenticated"))
-        for item in candidates:
-            if not isinstance(item, dict):
-                continue
-            # Single precedence with the collector: in actual mode a unit
-            # without its own actual key is skipped, never echo-guessed.
-            principal = _clean_identity(item.get("principal_ref"))
-            if has_actual_receipt(meta, raw):
-                if item is output:
-                    keys: tuple[str, ...] = (
-                        "actual_session_ref",
-                        "first_actual_session_ref",
-                        "second_actual_session_ref",
-                    )
-                else:
-                    keys = ("actual_session_ref",)
-                if not any(key in item for key in keys):
-                    continue
-                if any(
-                    (session, principal) == wanted
-                    for key in keys
-                    for session in [_clean_identity(item.get(key))]
-                    if session is not None
-                ):
-                    return True
+        if wanted in actual_account_pairs(raw):
+            return True
     return False
 
 

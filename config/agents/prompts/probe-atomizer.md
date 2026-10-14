@@ -24,3 +24,9 @@ Keep each task's related subjects, evidence, and source references explicit so
 the final commit can union question and task reads. State the purpose, subjects,
 return conditions, and completion criteria per task.
 Report structured reasons and original references, never private chain-of-thought.
+
+Decompose the supplied security uncertainty; do not add a preliminary full PoC,
+positive Task completion or final candidate review to an observation purpose.
+Preserve the planner's source observation and diagnostic references and stated
+prerequisites. Diagnostic records are not target-execution proof. Do not replace
+an unavailable source-correction prerequisite with repeated target requests.

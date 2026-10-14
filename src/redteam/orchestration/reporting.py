@@ -464,6 +464,7 @@ class TerminalReportProjection(BaseModel):
     evidence_validity_blockers: list[str] = Field(default_factory=list)
     investigations: list[dict[str, Any]] = Field(default_factory=list)
     executions: list[dict[str, Any]] = Field(default_factory=list)
+    runtime_records: dict[str, Any] = Field(default_factory=dict)
     criterion_evidence: list[dict[str, Any]] = Field(default_factory=list)
     unresolved_questions: list[dict[str, Any]] = Field(default_factory=list)
     cleanup_obligations: list[dict[str, Any]] = Field(default_factory=list)
@@ -602,6 +603,11 @@ class ReportingAgent:
         unresolved_refs = [
             str(item)[:200] for item in (getattr(runtime, "unresolved_evidence_ids", None) or [])
         ][-_UNRESOLVED_REF_LIMIT:]
+        from redteam.orchestration.evidence_access import project_runtime_records
+
+        runtime_records = project_runtime_records(
+            evidence, run_id=runtime.run_id, engagement_id=runtime.engagement_id,
+        )
         unresolved_details = _project_unresolved_details(evidence)
         if unresolved_refs:
             ref_order = {identity: index for index, identity in enumerate(unresolved_refs)}
@@ -704,6 +710,7 @@ class ReportingAgent:
             unresolved_evidence_ids=unresolved_refs,
             evidence_reads=evidence_read_projections,
             unresolved_details=unresolved_details,
+            runtime_records=runtime_records,
             evidence_validity=[item.model_dump(mode="json") for item in validity],
             evidence_validity_blockers=validity_blockers,
             run_outcome="unknown",

@@ -516,9 +516,10 @@ class InvestigationEngine:
                     self.last_event_id = result.last_event_id
                 response = asdict(result)
             except (ValueError, TypeError, DecisionFailure) as exc:
+                diagnostic = diagnostic_for_exception(exc, stage="local_tool")
                 response = {
-                    "ok": False,
-                    "error": diagnostic_for_exception(exc, stage="local_tool").feedback(),
+                    "ok": False, "error": diagnostic.feedback(),
+                    "payload": {"diagnostic": diagnostic.model_dump(mode="json")},
                 }
             finally:
                 # Internal review requests belong to the current requester,
