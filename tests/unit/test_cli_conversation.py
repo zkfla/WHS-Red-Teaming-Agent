@@ -209,11 +209,11 @@ async def test_transport_error_raises_without_execution() -> None:
             scope=["localhost"],
         )
 
-    assert len(llm.structured_calls) == 3
+    assert len(llm.structured_calls) == 6
     assert llm.complete_calls == []
 
 
-async def test_repeated_format_errors_call_exactly_three_times() -> None:
+async def test_repeated_format_errors_call_exactly_six_times() -> None:
     llm = _ScriptedDecisionLLM([{}])
     assistant = ConversationAssistant(llm)
 
@@ -224,7 +224,7 @@ async def test_repeated_format_errors_call_exactly_three_times() -> None:
             scope=["localhost"],
         )
 
-    assert len(llm.structured_calls) == 3
+    assert len(llm.structured_calls) == 6
     for call in llm.structured_calls:
         assert call.get("num_retries") == 0
     assert llm.complete_calls == []
