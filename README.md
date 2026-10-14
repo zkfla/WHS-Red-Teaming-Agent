@@ -1,4 +1,4 @@
-# WHS Red Teaming Agent 문서 사이트
+# WHS Red Teaming Agent 기술 문서 사이트
 
 이 `docs-site` 브랜치는 사이트 원본과 배포 설정만 관리한다.
 애플리케이션 개발은 `dev`에서 진행하며, 두 브랜치를 서로 병합하지 않는다.

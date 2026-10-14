@@ -1,0 +1,38 @@
+name: Example Engagement
+description: Authorized test engagement used to validate the framework skeleton.
+scope:
+  allowed_hosts:
+  - example.local
+  allowed_domains: []
+  allowed_networks: []
+  denied_hosts: []
+  denied_domains: []
+  allowed_assets: []
+  denied_assets: []
+rules_of_engagement:
+- name: prototype-open
+  description: No restrictions; keeps the demo green regardless of clock.
+  allowed_capabilities: []
+  denied_capabilities: []
+  allowed_operations: []
+  denied_operations: []
+  max_parallel_actions: null
+  availability_impact_allowed: false
+  start_at: null
+  end_at: null
+  allowed_time_windows: []
+  prohibited_techniques: []
+  notes: ''
+execution_budget:
+  max_actions: 5
+  max_tool_calls: 5
+  max_duration_seconds: 300
+rate_limit_policy:
+  max_actions_per_minute: 30
+  max_concurrent_actions: 1
+approval_policy:
+  require_approval_for: []
+  default_approval_id: null
+  auto_approve: false
+metadata:
+  owner: pm

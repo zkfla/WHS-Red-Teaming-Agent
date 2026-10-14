@@ -1,0 +1,28 @@
+{
+  "run_id": "run_21e5fa3b3311",
+  "phase": "finished",
+  "termination_reason": "no_actionable_plan",
+  "pending_approval_id": null,
+  "ready_for_release": true,
+  "actions_executed": 2,
+  "finding_count": 0,
+  "evidence_count": 2,
+  "work_status_counts": {
+    "failed": 1,
+    "succeeded": 1
+  },
+  "findings": [],
+  "evidence_ids": [
+    "ev_de30bd0d3aed",
+    "ev_7de8a6368b06"
+  ],
+  "integrity_blockers": [],
+  "unresolved_hypotheses": [],
+  "outstanding_cleanup": [],
+  "effectiveness": {
+    "successful_work_per_action": 0.5,
+    "evidence_per_action": 1.0,
+    "verified_findings_per_action": 0.0,
+    "dead_end_work_ratio": 0.5
+  }
+}

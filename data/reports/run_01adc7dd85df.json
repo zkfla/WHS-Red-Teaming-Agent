@@ -1,0 +1,112 @@
+{
+  "run_id": "run_01adc7dd85df",
+  "phase": "finished",
+  "termination_reason": "budget_exhausted",
+  "pending_approval_id": null,
+  "ready_for_release": false,
+  "actions_executed": 6,
+  "finding_count": 0,
+  "evidence_count": 6,
+  "work_status_counts": {
+    "succeeded": 6
+  },
+  "findings": [],
+  "evidence_ids": [
+    "ev_238d85ee90a2",
+    "ev_ce2e668bac53",
+    "ev_21c4cae04824",
+    "ev_80b77551115b",
+    "ev_f435c37d4a21",
+    "ev_0f5b81cac8e8"
+  ],
+  "integrity_blockers": [],
+  "unresolved_hypotheses": [],
+  "outstanding_cleanup": [],
+  "mission": {
+    "mission_id": "mission_e3f7bdb1e4b3",
+    "objective": "Assess the declared scope of Vulnbank stdio recon test",
+    "status": "completed",
+    "workstreams": [
+      {
+        "name": "reconnaissance",
+        "status": "completed",
+        "reason": null,
+        "task_count": 1,
+        "completed_task_count": 1,
+        "task_ids": [
+          "task_2085547748bc"
+        ]
+      },
+      {
+        "name": "Web/API",
+        "status": "partial",
+        "reason": "0 of 1 tasks completed",
+        "task_count": 1,
+        "completed_task_count": 0,
+        "task_ids": [
+          "task_0fe51c966617"
+        ]
+      },
+      {
+        "name": "Mobile",
+        "status": "partial",
+        "reason": "0 of 1 tasks completed",
+        "task_count": 1,
+        "completed_task_count": 0,
+        "task_ids": [
+          "task_c3b7ba67bd83"
+        ]
+      }
+    ],
+    "tasks": [
+      {
+        "task_id": "task_2085547748bc",
+        "title": "Recon Agent",
+        "status": "completed",
+        "required": true,
+        "workstream": "Reconnaissance",
+        "blocked_reason": null
+      },
+      {
+        "task_id": "task_0fe51c966617",
+        "title": "Web/API Agent",
+        "status": "running",
+        "required": false,
+        "workstream": "Web/API",
+        "blocked_reason": null
+      },
+      {
+        "task_id": "task_c3b7ba67bd83",
+        "title": "Mobile Agent",
+        "status": "cancelled",
+        "required": false,
+        "workstream": "Mobile",
+        "blocked_reason": null
+      }
+    ],
+    "task_status_counts": {
+      "cancelled": 1,
+      "completed": 1,
+      "running": 1
+    },
+    "completed_task_count": 1,
+    "partial_task_count": 2,
+    "blocked_task_count": 0,
+    "success_criteria": [
+      {
+        "criterion": "verified evidence for reconnaissance",
+        "met": true,
+        "reason": null,
+        "evidence_count": 2
+      }
+    ],
+    "verified_finding_count": 0,
+    "evidence_count": 6
+  },
+  "effectiveness": {
+    "successful_work_per_action": 1.0,
+    "evidence_per_action": 1.0,
+    "verified_findings_per_action": 0.0,
+    "dead_end_work_ratio": 0.0
+  }
+}

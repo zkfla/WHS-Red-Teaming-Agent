@@ -1,0 +1,77 @@
+{
+  "run_id": "run_830077141806",
+  "phase": "finished",
+  "termination_reason": "investigation_held",
+  "planning_diagnostic": null,
+  "pending_event_count": 0,
+  "event_delivery_pending": false,
+  "pending_approval_id": null,
+  "ready_for_release": false,
+  "actions_executed": 2,
+  "finding_count": 0,
+  "evidence_count": 4,
+  "work_status_counts": {
+    "succeeded": 2
+  },
+  "findings": [],
+  "evidence_ids": [
+    "ev_13f055b89a4e",
+    "ev_2efc5b7c7391",
+    "ev_f5ffa178d48a",
+    "ev_60f0d6732b83"
+  ],
+  "integrity_blockers": [],
+  "unresolved_hypotheses": [],
+  "outstanding_cleanup": [],
+  "required_unresolved_hypotheses": [],
+  "deferred_hypotheses": [],
+  "mission": {
+    "mission_id": "mission_0dd210ca509b",
+    "objective": "Assess the declared scope of bootstrap",
+    "status": "blocked",
+    "workstreams": [
+      {
+        "name": "General",
+        "status": "partial",
+        "reason": "0 of 1 tasks completed",
+        "task_count": 1,
+        "completed_task_count": 0,
+        "task_ids": [
+          "task_dd786d0c781e"
+        ]
+      }
+    ],
+    "tasks": [
+      {
+        "task_id": "task_dd786d0c781e",
+        "title": "Investigate the operator goal",
+        "status": "running",
+        "required": true,
+        "workstream": "General",
+        "blocked_reason": null
+      }
+    ],
+    "task_status_counts": {
+      "running": 1
+    },
+    "completed_task_count": 0,
+    "partial_task_count": 1,
+    "blocked_task_count": 0,
+    "success_criteria": [
+      {
+        "criterion": "Assess the declared scope of bootstrap",
+        "met": false,
+        "reason": "completed_task_evidence_missing",
+        "evidence_count": 0
+      }
+    ],
+    "verified_finding_count": 0,
+    "evidence_count": 4
+  },
+  "effectiveness": {
+    "successful_work_per_action": 1.0,
+    "evidence_per_action": 2.0,
+    "verified_findings_per_action": 0.0,
+    "dead_end_work_ratio": 0.0
+  }
+}

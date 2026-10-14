@@ -1,0 +1,102 @@
+{
+  "run_id": "run_8b55cffe5f4e",
+  "phase": "finished",
+  "termination_reason": "mission_blocked",
+  "pending_approval_id": null,
+  "ready_for_release": false,
+  "actions_executed": 0,
+  "finding_count": 0,
+  "evidence_count": 0,
+  "work_status_counts": {},
+  "findings": [],
+  "evidence_ids": [],
+  "integrity_blockers": [],
+  "unresolved_hypotheses": [],
+  "outstanding_cleanup": [],
+  "mission": {
+    "mission_id": "mission_052ebad32e76",
+    "objective": "Assess the declared scope of Example Engagement",
+    "status": "blocked",
+    "workstreams": [
+      {
+        "name": "reconnaissance",
+        "status": "blocked",
+        "reason": "no candidate achieved the task objective",
+        "task_count": 1,
+        "completed_task_count": 0,
+        "task_ids": [
+          "task_14054a3ade61"
+        ]
+      },
+      {
+        "name": "web/api assessment",
+        "status": "partial",
+        "reason": "0 of 1 tasks completed",
+        "task_count": 1,
+        "completed_task_count": 0,
+        "task_ids": [
+          "task_3e9894aa0ae3"
+        ]
+      },
+      {
+        "name": "Mobile",
+        "status": "partial",
+        "reason": "0 of 1 tasks completed",
+        "task_count": 1,
+        "completed_task_count": 0,
+        "task_ids": [
+          "task_8e198bc43554"
+        ]
+      }
+    ],
+    "tasks": [
+      {
+        "task_id": "task_14054a3ade61",
+        "title": "Recon Agent",
+        "status": "blocked",
+        "required": true,
+        "workstream": "Reconnaissance",
+        "blocked_reason": "no candidate achieved the task objective"
+      },
+      {
+        "task_id": "task_3e9894aa0ae3",
+        "title": "Web/API Agent",
+        "status": "cancelled",
+        "required": false,
+        "workstream": "Web/API",
+        "blocked_reason": null
+      },
+      {
+        "task_id": "task_8e198bc43554",
+        "title": "Mobile Agent",
+        "status": "cancelled",
+        "required": false,
+        "workstream": "Mobile",
+        "blocked_reason": null
+      }
+    ],
+    "task_status_counts": {
+      "blocked": 1,
+      "cancelled": 2
+    },
+    "completed_task_count": 0,
+    "partial_task_count": 2,
+    "blocked_task_count": 1,
+    "success_criteria": [
+      {
+        "criterion": "verified evidence for reconnaissance",
+        "met": false,
+        "reason": "no matching Task completed",
+        "evidence_count": 0
+      }
+    ],
+    "verified_finding_count": 0,
+    "evidence_count": 0
+  },
+  "effectiveness": {
+    "successful_work_per_action": 0.0,
+    "evidence_per_action": 0.0,
+    "verified_findings_per_action": 0.0,
+    "dead_end_work_ratio": 0.0
+  }
+}

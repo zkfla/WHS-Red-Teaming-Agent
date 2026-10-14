@@ -1,0 +1,39 @@
+{
+  "run_id": "run_252494c19438",
+  "phase": "finished",
+  "termination_reason": "no_actionable_plan",
+  "pending_approval_id": null,
+  "ready_for_release": true,
+  "actions_executed": 3,
+  "finding_count": 1,
+  "evidence_count": 3,
+  "work_status_counts": {
+    "succeeded": 3
+  },
+  "findings": [
+    {
+      "finding_id": "find_30a4b2cc8416",
+      "title": "web/http_request confirmed a violation",
+      "severity": "high",
+      "verified": true,
+      "evidence_ids": [
+        "ev_306c7501be36",
+        "ev_4b0da84d13c9"
+      ]
+    }
+  ],
+  "evidence_ids": [
+    "ev_85f8ed17d7fa",
+    "ev_306c7501be36",
+    "ev_4b0da84d13c9"
+  ],
+  "integrity_blockers": [],
+  "unresolved_hypotheses": [],
+  "outstanding_cleanup": [],
+  "effectiveness": {
+    "successful_work_per_action": 1.0,
+    "evidence_per_action": 1.0,
+    "verified_findings_per_action": 0.333333,
+    "dead_end_work_ratio": 0.0
+  }
+}

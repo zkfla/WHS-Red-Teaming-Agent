@@ -5,7 +5,6 @@
 | 항목 | 내용 |
 | --- | --- |
 | 저장소 | [zkfla/WHS-Red-Teaming-Agent](https://github.com/zkfla/WHS-Red-Teaming-Agent) |
-| 상태 | 개발 중, v0.1.0, Web/API와 Recon 실연결 |
 | 대상 범위 | 허가된 대상 한정. Scope, ROE, 예산, 승인으로 통제 |
 | 실행 환경 | CLI(redteam)와 로컬 웹 UI |
 | 기술 스택 | Python 3.10+, LangGraph, MCP, LiteLLM, SQLite, Pydantic v2 |
