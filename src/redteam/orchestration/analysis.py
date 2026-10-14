@@ -608,12 +608,22 @@ class StructuredLLMAnalysisVerifier:
     _OUTCOMES = ("success", "refuted", "inconclusive", "blocked", "unknown")
 
     def __init__(
-        self, llm: Any, evidence_store: EvidenceStore, graph_service: Any | None = None
+        self,
+        llm: Any,
+        evidence_store: EvidenceStore,
+        graph_service: Any | None = None,
+        *,
+        decision_timeout_seconds: float = 900.0,
+        llm_attempt_timeout_seconds: float = 180.0,
     ) -> None:
         self._llm = llm
         self._store = evidence_store
         self._graph = graph_service
-        self._decider = StructuredDecisionClient(llm)
+        self._decider = StructuredDecisionClient(
+            llm,
+            decision_timeout_seconds=decision_timeout_seconds,
+            llm_attempt_timeout_seconds=llm_attempt_timeout_seconds,
+        )
 
     async def verify(
         self,

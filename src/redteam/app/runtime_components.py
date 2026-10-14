@@ -52,6 +52,7 @@ class ComponentFactoryContext:
     llm_client: Any
     evidence_store: Any
     graph_store: Any
+    settings: Any = None
 
 
 @dataclass(frozen=True)
@@ -89,6 +90,13 @@ def _builtin_factory(context: ComponentFactoryContext) -> RuntimeComponents:
     from redteam.orchestration.eligibility import EligibilityRegistry
     from redteam.orchestration.observations import ResultMapperRegistry
 
+    timeout_options = {}
+    if context.settings is not None:
+        timeout_options = {
+            "decision_timeout_seconds": context.settings.decision_timeout_seconds,
+            "llm_attempt_timeout_seconds": context.settings.llm_attempt_timeout_seconds,
+        }
+
     components = RuntimeComponents(
         agents=AgentRegistry(),
         candidate_providers=CandidateProviderRegistry(),
@@ -96,6 +104,7 @@ def _builtin_factory(context: ComponentFactoryContext) -> RuntimeComponents:
             context.llm_client,
             context.evidence_store,
             AttackGraphService(context.graph_store),
+            **timeout_options,
         ),
         result_mappers=ResultMapperRegistry(),
         eligibility=EligibilityRegistry(),

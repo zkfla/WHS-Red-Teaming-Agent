@@ -159,12 +159,11 @@ class DecisionBudget:
             if total_limit < 1:
                 raise ValueError("total_limit must be positive")
             self._max_attempts = min(self._max_attempts, total_limit)
+        self._deadline: float | None = None
         if timeout_seconds is not None:
             if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
                 raise ValueError("timeout_seconds must be finite and > 0")
             self._deadline = time.monotonic() + timeout_seconds
-        else:
-            self._deadline = None
         self.normal_used = 0
         self.repair_used = 0
         self._used = 0
