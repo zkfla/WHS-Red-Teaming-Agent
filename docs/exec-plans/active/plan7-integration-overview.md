@@ -87,9 +87,11 @@ Continuation audit2026-10-15: previous goal turn classified PROGRESS (04Nsourcec
 
 Latest user model override2026-10-15: Claude quota returned; prospective implementation workers use GPT6-Luna XHigh and anthropic/claude-haiku-5-5 XHigh in equal meaningful dispatch/work proportions. Existing running Luna ownership continues unchanged; no restart solely to rebalance. Orchestrator remains gpt-6.1-sol low, primary reviewer SolHigh and auxiliary agy Gemini3.8FlashHigh unchanged. This supersedes the earlier Luna-only rule for new worker assignments; no DeepSeek/Muse/Sonnet coordinator resumption.
 
+Subsequent user override supersedes the half/half rule: existing Luna workers finish only their currently assigned packets; do not assign new work after those packets complete. New worker packets use anthropic/claude-haiku-5-5 XHigh exclusively. If an actual Haiku429 occurs, switch worker assignments to GPT6-Luna XHigh, preserving partial work and concrete ownership handoffs; observation timeouts or unrelated failures do not constitute this trigger. Coordinator remains Sol6.1 low and review roles unchanged. This latest rule governs the queue below, including new follow-ups after a Luna packet freeze.
+
 ### Atomic integration queue — latest user parallelization/atomization steering
 
-Each row delivers one reviewable result. Existing live owners retain their files; splitting a queue is not permission to send two writers into the same file. Exact interfaces, paths and negative criteria remain in the child ExecPlans. Independent read-only packet/review work runs now; source mutation follows its interface review and predecessor freeze. Root alone integrates checked commits. New eligible implementation assignments alternate Haiku/Luna XHigh with comparable scopes; do not create filler agents or interrupt existing Luna work to adjust counts.
+Each row delivers one reviewable result. Existing live owners retain their files; splitting a queue is not permission to send two writers into the same file. Exact interfaces, paths and negative criteria remain in the child ExecPlans. Independent read-only packet/review work runs now; source mutation follows its interface review and predecessor freeze. Root alone integrates checked commits. New eligible worker assignments use Haiku XHigh under the latest override above; do not create filler agents or interrupt existing Luna work before its current packet completes.
 
 | Atomic task | Single result / boundary | Dependency and verification | Current disposition |
 |---|---|---|---|
