@@ -451,7 +451,10 @@ class InvestigationEngine:
     def __init__(self, deps) -> None:
         self.deps = deps
         self.client = StructuredDecisionClient(
-            deps.llm_client, max_attempts=deps.settings.decision_max_attempts
+            deps.llm_client,
+            max_attempts=deps.settings.decision_max_attempts,
+            decision_timeout_seconds=deps.settings.decision_timeout_seconds,
+            llm_attempt_timeout_seconds=deps.settings.llm_attempt_timeout_seconds,
         )
         from redteam.orchestration.planning import StructuredLLMPlanningProvider
 
@@ -470,6 +473,7 @@ class InvestigationEngine:
         return DecisionBudget.reasoning_chain(
             self.deps.settings.decision_normal_limit,
             self.deps.settings.decision_max_attempts,
+            timeout_seconds=self.deps.settings.decision_timeout_seconds,
         )
 
     def begin_native_turn(self, runtime) -> DecisionBudget:
