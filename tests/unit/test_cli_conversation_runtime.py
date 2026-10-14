@@ -85,7 +85,7 @@ async def test_model_failure_never_becomes_an_execution(tmp_path, monkeypatch):
     model = ConversationModel(RuntimeError("provider unavailable"))
     execute, _ = await session_run(tmp_path, monkeypatch, model)
     execute.assert_not_awaited()
-    assert len(model.payloads) == 3
+    assert len(model.payloads) == 6
 
 
 @pytest.mark.parametrize("new_mode,executions", [("answer", 0), ("execute", 1)])

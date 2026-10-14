@@ -123,9 +123,15 @@ class OrchestrationSettings(BaseModel):
     #: placeholder behaviour (the ratio is carried but inert) is preserved.
     #: One runtime mode; frozen legacy core flags do not select it.
     llm_candidate_generation: Literal[True] = True
-    decision_max_attempts: int = Field(default=3, ge=1, le=6)
+    decision_max_attempts: int = Field(default=6, ge=1, le=6)
     # Normal plan/review decisions are not malformed-response retries.
-    decision_normal_limit: int = Field(default=8, ge=1, le=32)
+    decision_normal_limit: int = Field(default=12, ge=1, le=32)
+    decision_timeout_seconds: float = Field(
+        default=900.0, gt=0, le=3600, allow_inf_nan=False
+    )
+    llm_attempt_timeout_seconds: float = Field(
+        default=180.0, gt=0, le=900, allow_inf_nan=False
+    )
 
     #: Overrides the value derived from ``max_steps`` when set.
     recursion_limit: int | None = Field(default=None, ge=1)
@@ -190,5 +196,9 @@ class OrchestrationSettings(BaseModel):
             base["llm_request_policy"] = config.llm_request_policy
             base["specialist_profile_path"] = config.specialist_profile_path
             base["code_fixture_policy_path"] = config.code_fixture_policy_path
+            base["decision_normal_limit"] = config.decision_normal_limit
+            base["decision_max_attempts"] = config.decision_max_attempts
+            base["decision_timeout_seconds"] = config.decision_timeout_seconds
+            base["llm_attempt_timeout_seconds"] = config.llm_attempt_timeout_seconds
         base.update({key: value for key, value in overrides.items() if value is not None})
         return cls.model_validate(base)

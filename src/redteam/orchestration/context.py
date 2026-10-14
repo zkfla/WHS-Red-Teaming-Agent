@@ -156,5 +156,7 @@ class RuntimeDeps:
                     self.llm_client,
                     self.evidence_store,
                     AttackGraphService(self.graph_store),
+                    decision_timeout_seconds=self.settings.decision_timeout_seconds,
+                    llm_attempt_timeout_seconds=self.settings.llm_attempt_timeout_seconds,
                 ),
             )

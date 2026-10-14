@@ -520,6 +520,7 @@ async def build_application(
             llm_client=resolved_llm,
             evidence_store=resolved_evidence_store,
             graph_store=resolved_attack_graph,
+            settings=resolved_settings,
         ),
     )
 
@@ -541,7 +542,12 @@ async def build_application(
     )
     profile_components = apply_extensions(
         profile_components,
-        ComponentFactoryContext(resolved_llm, resolved_evidence_store, resolved_attack_graph),
+        ComponentFactoryContext(
+            resolved_llm,
+            resolved_evidence_store,
+            resolved_attack_graph,
+            settings=resolved_settings,
+        ),
         extension_assembly,
         planning_provider_id=config.planning_provider,
         available_references=tuple(("mcp_profile", key) for key in profile_bundles),

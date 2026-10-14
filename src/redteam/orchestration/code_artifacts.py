@@ -286,7 +286,11 @@ async def prepare(tool_input: dict, context: LocalToolContext) -> LocalToolResul
         if writer.role_id == reviewer.role_id:
             raise ValueError("code_independent_review_required")
         windows = await _windows(context, sources)
-        client = StructuredDecisionClient(context.deps.llm_client)
+        client = StructuredDecisionClient(
+            context.deps.llm_client,
+            decision_timeout_seconds=context.deps.settings.decision_timeout_seconds,
+            llm_attempt_timeout_seconds=context.deps.settings.llm_attempt_timeout_seconds,
+        )
         from redteam.orchestration.metered_llm import llm_request_scope
         def metered_scope():
             return llm_request_scope(str(context.runtime.run_id), context.runtime.work_owner)

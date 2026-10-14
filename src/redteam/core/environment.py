@@ -84,6 +84,18 @@ class OrchestrationEnvInput(_SnapshotSettings):
     resource_wait_timeout_seconds: str | None = Field(
         default=None, validation_alias="REDTEAM_RESOURCE_WAIT_TIMEOUT_SECONDS"
     )
+    decision_normal_limit: str | None = Field(
+        default=None, validation_alias="REDTEAM_DECISION_NORMAL_LIMIT"
+    )
+    decision_max_attempts: str | None = Field(
+        default=None, validation_alias="REDTEAM_DECISION_MAX_ATTEMPTS"
+    )
+    decision_timeout_seconds: str | None = Field(
+        default=None, validation_alias="REDTEAM_DECISION_TIMEOUT_SECONDS"
+    )
+    llm_attempt_timeout_seconds: str | None = Field(
+        default=None, validation_alias="REDTEAM_LLM_ATTEMPT_TIMEOUT_SECONDS"
+    )
     llm_candidate_generation: str | None = Field(
         default=None, validation_alias="REDTEAM_ORCHESTRATION_LLM_CANDIDATE_GENERATION"
     )

@@ -29,8 +29,10 @@ Contract notes for the orchestration loop:
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
+import math
 import time
 from collections.abc import Callable
 from typing import Any, Literal
@@ -125,6 +127,11 @@ class DecisionBudget:
     Exposes remaining/used counters for the loop. When remaining reaches
     zero the next ask raises DecisionFailure with kind "budget" instead
     of returning an empty dict.
+
+    An optional absolute monotonic deadline bounds one complete decision
+    chain. The existing admission guard still decides whether the engagement
+    may admit each request, and this chain deadline independently bounds the
+    decision chain. The deadline is not derived from the engagement duration.
     """
 
     def __init__(
@@ -134,6 +141,7 @@ class DecisionBudget:
         normal_limit: int | None = None,
         repair_limit: int | None = None,
         total_limit: int | None = None,
+        timeout_seconds: float | None = None,
     ) -> None:
         if max_attempts < 1:
             raise ValueError("max_attempts must be >= 1")
@@ -151,6 +159,11 @@ class DecisionBudget:
             if total_limit < 1:
                 raise ValueError("total_limit must be positive")
             self._max_attempts = min(self._max_attempts, total_limit)
+        self._deadline: float | None = None
+        if timeout_seconds is not None:
+            if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+                raise ValueError("timeout_seconds must be finite and > 0")
+            self._deadline = time.monotonic() + timeout_seconds
         self.normal_used = 0
         self.repair_used = 0
         self._used = 0
@@ -175,14 +188,24 @@ class DecisionBudget:
 
     @classmethod
     def reasoning_chain(
-        cls, normal_limit: int, repair_limit: int, *, total_limit: int | None = None
+        cls,
+        normal_limit: int,
+        repair_limit: int,
+        *,
+        total_limit: int | None = None,
+        timeout_seconds: float | None = None,
     ) -> DecisionBudget:
         """Bound normal planning separately from correction, without multiplying caps."""
         return cls(
-            normal_limit=normal_limit, repair_limit=repair_limit, total_limit=total_limit
+            normal_limit=normal_limit,
+            repair_limit=repair_limit,
+            total_limit=total_limit,
+            timeout_seconds=timeout_seconds,
         )
 
     def permits(self, *, repair: bool = False) -> bool:
+        if self.timed_out():
+            return False
         if self.remaining <= 0:
             return False
         if self.normal_limit is None:
@@ -192,6 +215,8 @@ class DecisionBudget:
         return self.normal_used < self.normal_limit
 
     def exhaustion_code(self, *, repair: bool = False) -> str:
+        if self.timed_out():
+            return "decision_time_budget_exhausted"
         if self.normal_limit is None or self.remaining <= 0:
             return "decision_budget_exhausted"
         return "decision_repair_budget_exhausted" if repair else "decision_normal_budget_exhausted"
@@ -243,6 +268,17 @@ class DecisionBudget:
     def remaining(self) -> int:
         """LLM requests still available (max_attempts - used)."""
         return self._max_attempts - self._used
+
+    def remaining_seconds(self) -> float | None:
+        """Seconds left on the absolute chain deadline, or None when unbounded."""
+        if self._deadline is None:
+            return None
+        return max(0.0, self._deadline - time.monotonic())
+
+    def timed_out(self) -> bool:
+        """Whether the absolute chain deadline has elapsed."""
+        remaining = self.remaining_seconds()
+        return remaining is not None and remaining <= 0
 
     @property
     def tokens_used(self) -> int:
@@ -444,6 +480,31 @@ def _is_metered(llm) -> bool:
     return isinstance(llm, RunMeteredLLM)
 
 
+def _deadline_failure(stage: str, budget: DecisionBudget) -> DecisionFailure:
+    diagnostic = DecisionDiagnostic(
+        code="decision_time_budget_exhausted",
+        stage=stage,
+        kind="budget",
+        attempts=budget.used,
+        summary="The shared decision time allowance is exhausted.",
+        retryable=False,
+        last_cause=budget.last_failure,
+        **budget.diagnostic_details(),
+    )
+    return DecisionFailure(stage, "budget", budget.used, diagnostic=diagnostic)
+
+
+def _request_timeout_diagnostic(stage: str, *, attempts: int = 0) -> DecisionDiagnostic:
+    return DecisionDiagnostic(
+        code="llm_request_timeout",
+        stage=stage,
+        kind="transport",
+        attempts=attempts,
+        summary="The LLM request exceeded its per-attempt time allowance.",
+        retryable=True,
+    )
+
+
 class StructuredDecisionClient:
     """Ask the model for a JSON decision validated against a schema.
 
@@ -459,9 +520,18 @@ class StructuredDecisionClient:
     Budget sharing: pass the same DecisionBudget to several ask calls to
     share one limit across draft, review, and action decisions (and any
     caller-side semantic retry loop). When budget is None an internal
-    DecisionBudget(self._max_attempts) is used, so existing callers keep
-    working. When a budget is given it is the sole limit;
+    DecisionBudget(self._max_attempts, timeout_seconds=decision_timeout_seconds)
+    is used. When a budget is given it is the sole limit;
     self._max_attempts is ignored and never multiplied with it.
+
+    The existing admission guard decides whether the engagement may admit
+    each request. The chain deadline independently bounds the whole decision
+    chain, while llm_attempt_timeout_seconds bounds one admitted inflight SDK
+    call; that call may finish after the engagement's admission window closes,
+    by at most the configured per-attempt timeout. An attempt timeout is
+    charged as unknown usage and is retryable inside the shared budget.
+    Cancellation propagates unchanged, with dispatched requests settled by
+    the metered facade's request ledger. SDK retries stay off.
 
     Request guard: before_call is an optional zero-argument callable
     (sync or async) awaited before every actual LLM request, including
@@ -485,14 +555,32 @@ class StructuredDecisionClient:
     def __init__(
         self,
         llm: Any,
-        max_attempts: int = 3,
+        max_attempts: int = 6,
         context_provider: Callable[..., Any] | None = None,
+        *,
+        decision_timeout_seconds: float = 900.0,
+        llm_attempt_timeout_seconds: float = 180.0,
     ) -> None:
         if max_attempts < 1:
             raise ValueError("max_attempts must be >= 1")
+        if not math.isfinite(decision_timeout_seconds) or decision_timeout_seconds <= 0:
+            raise ValueError("decision_timeout_seconds must be finite and > 0")
+        if not math.isfinite(llm_attempt_timeout_seconds) or llm_attempt_timeout_seconds <= 0:
+            raise ValueError("llm_attempt_timeout_seconds must be finite and > 0")
         self._llm = llm
         self._max_attempts = max_attempts
         self._context_provider = context_provider
+        self._decision_timeout_seconds = float(decision_timeout_seconds)
+        self._llm_attempt_timeout_seconds = float(llm_attempt_timeout_seconds)
+
+    def _timeout_for_attempt(self, stage: str, budget: DecisionBudget) -> float | None:
+        if budget.timed_out():
+            raise _deadline_failure(stage, budget)
+        limits = [self._llm_attempt_timeout_seconds]
+        remaining = budget.remaining_seconds()
+        if remaining is not None:
+            limits.append(remaining)
+        return min(limits) if limits else None
 
     async def ask(
         self,
@@ -506,7 +594,9 @@ class StructuredDecisionClient:
         validate_response: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         if budget is None:
-            budget = DecisionBudget(self._max_attempts)
+            budget = DecisionBudget(
+                self._max_attempts, timeout_seconds=self._decision_timeout_seconds
+            )
         elif not isinstance(budget, DecisionBudget):
             raise TypeError("budget must be a DecisionBudget or None")
         working = dict(payload)
@@ -559,13 +649,47 @@ class StructuredDecisionClient:
                     summary="The configured model adapter does not support native tool calls.",
                 ),
             )
-        active = budget or DecisionBudget(self._max_attempts)
+        if budget is None:
+            active = DecisionBudget(
+                self._max_attempts, timeout_seconds=self._decision_timeout_seconds
+            )
+        elif not isinstance(budget, DecisionBudget):
+            raise TypeError("budget must be a DecisionBudget or None")
+        else:
+            active = budget
         repair = False
         while active.permits(repair=repair):
             if before_call is not None and not _is_metered(self._llm):
-                guarded = before_call()
-                if inspect.isawaitable(guarded):
-                    await guarded
+                try:
+                    guarded = before_call()
+                    if inspect.isawaitable(guarded):
+                        await guarded
+                except DecisionFailure:
+                    raise
+                except ReasoningHalted as halted:
+                    diagnostic = halted.diagnostic.model_copy(update={
+                        "stage": "native_action", "attempts": active.used,
+                        "last_cause": active.last_failure,
+                    })
+                    active.last_failure = diagnostic
+                    raise DecisionFailure(
+                        "native_action", "budget", active.used, diagnostic=diagnostic,
+                    ) from halted
+                except Exception as exc:
+                    diagnostic = DecisionDiagnostic(
+                        code="reasoning_guard_blocked", stage="native_action",
+                        kind="budget", attempts=active.used,
+                        summary="Model reasoning is not allowed at this time.",
+                        retryable=False, error_type=error_type_for(exc),
+                        exception_chain=exception_chain_for(exc),
+                    )
+                    active.last_failure = diagnostic
+                    raise DecisionFailure(
+                        "native_action", "budget", active.used, diagnostic=diagnostic,
+                    ) from exc
+            if active.timed_out():
+                break
+            attempt_timeout = self._timeout_for_attempt("native_action", active)
             active.consume(stage="native_action", repair=repair)
             try:
                 from redteam.orchestration.prompts import instruction_scope
@@ -573,9 +697,24 @@ class StructuredDecisionClient:
                 with instruction_scope("native_action", role_id), _metered_guard_scope(
                     self._llm, before_call
                 ):
-                    response = await request(
+                    request_call = request(
                         messages=messages, tools=tools, system=system, num_retries=0
                     )
+                    if attempt_timeout is None:
+                        response = await request_call
+                    else:
+                        response = await asyncio.wait_for(
+                            request_call, timeout=attempt_timeout,
+                        )
+            except asyncio.TimeoutError:
+                active.add_usage(None)
+                diagnostic = _request_timeout_diagnostic(
+                    "native_action", attempts=active.used,
+                )
+                active.last_failure = diagnostic
+                active.record_failure(diagnostic.code)
+                repair = True
+                continue
             except ReasoningHalted as halted:
                 raise DecisionFailure(
                     "native_action", "budget", active.used,
@@ -635,6 +774,7 @@ class StructuredDecisionClient:
         feedback: str,
         kind: str,
         budget: DecisionBudget,
+        attempt_timeout: float | None,
         guard: Callable[..., Any] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         messages = [{"role": "user", "content": self._prompt_for(working, feedback, kind)}]
@@ -643,24 +783,43 @@ class StructuredDecisionClient:
         try:
             with _metered_guard_scope(self._llm, guard):
                 if use_metered:
-                    completion = await self._llm.complete_structured_with_usage(
+                    request_call = self._llm.complete_structured_with_usage(
                         messages=messages,
                         response_schema=response_schema,
                         system=system,
                         num_retries=0,
                     )
+                    if attempt_timeout is None:
+                        completion = await request_call
+                    else:
+                        completion = await asyncio.wait_for(
+                            request_call, timeout=attempt_timeout,
+                        )
                     budget.add_usage(getattr(completion, "total_tokens", None))
                     raw = getattr(completion, "value", None)
                 else:
-                    raw = await self._llm.complete_structured(
+                    request_call = self._llm.complete_structured(
                         messages=messages,
                         response_schema=response_schema,
                         system=system,
                         num_retries=0,
                     )
+                    if attempt_timeout is None:
+                        raw = await request_call
+                    else:
+                        raw = await asyncio.wait_for(
+                            request_call, timeout=attempt_timeout,
+                        )
                     # Legacy dict-only providers never report usage: the cost of
                     # this request is unknown, never zero.
                     budget.add_usage(None)
+        except asyncio.TimeoutError as exc:
+            budget.add_usage(None)
+            elapsed_ms = max(0, int((time.perf_counter() - attempt_start) * 1000))
+            raise _RetryableDecisionError(
+                _request_timeout_diagnostic(stage), elapsed_ms=elapsed_ms,
+                response_shape={"type": "absent", "observed": False},
+            ) from exc
         except ReasoningHalted as halted:
             raise DecisionFailure(
                 stage, "budget", budget.used,
@@ -843,6 +1002,7 @@ class StructuredDecisionClient:
                 # ``_metered_guard_scope``), so exhaustion while waiting for a
                 # slot still stops with a structured budget error.
                 await run_guard()
+                attempt_timeout = self._timeout_for_attempt(stage, budget)
                 budget.consume(stage=stage, repair=is_repair)
                 budget.record(stage, "request", feedback=safe_feedback(feedback))
                 with attempt:
@@ -855,6 +1015,7 @@ class StructuredDecisionClient:
                             feedback=feedback,
                             kind=kind,
                             budget=budget,
+                            attempt_timeout=attempt_timeout,
                             guard=before_call,
                         )
                         if validate_response is not None:

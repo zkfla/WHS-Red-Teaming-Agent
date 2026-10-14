@@ -84,7 +84,7 @@ def test_config_preserves_request_policy_and_other_limits():
     })
     settings = OrchestrationSettings.from_config(config)
     assert settings.max_steps == 9
-    assert settings.decision_max_attempts == 3
+    assert settings.decision_max_attempts == 6
     assert settings.llm_request_policy.mode == "unlimited_requests"
 
 

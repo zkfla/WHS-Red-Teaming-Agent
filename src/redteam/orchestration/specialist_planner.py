@@ -147,7 +147,12 @@ class SpecialistPlanner:
         self.deps, self.policy = deps, deps.specialist_policy
         self.coordinator: Any = None
         self.admission: Any = None
-        self.client = StructuredDecisionClient(deps.llm_client)
+        self.client = StructuredDecisionClient(
+            deps.llm_client,
+            max_attempts=deps.settings.decision_max_attempts,
+            decision_timeout_seconds=deps.settings.decision_timeout_seconds,
+            llm_attempt_timeout_seconds=deps.settings.llm_attempt_timeout_seconds,
+        )
         self._hypothesis_lock = asyncio.Lock()
 
     def wake_events(self):
@@ -219,7 +224,8 @@ class SpecialistPlanner:
             "operator_guidance": operator_context,
         })
         budget = DecisionBudget(normal_limit=self.deps.settings.decision_normal_limit,
-                                repair_limit=self.deps.settings.decision_max_attempts)
+                                repair_limit=self.deps.settings.decision_max_attempts,
+                                timeout_seconds=self.deps.settings.decision_timeout_seconds)
 
         def check_questions(raw):
             try:
