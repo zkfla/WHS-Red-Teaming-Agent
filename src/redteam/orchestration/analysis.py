@@ -615,6 +615,7 @@ class StructuredLLMAnalysisVerifier:
         *,
         decision_timeout_seconds: float = 900.0,
         llm_attempt_timeout_seconds: float = 180.0,
+        transport_limit: int = 5,
     ) -> None:
         self._llm = llm
         self._store = evidence_store
@@ -623,6 +624,7 @@ class StructuredLLMAnalysisVerifier:
             llm,
             decision_timeout_seconds=decision_timeout_seconds,
             llm_attempt_timeout_seconds=llm_attempt_timeout_seconds,
+            transport_limit=transport_limit,
         )
 
     async def verify(

@@ -290,6 +290,7 @@ async def prepare(tool_input: dict, context: LocalToolContext) -> LocalToolResul
             context.deps.llm_client,
             decision_timeout_seconds=context.deps.settings.decision_timeout_seconds,
             llm_attempt_timeout_seconds=context.deps.settings.llm_attempt_timeout_seconds,
+            transport_limit=context.deps.settings.decision_transport_max_attempts,
         )
         from redteam.orchestration.metered_llm import llm_request_scope
         def metered_scope():

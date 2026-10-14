@@ -126,6 +126,13 @@ class OrchestrationSettings(BaseModel):
     decision_max_attempts: int = Field(default=6, ge=1, le=6)
     # Normal plan/review decisions are not malformed-response retries.
     decision_normal_limit: int = Field(default=12, ge=1, le=32)
+    #: Separately counted transport-error retries inside the same chain
+    #: total and deadline. 0 disables transport retries; never above 5.
+    #: Scope note: ConversationAssistant keeps its own constructor limits
+    #: (transport_limit=5 with its own timeout/max_attempts) and is NOT
+    #: wired to this global setting, so changing this value never alters
+    #: conversation behavior silently.
+    decision_transport_max_attempts: int = Field(default=5, ge=0, le=5)
     decision_timeout_seconds: float = Field(
         default=900.0, gt=0, le=3600, allow_inf_nan=False
     )
@@ -198,6 +205,7 @@ class OrchestrationSettings(BaseModel):
             base["code_fixture_policy_path"] = config.code_fixture_policy_path
             base["decision_normal_limit"] = config.decision_normal_limit
             base["decision_max_attempts"] = config.decision_max_attempts
+            base["decision_transport_max_attempts"] = config.decision_transport_max_attempts
             base["decision_timeout_seconds"] = config.decision_timeout_seconds
             base["llm_attempt_timeout_seconds"] = config.llm_attempt_timeout_seconds
         base.update({key: value for key, value in overrides.items() if value is not None})

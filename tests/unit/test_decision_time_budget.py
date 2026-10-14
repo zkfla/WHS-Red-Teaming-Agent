@@ -225,6 +225,7 @@ async def test_analysis_verification_budget_carries_the_absolute_deadline(monkey
     monkeypatch.setattr(cognition.time, "monotonic", lambda: now[0])
     deps = SimpleNamespace(settings=SimpleNamespace(
         decision_max_attempts=3, decision_timeout_seconds=1.0,
+        decision_transport_max_attempts=5,
     ))
     state = {"runtime": SimpleNamespace(delegations={})}
     budget = analysis_budget.verification_budget(state, deps=deps)
@@ -257,7 +258,10 @@ async def test_analysis_engagement_time_guard_denial_stays_budget_and_is_not_ret
         analysis_budget, "reasoning_time_allowed", lambda *_args, **_kwargs: False,
     )
     deps = SimpleNamespace(
-        settings=SimpleNamespace(decision_max_attempts=3, decision_timeout_seconds=10.0),
+        settings=SimpleNamespace(
+            decision_max_attempts=3, decision_timeout_seconds=10.0,
+            decision_transport_max_attempts=5,
+        ),
         central_state=None,
         coordinator=Coordinator(),
         engagement=object(),

@@ -150,6 +150,7 @@ class SpecialistPlanner:
         self.client = StructuredDecisionClient(
             deps.llm_client,
             max_attempts=deps.settings.decision_max_attempts,
+            transport_limit=deps.settings.decision_transport_max_attempts,
             decision_timeout_seconds=deps.settings.decision_timeout_seconds,
             llm_attempt_timeout_seconds=deps.settings.llm_attempt_timeout_seconds,
         )
@@ -225,6 +226,7 @@ class SpecialistPlanner:
         })
         budget = DecisionBudget(normal_limit=self.deps.settings.decision_normal_limit,
                                 repair_limit=self.deps.settings.decision_max_attempts,
+                                transport_limit=self.deps.settings.decision_transport_max_attempts,
                                 timeout_seconds=self.deps.settings.decision_timeout_seconds)
 
         def check_questions(raw):
