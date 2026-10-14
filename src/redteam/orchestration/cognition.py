@@ -117,10 +117,10 @@ class DecisionValidationError(Exception):
 class DecisionBudget:
     """Shared attempt budget for one decision or a chain of decisions.
 
-    One budgeted unit is consumed per actual LLM request. Transport
-    failures, format/schema failures, and caller-side semantic retries
-    that call ask again share the same instance, so an outer caller loop
-    must not multiply its own limit with the client's max_attempts.
+    One budgeted unit is consumed per actual LLM request. Transport retries,
+    format/schema correction, and caller-side semantic retries that call ask
+    again share the same instance, so an outer caller loop must not multiply
+    its own limit with the client's max_attempts.
     A single decision uses a single budget: when ask receives one it is
     the sole limit and max_attempts is ignored (no nesting).
 
@@ -140,6 +140,7 @@ class DecisionBudget:
         *,
         normal_limit: int | None = None,
         repair_limit: int | None = None,
+        transport_limit: int | None = None,
         total_limit: int | None = None,
         timeout_seconds: float | None = None,
     ) -> None:
@@ -153,6 +154,9 @@ class DecisionBudget:
             raise ValueError("normal_limit must be positive and repair_limit non-negative")
         self.normal_limit = normal_limit
         self.repair_limit = repair_limit
+        if transport_limit is not None and transport_limit < 0:
+            raise ValueError("transport_limit must be non-negative")
+        self.transport_limit = transport_limit
         if normal_limit is not None:
             self._max_attempts = normal_limit + repair_value
         if total_limit is not None:
@@ -166,6 +170,7 @@ class DecisionBudget:
             self._deadline = time.monotonic() + timeout_seconds
         self.normal_used = 0
         self.repair_used = 0
+        self.transport_used = 0
         self._used = 0
         self._tokens_used = 0
         self._tokens_unknown = 0
@@ -181,8 +186,10 @@ class DecisionBudget:
             "attempt_limit": self.max_attempts,
             "normal_limit": self.normal_limit,
             "repair_limit": self.repair_limit,
+            "transport_limit": self.transport_limit,
             "normal_used": self.normal_used,
             "repair_used": self.repair_used,
+            "transport_used": self.transport_used,
             "failure_counts": dict(self.failure_counts),
         }
 
@@ -192,6 +199,7 @@ class DecisionBudget:
         normal_limit: int,
         repair_limit: int,
         *,
+        transport_limit: int | None = None,
         total_limit: int | None = None,
         timeout_seconds: float | None = None,
     ) -> DecisionBudget:
@@ -199,25 +207,43 @@ class DecisionBudget:
         return cls(
             normal_limit=normal_limit,
             repair_limit=repair_limit,
+            transport_limit=transport_limit,
             total_limit=total_limit,
             timeout_seconds=timeout_seconds,
         )
 
-    def permits(self, *, repair: bool = False) -> bool:
+    def _effective_stage(self, *, repair: bool, transport: bool) -> tuple[bool, bool]:
+        if repair and transport:
+            raise ValueError("repair and transport stages are mutually exclusive")
+        # With no separate transport cap, retain the historical rule that
+        # every retry after the first consumes the repair allowance.
+        if transport and self.transport_limit is None:
+            return True, False
+        return repair, transport
+
+    def permits(self, *, repair: bool = False, transport: bool = False) -> bool:
         if self.timed_out():
             return False
         if self.remaining <= 0:
             return False
+        repair, transport = self._effective_stage(repair=repair, transport=transport)
+        if transport:
+            return self.transport_used < (self.transport_limit or 0)
         if self.normal_limit is None:
             return repair or self.normal_used < self.max_attempts
         if repair:
             return self.repair_used < (self.repair_limit or 0)
         return self.normal_used < self.normal_limit
 
-    def exhaustion_code(self, *, repair: bool = False) -> str:
+    def exhaustion_code(self, *, repair: bool = False, transport: bool = False) -> str:
         if self.timed_out():
             return "decision_time_budget_exhausted"
-        if self.normal_limit is None or self.remaining <= 0:
+        repair, transport = self._effective_stage(repair=repair, transport=transport)
+        if self.remaining <= 0:
+            return "decision_budget_exhausted"
+        if transport:
+            return "decision_transport_budget_exhausted"
+        if self.normal_limit is None:
             return "decision_budget_exhausted"
         return "decision_repair_budget_exhausted" if repair else "decision_normal_budget_exhausted"
 
@@ -324,17 +350,22 @@ class DecisionBudget:
             return True
         return self._tokens_used >= max_tokens
 
-    def consume(self, *, stage: str = "decision", repair: bool = False) -> int:
+    def consume(
+        self, *, stage: str = "decision", repair: bool = False, transport: bool = False,
+    ) -> int:
         """Consume one budgeted LLM request and return remaining.
 
         Raises RuntimeError when no budget remains; the client checks
         remaining first and raises DecisionFailure(kind="budget")
         instead, so this error only signals a programming bug.
         """
-        if not self.permits(repair=repair):
+        repair, transport = self._effective_stage(repair=repair, transport=transport)
+        if not self.permits(repair=repair, transport=transport):
             raise RuntimeError("decision budget exhausted")
         self._used += 1
-        if repair:
+        if transport:
+            self.transport_used += 1
+        elif repair:
             self.repair_used += 1
         else:
             self.normal_used += 1
@@ -509,9 +540,9 @@ class StructuredDecisionClient:
     """Ask the model for a JSON decision validated against a schema.
 
     The model always decides; schema enforcement never substitutes a
-    rule-based answer. Transport failures and format/schema mismatches
-    share one DecisionBudget. Each retry carries the previous failure
-    message back into the user prompt. Budget spent raises
+    rule-based answer. Transport failures and format/schema mismatches share
+    one DecisionBudget. Format/schema failures add correction feedback to the
+    next prompt; transport retries retain the previous prompt state. Budget spent raises
     DecisionFailure(kind="budget"), never an empty dict.
 
     No chain-of-thought is requested or stored; system is passed through
@@ -519,10 +550,9 @@ class StructuredDecisionClient:
 
     Budget sharing: pass the same DecisionBudget to several ask calls to
     share one limit across draft, review, and action decisions (and any
-    caller-side semantic retry loop). When budget is None an internal
-    DecisionBudget(self._max_attempts, timeout_seconds=decision_timeout_seconds)
-    is used. When a budget is given it is the sole limit;
-    self._max_attempts is ignored and never multiplied with it.
+    caller-side semantic retry loop). When budget is None an internal budget
+    is created from the client's total and transport limits. When a budget is
+    given it is the sole limit; client limits are ignored and never multiplied.
 
     The existing admission guard decides whether the engagement may admit
     each request. The chain deadline independently bounds the whole decision
@@ -558,6 +588,7 @@ class StructuredDecisionClient:
         max_attempts: int = 6,
         context_provider: Callable[..., Any] | None = None,
         *,
+        transport_limit: int | None = 5,
         decision_timeout_seconds: float = 900.0,
         llm_attempt_timeout_seconds: float = 180.0,
     ) -> None:
@@ -570,6 +601,9 @@ class StructuredDecisionClient:
         self._llm = llm
         self._max_attempts = max_attempts
         self._context_provider = context_provider
+        if transport_limit is not None and transport_limit < 0:
+            raise ValueError("transport_limit must be non-negative")
+        self._transport_limit = transport_limit
         self._decision_timeout_seconds = float(decision_timeout_seconds)
         self._llm_attempt_timeout_seconds = float(llm_attempt_timeout_seconds)
 
@@ -595,7 +629,8 @@ class StructuredDecisionClient:
     ) -> dict[str, Any]:
         if budget is None:
             budget = DecisionBudget(
-                self._max_attempts, timeout_seconds=self._decision_timeout_seconds
+                self._max_attempts, transport_limit=self._transport_limit,
+                timeout_seconds=self._decision_timeout_seconds,
             )
         elif not isinstance(budget, DecisionBudget):
             raise TypeError("budget must be a DecisionBudget or None")
@@ -651,14 +686,16 @@ class StructuredDecisionClient:
             )
         if budget is None:
             active = DecisionBudget(
-                self._max_attempts, timeout_seconds=self._decision_timeout_seconds
+                self._max_attempts, transport_limit=self._transport_limit,
+                timeout_seconds=self._decision_timeout_seconds,
             )
         elif not isinstance(budget, DecisionBudget):
             raise TypeError("budget must be a DecisionBudget or None")
         else:
             active = budget
         repair = False
-        while active.permits(repair=repair):
+        transport = False
+        while active.permits(repair=repair, transport=transport):
             if before_call is not None and not _is_metered(self._llm):
                 try:
                     guarded = before_call()
@@ -690,7 +727,7 @@ class StructuredDecisionClient:
             if active.timed_out():
                 break
             attempt_timeout = self._timeout_for_attempt("native_action", active)
-            active.consume(stage="native_action", repair=repair)
+            active.consume(stage="native_action", repair=repair, transport=transport)
             try:
                 from redteam.orchestration.prompts import instruction_scope
 
@@ -713,7 +750,7 @@ class StructuredDecisionClient:
                 )
                 active.last_failure = diagnostic
                 active.record_failure(diagnostic.code)
-                repair = True
+                repair, transport = False, True
                 continue
             except ReasoningHalted as halted:
                 raise DecisionFailure(
@@ -736,7 +773,10 @@ class StructuredDecisionClient:
                         "native_action", diagnostic.kind, active.used,
                         diagnostic=diagnostic,
                     ) from exc
-                repair = True
+                repair, transport = (
+                    (False, True)
+                    if diagnostic.kind == "transport" else (True, False)
+                )
                 continue
             active.add_usage(getattr(response, "total_tokens", None))
             active.record(
@@ -747,7 +787,8 @@ class StructuredDecisionClient:
         raise DecisionFailure(
             "native_action", "budget", active.used,
             diagnostic=DecisionDiagnostic(
-                code=active.exhaustion_code(repair=repair), stage="native_action",
+                code=active.exhaustion_code(repair=repair, transport=transport),
+                stage="native_action",
                 kind="budget", retryable=False,
                 summary="The native model request allowance is exhausted.",
                 last_cause=active.last_failure,
@@ -936,10 +977,11 @@ class StructuredDecisionClient:
         validate_response: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         is_repair = False
+        is_transport = False
 
         def exhausted() -> DecisionFailure:
             diagnostic = DecisionDiagnostic(
-                code=budget.exhaustion_code(repair=is_repair),
+                code=budget.exhaustion_code(repair=is_repair, transport=is_transport),
                 stage=stage,
                 kind="budget",
                 attempts=budget.used,
@@ -995,7 +1037,7 @@ class StructuredDecisionClient:
                 retry=retry_if_exception_type(_RetryableDecisionError),
                 reraise=True,
             ):
-                if not budget.permits(repair=is_repair):
+                if not budget.permits(repair=is_repair, transport=is_transport):
                     raise exhausted()
                 # Non-metered transports check the guard here; metered ones
                 # also re-check it AFTER their semaphore/cooldown wait (see
@@ -1003,7 +1045,7 @@ class StructuredDecisionClient:
                 # slot still stops with a structured budget error.
                 await run_guard()
                 attempt_timeout = self._timeout_for_attempt(stage, budget)
-                budget.consume(stage=stage, repair=is_repair)
+                budget.consume(stage=stage, repair=is_repair, transport=is_transport)
                 budget.record(stage, "request", feedback=safe_feedback(feedback))
                 with attempt:
                     try:
@@ -1036,8 +1078,9 @@ class StructuredDecisionClient:
                         budget.last_failure = exc.diagnostic.model_copy(
                             update={"attempts": budget.used}
                         )
-                        feedback = exc.feedback
-                        kind = exc.kind
+                        if exc.diagnostic.kind != "transport":
+                            feedback = exc.feedback
+                            kind = exc.kind
                         budget.record(
                             stage, "response_rejected", reason=exc.diagnostic.feedback(),
                             validation_issues=exc.diagnostic.validation_issues,
@@ -1049,7 +1092,10 @@ class StructuredDecisionClient:
                             raise DecisionFailure(
                                 stage, exc.kind, budget.used, diagnostic=budget.last_failure
                             ) from exc
-                        is_repair = True
+                        is_repair, is_transport = (
+                            (False, True)
+                            if exc.diagnostic.kind == "transport" else (True, False)
+                        )
                         raise
         except _RetryableDecisionError as exc:
             raise exhausted() from exc
