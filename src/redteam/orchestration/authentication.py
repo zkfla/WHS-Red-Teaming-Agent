@@ -119,7 +119,12 @@ def _safe_response_metadata(output: dict[str, Any]) -> dict[str, Any]:
 
 
 def http_observation(arguments: dict[str, Any], result: ToolResult) -> dict[str, Any] | None:
-    if str(result.tool_id) != "web.http_request" or not result.success:
+    """Project HTTP data for its registered mapper or explicit auth assessment.
+
+    Physical ToolId spelling is not an HTTP contract. Generic evidence
+    consumers obtain this projection from the selected mapper instead.
+    """
+    if not result.success:
         return None
     output = result.output
     if not isinstance(output, dict):
@@ -153,6 +158,8 @@ def http_observation(arguments: dict[str, Any], result: ToolResult) -> dict[str,
         # leaving the Capability Layer.
         "redirect": output.get("redirect") is True,
         "body_sha256": digest if isinstance(digest, str) else None,
+        **({"actual_session_ref": output["actual_session_ref"]}
+           if "actual_session_ref" in output else {}),
         **_safe_response_metadata(output),
     }
 

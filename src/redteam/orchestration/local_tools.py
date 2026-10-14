@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 from redteam.core.extensions import Contribution
 from redteam.core.ids import EventId
 from redteam.orchestration.cognition import DecisionBudget
+from redteam.orchestration.diagnostics import DecisionDiagnostic
 
 RUNTIME_TOOL_KIND = "runtime_tool"
 RUNTIME_TOOL_CONTRIBUTION_VERSION = "v1"
@@ -69,6 +70,10 @@ class LocalToolDescriptor:
     detail lookup): the model node always advertises those schemas so every
     other helper stays reachable through lookup. The flag is declared by
     the owning contribution, never by a central name list.
+
+    initial_exposure independently declares read/Task return schemas needed
+    immediately. It defaults false, changes no discovery or execution permission,
+    and must be versioned by the owning contribution when its meaning changes.
     """
 
     tool_id: str
@@ -77,6 +82,8 @@ class LocalToolDescriptor:
     contribution_id: str = ""
     version: str = RUNTIME_TOOL_CONTRIBUTION_VERSION
     bootstrap: bool = False
+    # Read/return contracts needed without discovery; distinct from navigators.
+    initial_exposure: bool = False
 
 
 @dataclass(frozen=True)
@@ -90,14 +97,32 @@ class LocalToolResult:
     local_call_id: str = ""
     runtime_outcome: str | None = None
     last_event_id: EventId | None = None
+    # Only the owning evidence reader supplies this display-window request.
+    # Provider delivery rehydrates it; checkpoint messages retain references.
+    evidence_read_request: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.runtime_outcome is None:
             return
         if self.runtime_outcome not in RUNTIME_OUTCOME_VALUES:
-            raise ValueError("unknown runtime outcome")
+            raise LocalToolContractError("unknown runtime outcome")
         if not self.ok:
-            raise ValueError("runtime outcome needs a successful result")
+            raise LocalToolContractError("runtime outcome needs a successful result")
+
+
+class LocalToolContractError(ValueError):
+    """A handler returned a contradictory local-runtime contract, not bad model input."""
+
+    def __init__(self, message):
+        super().__init__(message)
+        self.diagnostic = DecisionDiagnostic(
+            code="local_result_contract_invalid", stage="native_local_tool", kind="execution",
+            cause_scope="runtime_contract", owner="orchestration.local_tools",
+            summary="The runtime-local handler violated its result contract.",
+            repair_condition="The handler implementation must be corrected before this "
+                             "operation can resume. Preserve originals in an unresolved result; "
+                             "target calls cannot repair this condition.",
+        )
 
 
 class LocalToolHandler(Protocol):
@@ -182,8 +207,18 @@ class LocalToolRegistry:
         descriptor, handler = entry
         problem = _schema_problem(descriptor.input_schema, tool_input)
         if problem is not None:
-            return LocalToolResult(ok=False, error=problem)
-        return await handler(dict(tool_input or {}), context)
+            diagnostic = DecisionDiagnostic(
+                code="local_input_schema_invalid", stage="native_local_tool", kind="format",
+                cause_scope="model_input", owner="orchestration.local_tools", retryable=True,
+                summary="The local tool input does not match its registered schema.",
+                repair_condition="Correct the arguments using the registered input schema.",
+            )
+            return LocalToolResult(ok=False, error=problem,
+                                   payload={"diagnostic": diagnostic.model_dump(mode="json")})
+        result = await handler(dict(tool_input or {}), context)
+        if not isinstance(result, LocalToolResult):
+            raise LocalToolContractError("handler did not return a local result")
+        return result
 
 
 def runtime_tool_contribution(
@@ -201,4 +236,3 @@ def runtime_tool_contribution(
         version=version,
         factory=factory,
     )
-

@@ -52,7 +52,7 @@ async def test_planner_state_follows_the_stored_model_request_and_judgment(tmp_p
         (RUN, RUN, json.dumps({"termination": "held", "reason": "no useful question left"})),
     ))
     view = await graph(state)
-    assert view["planner"]["state"] == "waiting"
+    assert view["planner"]["state"] == "held"
     assert view["planner"]["last_judgment"] == {
         "termination": "held", "reason": "no useful question left",
     }
@@ -60,6 +60,30 @@ async def test_planner_state_follows_the_stored_model_request_and_judgment(tmp_p
         "requests": 1, "in_flight": 0, "known_tokens": 42, "unknown_usage": 0,
         "unknown_outcome": 0,
     }
+
+
+async def test_split_planner_live_stage_and_usage_are_read_from_original_requests(tmp_path):
+    state, ledger = await bound(tmp_path)
+    for stage in ("hypothesis_planning", "task_atomization"):
+        request = await ledger.reserve(RUN, owner="hypothesis_planning",
+                                       kind="complete_structured", stage=stage)
+        view = await graph(state)
+        assert view["planner"]["state"] == "deciding"
+        assert view["planner"]["stage"] == stage
+        await ledger.dispatch(RUN, request)
+        await ledger.settle(RUN, request)
+    view = await graph(state)
+    assert view["planner"]["usage"]["requests"] == 2
+    assert view["usage"]["by_stage"]["hypothesis_planning"]["unknown_usage"] == 1
+    assert view["usage"]["by_stage"]["task_atomization"]["spent"] == 1
+    assert view["usage"]["requests"] == sum(
+        item["spent"] for item in view["usage"]["by_stage"].values()
+    )
+    review = await ledger.reserve(RUN, owner="hypothesis_planning", kind="complete_structured",
+                                  stage="task_completion_review")
+    view = await graph(state)
+    assert view["planner"]["state"] == "waiting" and view["planner"]["usage"]["requests"] == 2
+    await ledger.release_undispatched(RUN, review)
 
 
 async def test_candidate_is_projected_separately_from_tasks_findings_and_mission(tmp_path):

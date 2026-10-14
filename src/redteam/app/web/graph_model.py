@@ -13,8 +13,11 @@ from redteam.app.cli.display import safe_text
 from redteam.core.contracts.execution import ExecutionState, TaskExecution
 from redteam.core.contracts.graph import Hypothesis
 from redteam.core.contracts.mission import MissionPlan, MissionTask
+from redteam.orchestration.llm_requests import request_stage_usage
 
 PLANNER_OWNER = "specialist_planning"
+PLANNER_OWNERS = frozenset({PLANNER_OWNER, "hypothesis_planning", "task_atomization"})
+PLANNER_STAGES = frozenset({"hypothesis_planning", "task_atomization"})
 REVIEW_OWNERS = frozenset({"task_completion_review", "goal_completion"})
 _LIVE_REQUEST = frozenset({"reserved", "dispatched"})
 _OPEN_EXECUTION = frozenset({ExecutionState.PENDING, ExecutionState.RUNNING})
@@ -60,25 +63,30 @@ def _usage(requests: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _planner(raw: GraphRaw) -> dict[str, Any]:
-    finished = bool(raw.mission and (
-        raw.mission.termination_reason
-        or raw.mission.status.value in {"completed", "cancelled", "failed"}
-    ))
-    if _live(raw.llm_requests, PLANNER_OWNER):
+    planner_requests = [r for r in raw.llm_requests if r.get("stage") in PLANNER_STAGES
+                        or (r.get("stage") is None and r.get("owner") in PLANNER_OWNERS)]
+    live = [r for r in planner_requests if r.get("state") in _LIVE_REQUEST]
+    judgment = raw.planner_judgment
+    finished = bool(raw.mission and raw.mission.status.value in {
+        "completed", "cancelled", "failed",
+    })
+    stages = {r.get("stage") for r in live}
+    if live:
         state = "deciding"
     elif finished:
         state = "finished"
+    elif judgment and judgment.get("termination") in {"held", "exhausted"}:
+        state = judgment["termination"]
+    elif raw.mission and raw.mission.termination_reason:
+        state = "finished"
     else:
         state = "waiting"
-    judgment = raw.planner_judgment
     by_status: dict[str, int] = {}
     for task in raw.tasks:
         by_status[task.status.value] = by_status.get(task.status.value, 0) + 1
-    planner_requests = [r for r in raw.llm_requests if r.get("owner") == PLANNER_OWNER]
     return {
         "state": state,
-        # Stage (question proposal vs. task split) and the waking event are not stored.
-        "stage": None,
+        "stage": _text(next(iter(stages)), 80) if len(stages) == 1 else None,
         "trigger": None,
         "inputs": {
             "goal": _text(raw.mission.objective if raw.mission else None, 300),
@@ -100,6 +108,7 @@ def _planner(raw: GraphRaw) -> dict[str, Any]:
             True if judgment is not None and "candidate_inputs" in judgment else None
         ),
         "usage": _usage(planner_requests),
+        "usage_by_stage": request_stage_usage(planner_requests),
     }
 
 
@@ -247,7 +256,8 @@ def build_graph(raw: GraphRaw) -> dict[str, Any]:
             "verified_findings": raw.event_counts.get("FindingVerified", 0),
             "hypotheses": len(candidates),
         },
-        "usage": {**_usage(raw.llm_requests), "budget_remaining": raw.budget_remaining},
+        "usage": {**_usage(raw.llm_requests), "by_stage": request_stage_usage(raw.llm_requests),
+                  "budget_remaining": raw.budget_remaining},
         "edges": edges,
         "events": [_event(r) for r in raw.events[:EVENT_LIMIT]],
     }

@@ -225,6 +225,14 @@ async def test_boundaries_preserve_pending_originals_and_resume_exact_calls(tmp_
         original, = await session.deps.central_state.list_executions()
         task = await session.deps.central_state.get_task(identity)
         assert task.status is TaskStatus.BLOCKED and task.result.outcome == "blocked"
+        # Current execution waits live in the ledger; immutable gaps keep the history.
+        assert task.result.observations == [] and task.result.limitations == []
+        original_result_id = task.result.result_id
+        historical_refs = list(task.result.evidence_ids)
+        gap = await session.deps.evidence_store.get(historical_refs[-1])
+        assert gap.metadata["diagnostic"]["trace"][0]["invocation_id"] == str(
+            original.invocation_id,
+        )
         assert task.occupant_owner == result.runtime.work_owner
         assert await session.deps.central_state.transaction(
             lambda tx: tx.active_activation_count(), write=False,
@@ -246,10 +254,17 @@ async def test_boundaries_preserve_pending_originals_and_resume_exact_calls(tmp_
             assert tools.inner.invocations[0].invocation_id == original.invocation_id
             completed = await session.deps.central_state.get_task(identity)
             assert completed.status is TaskStatus.COMPLETED
+            assert completed.result.result_id == original_result_id
+            assert set(historical_refs) <= set(completed.result.evidence_ids)
+            assert completed.result.observations == []
+            assert "approval_pending" not in completed.result.limitations
+            assert not updated.wait_reason and updated.result_evidence_id
         else:
             recovered, outcome = await session.driver.recover_central_instance(result.runtime)
             assert not outcome.ready
             assert outcome.pending_invocations == [str(original.invocation_id)]
+            current = await session.deps.central_state.get_task(identity)
+            assert current.result == task.result
             assert len(tools.inner.invocations) == 1
         after = await session.deps.central_state.transaction(
             lambda tx: tx.probe_usage(identity), write=False,

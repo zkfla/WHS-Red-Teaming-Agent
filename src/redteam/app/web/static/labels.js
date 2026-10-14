@@ -19,7 +19,7 @@ export const HOST = {
   closed: "서버 종료됨",
 };
 
-export const PLANNER = { deciding: "판단 중", waiting: "대기", finished: "종료" };
+export const PLANNER = { deciding: "판단 중", waiting: "대기", held: "보류", exhausted: "탐색 중단", finished: "종료" };
 
 export const TASK = {
   pending: "대기", ready: "준비됨", running: "진행 중", blocked: "막힘",

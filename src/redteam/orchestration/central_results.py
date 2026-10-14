@@ -19,6 +19,7 @@ from redteam.orchestration.completion_proposal import (
     validate_unresolved,
 )
 from redteam.orchestration.coordination import StateConflict, content_hash
+from redteam.orchestration.diagnostics import DecisionDiagnostic, safe_feedback
 from redteam.orchestration.local_tools import LocalToolDescriptor, LocalToolResult
 
 # An open EventEnvelope type; no schema/table or independent question state.
@@ -34,6 +35,11 @@ def result_for(
     task, *, outcome, summary, evidence_ids, questions=(), receipt_id=None, hypothesis_ids=(),
     observations=(), limitations=(),
 ):
+    """Retain durable investigation assertions and stable source references.
+
+    Execution snapshots belong to immutable gap records, never these assertions:
+    consumers project current waits from the execution ledger independently.
+    """
     prior = task.result
     retained = {question.question_id: question for question in prior.questions} if prior else {}
     for question in questions:
@@ -174,7 +180,7 @@ def register_result_tool(registry):
         LocalToolDescriptor(
             tool_id="task.publish_result",
             contribution_id="central-investigation-result",
-            version="2",
+            version="3", initial_exposure=True,
             description="Publish an intermediate investigation result and its follow-up questions "
             "while retaining the task. Cite preserved originals. Confirmed results require "
             "task.settle review. Probe contract v2 refutations also require review; outcomes "
@@ -254,14 +260,51 @@ async def settle_central(scope, proposal: CompletionProposal, context):
             budget=context.budget,
         )
         if errors:
-            return LocalToolResult(ok=False, error="; ".join(errors))
+            return await completion_rejection(errors, proposal, task, deps, runtime)
     else:
         errors = await complete_unresolved_result(deps, runtime, task, token, proposal)
         if errors:
-            return LocalToolResult(ok=False, error="; ".join(errors))
+            return await completion_rejection(errors, proposal, task, deps, runtime)
     return LocalToolResult(
         ok=True,
         payload={"scope": scope, "outcome": proposal.outcome},
         refs=tuple(proposal.evidence_ids),
         runtime_outcome="task_completed",
+    )
+
+
+async def completion_rejection(errors, proposal, task, deps, runtime):
+    """Keep producer diagnostics; unspecified legacy failures stay unknown.
+
+    Publish scoped references only. A rejected reference is not made trustworthy
+    by appearing in the diagnostic, nor is a diagnostic an execution original.
+    """
+    from redteam.core.contracts.completion import criterion_id
+
+    evidence_ids = []
+    for identity in dict.fromkeys(proposal.evidence_ids):
+        record = await deps.evidence_store.get(identity)
+        if (record is not None and str(record.run_id) == str(runtime.run_id)
+                and str(record.engagement_id) == str(runtime.engagement_id)
+                and (not record.metadata.get("mission_id")
+                     or str(record.metadata["mission_id"]) == str(runtime.mission_id))):
+            evidence_ids.append(identity)
+    criterion_ids = [criterion_id(item) for item in task.completion_criteria]
+    diagnostics = getattr(errors, "diagnostics", []) or [DecisionDiagnostic(
+        code="completion_support_unproven", stage="completion_validation", kind="validation",
+        cause_scope="unknown", owner="orchestration.semantic_completion",
+        summary="Completion support was rejected; its cause is not yet classified.",
+        repair_condition="Preserve originals and return an unresolved gap if no independent "
+                         "support exists. Rereading does not repair internal contracts.",
+    )]
+    diagnostics = [item.model_copy(update={
+        "evidence_ids": [ref for ref in (item.evidence_ids or evidence_ids)
+                         if ref in evidence_ids],
+        "criterion_ids": [ref for ref in (item.criterion_ids or criterion_ids)
+                          if ref in criterion_ids],
+    }).model_dump(mode="json") for item in diagnostics]
+    return LocalToolResult(
+        ok=False, error=safe_feedback("; ".join(errors)),
+        payload={"diagnostics": diagnostics, "task_id": str(task.task_id),
+                 "completion_accepted": False}, refs=tuple(evidence_ids),
     )

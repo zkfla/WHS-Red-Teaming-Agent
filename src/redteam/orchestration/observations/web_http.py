@@ -518,7 +518,13 @@ def map_web_http_request(
         }
         or any(type(value) is not bool for value in headers.values())
         or not is_hex64(digest)
-        or output.get("body_omitted") is not True
+        or not (
+            output.get("body_omitted") is True
+            or (output.get("body_omitted") is False
+                and isinstance(output.get("body_preview"), str)
+                and output.get("body_preview_is_untrusted_data") is True
+                and type(output.get("body_preview_truncated")) is bool)
+        )
         or type(output.get("body_bytes")) is not int
         or output["body_bytes"] < 0
     ):

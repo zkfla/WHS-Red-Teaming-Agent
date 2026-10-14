@@ -73,6 +73,10 @@ async def evidence_read_handler(
         # names the known field and rule without echoing raw inputs or
         # unknown key names. This never widens what the reader accepts.
         diagnostic = diagnostic_for_exception(exc, stage="native_local_tool")
+        diagnostic = diagnostic.model_copy(update={
+            "cause_scope": "model_input", "owner": "orchestration.evidence_access",
+            "repair_condition": "Correct the evidence read arguments using the registered schema.",
+        })
         return LocalToolResult(
             ok=False,
             error=diagnostic.feedback(),
@@ -96,6 +100,9 @@ async def evidence_read_handler(
         else:
             result = await EvidenceReader(store).read(
                 run_id=run_id,
+                engagement_id=str(getattr(runtime, "engagement_id", ""))
+                if getattr(runtime, "engagement_id", None)
+                else None,
                 **request.model_dump(
                     include={"evidence_id", "offset", "limit", "query"}
                 ),
@@ -127,6 +134,9 @@ async def evidence_read_handler(
             ok=True,
             payload=dict(result),
             refs=(str(request.evidence_id),),
+            evidence_read_request=request.model_dump(
+                include={"evidence_id", "offset", "limit", "query"},
+            ),
         )
     return LocalToolResult(
         ok=False,
@@ -144,6 +154,10 @@ async def _settle(
         # Same shared validation contract as the evidence reader: known
         # fields and rules only, never raw values or unknown key names.
         diagnostic = diagnostic_for_exception(exc, stage="native_local_tool")
+        diagnostic = diagnostic.model_copy(update={
+            "cause_scope": "model_input", "owner": "orchestration.completion_proposal",
+            "repair_condition": "Correct the completion arguments using the registered schema.",
+        })
         return LocalToolResult(
             ok=False,
             error=diagnostic.feedback(),
@@ -185,15 +199,15 @@ def evidence_read_descriptor() -> LocalToolDescriptor:
     return LocalToolDescriptor(
         tool_id=EVIDENCE_READ_TOOL_ID,
         description=(
-            "Read back one preserved original evidence record of the current "
-            "run as a bounded window (evidence_id plus optional offset, "
-            "limit, and query). Raw outputs stay in the store; only the "
-            "requested window is returned. Use the returned text to ground "
-            "facts, hypotheses, and settlement evidence."
+            "Read a bounded evidence window for this run and engagement (evidence_id, "
+            "offset, limit, query). view_kind distinguishes execution_original from "
+            "runtime_diagnostic, review and unresolved DATA. Diagnostic reads prove no "
+            "execution or Finding; review admission still requires its original binding gates. "
+            "no_raw explains unsupported views or absent originals; rereading changes neither."
         ),
         input_schema=EvidenceReadRequest.model_json_schema(),
         contribution_id=EVIDENCE_READ_CONTRIBUTION_ID,
-        version=RUNTIME_TOOL_CONTRIBUTION_VERSION,
+        version="v3", initial_exposure=True,
     )
 
 
@@ -210,7 +224,7 @@ def task_settle_descriptor() -> LocalToolDescriptor:
         ),
         input_schema=CompletionProposal.model_json_schema(),
         contribution_id=TASK_SETTLE_CONTRIBUTION_ID,
-        version=RUNTIME_TOOL_CONTRIBUTION_VERSION,
+        version="v3", initial_exposure=True,
     )
 
 
@@ -236,7 +250,7 @@ def evidence_read_contribution() -> Contribution:
 
     return runtime_tool_contribution(
         contribution_id=EVIDENCE_READ_CONTRIBUTION_ID,
-        factory=factory,
+        version="v3", factory=factory,
     )
 
 
@@ -246,7 +260,7 @@ def task_settle_contribution() -> Contribution:
 
     return runtime_tool_contribution(
         contribution_id=TASK_SETTLE_CONTRIBUTION_ID,
-        factory=factory,
+        version="v3", factory=factory,
     )
 
 

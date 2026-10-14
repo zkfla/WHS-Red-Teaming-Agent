@@ -9,8 +9,12 @@ become a hidden allowlist and no second registry can drift from discovery:
 - local_helper: LocalToolRegistry descriptors (callable runtime-local
   tools). Like catalog tools they are exposed lazily: only helpers whose
   contribution declares bootstrap (the card search and detail navigators)
-  stay always-advertised, and every other schema appears after a detail
-  lookup. Runs without the lookup helper keep full advertisement.
+  stay always-advertised. Contributions may independently declare
+  initial_exposure for essential read/Task-return schemas. Other local schemas
+  appear after a detail lookup. Native external schema advertisement provides
+  the entire eligible catalog when its full input envelope fits the bounded
+  budget; otherwise discovery remains lazy. No lookup means full advertisement,
+  still subject to the same input bound.
 - program: shell programs from two single sources -- (a) the TASK-003
   image manifest for image-provided programs, read only through the
   ShellProgramDiscovery provider, (b) live workroom rows for the trusted
@@ -34,10 +38,14 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Collection, Mapping, Sequence
+from dataclasses import asdict
 from typing import Any, cast
+
+from pydantic import BaseModel, ConfigDict, Field
 
 from redteam.core.enums import RiskLevel, ToolHealthStatus
 from redteam.core.ids import ToolId
+from redteam.core.ports.llm import NativeToolSpec
 from redteam.core.ports.program_discovery import (
     PROGRAM_ABSENT_CODES,
     ProgramRecord,
@@ -62,6 +70,29 @@ from redteam.orchestration.native_binding import exposed_tool_name
 
 CARD_SUMMARY_CHARS = 240
 MAX_LIST_CARDS = 100
+
+
+class NativeInputLimit(BaseModel):
+    """Canonical UTF-8 input envelope budget, independent of output tokens.
+
+    No operational setting/cache: one default for the exposure owner. Smaller
+    budgets are useful to validate the same boundary without large fixtures.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    max_bytes: int = Field(default=256 * 1024, strict=True, gt=0, le=256 * 1024)
+
+    def size(self, *, messages, tools: Sequence[NativeToolSpec], system) -> int:
+        return len(json.dumps(
+            {"messages": messages, "tools": [asdict(tool) for tool in tools], "system": system},
+            ensure_ascii=False, allow_nan=False, separators=(",", ":"),
+        ).encode("utf-8"))
+
+    def fits(self, **envelope) -> bool:
+        return self.size(**envelope) <= self.max_bytes
+
+
+NATIVE_INPUT_LIMIT = NativeInputLimit()
 
 TOOL_LIST_CARDS_ID = "tool.list_cards"
 TOOL_GET_DETAIL_ID = "tool.get_detail"

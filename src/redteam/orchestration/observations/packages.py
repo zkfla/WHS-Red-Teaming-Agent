@@ -88,6 +88,7 @@ def builtin_observation_packages() -> tuple[MapperContribution, ...]:
             "web.http_request",
             f"{base}.web_http:map_web_http_request",
             keys=("security_headers_present",),
+            version="2",
         ),
         _bundle(
             "web.http_compare_sessions",
