@@ -6,7 +6,11 @@ from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from redteam.core.contracts.completion import CompletionCriterion, criterion_id
+from redteam.core.contracts.completion import (
+    CompletionCriterion,
+    contradictory_candidate_verdict,
+    criterion_id,
+)
 from redteam.core.contracts.events import EventEnvelope, EventType
 from redteam.core.contracts.graph import HypothesisUpdate
 from redteam.core.contracts.mission import MissionTask, Provenance
@@ -95,6 +99,8 @@ def _validate_subjects(
                 raise SpecialistProposalError("specialist_condition_principal_outside_subjects")
             if condition.hypothesis_id and condition.hypothesis_id not in known_hypotheses:
                 raise SpecialistProposalError("specialist_unknown_hypothesis")
+        if contradictory_candidate_verdict(item.completion_criteria) is not None:
+            raise SpecialistProposalError("specialist_contradictory_candidate_verdict")
 
 
 def validate_strategy_tasks(

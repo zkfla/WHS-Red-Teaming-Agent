@@ -18,16 +18,19 @@ EXEC_FP = "ab" * 32
 
 @pytest.mark.parametrize("collect", [False, True])
 @pytest.mark.parametrize("fingerprint", [EXEC_FP, None])
+@pytest.mark.parametrize("network_fingerprint", ["cd" * 32, None])
 async def test_central_dispatch_forwards_original_environment(
     tmp_path,
     monkeypatch,
     collect,
     fingerprint,
+    network_fingerprint,
 ):
     async with selection(tmp_path) as (session, _):
         binding = session.deps.component_binding.model_copy(
             update={
                 "execution_environment_fingerprint": fingerprint,
+                "network_environment_fingerprint": network_fingerprint,
             }
         )
         # Pin before re-recording the initial metadata; no Task/provider activity.
@@ -69,7 +72,8 @@ async def test_central_dispatch_forwards_original_environment(
             )
         captured.assert_awaited_once()
         actual = captured.await_args.kwargs["original_component_binding"]
-        if fingerprint:
-            assert actual["execution_environment_fingerprint"] == fingerprint
+        if fingerprint or network_fingerprint:
+            assert actual.get("execution_environment_fingerprint") == fingerprint
+            assert actual.get("network_environment_fingerprint") == network_fingerprint
         else:
             assert actual is None

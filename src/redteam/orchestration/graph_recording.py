@@ -69,12 +69,12 @@ from redteam.orchestration.diagnostics import DecisionDiagnostic, diagnostic_for
 from redteam.orchestration.evidence_access import raw_from_metadata
 from redteam.orchestration.findings import FindingPromoter, PromotionRequest
 from redteam.orchestration.local_tools import (
-    RUNTIME_TOOL_CONTRIBUTION_VERSION,
     LocalToolContext,
     LocalToolDescriptor,
     LocalToolResult,
     runtime_tool_contribution,
 )
+from redteam.orchestration.observations.shell_execution import is_shell_execution_envelope
 
 GRAPH_RECORD_TOOL_ID = "graph.record"
 GRAPH_RECORD_CONTRIBUTION_ID = "graph-record"
@@ -477,6 +477,12 @@ class GraphRecordingHandler:
             return
         if observed_target.strip() != target:
             refused_facts.append({"evidence_id": eid, "reason": "observed another target"})
+            return
+        if is_shell_execution_envelope(output):
+            refused_facts.append({
+                "evidence_id": eid,
+                "reason": "shell output is a program assertion, not a measured remote fact",
+            })
             return
         if service is None:
             refused_facts.append({"evidence_id": eid, "reason": "graph unavailable"})
@@ -1119,7 +1125,7 @@ class GraphRecordingHandler:
             source = await store.get(ref)
             if _posthoc_source_gap(source, raw_from_metadata(source.metadata)) is not None:
                 return _refused_entry(base, "source origin invalid", "finding_id")
-            if not await claim_target_is_grounded(service, source, target):
+            if not await claim_target_is_grounded(service, source, target, evidence_store=store):
                 return _refused_entry(
                     base, "claim target has no source-backed relation", "finding_id"
                 )
@@ -1394,11 +1400,13 @@ def graph_recording_descriptor() -> LocalToolDescriptor:
             + ") and written to existing graph nodes or edges only; "
             "hypotheses stay open inference here and resolve through an "
             "explicit finding or execution verification; findings run "
-            "posthoc review plus promotion here."
+            "posthoc review plus promotion here. Shell streams and exit codes are program "
+            "assertions/execution metadata; use evidence-linked hypotheses or unresolved "
+            "observations, never measured remote facts."
         ),
         input_schema=GraphRecordingInput.model_json_schema(),
         contribution_id=GRAPH_RECORD_CONTRIBUTION_ID,
-        version=RUNTIME_TOOL_CONTRIBUTION_VERSION,
+        version="3",
     )
 
 
@@ -1426,5 +1434,6 @@ def graph_recording_contribution() -> Contribution:
 
     return runtime_tool_contribution(
         contribution_id=GRAPH_RECORD_CONTRIBUTION_ID,
+        version="3",
         factory=factory,
     )

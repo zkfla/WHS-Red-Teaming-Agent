@@ -1669,7 +1669,9 @@ async def validate_result_claims(
             continue
         if target_ref and step_target_set and target_ref not in step_target_set:
             related = any([
-                await claim_target_is_grounded(graph_service, record, target)
+                await claim_target_is_grounded(
+                    graph_service, record, target, evidence_store=evidence_store,
+                )
                 for target in step_target_set
             ])
             for receipt_meta in admission_receipts:
@@ -1679,7 +1681,7 @@ async def validate_result_claims(
                 ):
                     try:
                         related = await claim_target_is_grounded(
-                            graph_service, record, claimed_target
+                            graph_service, record, claimed_target, evidence_store=evidence_store,
                         )
                     except Exception:
                         related = False

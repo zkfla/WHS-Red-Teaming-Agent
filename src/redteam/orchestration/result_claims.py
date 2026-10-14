@@ -128,7 +128,9 @@ async def check_result_review(
             record = await evidence_store.get(identity)
             if record is not None and preserved_target_is_absent(record.metadata):
                 for target in claim.target_node_ids:
-                    if not await claim_target_is_grounded(graph_service, record, target):
+                    if not await claim_target_is_grounded(
+                        graph_service, record, target, evidence_store=evidence_store,
+                    ):
                         return ["target-free evidence does not ground the claimed target"]
         errors = await validate_result_claims(
             criteria=[

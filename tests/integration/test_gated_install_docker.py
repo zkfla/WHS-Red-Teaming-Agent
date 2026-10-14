@@ -38,24 +38,53 @@ from redteam.core.contracts.tool import ExecutionContext, ToolInvocation
 from redteam.core.ids import ActionId, AgentInstanceId, EngagementId, InvocationId, RunId, ToolId
 from redteam.evidence.stores.filesystem import FilesystemEvidenceStore
 from tests.integration.test_gated_window_docker import (
-    SIDECAR_IMG,
     docker,
     image_available,
-    image_pin,
+    quota_supported,
+    sidecar_image,
 )
 
 pytestmark = pytest.mark.skipif(shutil.which("docker") is None, reason="docker unavailable")
-ROOM_IMAGE = "shell-workroom:t003-draft"
 MOCK_IMAGE = "python:3.11-slim"
+
+
+async def _workroom_image():
+    """The current fingerprint-tagged workroom image, built locally if needed.
+
+    plan7a replaced the old fixed `shell-workroom:t003-draft` fixture with a
+    content-hashed `whs-shell-workroom:<recipe>` tag (`shell_image.py`); this
+    proof must resolve the same real tag production code would use.
+    """
+    from redteam.capability.shell_image import ShellImageError, build_default_image
+    from redteam.capability.shell_preparation import preparation_cache_directory
+
+    try:
+        tag, _image_id = await build_default_image(
+            ShellWorkroomPolicy(image="sha256:" + "0" * 64),
+            preparation_cache_directory(),
+        )
+    except ShellImageError:
+        return None
+    return tag
 
 
 async def test_real_pip_install_uses_proxy_and_direct_mirror_is_blocked(tmp_path, monkeypatch):
     # Like the other gated Docker proofs, require already-local fixtures
     # before creating any resources. Missing fixtures are not a gate proof
     # failure and must not trigger Docker's implicit image download.
-    for image in (ROOM_IMAGE, SIDECAR_IMG, MOCK_IMAGE):
-        if not await image_available(image):
-            pytest.skip("gated install fixture image not available locally: " + image)
+    room_image = await _workroom_image()
+    if room_image is None:
+        pytest.skip("workroom image could not be built on this Docker endpoint")
+    sidecar = await sidecar_image()
+    if sidecar is None:
+        pytest.skip("sidecar image could not be built on this Docker endpoint")
+    if not await quota_supported(sidecar):
+        pytest.skip("this Docker kernel does not support nft named quota "
+                    "(CONFIG_NFT_QUOTA); see deploy/docker/gate-sidecar/README.md")
+    ROOM_IMAGE = room_image
+    SIDECAR_IMG = sidecar
+    if not await image_available(MOCK_IMAGE):
+        pytest.skip("gated install fixture image not available locally: " + MOCK_IMAGE)
     suffix = uuid.uuid4().hex[:10]
     run_id, instance = "pip" + suffix, "i1"
     key = workroom_key_for(run_id, instance)
@@ -122,7 +151,7 @@ async def test_real_pip_install_uses_proxy_and_direct_mirror_is_blocked(tmp_path
         caps = WindowCaps(max_flow_init_deliveries=30, max_output_bytes=500000,
                           duration_seconds=120, purpose=NetworkPurpose.INSTALL)
         config = GatedNetworkPolicy(
-            sidecar_image=await image_pin(SIDECAR_IMG),
+            sidecar_image=SIDECAR_IMG,
             budget=budget, default_install_caps=caps,
             default_target_caps=caps.model_copy(update={"purpose": NetworkPurpose.TARGET}),
             registry=PinnedRegistry(mirrors={"mirror": (mirror_ip,), "proxy": (proxy_ip,)}),

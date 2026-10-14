@@ -63,20 +63,34 @@ function sessionBox(def, draft, onChange) {
 
 export function fieldNode(def, draft, onChange) {
   if (def.name === "web_sessions") return sessionBox(def, draft, onChange);
+  if (def.kind === "object") {
+    const values = draft[def.name] || (draft[def.name] = { ...def.default });
+    return h("fieldset", { class: "choices" }, h("legend", { text: def.label }),
+      h("p", { class: "note", text: "Kali 작업공간을 대상 Docker bridge에 직접 연결합니다. 대상 IP·port는 도구 입력과 조사 범위에서 검사하지만, 별도의 packet gate·트래픽 quota·NFQUEUE는 사용하지 않습니다." }),
+      h("p", { class: "note", text: "127.0.0.1은 Kali 컨테이너 자신입니다. 같은 Docker daemon의 Vuln Bank는 실제 컨테이너 IP·port와 bridge ID를 입력하세요. 실행 중 해당 bridge에 연결하고 실행 종료 후 분리합니다. 주소·port 자동 치환이나 터널 생성은 하지 않습니다." }),
+      def.fields.map((field) => fieldNode(field, values, onChange)));
+  }
   if (def.choices) {
     if (draft[def.name] == null) draft[def.name] = def.default;
     const control = h("select", { name: def.name,
       onchange: (event) => {
         draft[def.name] = event.target.value;
+        if (def.name === "kali_network_mode") {
+          if (event.target.value !== "prepare") draft.kali_network_preparation = null;
+          if (event.target.value !== "configured") draft.kali_network_policy_path = null;
+        }
         if (def.name === "web_policy_mode" && event.target.value !== "paths") draft.web_paths = [];
         if (def.name === "web_policy_mode" && event.target.value === "manual") {
           draft.web_permissions = "read_only"; draft.web_sessions = [];
           draft.kali_network_mode = "inherit"; draft.kali_network_policy_path = null;
+          draft.kali_network_preparation = null;
         }
         onChange();
       },
     }, def.choices.map((choice) => h("option", {
       value: choice.value, selected: draft[def.name] === choice.value, text: choice.label,
+      disabled: def.name === "kali_network_mode" && draft.web_policy_mode === "manual"
+        && !["closed", "inherit"].includes(choice.value),
     })));
     return h("label", {}, def.label, control);
   }
@@ -98,7 +112,7 @@ export function fieldNode(def, draft, onChange) {
   let control;
   if (def.kind === "integer") {
     control = h("input", {
-      ...common, type: "number", min: 0, step: 1,
+      ...common, type: "number", min: def.min ?? 0, max: def.max, step: 1,
       value: draft[def.name] ?? (def.default ?? ""),
       oninput: (event) => {
         const text = event.target.value.trim();
@@ -121,7 +135,7 @@ export function fieldNode(def, draft, onChange) {
       ...common, ...(tag === "input" ? { type: "text" } : { rows: 3 }),
       value: tag === "input" ? draft[def.name] || "" : null,
       oninput: (event) => {
-        draft[def.name] = event.target.value;
+        draft[def.name] = def.nullable ? event.target.value.trim() || null : event.target.value;
         onChange();
       },
     });

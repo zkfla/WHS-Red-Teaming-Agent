@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Sequence
 from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
@@ -62,6 +63,34 @@ def completion_contract_hash(task: Any) -> str:
         if task.probe_limits is not None:
             purpose["probe_limits"] = task.probe_limits.model_dump(mode="json")
     return _digest(purpose)
+
+
+def contradictory_candidate_verdict(criteria: Sequence[CompletionCriterion]) -> str | None:
+    """A hypothesis_id this same list requires both ``confirmed`` and ``refuted`` for.
+
+    A Hypothesis has one ``status`` at a time (``core/contracts/graph.py``): it
+    cannot be simultaneously confirmed and refuted, so a single purpose (one
+    Task, one investigation question, one probe) that ANDs both verdict kinds
+    for the same candidate can never be satisfied -- not "hard", genuinely
+    impossible. Different candidates each needing one verdict, or a kind
+    repeated for the same candidate, are not contradictions and are not
+    flagged. The single shared registration boundary
+    (``specialist_tasks._validate_subjects`` / ``validate_probe_subjects``) and
+    the stage-1 question check (``probe_atomization.bind_plan``) both call this,
+    so neither a direct task/question proposal nor the split planning stage can
+    register the deadlock; see plan7d.
+    """
+    confirmed: set[str] = set()
+    refuted: set[str] = set()
+    for item in criteria:
+        if not item.hypothesis_id:
+            continue
+        if item.kind == "hypothesis_confirmed":
+            confirmed.add(item.hypothesis_id)
+        elif item.kind == "hypothesis_refuted":
+            refuted.add(item.hypothesis_id)
+    shared = confirmed & refuted
+    return min(shared) if shared else None
 
 
 def completion_conditions(task: Any) -> list[dict[str, Any]]:

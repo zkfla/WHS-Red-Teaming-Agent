@@ -36,9 +36,32 @@ from redteam.core.contracts.network import (
 )
 
 ROOM_IMG = os.environ.get("SHELL_TEST_IMAGE", "python:3.11-slim")
-SIDECAR_IMG = "t005-gate-sidecar"
 NETWORK_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "gated_network.py"
 pytestmark = pytest.mark.skipif(shutil.which("docker") is None, reason="docker unavailable")
+async def sidecar_image() -> str | None:
+    """The removed gate-sidecar is unavailable to legacy opt-in proofs."""
+    return None
+
+
+async def quota_supported(image: str) -> bool:
+    """The README's own bounded `nft --check` probe: rule syntax only, no packets.
+
+    A real but quota-less kernel (observed on some Docker Desktop Linux VMs, see
+    deploy/docker/gate-sidecar/README.md) builds and runs this exact sidecar fine
+    but cannot apply the production ruleset, which always requires a byte quota
+    (`build_ruleset` takes no "off" switch -- removing quota would be exactly the
+    kind of budget bypass plan7 forbids). Skip with that precise, freshly-measured
+    reason instead of either a confusing low-level failure or a silent pass.
+    """
+    from redteam.capability.gated_window import build_ruleset
+
+    ruleset = build_ruleset(queue_num=7, allowed=(), quota_bytes=4096)
+    code, _out, _err = await docker(
+        "run", "--rm", "--pull=never", "--network", "none", "--cap-drop", "ALL",
+        "--cap-add", "NET_ADMIN", "--entrypoint", "nft", "-i", image, "--check", "-f", "-",
+        stdin=ruleset.encode(),
+    )
+    return code == 0
 
 
 async def docker(*argv, stdin=None, timeout=60.0):
@@ -119,8 +142,12 @@ async def test_install_zero_capacity_refused(tmp_path):
 
 
 async def test_quiet_window_releases_with_live_meter(tmp_path):
-    if not await image_available(SIDECAR_IMG):
-        pytest.skip("sidecar image not built")
+    sidecar = await sidecar_image()
+    if sidecar is None:
+        pytest.skip("sidecar image could not be built on this Docker endpoint")
+    if not await quota_supported(sidecar):
+        pytest.skip("this Docker kernel does not support nft named quota "
+                    "(CONFIG_NFT_QUOTA); see deploy/docker/gate-sidecar/README.md")
     if not await image_available(ROOM_IMG):
         pytest.skip("room image missing")
     os.makedirs("data/t005-gated", exist_ok=True)
@@ -151,7 +178,7 @@ async def test_quiet_window_releases_with_live_meter(tmp_path):
     instance_id = "i1"
     key = workroom_key_for(run_id, instance_id)
     network_policy = GatedNetworkPolicy(
-        sidecar_image=await image_pin(SIDECAR_IMG),
+        sidecar_image=sidecar,
         budget=budget,
         default_target_caps=target_caps,
         default_install_caps=WindowCaps(
@@ -228,7 +255,7 @@ async def _room(tag):
     return name
 
 
-async def _sidecar(tag, room):
+async def _sidecar(tag, room, image):
     name = "t005-gated-side-" + tag
     code, _, err = await docker(
         "create",
@@ -242,7 +269,7 @@ async def _sidecar(tag, room):
         "ALL",
         "--label",
         "t005-gated",
-        SIDECAR_IMG,
+        image,
     )
     assert code == 0, err.decode()
     code, _, err = await docker("start", name)
@@ -302,8 +329,12 @@ async def _cleanup(*names):
 
 async def test_kernel_boundary(tmp_path):
     _ = tmp_path
-    if not await image_available(SIDECAR_IMG):
-        pytest.skip("sidecar image not built")
+    sidecar = await sidecar_image()
+    if sidecar is None:
+        pytest.skip("sidecar image could not be built on this Docker endpoint")
+    if not await quota_supported(sidecar):
+        pytest.skip("this Docker kernel does not support nft named quota "
+                    "(CONFIG_NFT_QUOTA); see deploy/docker/gate-sidecar/README.md")
     if not await image_available(ROOM_IMG):
         pytest.skip("room image missing")
     os.makedirs("data/t005-gated", exist_ok=True)
@@ -320,7 +351,7 @@ async def test_kernel_boundary(tmp_path):
         )
         assert code == 0
         room = await _room(tag)
-        side = await _sidecar(tag, room)
+        side = await _sidecar(tag, room, sidecar)
         mock, mock_ip = await _mock(tag, net, NETWORK_FIXTURE)
         rules = build_ruleset(
             queue_num=7,
@@ -454,8 +485,12 @@ async def test_kernel_boundary(tmp_path):
 
 
 async def test_window_e2e_busy_static_settle(tmp_path):
-    if not await image_available(SIDECAR_IMG):
-        pytest.skip("sidecar image not built")
+    sidecar = await sidecar_image()
+    if sidecar is None:
+        pytest.skip("sidecar image could not be built on this Docker endpoint")
+    if not await quota_supported(sidecar):
+        pytest.skip("this Docker kernel does not support nft named quota "
+                    "(CONFIG_NFT_QUOTA); see deploy/docker/gate-sidecar/README.md")
     if not await image_available(ROOM_IMG):
         pytest.skip("room image missing")
     os.makedirs("data/t005-gated", exist_ok=True)
@@ -503,7 +538,7 @@ async def test_window_e2e_busy_static_settle(tmp_path):
         )
         assert result.exit_code == 0
         mock, mock_ip = await _mock(tag, wnet, NETWORK_FIXTURE)
-        policy_net = make_policy(mock_ip, sidecar_image=await image_pin(SIDECAR_IMG))
+        policy_net = make_policy(mock_ip, sidecar_image=sidecar)
         ledger = SQLiteNetworkGrantLedger(
             str(tmp_path / "net.db"), engagement_id="egated", budget=policy_net.budget
         )

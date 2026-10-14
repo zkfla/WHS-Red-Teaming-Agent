@@ -248,6 +248,27 @@ def verify_task_receipt(
     return []
 
 
+def _cites_declared_source(task: Any, meta: dict[str, Any]) -> bool:
+    """A follow-up task may cite its own already-verified source task's evidence.
+
+    ``task.source_task_id``/``source_result_id`` is validated once, at Task
+    registration (hypothesis_planner.bind_decision / probe_atomization.bind_plan):
+    the cited result must already exist on the named source task's stored
+    ``MissionTask.result``. Citing that same source task's evidence again here
+    -- to review or carry forward its observation -- reads the original, it does
+    not change its recorded purpose. This never widens to "any task": only the
+    exact task_id this Task declared (and had verified) as its source, matched
+    against the evidence's own recorded originating task, is accepted. A task
+    with no declared source_task_id gets no exception; the purpose hash must
+    still match exactly.
+    """
+    source_task_id = _record_text(getattr(task, "source_task_id", "") or "").strip()
+    if not source_task_id:
+        return False
+    origin_task_id = _record_text(meta.get("mission_task_id", "") or "").strip()
+    return bool(origin_task_id) and origin_task_id == source_task_id
+
+
 async def verify_single_origin(
     *,
     evidence_store: Any,
@@ -308,7 +329,9 @@ async def verify_single_origin(
         current_hash = (completion_contract_hash(task)
                         if meta.get("central_execution_version") == 1
                         else purpose_hash(_record_text(getattr(task, "objective", ""))))
-        if expected_hash and expected_hash != current_hash:
+        if expected_hash and expected_hash != current_hash and not _cites_declared_source(
+            task, meta,
+        ):
             message = "task origin '" + str(evidence_id) + "' purpose changed since the evidence"
             return None, [message]
     return record, []
@@ -495,7 +518,7 @@ async def _verify_task_origin(
         expected_hash = (completion_contract_hash(task)
                          if meta.get("central_execution_version") == 1
                          else purpose_hash(_record_text(getattr(task, "objective", ""))))
-        if task_hash != expected_hash:
+        if task_hash != expected_hash and not _cites_declared_source(task, meta):
             message = "evidence '" + str(evidence_id) + "' purpose changed since the evidence"
             return None, [message], {}
     target_ref = _record_text(meta.get("target_node_id", "")).strip()

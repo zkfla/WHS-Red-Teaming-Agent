@@ -1,5 +1,13 @@
 # Probe task atomizer
 
+This handoff contains the selected questions and their related source Tasks,
+results, candidate revisions, waits and constraints, not the full investigation.
+Absence from this handoff does not prove absence from the central state. Preserve
+every supplied original condition and source binding. A same-candidate followup
+may have a different premise, principal or source; do not reject it by title or
+target similarity. Strategy has already selected the purposes; do not replan the
+mission or request another fixed lookup/replanning stage.
+
 Turn each supplied investigation question into independently assessable probe
 tasks. Cover every supplied question with at least one task; never skip a
 question and never invent a question the planner did not supply.

@@ -40,6 +40,12 @@ from redteam.orchestration.evidence_access import (
     EvidenceReadRequest,
     read_for_runtime,
 )
+from redteam.orchestration.investigation_context import (
+    ContextQuery,
+    ContextReadError,
+    InvestigationContextReader,
+    capture_investigation_context,
+)
 from redteam.orchestration.local_tools import (
     RUNTIME_TOOL_CONTRIBUTION_VERSION,
     LocalToolContext,
@@ -51,10 +57,19 @@ from redteam.orchestration.local_tools import (
 EVIDENCE_READ_TOOL_ID = "evidence.read"
 TASK_SETTLE_TOOL_ID = "task.settle"
 GOAL_SETTLE_TOOL_ID = "goal.settle"
+CONTEXT_QUERY_TOOL_ID = "context.query"
 
 EVIDENCE_READ_CONTRIBUTION_ID = "evidence-read"
 TASK_SETTLE_CONTRIBUTION_ID = "task-settle"
 GOAL_SETTLE_CONTRIBUTION_ID = "goal-settle"
+CONTEXT_QUERY_CONTRIBUTION_ID = "context-query"
+
+# plan8c: bounded read scope for this handler's own snapshot capture. A worker
+# query is one Task's own neighborhood, not the mission-wide planning capture
+# (hypothesis_planner.capture_snapshot) -- see investigation-context.md.
+_CONTEXT_QUERY_HOPS = 1
+_CONTEXT_QUERY_MAX_NODES = 32
+_CONTEXT_QUERY_MAX_EDGES = 64
 
 _READ_ERRORS = {
     "not_found": "evidence not found",
@@ -195,19 +210,91 @@ async def goal_settle_handler(
     return await _settle("goal", tool_input, context)
 
 
+async def context_query_handler(
+    tool_input: dict[str, Any], context: LocalToolContext
+) -> LocalToolResult:
+    """plan8c: bounded Task/candidate/execution/graph lookup, scoped to this worker.
+
+    Mirrors the Planner's structured ``context_request`` (plan8b) but as a
+    runtime-local tool: the worker reads this same read-only service mid-turn
+    instead of receiving a full mission dump. Capture is read-only and scoped
+    by ``InvestigationContextReader(..., worker_task_id=...)`` -- forward
+    source/dependency ancestry and the admitted candidate revision only, never
+    reverse sibling Tasks or a newer un-admitted candidate (see
+    docs/contracts/investigation-context.md "Worker scope and evidence").
+    """
+    try:
+        query = ContextQuery.model_validate(tool_input or {})
+    except Exception as exc:
+        diagnostic = diagnostic_for_exception(exc, stage="native_local_tool")
+        diagnostic = diagnostic.model_copy(update={
+            "cause_scope": "model_input", "owner": "orchestration.investigation_context",
+            "repair_condition": "Correct the context query using the registered schema.",
+        })
+        return LocalToolResult(
+            ok=False,
+            error=diagnostic.feedback(),
+            payload={"diagnostic": diagnostic.model_dump(mode="json")},
+        )
+    deps = getattr(context, "deps", None)
+    runtime = getattr(context, "runtime", None)
+    state = getattr(deps, "central_state", None)
+    task_id = str(getattr(runtime, "active_task_id", "") or "")
+    if state is None or not task_id.strip():
+        return LocalToolResult(
+            ok=False, error="context query needs a central store and an active task"
+        )
+    try:
+        snapshot = await capture_investigation_context(
+            state, hops=_CONTEXT_QUERY_HOPS, max_nodes=_CONTEXT_QUERY_MAX_NODES,
+            max_edges=_CONTEXT_QUERY_MAX_EDGES,
+        )
+        reader = InvestigationContextReader(snapshot, worker_task_id=task_id)
+        result = reader.query(query)
+    except ContextReadError as exc:
+        diagnostic = diagnostic_for_exception(exc, stage="native_local_tool")
+        diagnostic = diagnostic.model_copy(update={
+            "code": exc.code, "cause_scope": "model_input",
+            "owner": "orchestration.investigation_context",
+            "repair_condition": "The query root, revision or scope is not available to this "
+                                "worker; request only this Task's own ancestry, candidates "
+                                "and admitted revisions.",
+        })
+        return LocalToolResult(
+            ok=False,
+            error=diagnostic.feedback(),
+            payload={"diagnostic": diagnostic.model_dump(mode="json")},
+        )
+    except Exception as exc:
+        diagnostic = operational_exception_diagnostic(
+            exc, stage="native_local_tool", code="context_query_failed",
+            summary="The investigation context could not be read.",
+        )
+        return LocalToolResult(
+            ok=False,
+            payload={"diagnostic": diagnostic.model_dump(mode="json")},
+            error=diagnostic.feedback(),
+        )
+    refs = tuple(f"{record['kind']}:{record['identity']}" for record in result.get("records", ()))
+    return LocalToolResult(ok=result.get("status") == "ok", payload=result, refs=refs)
+
+
 def evidence_read_descriptor() -> LocalToolDescriptor:
     return LocalToolDescriptor(
         tool_id=EVIDENCE_READ_TOOL_ID,
         description=(
             "Read a bounded evidence window for this run and engagement (evidence_id, "
             "offset, limit, query). view_kind distinguishes execution_original from "
-            "runtime_diagnostic, review and unresolved DATA. Diagnostic reads prove no "
+            "runtime_diagnostic, network_admission, review and unresolved DATA. Shell "
+            "originals include bounded program_output and execution flags/linkage; "
+            "network admissions prove attempts/metering, not reached peers. "
+            "Diagnostic reads prove no "
             "execution or Finding; review admission still requires its original binding gates. "
             "no_raw explains unsupported views or absent originals; rereading changes neither."
         ),
         input_schema=EvidenceReadRequest.model_json_schema(),
         contribution_id=EVIDENCE_READ_CONTRIBUTION_ID,
-        version="v3", initial_exposure=True,
+        version="v4", initial_exposure=True,
     )
 
 
@@ -244,13 +331,33 @@ def goal_settle_descriptor() -> LocalToolDescriptor:
     )
 
 
+def context_query_descriptor() -> LocalToolDescriptor:
+    return LocalToolDescriptor(
+        tool_id=CONTEXT_QUERY_TOOL_ID,
+        description=(
+            "Bounded read of this run's Task/candidate/execution/graph state, scoped to "
+            "this worker's own Task and its forward source/dependency ancestry -- never "
+            "sibling Tasks that merely share a target. mode=list searches/filters; "
+            "mode=related traverses from given refs (hops<=3); mode=read returns one "
+            "exact detail (section=completion_criteria/result/properties). count<=20, "
+            "max_bytes bounds the reply. blocked is not terminal; held/inconclusive "
+            "candidates are not rejected. No match is a scoped result, not proof the "
+            "work does not exist elsewhere in the mission. This never settles a Task, "
+            "proposes a verdict or grants execution/scope; it is read-only."
+        ),
+        input_schema=ContextQuery.model_json_schema(),
+        contribution_id=CONTEXT_QUERY_CONTRIBUTION_ID,
+        version="v1", initial_exposure=True,
+    )
+
+
 def evidence_read_contribution() -> Contribution:
     def factory(wiring: Any) -> tuple[LocalToolDescriptor, Any]:
         return evidence_read_descriptor(), evidence_read_handler
 
     return runtime_tool_contribution(
         contribution_id=EVIDENCE_READ_CONTRIBUTION_ID,
-        version="v3", factory=factory,
+        version="v4", factory=factory,
     )
 
 
@@ -274,9 +381,20 @@ def goal_settle_contribution() -> Contribution:
     )
 
 
+def context_query_contribution() -> Contribution:
+    def factory(wiring: Any) -> tuple[LocalToolDescriptor, Any]:
+        return context_query_descriptor(), context_query_handler
+
+    return runtime_tool_contribution(
+        contribution_id=CONTEXT_QUERY_CONTRIBUTION_ID,
+        version="v1", factory=factory,
+    )
+
+
 def native_local_tool_contributions() -> tuple[Contribution, ...]:
     return (
         evidence_read_contribution(),
         task_settle_contribution(),
         goal_settle_contribution(),
+        context_query_contribution(),
     )

@@ -253,6 +253,18 @@ class BuiltinShellAdapter(ContextualInvocationAdapter, ExecutionRecoveryProvider
         self._gated_descriptors = stored
         self._gated_by_name = {item.tool_name: item for item in stored}
 
+    def set_network_policy(
+        self,
+        executor: GatedExecutionPolicy,
+        descriptors: list[ToolDescriptor],
+    ) -> None:
+        """Configure contextual network tools through the existing dispatch seam.
+
+        The neutral name is used by direct target networking.  The older method
+        remains as a compatibility alias for saved gated runs and their tests.
+        """
+        self.set_gated_policy(executor, descriptors)
+
     @property
     def program_source(self) -> ShellWorkroomManager:
         """Discovery object for the shell_programs injection (no new factory)."""

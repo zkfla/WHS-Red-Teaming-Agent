@@ -5,7 +5,6 @@ from redteam.app.cli.conversation import catalog_tool_labels
 from redteam.capability.settings import (
     MCPServerSettings,
     automatic_shell_setup_from_environment,
-    gated_network_policy_path_from_environment,
     shell_policy_path_from_environment,
 )
 from redteam.core.contracts.mission import redact_secret_material
@@ -48,8 +47,15 @@ def configured_tool_context(config):
         shell = "prepare_at_run_start" if automatic_shell_setup_from_environment() else (
             "configured_unverified" if shell_policy_path_from_environment() else "disabled"
         )
-        kali_network = "configured_unverified" if gated_network_policy_path_from_environment() \
-            else "closed"
+        kali_network = "closed"
+        from redteam.app.kali_preparation import kali_selection
+        from redteam.app.web_policy import KALI_NETWORK_MODE_KEY
+        selection = kali_selection(config.engagement)
+        selected_mode = (selection.kali_network_mode if selection else
+                         config.engagement.metadata.get(KALI_NETWORK_MODE_KEY, "inherit"))
+        if selected_mode != "inherit":
+            kali_network = {"closed": "closed", "configured": "configured_unverified",
+                            "prepare": "prepare_at_run_start"}[selected_mode]
     except ValueError:
         shell, kali_network = "invalid_configuration", "invalid_configuration"
     return {"tools": [], "tool_availability": {

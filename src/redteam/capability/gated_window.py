@@ -53,6 +53,7 @@ from redteam.capability.shell_workroom import (
     workroom_key_for,
 )
 from redteam.core.contracts.network import (
+    WINDOW_EGRESS_SOURCE_ID,
     GrantRefused,
     MeterReading,
     NetworkGrant,
@@ -71,7 +72,7 @@ OPAQUE_PREFIX = "gwin-"
 # Provider-owned source string stamped on every emitted companion.
 # The 004A side reads it; it never authorizes anything.
 # A manager-level source_id property for cards remains 007-owned.
-GATE_SOURCE_ID = "whs-gated-window-v1"
+GATE_SOURCE_ID = WINDOW_EGRESS_SOURCE_ID
 
 # Constraint 4: external IPv6 is unsupported/fail-closed. This reason string
 # is surfaced wherever an IPv6 allow is requested.
@@ -107,6 +108,7 @@ class OpenWindow:
     daemon_proc: asyncio.subprocess.Process | None = field(default=None)
     rpc_error: str | None = field(default=None)
     network_created: bool = field(default=False)
+    target_route_identity: dict | None = None
 
 
 def opaque_window_tag(run_id: str, instance_id: str, epoch: int) -> str:
@@ -231,11 +233,53 @@ class GatedWindowExtension(ExecutionAdmission):
     run_docker: RunDocker
     policy: GatedNetworkPolicy | None = None
     queue_num: int = GATED_QUEUE_NUM
+    target_route_identity: dict | None = None
+    docker_endpoint: dict | None = None
 
     def __post_init__(self) -> None:
         self._open: dict[str, OpenWindow] = {}
         self._opening: set[str] = set()
         self._companions: dict[str, dict[str, object]] = {}
+
+    def program_execution_routes(self):
+        from redteam.capability.gated_manifest import OPERATION_PURPOSE, build_gated_descriptors
+        from redteam.core.ports.program_discovery import ProgramExecutionRoute
+
+        policy = self.policy
+        if policy is None:
+            return super().program_execution_routes()
+        descriptors = build_gated_descriptors(self.manager.policy)
+        routes = []
+        for purpose in NetworkPurpose:
+            registry = (policy.registry.targets if purpose is NetworkPurpose.TARGET
+                        else policy.registry.mirrors)
+            ready = bool(self.target_route_identity and self.docker_endpoint)
+            reason = "prepared_route_rechecked_at_execution" if ready else "route_not_prepared"
+            status = ("target_ready" if purpose is NetworkPurpose.TARGET else "install_ready"
+                      ) if ready else "configured_unverified"
+            capacity = (policy.budget.target_capacity if purpose is NetworkPurpose.TARGET
+                        else policy.budget.install_capacity)
+            if not registry or not policy.sidecar_image:
+                status, reason = "unavailable", "gated_registry_or_sidecar_missing"
+            elif min(capacity.max_flow_init_deliveries,
+                     policy.budget.global_capacity.max_flow_init_deliveries,
+                     policy.caps_for(purpose).max_flow_init_deliveries) == 0 or min(
+                         capacity.max_output_bytes, policy.budget.global_capacity.max_output_bytes,
+                         policy.caps_for(purpose).max_output_bytes) == 0:
+                status, reason = "unavailable", "network_purpose_budget_disabled"
+            elif purpose is NetworkPurpose.INSTALL and policy.install_proxy is None:
+                status, reason = "unavailable", "install_proxy_unconfigured"
+            routes.append(ProgramExecutionRoute(
+                purpose=purpose.value, status=status, reason_code=reason,
+                tool_ids=[str(tool.tool_id) for tool in descriptors
+                          if OPERATION_PURPOSE[tool.operations[0]] is purpose],
+                selectors={name: {"ips": list(ips),
+                                  "ports": list(policy.target_ports.get(name, ()))
+                                  if purpose is NetworkPurpose.TARGET else None}
+                           for name, ips in registry.items()},
+                limits=policy.caps_for(purpose).model_dump(mode="json"),
+            ))
+        return routes
 
     def _held(self, key: str) -> bool:
         return key in self._open or key in self._opening
@@ -254,6 +298,14 @@ class GatedWindowExtension(ExecutionAdmission):
         if window is not None and not window.settled:
             return frozenset({window.network_name})
         return super().expected_networks(key)
+
+    def expected_network_ids(self, key: str) -> dict[str, str]:
+        window = self._open.get(key)
+        if window is not None and not window.settled and window.target_route_identity:
+            identity = window.target_route_identity
+            if identity.get("network_id"):
+                return {window.network_name: identity["network_id"]}
+        return {}
 
     def check_exec_allowed(self, key: str, *, invocation_id: str | None = None) -> None:
         """Only the trusted window holder may enter its execution delegate."""
@@ -307,6 +359,23 @@ class GatedWindowExtension(ExecutionAdmission):
             raise GatedNetworkError("holder_identity_required")
         validate_allowed_flows(allowed)
         self._check_scope_membership(allowed, caps.purpose)
+        route_identity = None
+        if caps.purpose is NetworkPurpose.TARGET:
+            from redteam.capability.gated_routing import TargetRouteError, validate_target_route
+            try:
+                route_identity = await validate_target_route(
+                    self.policy, self.run_docker, expected=self.target_route_identity,
+                )
+            except TargetRouteError as exc:
+                raise GatedNetworkError(str(exc)) from None
+        if self.docker_endpoint is not None:
+            code, out, _, timed_out, cut = await self.run_docker(
+                ("context", "inspect", self.docker_endpoint["context"], "--format",
+                 "{{.Endpoints.docker.Host}}"), None, 30, 8192,
+            )
+            if (code or timed_out or cut
+                    or out.decode().strip() != self.docker_endpoint["host"]):
+                raise GatedNetworkError("gated_docker_endpoint_changed")
 
         # Operator image selection/availability is checked before reserving
         # capacity or creating a room. Never pull a mutable default image.
@@ -329,6 +398,11 @@ class GatedWindowExtension(ExecutionAdmission):
             raise GatedNetworkError("window_open_in_progress")
         tag = opaque_window_tag(run_id, instance_id, epoch)
         network_name = tag.replace(OPAQUE_PREFIX, "gwn-", 1)
+        selected_network = (self.policy.target_network_id
+                            if caps.purpose is NetworkPurpose.TARGET else None)
+        if selected_network is not None:
+            assert route_identity is not None
+            network_name = route_identity["network_name"]
         session = uuid.uuid4().hex
         self._opening.add(key)
         grant: NetworkGrant | None = None
@@ -350,17 +424,46 @@ class GatedWindowExtension(ExecutionAdmission):
                 ),
             )
             await self._add_live_elements(tag, allowed, caps.duration_seconds)
-            created = await self._transition_network(room, network_name, internal)
+            if selected_network is not None:
+                await self._connect_network(room, selected_network)
+            else:
+                created = await self._transition_network(room, network_name, internal)
             await self._verify_open_posture_or_raise(tag, allowed=allowed)
-        except Exception:
-            await self._remove_sidecar(tag)
-            if created:
-                await self._remove_owned_network(network_name)
-            self._opening.discard(key)
-            if grant is not None:
-                await self.ledger.settle_window(
-                    window_id=grant.window_id, meter=None, verified_closed=False
-                )
+        except BaseException:
+            # Cancellation during reserve/attach is also an unknown outcome.
+            # Keep the key held until the shielded rollback settles the original grant.
+            async def rollback():
+                try:
+                    if room is not None:
+                        try:
+                            await self._apply_ruleset(
+                                tag, build_closed_ruleset(), atomic_reset=True,
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            await self._docker(("network", "disconnect",
+                                                selected_network or network_name, room),
+                                               None, 30.0, None)
+                        except Exception:
+                            pass
+                    await self._remove_sidecar(tag)
+                    if selected_network is None:
+                        await self._remove_owned_network(network_name)
+                finally:
+                    try:
+                        if grant is not None:
+                            await self.ledger.settle_window(
+                                window_id=grant.window_id, meter=None, verified_closed=False
+                            )
+                    finally:
+                        self._opening.discard(key)
+            try:
+                await asyncio.shield(asyncio.create_task(rollback()))
+            except Exception:
+                # The ledger finally path still holds the unknown reservation.
+                # Preserve the original stop/failure instead of replacing its cause.
+                pass
             raise
         window = OpenWindow(
             key=key, room=room, grant=grant, daemon_session_id=session,
@@ -370,6 +473,7 @@ class GatedWindowExtension(ExecutionAdmission):
             holder_invocation_id=holder_invocation_id,
             holder_work_id=holder_work_id,
             allowed=allowed,
+            target_route_identity=route_identity,
         )
         window.rpc_task = asyncio.ensure_future(self._rpc_loop(window))
         self._open[key] = window
@@ -394,19 +498,21 @@ class GatedWindowExtension(ExecutionAdmission):
         if code != 0:
             raise GatedNetworkError(f"sidecar_start_failed: {_short(err)}")
 
-    async def _apply_ruleset(self, tag: str, text: str) -> None:
+    async def _apply_ruleset(self, tag: str, text: str, *, atomic_reset: bool = False) -> None:
         """Replace our table; a missing table is fresh, not an error.
 
-        Delete-then-define keeps re-application idempotent: the delete is
-        best-effort (a missing table deletes nothing) and the define fails
-        loudly when the netns cannot take it.
+        Opening in network-none tolerates a missing table. Closing replaces
+        an existing table in one nft transaction so the barrier has no gap.
         """
-        await self._docker(
-            ("exec", tag, "nft", "delete", "table", "inet", TABLE_NAME),
-            None,
-            30.0,
-            None,
-        )
+        if atomic_reset:
+            # The barrier must remain until its replacement commits. Two
+            # separate delete/define commands would briefly remove filtering.
+            text = f"delete table inet {TABLE_NAME}\n" + text
+        else:
+            await self._docker(
+                ("exec", tag, "nft", "delete", "table", "inet", TABLE_NAME),
+                None, 30.0, None,
+            )
         code, _out, err = await self._docker(
             ("exec", "-i", tag, "nft", "-f", "-"), text.encode(), 30.0, None
         )
@@ -446,6 +552,11 @@ class GatedWindowExtension(ExecutionAdmission):
         for flow in allowed:
             if str(ipaddress.IPv4Address(flow.ip)) not in normalized:
                 raise GatedNetworkError("scope_unpinned")
+            if purpose is NetworkPurpose.TARGET:
+                for name, pins in self.policy.registry.targets.items():
+                    ports = self.policy.target_ports.get(name)
+                    if flow.ip in pins and ports is not None and flow.port not in ports:
+                        raise GatedNetworkError("gated_target_port_unselected")
 
 
     async def _network_owned(self, network_name: str) -> bool | None:
@@ -512,17 +623,31 @@ class GatedWindowExtension(ExecutionAdmission):
             if code != 0:
                 raise GatedNetworkError(f"network_create_failed: {_short(err)}")
             created = True
+        await self._connect_network(room, network_name)
+        return created
+
+    async def _connect_network(self, room: str, network: str) -> None:
         code, _o, err = await self._docker(
             ("network", "disconnect", "none", room), None, 30.0, None
         )
         if code != 0:
-            raise GatedNetworkError(f"none_disconnect_failed: {_short(err)}")
+            # A settled room has no attachments; prove absence instead of
+            # interpreting an arbitrary Docker error as a safe disconnect.
+            check, out, _, timed_out, cut = await self.run_docker(
+                ("inspect", "--format", "{{json .NetworkSettings.Networks}}", room),
+                None, 30.0, 65536,
+            )
+            try:
+                empty = json.loads(out) == {}
+            except ValueError:
+                empty = False
+            if check or timed_out or cut or not empty:
+                raise GatedNetworkError("none_disconnect_failed")
         code, _o, err = await self._docker(
-            ("network", "connect", network_name, room), None, 30.0, None
+            ("network", "connect", network, room), None, 30.0, None
         )
         if code != 0:
             raise GatedNetworkError(f"network_connect_failed: {_short(err)}")
-        return created
 
     async def _verify_open_posture_or_raise(
         self, tag: str, *, allowed: tuple[AllowedFlow, ...]
@@ -693,7 +818,9 @@ class GatedWindowExtension(ExecutionAdmission):
         self._emit_companion(window, settlement)
         window.settled = True
         if await self._container_present(window.container_tag):
-            await self._apply_ruleset(window.container_tag, build_closed_ruleset())
+            await self._apply_ruleset(
+                window.container_tag, build_closed_ruleset(), atomic_reset=True,
+            )
             await self._remove_sidecar(window.container_tag)
         # A removed sidecar skips the reset: nobody privileged remains in
         # that netns, the queue listener died with it, and settlement above
@@ -721,18 +848,18 @@ class GatedWindowExtension(ExecutionAdmission):
         created (owner label) may be removed. A failed detach raises loudly;
         the final label-checked removal is best-effort.
         """
-        if not window.network_created:
-            return
+        selected_network = (window.target_route_identity or {}).get("network_id")
         if await self._container_present(window.room):
             code, _out, err = await self._docker(
-                ("network", "disconnect", window.network_name, window.room),
+                ("network", "disconnect", selected_network or window.network_name, window.room),
                 None,
                 30.0,
                 None,
             )
             if code != 0:
                 raise GatedNetworkError(f"network_disconnect_failed: {_short(err)}")
-        await self._remove_owned_network(window.network_name)
+        if window.network_created:
+            await self._remove_owned_network(window.network_name)
         window.network_created = False
 
     async def _apply_barrier(self, tag: str) -> None:
@@ -876,6 +1003,10 @@ class GatedWindowExtension(ExecutionAdmission):
                 "session provenance"
             ),
         }
+        if window.target_route_identity is not None:
+            companion["target_route_identity"] = window.target_route_identity
+        if self.docker_endpoint is not None:
+            companion["docker_endpoint"] = self.docker_endpoint
         prior = self._companions.get(window_id)
         if prior is not None:
             for name in ("committed_deliveries", "metered_bytes", "charged_bytes"):

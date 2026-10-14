@@ -255,8 +255,9 @@ async def test_split_loop_atomizer_failure_commits_nothing(tmp_path):
         assert failed.value.kind == "budget"
         assert failed.value.diagnostic.code == "decision_repair_budget_exhausted"
         structured = [r for r in llm.requests if r["kind"] == "complete_structured"]
-        assert failed.value.attempts == len(structured) == 5
-        assert (await session.status())["usage"]["spent"] == 5
+        expected = 2 + session.deps.settings.decision_max_attempts  # plan + atomizer + repairs
+        assert failed.value.attempts == len(structured) == expected
+        assert (await session.status())["usage"]["spent"] == expected
         assert await state.list_tasks() == []
         assert await AttackGraphService(session.deps.graph_store).list_hypotheses() == []
         cursor = await state.transaction(lambda tx: tx.hypothesis_planner_cursor(), write=False)

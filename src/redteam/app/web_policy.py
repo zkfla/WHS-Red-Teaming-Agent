@@ -28,6 +28,7 @@ from redteam.capability.deployment import (
     provision,
     validate_session_access,
 )
+from redteam.capability.direct_target import TargetNetworkPreparation
 from redteam.capability.server_roles import role_spec
 from redteam.capability.servers.config import (
     HTTPMethod,
@@ -41,6 +42,7 @@ from redteam.core.config import EngagementConfig, load_engagement_config
 from redteam.core.environment import env_snapshot
 
 WEB_POLICY_KEY = "web_policy"
+KALI_NETWORK_MODE_KEY = "kali_network_mode"
 DEPLOYMENT_KEYS = frozenset({"mcp_deployment", "mcp_targets", "target_refs", "auth_sessions"})
 
 
@@ -62,6 +64,7 @@ _PERMISSION_DEFAULTS = {
     "allow_all_request_headers": False, "request_body_enabled": False,
     "response_body_max_chars": 0, "sessions": [], "kali_network_mode": "inherit",
     "kali_network_policy_path": None, "kali_network_policy_sha256": None,
+    "kali_network_preparation": None,
 }
 
 
@@ -80,9 +83,10 @@ class WebPolicySelection(BaseModel):
     request_body_enabled: bool = False
     response_body_max_chars: int = Field(default=0, ge=0, le=16384)
     sessions: list[WebSessionSelection] = Field(default_factory=list, max_length=60)
-    kali_network_mode: Literal["inherit", "closed", "configured"] = "inherit"
+    kali_network_mode: Literal["inherit", "closed", "configured", "prepare"] = "inherit"
     kali_network_policy_path: str | None = None
     kali_network_policy_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    kali_network_preparation: TargetNetworkPreparation | None = None
 
     @model_validator(mode="after")
     def explicit_subjects(self):
@@ -113,6 +117,8 @@ class WebPolicySelection(BaseModel):
                 raise ValueError("kali_network_policy_absolute_path_required")
         elif self.kali_network_policy_path or self.kali_network_policy_sha256:
             raise ValueError("kali_network_policy_not_selected")
+        if (self.kali_network_mode == "prepare") != (self.kali_network_preparation is not None):
+            raise ValueError("kali_network_preparation_selection_mismatch")
         if len({session.session_ref for session in self.sessions}) != len(self.sessions):
             raise ValueError("duplicate_session_ref")
         if any(session.origin not in self.origins for session in self.sessions):
@@ -239,11 +245,13 @@ def permissions_expand(before: WebPolicySelection, after: WebPolicySelection) ->
     return after.kali_network_mode != "closed" and any(
         getattr(before, key) != getattr(after, key) for key in (
             "kali_network_mode", "kali_network_policy_path", "kali_network_policy_sha256",
+            "kali_network_preparation",
         )
     )
 
 
-async def _networks(selection: WebPolicySelection, config: EngagementConfig) -> list[str]:
+async def selected_target_networks(selection: WebPolicySelection,
+                                   config: EngagementConfig) -> list[str]:
     """Pin explicitly selected hosts, never default to an unrestricted CIDR."""
     if config.scope.allowed_networks:
         return list(config.scope.allowed_networks)
@@ -303,7 +311,10 @@ async def prepare_web_deployment(path: Path) -> dict[str, str]:
     config = load_engagement_config(path)
     raw = config.metadata.get(WEB_POLICY_KEY)
     if raw is None:
-        return env_snapshot()  # Explicit manual/remote configuration stays selected.
+        environment = env_snapshot()
+        if config.metadata.get(KALI_NETWORK_MODE_KEY) == "closed":
+            environment["REDTEAM_GATED_NETWORK_POLICY_PATH"] = ""
+        return environment  # Explicit manual/remote configuration stays selected.
     selection = WebPolicySelection.model_validate(raw)
     root = path.resolve().parent / (path.stem + ".mcp")
     if config.metadata.get("mcp_deployment") is not None:
@@ -323,7 +334,7 @@ async def prepare_web_deployment(path: Path) -> dict[str, str]:
         # Scope is proved before DNS resolution; no request to a target is made.
         for origin in selection.origins:
             check_origin_scope(origin, config.scope)
-        networks = await _networks(selection, config)
+        networks = await selected_target_networks(selection, config)
         spec = selection.spec(networks)
         fingerprint = digest(encoded({"spec": spec.model_dump(mode="json"),
                                       "scope": config.scope.model_dump(mode="json")}))
@@ -342,7 +353,7 @@ async def prepare_web_deployment(path: Path) -> dict[str, str]:
             binding = DeploymentBinding.model_validate(generated.metadata["mcp_deployment"])
         EngagementStore(path).install_deployment(config, generated.metadata)
     environment = deployment_environment(spec, binding)
-    if selection.kali_network_mode == "closed":
+    if selection.kali_network_mode in {"closed", "prepare"}:
         environment["REDTEAM_GATED_NETWORK_POLICY_PATH"] = ""
     elif selection.kali_network_mode == "configured":
         assert selection.kali_network_policy_path is not None

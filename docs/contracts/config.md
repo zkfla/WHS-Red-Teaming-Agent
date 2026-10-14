@@ -111,19 +111,71 @@ Sessions use named principal/session references and either a bearer environment
 variable name or an existing private Playwright storage-state file, plus explicit
 paths. The form never accepts raw credential values or claims a login was verified.
 
-Kali communication is independently closed, inherited, or selected via an existing
-reviewed gated-network policy file. Selected policies require a pinned sidecar,
-bounded network budgets, registry names matching the chosen hosts, and no package
-mirror/install route. Startup checks each registry IP against its selected host's
-resolved addresses and snapshots the hash-bound file privately. This selection
-does not build a sidecar or prove its kernel prerequisites; those remain execution
-startup/runtime checks of the existing gate. Local shell execution stays network
-closed. Full web request permission never implies unrestricted shell networking.
+Kali communication is independently closed, inherited, imported from a legacy
+network selection, or explicitly prepared for the selected origins.
+Closed overrides inherited environment settings, including manual MCP selections
+(`metadata.kali_network_mode: closed`). The form's prepare mode records
+`metadata.web_policy.kali_network_mode: prepare` and a validated
+`kali_network_preparation` object. CLI startup consumes the same engagement metadata;
+neither path mutates `.env` or the global Docker context.
+
+`TargetNetworkPreparation` contains the Docker context and optional full bridge ID.
+Review shows these route inputs together with the selected origins and ports. At Run
+startup, preparation verifies the Docker endpoint, Linux engine, selected bridge,
+and running target-container attachment. It does not build a sidecar, inspect `nft`
+kernel features, contact the target, or prove reachability.
+
+The target shell tool checks its declared target and port against the prepared
+selection, approved target and common scope, then attaches the Kali workroom to the
+selected Docker bridge for that synchronous execution. It detaches the bridge when
+the execution ends. There is no packet-level IP/port allowlist, byte/flow quota,
+NFQUEUE daemon or gate sidecar; an arbitrary script can technically reach other
+addresses visible from that bridge. Local shell tools stay network closed.
 
 Conversation inputs receive configured, unverified server declarations before
 a Run and finalized catalog/health data while attached to a live Run. Declaration
 inspection performs no MCP or Docker startup. Planner and worker contexts receive
 the generated target permissions; tool discovery does not replace Control admission.
+
+## Kali target addresses and Docker routes
+
+Target origins and registry pins use their actual direct IPv4 addresses. No
+loopback, address, port or DNS alias translation is implicit. `127.0.0.0/8`
+inside a workroom names that workroom, not the operator machine or Docker host;
+target preparation refuses it. Remote Docker contexts route from the remote
+daemon, so an operator's local loopback is never interpreted as VM loopback.
+Choose a reachable host/interface address and port explicitly. If a host service
+listens only on loopback, a verified operator deployment/forwarding choice is
+needed; this implementation does not create a relay or claim its identity.
+
+For targets in another container on the same daemon, prepare mode additionally
+accepts `kali_network_preparation.target_network_id`: the existing bridge's full
+64-character Docker ID. Select the target's actual container IPv4 and listening
+port as the origin. The matching policy fields are `target_network_id` and
+`target_ports` (registry name to port tuples). HTTP transport and Kali container
+transport have separate reachability; choosing a bridge does not make its private
+IP reachable from a host-side HTTP provider.
+
+Preparation verifies each pinned IP against the selected bridge's current
+membership and running container's ID, image and attachment. The identity is
+part of the existing preparation fingerprint and is checked again before direct
+execution. Scope and logical approved target/port are checked separately;
+pins still must match selected host resolution. Changed Docker endpoint,
+container identity, pins, ports or selected network cannot use the original
+prepared environment. Historical prepared network identities that lack the new
+route binding are refused on resume; reports remain readable and no data is
+migrated or overwritten. Local closed policies retain their serialized defaults.
+
+Opening joins the selected bridge by ID. Closing detaches the workroom, but never
+removes the operator's bridge or target containers. A detached workroom with no
+data networks remains eligible for closed reuse; a same-named bridge with another
+ID is rejected. Only the synchronous target-run tool receives this route; background
+target jobs and package-install routes are not advertised.
+
+Catalog target schemas advertise selected registry names and ports. Model scripts
+retain zero capabilities: NET_ADMIN and raw-packet modes remain unavailable, and
+network selection does not authorize a privileged run. Native HTTP restrictions
+and common scope, ROE and approval checks remain separate from the direct Kali route.
 
 ## Secrets
 
@@ -159,8 +211,17 @@ policies. Legacy bindings omit the field and keep manual resume behavior.
 The optional policy `docker_context` pins workroom commands to the same
 Docker context used for preparation. Existing context-free manual policies
 retain their ambient Docker selection.
+Direct target preparation resolves and fingerprints the Docker endpoint used by
+the shell so readiness and execution cannot silently switch daemons. Closed local
+execution retains its prior behavior.
 
-Central Runs with a pinned LLM connection or execution environment also keep
+Target-network preparation records `network_environment_fingerprint` in the same
+component binding. Its private provider-cache record binds target IPs and ports,
+the selected bridge and target-container identity, Docker endpoint, and prepared
+shell identity. Resume rechecks that identity; changed selections cannot silently
+replace the original environment for that Run.
+
+Central Runs with a pinned LLM connection, execution or network environment also keep
 their component binding in the existing `run_configuration` record. Central
 resume and original collection read this identity before provider assembly;
 changed Go routing is refused and the original prepared Docker fingerprint is
@@ -248,3 +309,39 @@ For Anthropic, [omitted thinking](https://platform.claude.com/docs/en/build-with
 returns an empty thinking field with an encrypted signature that must be replayed
 unchanged. Plaintext thinking is rejected rather than scrubbed into a forged
 signed block. Provider-specific availability remains an API concern.
+
+## Program execution metadata and selection
+
+The existing shell-program discovery provider optionally implements
+`ProgramExecutionDiscovery.describe_execution_environment()` (metadata version
+1). Its Capability-owned snapshot describes local/target/install routes, actual
+descriptor IDs, selected pins/ports, purpose limits and unsupported privilege
+modes. Default local execution is network-none; an unconfigured target/install
+route is unavailable. Prepared route/context identities yield `target_ready`
+(or `install_ready` when a mirror/proxy and nonzero capacity exist). Legacy
+configured routes without those preparation identities stay
+`configured_unverified`. This is declaration/preparation metadata: it neither
+proves reachability nor grants permission. Unknown health remains unknown, and
+every action still passes Control, schema/scope binding and provider checks.
+Providers without the optional seam report unknown metadata; no target
+readiness is inferred from inventory or registration. Eligible catalog IDs
+filter route IDs for the current role.
+
+Worker context, Planner/atomizer payload, `agent.readiness` and `program.describe`
+share this projection. Passive context contains at most eight program samples
+and prioritizes callable/reference cards within its existing 100-card ceiling.
+Counts/status/search guidance retain the full inventory. Samples are not an
+allowlist: `program.list` and `tool.list_cards` still search/page the owner's
+whole current manifest/instance, and `program.describe` returns the executable
+and route constraints without claiming every program flag is usable.
+Already-supplied execution schemas need no discovery round. No per-program
+wrappers, title-based tool switch, extra registry or model approval polling is
+introduced; the native input bound and shared model-request ledger remain.
+
+`native-probes` is version 10 (worker prompt 5, strategy prompt 4). The explicit
+legacy single-stage profile is version 7 with the shared worker prompt 5.
+Discovery and role-readiness metadata contributions use version 2. Prompt
+hashes, role/tool and extension fingerprints continue to reject incompatible
+execution resume rather than changing historical Run selections. See
+[program evidence](evidence.md#program-originals-and-protected-network-linkage)
+for original-output delivery and the boundary between attempts and claims.

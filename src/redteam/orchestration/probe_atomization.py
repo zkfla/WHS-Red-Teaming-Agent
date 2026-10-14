@@ -29,12 +29,14 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from redteam.core.contracts.completion import (
     CompletionCriterion,
     completion_conditions,
+    contradictory_candidate_verdict,
     criterion_id,
 )
 from redteam.core.contracts.graph import HypothesisUpdate
 from redteam.core.contracts.specialists import ProbeLimits
 from redteam.core.ids import new_id
 from redteam.orchestration.diagnostics import DecisionDiagnostic, safe_feedback
+from redteam.orchestration.planner_context import PlannerContextRequest
 from redteam.orchestration.specialist_tasks import (
     HypothesisProbeProposal,
     ProbeTaskProposal,
@@ -163,6 +165,7 @@ class HypothesisPlanDraft(BaseModel):
     reason: str = Field(min_length=1)
     termination: Literal["continue", "held", "exhausted", "goal_achieved"] = "continue"
     resume_conditions: list[str] = Field(default_factory=list)
+    context_request: PlannerContextRequest | None = None
 
 
 class AtomizedProbeTask(ProbeTaskProposal):
@@ -295,6 +298,30 @@ def bind_plan(
                 hypothesis_ref, hypothesis_ref
             ) not in revisions:
                 raise AtomizationProposalError("plan_question_criterion_outside_purpose")
+        contradicted = contradictory_candidate_verdict(question.completion_criteria)
+        if contradicted is not None:
+            # Diagnosed here, before the second (atomizer) model request is ever
+            # made -- plan7d: a contradiction must not reach atomization.
+            code = "plan_question_contradictory_candidate_verdict"
+            location = "$.questions"
+            raise AtomizationProposalError(code, diagnostic=DecisionDiagnostic(
+                code=code, stage="hypothesis_planning", kind="validation", retryable=True,
+                cause_scope="model_input", owner="orchestration.probe_atomization",
+                location=location,
+                summary=safe_feedback(
+                    f"Question {safe_feedback(question.question_id, 80)} requires both "
+                    f"hypothesis_confirmed and hypothesis_refuted for the same candidate "
+                    f"'{safe_feedback(contradicted, 80)}'. A candidate has one status at a "
+                    "time; AND-ing both verdicts for it can never be satisfied. An 'If X "
+                    "then confirmed, else refuted' description does not change this -- "
+                    "every completion_criteria entry is required, not a branch. Split into "
+                    "two tasks only if a different purpose genuinely needs each verdict, or "
+                    "keep only the one verdict this purpose actually proves.",
+                ),
+                repair_condition="Keep at most one of hypothesis_confirmed/hypothesis_refuted "
+                                 f"per candidate ('{contradicted}') on this question.",
+                validation_issues=[{"rule": code, "location": location}],
+            ))
         if question.source_task_id:
             source = snapshot.tasks.get(question.source_task_id)
             if source is None or source.result is None or (
@@ -485,8 +512,59 @@ def build_atomizer_input(
         # existing candidate; the prospective revision lives in versions[id].
         entry["proposed_revision"] = versions[update.hypothesis.hypothesis_id]
         strategy_updates.append(entry)
+    candidate_ids = {issued.get(ref, ref) for question in questions
+                     for ref in question.hypothesis_revisions}
+    candidate_ids.update(update.hypothesis.hypothesis_id for update in updates)
+    candidate_ids.update(ref for update in updates
+                         for ref in update.hypothesis.source_hypothesis_ids)
+    task_ids = {question.source_task_id for question in questions if question.source_task_id}
+    targets = {ref for question in questions for ref in question.target_node_ids}
+    principals = {ref for question in questions for ref in question.principal_refs}
+    evidence_ids = {ref for question in questions for ref in question.evidence_ids}
+    for update in updates:
+        evidence_ids.update(update.hypothesis.supporting_evidence_ids)
+        evidence_ids.update(update.hypothesis.refuting_evidence_ids)
+        if update.review_evidence_id:
+            evidence_ids.add(update.review_evidence_id)
+    tasks = [item for item in payload.get("investigations", [])
+             if item["task_id"] in task_ids or (
+                 item.get("status") in {"pending", "ready", "running", "blocked"}
+                 and targets.intersection(item.get("related_attack_graph_node_ids", [])))]
+    # The hydrated handoff contains source ancestry; retain it transitively.
+    changed = True
+    while changed:
+        ancestors = {ref for item in tasks for ref in (
+            item.get("source_task_id"), *item.get("dependency_task_ids", [])) if ref}
+        missing = [item for item in payload.get("investigations", [])
+                   if item["task_id"] in ancestors and item not in tasks]
+        tasks.extend(missing)
+        changed = bool(missing)
+    evidence_ids.update(ref for item in tasks for ref in (
+        *item.get("evidence_ids", []), *(item.get("result") or {}).get("evidence_ids", [])))
+    related_task_ids = {item["task_id"] for item in tasks}
+    # Explicit handoff: never inherit investigation history, ledger or unrelated receipts.
+    selected = {key: payload[key] for key in (
+        "mission", "constraints", "operator_instructions", "role_readiness", "tools_by_role",
+        "tool_cards", "program_execution_environment", "program_manifest_status",
+        "workroom_status", "tool_cards_total", "tool_cards_truncated", "tool_cards_guidance",
+        "probe_limits", "max_tasks", "remaining_budget", "related_work", "related_executions",
+    ) if key in payload}
     return {
-        **payload,
+        **selected,
+        "known_target_ids": sorted(targets),
+        "registered_principal_refs": sorted(principals),
+        "candidates": [item for item in payload.get("candidates", [])
+                       if item["hypothesis_id"] in candidate_ids],
+        "investigations": tasks,
+        "execution_history": [item for item in payload.get("execution_history", [])
+                              if item["task_id"] in related_task_ids],
+        "evidence_validity": [item for item in payload.get("evidence_validity", [])
+                              if item["evidence_id"] in evidence_ids],
+        "original_observations": {
+            "records": [item for item in payload.get("original_observations", {}).get("records", [])
+                        if item["evidence_id"] in evidence_ids],
+            "note": "Bounded related original windows, not independent verdict receipts.",
+        },
         "questions": [{**question.model_dump(mode="json"),
                        "completion_criteria": completion_conditions(question)}
                       for question in questions],
@@ -499,5 +577,6 @@ def build_atomizer_input(
             "resume_conditions": list(plan.resume_conditions),
         },
         "issued_candidate_ids": dict(issued),
-        "candidate_revisions": dict(versions),
+        "candidate_revisions": {ref: versions[ref] for ref in sorted(candidate_ids)
+                                if ref in versions},
     }

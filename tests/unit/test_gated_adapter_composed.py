@@ -317,7 +317,7 @@ def test_composed_gated_run_job_install_bodies() -> None:
         foreign_result = await adapter.invoke_contextual(foreign_inv)
         assert foreign_result.success is False
         assert foreign_result.error is not None
-        assert foreign_result.error.code == "gated_unknown_registry_name"
+        assert foreign_result.error.code == "gated_approved_target_mismatch"
         assert window.opened == opened_before + 3
         assert len(evidence.records) >= 2
 

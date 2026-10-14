@@ -153,7 +153,6 @@ async def test_cli_resume_reuses_original_approval_action_and_budget(tmp_path, m
         return result
     monkeypatch.setattr(run_command, "build_application", with_explicit_test_doubles)
     monkeypatch.setattr(run_command, "prepare_shell_runtime", AsyncMock(return_value=None))
-    monkeypatch.setattr(run_command, "build_gated_provider_config", lambda _: None)
     args = SimpleNamespace(run_id=str(original.run_id), instance=None, json=True,
                            workers=None, max_steps=None)
     async with AsyncExitStack() as stack:

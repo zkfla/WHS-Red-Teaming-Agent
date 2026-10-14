@@ -263,21 +263,89 @@ class GraphTransaction:
         )]
 
     def incident_edges(
-        self, node_id: GraphNodeId, *, direction: Direction = "any",
+        self, node_id: GraphNodeId, *, direction: Direction = "any", limit: int | None = None,
     ) -> list[GraphEdge]:
         if direction not in {"in", "out", "any"}:
             raise ValueError("graph_direction_invalid")
+        if limit is not None and (type(limit) is not int or not 1 <= limit <= 1025):
+            raise ValueError("graph_read_limit_invalid")
         # Separate indexed branches avoid scanning a whole namespace for OR.
         queries: list[str] = []
-        args: list[str] = []
+        args: list[Any] = []
         for selected, column in (("out", "source_id"), ("in", "target_id")):
             if direction in {selected, "any"}:
                 queries.append("SELECT edge_id,payload FROM state_graph_edges "
                                f"WHERE namespace=? AND {column}=?")
                 args.extend((self.namespace, str(node_id)))
-        return [self.check_edge(GraphEdge.model_validate_json(row[0])) for row in self.db.execute(
-            "SELECT payload FROM (" + " UNION ".join(queries) + ") ORDER BY edge_id", args,
-        )]
+        sql = "SELECT payload FROM (" + " UNION ".join(queries) + ") ORDER BY edge_id"
+        if limit is not None:
+            sql += " LIMIT ?"
+            args.append(limit)
+        return [self.check_edge(GraphEdge.model_validate_json(row[0]))
+                for row in self.db.execute(sql, args)]
+
+    def context_neighborhood(
+        self, roots: tuple[str, ...], *, hops: int = 1, max_nodes: int = 32,
+        max_edges: int = 64,
+    ) -> tuple[list[GraphNode], list[GraphEdge], bool]:
+        """Bounded local-ID read for a captured context, without whole-graph materialization.
+
+        The last flag means the requested neighborhood may be incomplete. It is
+        not an exact omitted-node count. Existing unrestricted graph reads keep
+        their original contract.
+        """
+        if (type(hops) is not int or not 0 <= hops <= 3
+                or type(max_nodes) is not int or not 1 <= max_nodes <= 128
+                or type(max_edges) is not int or not 1 <= max_edges <= 256
+                or len(roots) > min(16, max_nodes)):
+            raise ValueError("graph_context_limits_invalid")
+        nodes: dict[str, GraphNode] = {}
+        edges: dict[str, GraphEdge] = {}
+        queue: deque[tuple[str, int]] = deque()
+        truncated = False
+        for root in sorted(set(roots)):
+            if "\x1f" in root:
+                raise ValueError("graph_context_namespace_invalid")
+            node = self.get_local_node(GraphNodeId(root))
+            if node is None:
+                raise ValueError("graph_context_root_not_found")
+            nodes[root] = node
+            queue.append((root, 0))
+        while queue:
+            current, depth = queue.popleft()
+            if depth >= hops:
+                continue
+            remaining = max_edges - len(edges)
+            if remaining <= 0:
+                truncated = True
+                break
+            found = self.incident_edges(GraphNodeId(self._prefix + current), limit=max_edges + 1)
+            if len(found) > max_edges:
+                truncated = True
+            for edge in found[:max_edges]:
+                if str(edge.id) in edges:
+                    continue
+                if len(edges) >= max_edges:
+                    truncated = True
+                    break
+                ends = [str(edge.source_id)[len(self._prefix):],
+                        str(edge.target_id)[len(self._prefix):]]
+                missing = set(ends) - nodes.keys()
+                if len(nodes) + len(missing) > max_nodes:
+                    truncated = True
+                    continue
+                for identity in sorted(missing):
+                    node = self.get_local_node(GraphNodeId(identity))
+                    if node is None:
+                        raise ValueError("graph_context_endpoint_not_found")
+                    nodes[identity] = node
+                    queue.append((identity, depth + 1))
+                edges[str(edge.id)] = edge.model_copy(update={
+                    "id": GraphEdgeId(str(edge.id)[len(self._prefix):]),
+                    "source_id": GraphNodeId(ends[0]), "target_id": GraphNodeId(ends[1]),
+                })
+        return ([nodes[key] for key in sorted(nodes)],
+                sorted(edges.values(), key=lambda edge: str(edge.id)), truncated)
 
     def neighbors(self, node_id: GraphNodeId) -> list[GraphNode]:
         rows = self.db.execute(

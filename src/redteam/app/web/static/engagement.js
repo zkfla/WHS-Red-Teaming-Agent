@@ -40,7 +40,7 @@ export function setupEngagement(afterSave) {
   }
 
   function reviewBody() {
-    const nodes = [...summaryNode(preview)];
+    const nodes = [...summaryNode(preview, model.fields)];
     confirmScope = h("input", { type: "checkbox", onchange: refreshSave });
     confirmWide = preview.scope_expanded ? h("input", { type: "checkbox", onchange: refreshSave }) : null;
     nodes.push(h("label", { class: "check" }, confirmScope, "위 범위가 허용된 점검 대상임을 확인했습니다."));
@@ -59,9 +59,11 @@ export function setupEngagement(afterSave) {
       const customOnly = new Set(["web_methods", "web_query_keys", "web_all_query_keys",
         "web_request_headers", "web_all_request_headers", "web_request_body"]);
       current.fields.filter((name) => {
-        if (current.id === "permissions" && draft.web_policy_mode === "manual") return false;
+        if (current.id === "permissions" && draft.web_policy_mode === "manual"
+          && name !== "kali_network_mode") return false;
         if (customOnly.has(name)) return draft.web_permissions === "custom";
         if (name === "kali_network_policy_path") return draft.kali_network_mode === "configured";
+        if (name === "kali_network_preparation") return draft.kali_network_mode === "prepare";
         return true;
       }).forEach((name) => nodes.push(fieldNode(byName.get(name), draft, (rebuild) => {
         if (rebuild || ["web_policy_mode", "web_permissions", "kali_network_mode"].includes(name)) paint();

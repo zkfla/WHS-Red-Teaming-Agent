@@ -21,12 +21,14 @@ from redteam.app.cli.display import safe_text
 from redteam.app.cli.engagement_form import QUESTIONS, merge_edit
 from redteam.app.web_policy import (
     DEPLOYMENT_KEYS,
+    KALI_NETWORK_MODE_KEY,
     WEB_POLICY_KEY,
     WebPolicySelection,
     WebSessionSelection,
     permissions_expand,
     validate_kali_network_policy,
 )
+from redteam.capability.direct_target import TargetNetworkPreparation
 from redteam.capability.servers.config import HTTPMethod, read_methods
 from redteam.core.config import EngagementConfig, OrchestrationConfig, load_engagement_config
 from redteam.intake.models import CANONICAL_CAPABILITIES, EngagementDraft
@@ -55,14 +57,16 @@ class WebEngagementDraft(EngagementDraft):
     web_request_body: bool = False
     web_response_body_chars: int = Field(default=0, ge=0, le=16384)
     web_sessions: list[WebSessionSelection] = Field(default_factory=list)
-    kali_network_mode: Literal["inherit", "closed", "configured"] = "inherit"
+    kali_network_mode: Literal["inherit", "closed", "configured", "prepare"] = "inherit"
     kali_network_policy_path: str | None = None
+    kali_network_preparation: TargetNetworkPreparation | None = None
 
 
 WEB_PERMISSION_FIELDS = (
     "web_permissions", "web_methods", "web_query_keys", "web_all_query_keys",
     "web_request_headers", "web_all_request_headers", "web_request_body",
     "web_response_body_chars", "web_sessions", "kali_network_mode", "kali_network_policy_path",
+    "kali_network_preparation",
 )
 
 FIELD_ORDER = (
@@ -122,6 +126,7 @@ def field_definitions() -> list[dict[str, Any]]:
             "web_response_body_chars": "모델에 제공할 응답 본문 최대 글자 수 (0: 제공 안 함)",
             "web_sessions": "테스트 계정 session", "kali_network_mode": "Kali 대상 통신",
             "kali_network_policy_path": "검토된 Kali 네트워크 정책 파일의 절대 경로",
+            "kali_network_preparation": "Kali 대상 네트워크 준비 설정",
         }
         item: dict[str, Any] = {"name": name, "label": labels.get(name, QUESTIONS.get(name)),
                                 "kind": kind}
@@ -143,8 +148,19 @@ def field_definitions() -> list[dict[str, Any]]:
         if name == "kali_network_mode":
             item.update(default="closed", choices=[
                 {"value": "closed", "label": "차단 — Kali 로컬 분석만"},
-                {"value": "configured", "label": "허용 — 검토된 대상 통신 정책 사용"},
+                {"value": "configured", "label": "직접 연결 — 기존 대상 설정 가져오기"},
+                {"value": "prepare", "label": "직접 연결 — 선택한 Docker 대상 사용"},
                 {"value": "inherit", "label": "기존 실행 환경 설정 유지"},
+            ])
+        if name == "kali_network_preparation":
+            item.update(kind="object", default=TargetNetworkPreparation().model_dump(), fields=[
+                {"name": key, "label": prop["title"],
+                 "kind": prop.get("type", "string"), "default": prop.get("default"),
+                 "min": (prop["exclusiveMinimum"] + 1 if "exclusiveMinimum" in prop
+                          else prop.get("minimum")),
+                 "nullable": any(part.get("type") == "null" for part in prop.get("anyOf", [])),
+                 "max": prop.get("maximum")}
+                for key, prop in TargetNetworkPreparation.model_json_schema()["properties"].items()
             ])
         if name in {"allowed_capabilities", "denied_capabilities"}:
             item["options"] = list(CANONICAL_CAPABILITIES)
@@ -170,10 +186,17 @@ def _items(value: Any) -> list[str]:
 def coerce_field(name: str, value: Any) -> Any:
     if name in {"web_permissions", "kali_network_mode"}:
         choices = ({"read_only", "custom", "full"} if name == "web_permissions"
-                   else {"inherit", "closed", "configured"})
+                   else {"inherit", "closed", "configured", "prepare"})
         if not isinstance(value, str) or value not in choices:
             raise ValueError("invalid_choice")
         return value
+    if name == "kali_network_preparation":
+        if value is None:
+            return None
+        try:
+            return TargetNetworkPreparation.model_validate(value)
+        except (ValueError, TypeError):
+            raise ValueError("invalid_network_preparation") from None
     if name == "web_sessions":
         if not isinstance(value, list) or len(value) > 60:
             raise ValueError("invalid_type")
@@ -288,6 +311,9 @@ def summarize(config: EngagementConfig) -> dict[str, Any]:
     budget = config.execution_budget
     return {
         "web_policy": config.metadata.get(WEB_POLICY_KEY),
+        "kali_network_mode": (config.metadata.get(WEB_POLICY_KEY) or {}).get(
+            "kali_network_mode", config.metadata.get(KALI_NETWORK_MODE_KEY, "inherit")
+        ),
         "name": safe_text(config.name, limit=200),
         "description": safe_text(config.description, limit=2000),
         "objective": safe_text(config.metadata.get("objective") or "", limit=1000),
@@ -339,6 +365,8 @@ class EngagementStore:
         problems = _rule_problems(config)
         try:
             draft = engagement_config_to_draft(config).model_dump()
+            if config.metadata.get(KALI_NETWORK_MODE_KEY) == "closed":
+                draft["kali_network_mode"] = "closed"
             raw = config.metadata.get(WEB_POLICY_KEY)
             if raw is not None:
                 selection = WebPolicySelection.model_validate(raw)
@@ -355,6 +383,8 @@ class EngagementStore:
                     web_sessions=[item.model_dump() for item in selection.sessions],
                     kali_network_mode=selection.kali_network_mode,
                     kali_network_policy_path=selection.kali_network_policy_path,
+                    kali_network_preparation=(selection.kali_network_preparation.model_dump()
+                                              if selection.kali_network_preparation else None),
                 )
             else:
                 draft.update(web_policy_mode="manual", web_paths=[])
@@ -395,21 +425,36 @@ class EngagementStore:
         previous_selection = existing.metadata.get(WEB_POLICY_KEY) if existing else None
         metadata = dict(config.metadata)
         if draft.web_policy_mode == "manual":
-            if draft.web_permissions != "read_only" or draft.kali_network_mode == "configured" \
-                    or draft.web_sessions:
+            if (
+                draft.web_permissions != "read_only"
+                or draft.kali_network_mode in {"configured", "prepare"}
+                or draft.web_sessions
+            ):
                 raise EngagementError("invalid", problems=[
                     {"field": "web_policy_mode", "code": "automatic_policy_required"},
                 ])
             selection_data = None
             metadata.pop(WEB_POLICY_KEY, None)
+            if draft.kali_network_mode == "closed":
+                metadata[KALI_NETWORK_MODE_KEY] = "closed"
+            else:
+                metadata.pop(KALI_NETWORK_MODE_KEY, None)
         else:
+            metadata.pop(KALI_NETWORK_MODE_KEY, None)
             try:
                 network_path, network_hash = None, None
                 if draft.kali_network_mode == "configured":
                     network_path = draft.kali_network_policy_path
                     if not network_path:
                         raise ValueError("kali_network_policy_required")
-                    network_hash, _ = validate_kali_network_policy(network_path, draft.web_origins)
+                    try:
+                        network_hash, _ = validate_kali_network_policy(
+                            network_path, draft.web_origins
+                        )
+                    except (OSError, ValueError):
+                        raise EngagementError("invalid", problems=[
+                            {"field": "kali_network_policy_path", "code": "kali_policy_invalid"},
+                        ]) from None
                 custom = draft.web_permissions == "custom"
                 selection = WebPolicySelection(
                     mode=draft.web_policy_mode, origins=draft.web_origins, paths=draft.web_paths,
@@ -424,6 +469,9 @@ class EngagementStore:
                     sessions=draft.web_sessions,
                     kali_network_mode=draft.kali_network_mode,
                     kali_network_policy_path=network_path, kali_network_policy_sha256=network_hash,
+                    kali_network_preparation=(draft.kali_network_preparation
+                                              or TargetNetworkPreparation()
+                                              if draft.kali_network_mode == "prepare" else None),
                 )
                 from redteam.capability.deployment import check_origin_scope
                 for origin in selection.origins:
@@ -446,6 +494,10 @@ class EngagementStore:
             raise EngagementError("invalid", problems=problems)
         changes = scope_diff(before, draft) if before is not None else {}
         added = any(added for added, _removed in changes.values())
+        previous_network_mode = (previous_selection.get("kali_network_mode", "inherit")
+                                 if previous_selection else existing.metadata.get(
+                                     KALI_NETWORK_MODE_KEY, "inherit") if existing else "inherit")
+        added = added or (previous_network_mode == "closed" and draft.kali_network_mode != "closed")
         if previous_selection is not None and selection_data is not None:
             before_policy = WebPolicySelection.model_validate(previous_selection)
             after_policy = WebPolicySelection.model_validate(selection_data)

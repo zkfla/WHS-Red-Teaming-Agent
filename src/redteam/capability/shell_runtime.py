@@ -83,6 +83,7 @@ async def prepare_shell_runtime(
     policy_path: str | None, *, auto_setup: bool = True,
     progress: Callable[[str], None] | None = None,
     expected_fingerprint: str | None = None,
+    docker_context: str | None = None,
 ) -> ShellRuntime | None:
     """Prepare Docker only at execution startup, then use the pure assembly.
 
@@ -95,11 +96,18 @@ async def prepare_shell_runtime(
                 "This run requires its prepared execution environment; "
                 "enable REDTEAM_SHELL_AUTO_SETUP to resume it."
             )
-        return build_shell_runtime(policy_path)
+        runtime = build_shell_runtime(policy_path)
+        if docker_context is not None and (
+            runtime is None or runtime.policy.docker_context != docker_context
+        ):
+            raise MCPConfigurationError("Manual shell policy must pin the selected Docker context.")
+        return runtime
     from redteam.capability.shell_preparation import prepare_shell_policy
 
+    options = {"docker_context": docker_context} if docker_context is not None else {}
     prepared = await prepare_shell_policy(
         policy_path, progress=progress, expected_fingerprint=expected_fingerprint,
+        **options,
     )
     runtime = build_shell_runtime(
         None, policy=prepared.policy, program_manifest_path=prepared.manifest_path,

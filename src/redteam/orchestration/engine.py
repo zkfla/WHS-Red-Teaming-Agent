@@ -991,6 +991,7 @@ class InvestigationEngine:
             ],
             "program_manifest_status": card_status.get(PROGRAM_MANIFEST_STATUS_KEY, ""),
             "workroom_status": card_status.get(WORKROOM_STATUS_KEY, ""),
+            "program_execution_environment": card_status["program_execution_environment"],
             "tool_cards_total": card_status.get("cards_total", 0),
             "tool_cards_truncated": card_status.get("cards_truncated", False),
             "tool_cards_counts": card_status.get("cards_counts", {}),

@@ -40,14 +40,14 @@ override requires manual setup or an explicitly configured Docker context.
 The workroom's existing resource limits, per-instance ownership, job
 recovery and network admission remain in force. Image building requires
 package downloads; this does not grant investigation scripts network
-access. Target access still requires the configured gated network policy.
+access. Target access requires the direct target route selected for the investigation.
 
 ## Hard invariants (do not relax here)
 
 - Local execution creates containers with `--network none`. There is no
-  networking switch in `ShellWorkroomPolicy`. Gated execution requires the
-  separate operator-owned network policy and a validated per-instance gate
-  namespace, assembled through the provider's execution admission extension.
+  networking switch in `ShellWorkroomPolicy`. Direct target execution uses the
+  execution-admission extension to attach the selected bridge for one synchronous
+  target run and detach it afterward.
   Without that explicit assembly, target and installation egress stay closed.
 - Labels use `io.whs-redteam.shell-workroom.*`, disjoint from the
   execution MCP `io.whs-redteam.execution.*` labels, so the execution
@@ -212,8 +212,8 @@ assembler skips the helper and the catalog honestly has no shell tools.
 - The isolation test inspects active interfaces, IPv4/IPv6 addresses and
   routes, not the number of dormant kernel tunnel devices. It sends no
   packets to external targets.
-- Gated installation also needs a supporting Docker host kernel; an image
-  build alone is insufficient. See [gate prerequisites](../gate-sidecar/README.md).
+- Direct target execution does not require nftables, NFQUEUE or a sidecar image.
+  Package installation routes are not part of the direct target connection.
 
 ## Assembly seam (catalog owner)
 

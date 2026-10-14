@@ -56,10 +56,8 @@ from redteam.app.cli.conversation import ConversationAssistant, catalog_tool_lab
 from redteam.capability.settings import (
     MCPConfigurationError,
     automatic_shell_setup_from_environment,
-    gated_network_policy_path_from_environment,
     shell_policy_path_from_environment,
 )
-from redteam.capability.shell_assembly import build_gated_provider_config
 from redteam.capability.shell_runtime import prepare_shell_runtime
 from redteam.core.config import AppConfig
 from redteam.core.contracts.events import EventEnvelope, EventType
@@ -806,6 +804,9 @@ async def build(
     before this was split out.
     """
     execution_fingerprint = None
+    network_fingerprint = None
+    from redteam.app.kali_preparation import kali_selection, prepare_kali_network
+    selection = kali_selection(config.engagement)
     if original_stores is not None:
         from redteam.llm.opencode_go_config import llm_connection_fingerprint_for_config
         from redteam.orchestration.component_binding import RuntimeComponentBinding
@@ -823,20 +824,25 @@ async def build(
         execution_fingerprint = (
             original_binding.execution_environment_fingerprint if original_binding else None
         )
+        network_fingerprint = (
+            original_binding.network_environment_fingerprint if original_binding else None
+        )
+    network_settings = selection.kali_network_preparation if selection is not None else None
+    preparation_options = ({"docker_context": network_settings.docker_context}
+                           if network_settings and network_settings.docker_context else {})
     shell_runtime = await prepare_shell_runtime(
         shell_policy_path_from_environment(),
         auto_setup=(automatic_shell_setup_from_environment()
                     if original_stores is None or execution_fingerprint is not None else False),
         progress=eprint, expected_fingerprint=execution_fingerprint,
+        **preparation_options,
     )
-    gated_provider_config = build_gated_provider_config(
-        gated_network_policy_path_from_environment()
+    prepared_network = await prepare_kali_network(
+        config.engagement, shell_runtime, selection=selection,
+        auto_setup=automatic_shell_setup_from_environment(), progress=eprint,
+        expected_fingerprint=network_fingerprint,
     )
-    if gated_provider_config is not None and shell_runtime is None:
-        raise MCPConfigurationError(
-            "gated network policy requires the shell provider: set "
-            "REDTEAM_SHELL_POLICY_PATH"
-        )
+    direct_target_provider = prepared_network.provider if prepared_network is not None else None
     if not config.capability.mcp_servers and shell_runtime is None:
         eprint(
             "WARNING: no MCP servers configured -- this run has an empty tool catalog "
@@ -859,10 +865,8 @@ async def build(
         component_options["builtin_concurrency"] = dict(shell_runtime.concurrency)
         component_options["builtin_output_limits"] = dict(shell_runtime.output_limits)
         component_options["shell_programs"] = shell_runtime.program_source
-    if gated_provider_config is not None:
-        # ONLY when the operator network policy is configured (absent means
-        # closed): the composition root validates the same builtin adapter.
-        component_options["gated_shell"] = (shell_runtime, gated_provider_config)
+    if direct_target_provider is not None:
+        component_options["direct_target_shell"] = (shell_runtime, direct_target_provider)
     if central_state is not None:
         from redteam.core.ids import EngagementId
         identity = EngagementId(central_state.engagement_id)
@@ -885,6 +889,13 @@ async def build(
         assert deps.component_binding is not None
         deps = replace(deps, component_binding=deps.component_binding.model_copy(update={
             "execution_environment_fingerprint": shell_runtime.environment_fingerprint,
+        }))
+    if prepared_network is not None and (
+        original_stores is None or network_fingerprint is not None
+    ):
+        assert deps.component_binding is not None
+        deps = replace(deps, component_binding=deps.component_binding.model_copy(update={
+            "network_environment_fingerprint": prepared_network.fingerprint,
         }))
     return engagement, deps
 

@@ -2,7 +2,7 @@ name: test
 description: ''
 scope:
   allowed_hosts:
-  - 127.0.0.1:80
+  - 172.18.0.4:5000
   allowed_domains: []
   allowed_networks: []
   denied_hosts: []
@@ -47,23 +47,27 @@ metadata:
     version: 1
     mode: site
     origins:
-    - http://127.0.0.1:80
+    - http://172.18.0.4:5000
     paths: []
     permissions: full
     response_body_max_chars: 4000
+    kali_network_mode: prepare
+    kali_network_preparation:
+      docker_context: null
+      target_network_id: dc8ebdd339bd02996873d7f1ad72d7acffddad5292c1e0d28d1c2a827e6df323
   target_refs:
-    127.0.0.1:80: target_e79d0b65276c07c7
+    172.18.0.4:5000: target_54a1566bce16ae83
   mcp_deployment:
-    source_path: /Users/yuyechan/folder/claude/REDRED/WHS-Red-Teaming-Agent/engagements/dd.mcp/eb9e8b70fab614c2727bd4188094e17914275f7dbf9887e3a770107667028125/deployment.json
-    source_sha256: 12449e39087546adb5d78b8a690ec6bd665b709c1a3c9e500776513868b87558
-    policy_path: /Users/yuyechan/folder/claude/REDRED/WHS-Red-Teaming-Agent/engagements/dd.mcp/eb9e8b70fab614c2727bd4188094e17914275f7dbf9887e3a770107667028125/policy.json
-    policy_sha256: a67c53539e60a9f40e410ff43cede35edea963543d7e531246d6c68b303e9e92
+    source_path: /Users/yuyechan/folder/claude/REDRED/WHS-Red-Teaming-Agent/engagements/dd.mcp/4bc313b8006cdbff85729f54e80c652f62924753dfcd5f7cc2ee17c8f95c2503/deployment.json
+    source_sha256: fd5b3138de583b1981055f893fe87790d35bfd266f2a60ef24c7d557caa51adb
+    policy_path: /Users/yuyechan/folder/claude/REDRED/WHS-Red-Teaming-Agent/engagements/dd.mcp/4bc313b8006cdbff85729f54e80c652f62924753dfcd5f7cc2ee17c8f95c2503/policy.json
+    policy_sha256: b22ed45a5d5bda1fd3198032f0b2f003b609d29d7ef7650526929d18909a98e0
   auth_sessions:
-    127.0.0.1:80: []
+    172.18.0.4:5000: []
   mcp_targets:
-    target_e79d0b65276c07c7:
-      host: 127.0.0.1
-      origin: http://127.0.0.1:80
+    target_54a1566bce16ae83:
+      host: 172.18.0.4
+      origin: http://172.18.0.4:5000
       allowed_paths: []
       allow_all_paths: true
       allowed_methods:

@@ -10,8 +10,10 @@ function join(values) {
   return values && values.length ? values.join(", ") : "";
 }
 
-export function summaryNode(preview) {
+export function summaryNode(preview, fields = []) {
   const s = preview.summary;
+  const networkLabels = new Map((fields.find((field) => field.name === "kali_network_preparation")?.fields || [])
+    .map((field) => [field.name, field.label]));
   const parts = [h("dl", { class: "review" },
     row("이름", s.name), row("설명", s.description), row("목표", s.objective),
     row("허용 호스트", join(s.scope.allowed_hosts)),
@@ -33,10 +35,14 @@ export function summaryNode(preview) {
       ...row("JSON·form 본문", s.web_policy.permissions === "full" || s.web_policy.request_body_enabled ? "허용" : "차단"),
       ...row("응답 본문 분석", s.web_policy.response_body_max_chars ? `마스킹 후 최대 ${s.web_policy.response_body_max_chars}글자` : "본문 제공 안 함"),
       ...row("테스트 계정", (s.web_policy.sessions || []).map((item) => `${item.session_ref} (${item.principal_ref})`).join(", ") || "없음"),
-      ...row("Kali 대상 통신", s.web_policy.kali_network_mode === "configured" ? "검토된 대상 통신 정책 사용 — 실제 실행 준비는 Run 시작 시 확인"
+      ...row("Kali 대상 통신", s.web_policy.kali_network_mode === "prepare" ? "선택한 Docker 대상에 직접 연결 — Run 시작 시 route 확인"
+        : s.web_policy.kali_network_mode === "configured" ? "기존 대상 설정을 가져와 직접 연결 — Run 시작 시 route 확인"
         : s.web_policy.kali_network_mode === "closed" ? "차단" : "기존 실행 환경 설정 유지"),
+      ...(s.web_policy.kali_network_preparation ? Object.entries(s.web_policy.kali_network_preparation)
+        .flatMap(([key, value]) => row(networkLabels.get(key) || key,
+          value == null ? "자동/현재 설정" : String(value))) : []),
       ...row("실행 승인", "현재 조사에 설정된 승인 규칙 적용"),
-    ] : []),
+    ] : row("Kali 대상 통신", s.kali_network_mode === "closed" ? "차단" : "기존 실행 환경 설정 유지")),
     row("허용 기능", join(s.allowed_capabilities) || "제한 없음"),
     row("금지 기능", join(s.denied_capabilities)),
     row("금지 행동", join(s.denied_operations)),

@@ -13,9 +13,17 @@ this module only *consumes* those types.
 from __future__ import annotations
 
 import ipaddress
+from typing import Annotated
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from redteam.capability.shell_policy import validate_pinned_image
 from redteam.core.contracts.network import NetworkBudget, NetworkPurpose, WindowCaps
@@ -141,6 +149,29 @@ class GatedNetworkPolicy(BaseModel):
     install_proxy: InstallProxyConfig | None = None
     # Missing legacy selections can still be inspected, but never open a gate.
     sidecar_image: str | None = Field(default=None, min_length=1, max_length=256)
+    # Direct addresses only: no implicit translation of host loopback or ports.
+    target_network_id: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    target_ports: dict[str, tuple[Annotated[int, Field(strict=True, ge=1, le=65535)], ...]] = Field(
+        default_factory=dict,
+    )
+
+    @model_serializer(mode="wrap")
+    def compatible_route_payload(self, handler):
+        value = handler(self)
+        if self.target_network_id is None:
+            value.pop("target_network_id", None)
+        if not self.target_ports:
+            value.pop("target_ports", None)
+        return value
+
+    @model_validator(mode="after")
+    def valid_target_ports(self):
+        for name, ports in self.target_ports.items():
+            if name not in self.registry.targets or not ports:
+                raise ValueError("target_ports must select existing target pins")
+            if any(isinstance(port, bool) or not 1 <= port <= 65535 for port in ports):
+                raise ValueError("target port must be 1..65535")
+        return self
 
     def require_sidecar_image(self) -> str:
         if self.sidecar_image is None:

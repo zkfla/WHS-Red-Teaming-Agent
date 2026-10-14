@@ -109,7 +109,7 @@ from redteam.orchestration.settings import OrchestrationSettings
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from redteam.capability.gated_activation import GatedProviderConfig
+    from redteam.capability.direct_target import DirectTargetProviderConfig
     from redteam.capability.shell_runtime import ShellRuntime
 
 #: The one, explicit, self-documenting way to request the in-process
@@ -326,7 +326,7 @@ async def build_application(
     builtin_concurrency: Mapping[str, int] | None = None,
     builtin_output_limits: Mapping[str, int] | None = None,
     shell_programs: ShellProgramDiscovery | None = None,
-    gated_shell: tuple[ShellRuntime, GatedProviderConfig] | None = None,
+    direct_target_shell: tuple[ShellRuntime, DirectTargetProviderConfig] | None = None,
 ) -> tuple[Engagement, RuntimeDeps]:
     """``AppConfig``-aware composition root. Every dependency is overridable.
 
@@ -482,25 +482,15 @@ async def build_application(
     # Build the evidence store first so both the Control Plane (blocked
     # actions) and Orchestration (executed results) share one store.
     resolved_evidence_store = evidence_store or FilesystemEvidenceStore(evidence_dir)
-    if gated_shell is not None:
-        from redteam.capability.gated_activation import configure_gated
+    if direct_target_shell is not None:
+        from redteam.capability.direct_target import configure_direct_target
 
-        shell, provider_config = gated_shell
+        shell, provider_config = direct_target_shell
         if tool_gateway is not None:
-            raise ValueError("gated provider must be assembled before gateway discovery")
+            raise ValueError("direct target provider must be assembled before gateway discovery")
         if not any(adapter is shell.adapter for adapter in builtin_adapters):
-            raise ValueError("gated provider must use the registered shell adapter")
-        ledger = SQLiteNetworkGrantLedger(
-            (central_state.path),
-            engagement_id=str(engagement.engagement_id),
-            budget=provider_config.network_policy.budget,
-        )
-        await ledger.setup()
-        gated = configure_gated(
-            shell, engagement.scope, ledger, resolved_evidence_store,
-            provider_config=provider_config,
-        )
-        shell.adapter.set_gated_policy(gated.executor, gated.descriptors)
+            raise ValueError("direct target provider must use the registered shell adapter")
+        configure_direct_target(shell, engagement.scope, provider_config)
     resolved_attack_graph = attack_graph or (build_central_graph(central_state))
     resolved_llm = llm or build_llm_client(config.llm)
     llm_connection_fingerprint = getattr(resolved_llm, "connection_fingerprint", None)
@@ -780,10 +770,14 @@ async def build_application(
 
     input_hash = content_hash({
         "llm": config.llm.model_dump(mode="json"),
-        "gated_network": (gated_shell[1].network_policy.model_dump(mode="json")
-                          if gated_shell is not None else None),
-        "gated_shell": (gated_shell[0].policy.model_dump(mode="json")
-                        if gated_shell is not None else None),
+        "direct_target_network": (
+            direct_target_shell[1].network.model_dump(mode="json")
+            if direct_target_shell is not None else None
+        ),
+        "direct_target_shell": (
+            direct_target_shell[0].policy.model_dump(mode="json")
+            if direct_target_shell is not None else None
+        ),
         "settings": {
             name: value for name, value in resolved_settings.durable_payload().items()
             if not name.endswith(("_path", "_backend"))

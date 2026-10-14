@@ -14,8 +14,10 @@ from typing import Any
 
 import pytest
 
+from redteam.core.contracts.evidence import EvidenceSourceType
 from redteam.orchestration.local_tools import LocalToolRegistry, LocalToolResult
 from redteam.orchestration.native_local_tools import (
+    CONTEXT_QUERY_TOOL_ID,
     EVIDENCE_READ_TOOL_ID,
     GOAL_SETTLE_TOOL_ID,
     TASK_SETTLE_TOOL_ID,
@@ -62,6 +64,13 @@ def _record(evidence_id: str, *, run_id: str = RUN, raw: Any | None = None) -> A
         evidence_id=evidence_id,
         run_id=run_id,
         engagement_id=ENGAGEMENT,
+        # execution_view (evidence_access.py) reads this unconditionally on every
+        # TOOL-sourced record; the real EvidenceRecord contract requires it.
+        source_type=EvidenceSourceType.TOOL,
+        action_id=None,
+        invocation_id=None,
+        hypothesis_id=None,
+        source_id="native-local-fake",
         summary="stored tool output",
         metadata={} if raw is None else {
             "tool_result": {"output": raw},
@@ -117,8 +126,8 @@ def test_runtime_outcome_needs_success() -> None:
 
 async def test_contributions_register_without_tool_name_branches() -> None:
     contributions = native_local_tool_contributions()
-    assert len(contributions) == 3
-    assert len({item.contribution_id for item in contributions}) == 3
+    assert len(contributions) == 4
+    assert len({item.contribution_id for item in contributions}) == 4
     assert all(item.kind == "runtime_tool" for item in contributions)
     registry = LocalToolRegistry()
     for item in contributions:
@@ -128,6 +137,7 @@ async def test_contributions_register_without_tool_name_branches() -> None:
         EVIDENCE_READ_TOOL_ID,
         TASK_SETTLE_TOOL_ID,
         GOAL_SETTLE_TOOL_ID,
+        CONTEXT_QUERY_TOOL_ID,
     }
     assert registry.get("no.such.tool") is None
     from redteam.orchestration.local_tools import LocalToolContext as Ctx
@@ -287,9 +297,10 @@ def test_builtin_registration_includes_native_local_tools() -> None:
     table = {item.extension_id: item for item in declarations}
     assert "builtin.native-local-tools" in table
     assert "builtin.graph-recording" in table
-    assert len(table["builtin.native-local-tools"].contributions) == 3
+    assert len(table["builtin.native-local-tools"].contributions) == 4
     assert {item.contribution_id for item in table["builtin.native-local-tools"].contributions} == {
         "evidence-read",
         "task-settle",
         "goal-settle",
+        "context-query",
     }

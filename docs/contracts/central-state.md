@@ -1,5 +1,10 @@
 # Central state foundation (schema 3)
 
+Read-only model-context snapshots, bounded relation queries and their current
+consumer-wiring limits are documented in
+[investigation context](investigation-context.md). They do not replace canonical
+admission, full planning snapshots or result/report storage.
+
 ## Candidate/probe admission (plan5a)
 
 `register_probe_tasks` consumes a `HypothesisProbeProposal` through the existing

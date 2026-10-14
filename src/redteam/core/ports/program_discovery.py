@@ -6,8 +6,8 @@ crossed with dpkg-query so rows name real executables) for
 image-provided programs, and the live workroom for instance-installed
 programs. This port declares only the narrow async shape both sides
 share. The capability-side provider implements it without importing
-orchestration, and discovery consumes it structurally: behavior only,
-no shared type import.
+orchestration. Program rows remain structural; the optional execution metadata
+seam uses the validated shared models below and performs no execution.
 
 Callers never build the workroom key: they pass the trusted execution
 identity (run_id plus required instance_id) and the provider derives the
@@ -25,7 +25,42 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
-from typing import Protocol
+from typing import Literal, Protocol
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class ProgramExecutionRoute(BaseModel):
+    """Provider declaration, not live reachability or execution permission."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    purpose: Literal["local", "target", "install"]
+    status: Literal["local_only", "target_ready", "install_ready",
+                    "configured_unverified", "unavailable"]
+    reason_code: str
+    tool_ids: list[str] = Field(default_factory=list)
+    selectors: dict = Field(default_factory=dict)
+    limits: dict = Field(default_factory=dict)
+
+
+class ProgramExecutionEnvironment(BaseModel):
+    """Optional metadata seam for program discovery providers (version 1).
+
+    A listed executable may require unsupported privileges. No per-program
+    mode inference or target contact is performed by this metadata lookup.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    version: Literal[1] = 1
+    source_id: str
+    routes: list[ProgramExecutionRoute]
+    unsupported_modes: list[str] = Field(default_factory=list)
+    target_execution_verified: Literal[False] = False
+    execution_permission_granted: Literal[False] = False
+
+
+class ProgramExecutionDiscovery(Protocol):
+    def describe_execution_environment(self) -> ProgramExecutionEnvironment: ...
 
 
 class ProgramDiscoveryError(Exception):

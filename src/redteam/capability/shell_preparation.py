@@ -342,11 +342,18 @@ async def prepare_shell_policy(
     *,
     progress: Callable[[str], None] | None = None,
     expected_fingerprint: str | None = None,
+    docker_context: str | None = None,
 ) -> PreparedShellEnvironment:
     """Prepare once, or restore the immutable environment recorded by a Run."""
     try:
         explicit = load_shell_workroom_policy(policy_path) if policy_path is not None else None
         initial = explicit or ShellWorkroomPolicy(image="sha256:" + "0" * 64)
+        if docker_context is not None:
+            if explicit is not None and explicit.docker_context not in (None, docker_context):
+                raise MCPConfigurationError("Selected Docker context conflicts with shell policy.")
+            initial = ShellWorkroomPolicy.model_validate({
+                **initial.model_dump(), "docker_context": docker_context,
+            })
         endpoint = await ensure_docker_ready(initial, progress=progress)
         initial = initial.model_copy(
             update={
@@ -432,3 +439,17 @@ async def prepare_shell_policy(
             "Kali preparation or recorded environment is unavailable "
             f"({type(exc).__name__}); no replacement environment was started."
         ) from None
+
+
+def preparation_cache_directory() -> Path:
+    """Provider-owned cache shared by shell and network preparation identities."""
+    return _cache_directory()
+
+
+def preparation_lock(path: Path):
+    return _preparation_lock(path)
+
+
+def write_preparation_record(path: Path, record: Any) -> None:
+    _atomic_json(path, record)
+    path.chmod(0o600)
