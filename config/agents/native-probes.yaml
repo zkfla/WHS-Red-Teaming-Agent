@@ -42,7 +42,7 @@ roles:
       capabilities: []
       tool_selection: {}
       context_profile: {profile_id: atomization}
-    prompt: {path: prompts/probe-atomizer.md, version: '2'}
+    prompt: {path: prompts/probe-atomizer.md, version: '3'}
   - definition:
       agent_id: probe-worker
       role: probe_execution

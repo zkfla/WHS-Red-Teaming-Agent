@@ -1063,7 +1063,7 @@ must pass before resuming an existing Run; incompatible Runs are not migrated.
 
 ## Worker delivery version
 
-The default split schema-3 profile is now `native-probes` version 8, with
+The default split schema-3 profile is now `native-probes` version 9, with
 `worker.md` prompt version 4 and `hypothesis-strategy.md` version 3 (combined
 candidate-v2 guidance and bounded original-feedback guidance). The retained single-stage
 profile is version 6
@@ -1073,6 +1073,29 @@ content hashes and versioned read/settlement contributions change the existing
 selection fingerprints. Historical Runs/results stay readable; an incompatible
 checkpoint cannot execute under new bindings without the normal compatibility
 checks. No historical checkpoint or evidence is rewritten.
+
+### Atomizer condition selection
+
+The split atomizer receives each normalized question's completion conditions with
+their code-owned `criterion_id`. Its output selects `completion_criterion_ids`
+for each task and cannot submit `completion_criteria` bodies. Code resolves those
+IDs against that question alone and attaches deep copies of the original
+conditions before existing subject, principal, coverage, revision, source, limit
+and atomic registration validation. Duplicate, invented or other-question IDs
+are rejected; every original condition must remain covered and a paired
+comparison remains one condition on a task with all its principals.
+
+The profile is version 9 and `probe-atomizer.md` is version 3. The single-stage
+profile's proposal shape and saved canonical Task conditions are unchanged.
+Historical split Runs/results remain readable, but old selection fingerprints
+cannot execute with the new atomizer contract. No stored Run is migrated.
+
+Atomization semantic rejections carry the task/question references, a precise
+`$.tasks[index].field` location, known condition IDs and differing field names
+through the existing `DecisionDiagnostic` feedback and saved planning diagnostic.
+Descriptions, proposed raw values and private reasoning are not copied into that
+diagnostic. Correction uses the existing bounded repair budget; scope, approval
+and completion checks are unchanged.
 
 An offline schema-sensitive double with identical short observation purpose,
 provider and review compared old lazy-schema preconditions against new delivery.

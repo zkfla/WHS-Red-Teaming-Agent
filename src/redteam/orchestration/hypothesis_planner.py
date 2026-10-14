@@ -16,7 +16,12 @@ from redteam.orchestration.central_results import RESULT_UPDATED
 from redteam.orchestration.central_runtime import event, process_controls, runtime_token
 from redteam.orchestration.cognition import DecisionFailure, DecisionValidationError
 from redteam.orchestration.coordination import PlanningInputsChanged, StateConflict, content_hash
-from redteam.orchestration.diagnostics import DecisionDiagnostic, diagnostic_for_exception
+from redteam.orchestration.diagnostics import (
+    DecisionDiagnostic,
+    diagnostic_for_exception,
+    error_type_for,
+    exception_chain_for,
+)
 from redteam.orchestration.engine import InvestigationEngine
 from redteam.orchestration.knowledge_validation import known_principals, known_target_ids
 from redteam.orchestration.metered_llm import llm_request_scope
@@ -27,6 +32,7 @@ from redteam.orchestration.probe_atomization import (
     bind_plan,
     build_atomizer_input,
     needs_atomization,
+    resolve_atomized_tasks,
     validate_atomized_tasks,
 )
 from redteam.orchestration.specialist_tasks import (
@@ -78,6 +84,12 @@ def _proposal_validation_diagnostic(
     and keep the existing human-readable repair `summary` instead of the generic one.
     """
     base = diagnostic_for_exception(exc, stage=stage, schema=schema)
+    detail = getattr(exc, "diagnostic", None)
+    if isinstance(detail, DecisionDiagnostic):
+        return detail.model_copy(update={
+            "stage": stage, "error_type": base.error_type or error_type_for(exc),
+            "exception_chain": base.exception_chain or exception_chain_for(exc),
+        })
     code = getattr(exc, "code", None) or "hypothesis_proposal_invalid"
     return base.model_copy(update={
         "code": code,
@@ -431,7 +443,9 @@ _SPLIT_PLAN_SYSTEM = FEEDBACK_SYSTEM + (
 
 _SPLIT_ATOMIZE_SYSTEM = (
     "Decompose each planned question into probe tasks. Reference each task to its plan-local "
-    "question_id and preserve that question's subjects, completion criteria, candidate "
+    "question_id and select completion_criterion_ids from that question's supplied "
+    "completion_criteria entries. Never emit or rewrite completion_criteria bodies; code "
+    "restores the original conditions. Preserve that question's subjects, candidate "
     "revisions, required meaning and source refs on every task. A task's subjects must stay "
     "within its question; together the tasks must cover the question's subjects and every "
     "completion criterion exactly. Keep a paired-comparison criterion as one condition on one "
@@ -491,8 +505,9 @@ async def _advance_split(planner, runtime, schema, snapshot, engine, budget, pay
         def validate_tasks(raw):
             try:
                 parsed = TaskAtomizationDraft.model_validate(raw)
+                hydrated = resolve_atomized_tasks(parsed.tasks, questions=questions)
                 validate_atomized_tasks(
-                    parsed.tasks, questions=questions, issued=issued, versions=versions,
+                    hydrated, questions=questions, issued=issued, versions=versions,
                     targets=targets, principals=principals, roles=roles,
                     limits=planner.policy.probe_limits, snapshot=snapshot,
                     max_tasks=planner.policy.max_tasks_per_strategy,
@@ -515,8 +530,9 @@ async def _advance_split(planner, runtime, schema, snapshot, engine, budget, pay
                 system=_SPLIT_ATOMIZE_SYSTEM,
             )
         parsed = TaskAtomizationDraft.model_validate(tasks_raw)
+        hydrated = resolve_atomized_tasks(parsed.tasks, questions=questions)
         atom_tasks = validate_atomized_tasks(
-            parsed.tasks, questions=questions, issued=issued, versions=versions,
+            hydrated, questions=questions, issued=issued, versions=versions,
             targets=targets, principals=principals, roles=roles,
             limits=planner.policy.probe_limits, snapshot=snapshot,
             max_tasks=planner.policy.max_tasks_per_strategy,

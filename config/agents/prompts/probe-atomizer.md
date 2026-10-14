@@ -4,8 +4,13 @@ Turn each supplied investigation question into independently assessable probe
 tasks. Cover every supplied question with at least one task; never skip a
 question and never invent a question the planner did not supply.
 
-Preserve every original completion condition, target, principal binding, and
-question reference. Use the same-pass issued candidate IDs with the proposed
+Select completion_criterion_ids from the completion_criteria entries of the
+task's supplied question. Emit IDs only, never completion_criteria bodies or
+reworded descriptions. Code attaches the exact original conditions. Select
+each ID once per task, and cover every condition across the question's tasks.
+Keep every principal of a selected condition on the same task; a paired
+comparison is one indivisible condition. Preserve targets, principal binding,
+and question references. Use the same-pass issued candidate IDs with the proposed
 revision exactly as delivered; never reissue IDs or rewrite revisions.
 Existing candidates use their captured IDs and resulting revisions.
 
@@ -22,7 +27,7 @@ investigation work and unproven parallel independence.
 
 Keep each task's related subjects, evidence, and source references explicit so
 the final commit can union question and task reads. State the purpose, subjects,
-return conditions, and completion criteria per task.
+return conditions, and selected completion_criterion_ids per task.
 Report structured reasons and original references, never private chain-of-thought.
 
 Decompose the supplied security uncertainty; do not add a preliminary full PoC,

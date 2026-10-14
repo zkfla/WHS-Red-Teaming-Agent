@@ -4,6 +4,7 @@ from copy import deepcopy
 
 import pytest
 
+from redteam.core.contracts.completion import CompletionCriterion, criterion_id
 from redteam.llm.fake import FakeLLMClient
 from redteam.orchestration.cognition import DecisionFailure
 from redteam.orchestration.specialist_planner import SpecialistPlanner
@@ -230,10 +231,9 @@ async def test_atomization_coded_semantic_error_preserves_proposal_code(tmp_path
         "title": "Response observation",
         "role_id": "probe-worker",
         "target_node_ids": [TARGET],
-        "completion_criteria": [{
-            "kind": "observation",
-            "description": "Inspect the preserved response",
-        }],
+        "completion_criterion_ids": [criterion_id(CompletionCriterion(
+            kind="observation", description="Inspect the preserved response",
+        ))],
     }]}
     llm = PlannerResponseLLM(plan=_valid_plan(), atom=atom)
     async with probe_selection(tmp_path, llm=llm) as (session, _, _):

@@ -40,6 +40,10 @@ from tests.integration.test_probe_workers import PROFILE, drive
 from tests.integration.test_probe_workers import selection as probe_selection
 
 
+def _condition_id(description, **kwargs):
+    return criterion_id(CompletionCriterion(kind="observation", description=description, **kwargs))
+
+
 class SplitDouble(FakeLLMClient):
     """Stage-1 plans (questions) then stage-2 atomizations (tasks)."""
 
@@ -95,12 +99,12 @@ def _atom_two_tasks():
         {"task_key": "t1", "question_id": "q1", "objective": "Probe first",
          "title": "First probe", "role_id": "probe-worker",
          "target_node_ids": [TARGET],
-         "completion_criteria": [{"kind": "observation", "description": "Inspect first"}],
+         "completion_criterion_ids": [_condition_id("Inspect first")],
          "probe_limits": {"max_actions": 1, "max_model_requests": 4}},
         {"task_key": "t2", "question_id": "q2", "objective": "Probe second",
          "title": "Second probe", "role_id": "probe-worker",
          "target_node_ids": [TARGET],
-         "completion_criteria": [{"kind": "observation", "description": "Inspect second"}],
+         "completion_criterion_ids": [_condition_id("Inspect second")],
          "probe_limits": {"max_actions": 1, "max_model_requests": 4}}]}
 
 
@@ -205,9 +209,7 @@ async def test_split_loop_updated_candidate_forwarded_to_atomizer(tmp_path):
                 "task_key": "t1", "question_id": "q1",
                 "objective": "Re-probe the refined premise", "title": "Refined probe",
                 "role_id": "probe-worker", "target_node_ids": [TARGET],
-                "completion_criteria": [{"kind": "observation",
-                                        "description": "Inspect refined",
-                                        "hypothesis_id": pid}],
+                "completion_criterion_ids": [_condition_id("Inspect refined", hypothesis_id=pid)],
                 "hypothesis_revisions": {pid: 2},
                 "probe_limits": {"max_actions": 1, "max_model_requests": 4}}]}
         llm.atoms.append(atom_updated)
@@ -230,7 +232,7 @@ async def test_split_loop_shared_budget_charges_both_asks_once(tmp_path):
     bad = {"tasks": [{"task_key": "t1", "question_id": "nope",
             "objective": "Probe", "title": "Probe", "role_id": "probe-worker",
             "target_node_ids": [TARGET],
-            "completion_criteria": [{"kind": "observation", "description": "Inspect"}]}]}
+            "completion_criterion_ids": [_condition_id("Inspect")]}]}
     llm = SplitDouble([_plan_two_questions()], [bad, _atom_two_tasks()])
     async with probe_selection(tmp_path, llm=llm) as (session, llm, tools):
         ids = await SpecialistPlanner(session.deps).advance(session.runtime)
@@ -243,7 +245,7 @@ async def test_split_loop_atomizer_failure_commits_nothing(tmp_path):
     bad = {"tasks": [{"task_key": "t1", "question_id": "nope",
             "objective": "Probe", "title": "Probe", "role_id": "probe-worker",
             "target_node_ids": [TARGET],
-            "completion_criteria": [{"kind": "observation", "description": "Inspect"}]}]}
+            "completion_criterion_ids": [_condition_id("Inspect")]}]}
     llm = SplitDouble([_new_candidate_plan()], [bad] * 6)
     async with probe_selection(tmp_path, llm=llm) as (session, llm, tools):
         state = session.deps.central_state
@@ -317,8 +319,7 @@ async def test_split_loop_related_change_between_stages_discards_all(tmp_path):
                 "task_key": "t1", "question_id": "q1",
                 "objective": "Probe the seeded premise", "title": "Seed probe",
                 "role_id": "probe-worker", "target_node_ids": [TARGET],
-                "completion_criteria": [{"kind": "observation",
-                                        "description": "Inspect seed"}],
+                "completion_criterion_ids": [_condition_id("Inspect seed")],
                 "hypothesis_revisions": {pid: 1},
                 "probe_limits": {"max_actions": 1, "max_model_requests": 4}}]}
         llm.atoms.append(atom_with_related_drift)
@@ -525,6 +526,48 @@ def _new_candidate_atom(payload):
     return {"tasks": [{"task_key": "t1", "question_id": "q1",
             "objective": "Probe the new premise", "title": "New premise probe",
             "role_id": "probe-worker", "target_node_ids": [TARGET],
-            "completion_criteria": [{"kind": "observation", "description": "Inspect new"}],
+            "completion_criterion_ids": [_condition_id("Inspect new")],
             "hypothesis_revisions": {pid: 1},
             "probe_limits": {"max_actions": 1, "max_model_requests": 4}}]}
+
+
+async def test_reference_repair_delivers_ids_and_persists_original_conditions(tmp_path):
+    class ReferenceRepairDouble(SplitDouble):
+        async def complete_structured(self, *, messages, response_schema, **kwargs):
+            if "tasks" in response_schema.get("properties", {}):
+                if self.atom_inputs:
+                    feedback = messages[-1]["content"].split("Previous attempt failed", 1)[1]
+                    assert "$.tasks[0].completion_criterion_ids" in feedback
+                    assert "Task t1 for question q1" in feedback
+                    assert _condition_id("Inspect first") in feedback
+                    assert "completion_criteria" not in response_schema["$defs"][
+                        "AtomizedProbeSelection"]["properties"]
+            return await super().complete_structured(
+                messages=messages, response_schema=response_schema, **kwargs,
+            )
+
+    def bad_selection(payload):
+        tasks = _atom_two_tasks()["tasks"]
+        tasks[0]["completion_criterion_ids"] = [
+            payload["questions"][1]["completion_criteria"][0]["criterion_id"]
+        ]
+        return {"tasks": tasks}
+
+    def original_selection(payload):
+        tasks = _atom_two_tasks()["tasks"]
+        for task, question in zip(tasks, payload["questions"], strict=True):
+            task["completion_criterion_ids"] = [
+                item["criterion_id"] for item in question["completion_criteria"]
+            ]
+        return {"tasks": tasks}
+
+    llm = ReferenceRepairDouble([_plan_two_questions()], [bad_selection, original_selection])
+    async with probe_selection(tmp_path, llm=llm) as (session, _, _):
+        ids = await SpecialistPlanner(session.deps).advance(session.runtime)
+        assert len(ids) == 2 and len(llm.atom_inputs) == 2
+        assert (await session.status())["usage"]["spent"] == 3
+        for task_id, expected in zip(ids, ("Inspect first", "Inspect second"), strict=True):
+            task = await session.deps.central_state.get_task(task_id)
+            assert task.completion_criteria[0].description == expected
+            assert criterion_id(task.completion_criteria[0]) == _condition_id(expected)
+        assert not await session.deps.central_state.list_executions()

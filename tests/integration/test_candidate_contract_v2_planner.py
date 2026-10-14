@@ -76,10 +76,8 @@ def _atomize_new_candidate(payload):
         "title": "Candidate response probe",
         "role_id": "probe-worker",
         "target_node_ids": [TARGET],
-        "completion_criteria": [{
-            "kind": "observation",
-            "description": "Inspect the candidate response",
-        }],
+        "completion_criterion_ids": [item["criterion_id"]
+                                     for item in payload["questions"][0]["completion_criteria"]],
         "hypothesis_revisions": {candidate_id: 1},
         "probe_limits": {"max_actions": 1, "max_model_requests": 4},
     }]}
