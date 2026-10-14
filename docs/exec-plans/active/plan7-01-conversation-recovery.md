@@ -2,7 +2,7 @@
 
 ## Status
 
-PLANNING — 2026-10-14, original Windows checkout, dev at 376b479d. User authorized implementation and stage commits; final review → repair → tests required.
+IMPLEMENTING — 2026-10-14, original Windows checkout, dev based on 376b479d. User authorized implementation and stage commits; final review → repair → tests required.
 
 ## Goal and Context
 
@@ -36,6 +36,16 @@ TASK-01-2: Implement requirements above with disjoint file ownership and public 
 
 TASK-01-3: Root integrates, runs minimum risk-based checks, commits this stage only. Dependencies: 01-2 and worker freeze. No stage completion based only on registration/prompt/model prose. Final independent review is stage08.
 
+### Concrete implementation packets / interface freeze
+
+TASK-01-Retry (D02): Orchestrator-assigned implementation worker owns cognition.py, diagnostics.py and new tests/unit/test_transport_repair_budget.py. Public contract: separately counted transport_limit/transport_used alongside existing repair_limit/repair_used; retryable transport cannot charge output correction. Shared total allowance remains current normal+repair (18 for default chain) and legacy explicit max_attempts remains its total cap; transport cap initial5, bounded by total/deadline/Run ledger rather than expanding them. Optional transport argument is passed by consumers; structured/native mixed failures preserve original safe cause/unknown usage, SDK num_retries0, guard/cancellation unretired. Execution SERIAL_ONLY for this common contract; owner not edit config/settings/UI. Acceptance: mixed transport→invalid JSON/semantic→success counts right; independent cap exhaustion; same budget across stages no reset; native timeout/cancel; old explicit total limits hold. Risk: classifier mismatch and repair-pool reset may multiply requests. Required validation: new regression plus shared_requests/time_budget/llm_usage/diagnostics.
+
+TASK-01-Conversation (D01,D03): Separate worker owns app/cli/conversation.py, session_types.py, session_controller.py, commands/interactive.py and commands/run.py, and own new diagnostic tests. Public contract: ConversationError.diagnostic contains safe DecisionDiagnostic; optional InputReceipt diagnostic remains attached to original input/binding. Retain exception chaining and cancellation; timeout/provider/format/semantic are separate safe cause codes. No provider response body, user prompt or internal reasoning in diagnostic. Existing event/log/output paths consume it; no new diagnostic database. Execution PARALLEL_SAFE with retry while consuming existing DecisionDiagnostic, coordinate added optional fields only. Acceptance: original DecisionFailure schema rule/location/cause reaches receipt; initial CLI catch preserves it; secret marker excluded; cancellation and stop never become retries. Risk: arbitrary exception message may leak inputs. Required validation: conversation/session-controller/WebFrontend cause propagation and masking fixtures.
+
+TASK-01-Configuration (D02 + D01 consumers): Separate worker owns core/config.py, core/environment.py, orchestration/settings.py, .env.example, engine.py, specialist_planner.py, analysis_budget.py and factory/analysis consumers where retry cap must propagate; also web/frontend.py + existing input UI rendering after Conversation contract freeze. Public config decision_transport_max_attempts default5, validated finite integer bounds, reaches runtime settings identity/fingerprint and actual DecisionBudget/client constructors. Transport total cap unchanged; conversation total180s/6 remains separate constructor semantics. Execution PARALLEL_AFTER Retry transport signature for consumer wiring and Conversation receipt signature for UI; config declaration may proceed independently. Acceptance: nondefault config/env reaches real consumers and saved fingerprints; old stored explicit caps honored; UI shows safe layer/code/rule cause rather than only typename. Risk: config carried but silently ignored by verifier/code consumer or UI signature drops diagnostic change. Required validation: config/env mapping and actual construction/injection, UI input projection, settings/resume neighboring checks.
+
+Root alone edits plans/contracts documentation and integrates commits; concrete worker/model names and any ownership refinement are logged by orchestrator before touching files. No nested worker delegation or silent model replacement.
+
 ## Test Strategy
 
 기존 대화·LLM ledger·time budget 검사와 새 cause 전달/마스킹·혼합 transport+semantic 실패/한도/취소 회귀. Use current pyproject.toml/CI and repo .venv; POSIX paths may use Linux runtime against same checkout with explicit platform evidence. No assertion relaxation or skipping to hide bugs.
@@ -43,6 +53,8 @@ TASK-01-3: Root integrates, runs minimum risk-based checks, commits this stage o
 ## Progress / Discoveries / Decision Log
 
 Initial plan created; implementation not yet claimed. Model assignment ledger is in parent plan. New findings update this document before dependent work.
+
+Plan review: Sol High approved direction conditional on explicit ROE enforceability acceptance (added stages04/05/07) and concrete ownership/interface packets (above). agy auxiliary plan review remains running; findings will be reconciled before affected stage. This does not replace final implementation review.
 
 ## Review Log / Validation Log
 

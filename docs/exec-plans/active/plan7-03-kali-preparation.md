@@ -44,6 +44,8 @@ closed/inherit/policy/preparation 저장·전달 fixture, readiness 오류 분�
 
 Initial plan created; implementation not yet claimed. Model assignment ledger is in parent plan. New findings update this document before dependent work.
 
+Root preparation evidence: current Docker desktop-linux kernel6.18.33.2-microsoft-standard-WSL2, sidecar sha256:8092cce5aa8856b9b44016973a835c8e255b46f2cf3f071b5c7ff635cdba23e8. Production build_ruleset(queue7, allowed empty, quota4096) passed actual nft --check in disposable network-none/cap-dropALL+NET_ADMIN sidecar. Binary LF stdin was used after PowerShell text piping produced CRLF syntax errors. This is readiness evidence only, not target packet execution/ledger proof. Source plan run_a3947f4a3758 has zero state_requests in this checkout; its reported execution is unverified here.
+
 ## Review Log / Validation Log
 
 Pending independent plan review and actual test evidence. Record exact tests/artifacts and distinguish fake, physical provider, live LLM and Finding evidence.

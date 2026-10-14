@@ -14,6 +14,7 @@ PLANNING — 2026-10-14, original Windows checkout, dev at 376b479d. User author
 - E02: scripted common worker가 실제 Kali provider/gateway/control를 통과하는 proof에서 approval 대기→같은 invocation 1회→원본→worker재요청→Task관측→Planner를 검증한다. fake model과 실제 provider/유료 LLM/취약점 발견은 구분한다.
 - E03: 기존 CLI/web 상태에서 선택/준비/local-only/target-ready/approval/실행/UNKNOWN/종료를 현재identity·시점과 표시한다. Kali 횟수는 실제 provider/execution 원장 기준이며 준비·HTTP·program조회 제외, tokenunknown 보존.
 - E04: 동일 설정 checkpoint/job복구·변경된정책/route/image/manifest/profile resume거절·과거read/report를 검증한다. 환경 미지원이면 현 daemon 원인과 필요한조건을 남기고 실제proof 미완료를 정직하게 유지한다.
+- E05: 실제 gate allow/deny와 별도로 적용되는 공통 ROE의 HTTP method/path/header/session 제약을 강제하지 못하는 arbitrary-program route는 target-ready가 아님을 부정 검사한다. NET_ADMIN/NET_RAW는 model 실행에 부여하지 않는다.
 
 ## Constraints
 
@@ -57,6 +58,7 @@ Pending independent plan review and actual test evidence. Record exact tests/art
 | E02 | Pending | Pending | Pending | OPEN |
 | E03 | Pending | Pending | Pending | OPEN |
 | E04 | Pending | Pending | Pending | OPEN |
+| E05 | Pending | Pending | Pending | OPEN |
 
 ## Completion Criteria
 

@@ -13,6 +13,7 @@ PLANNING — 2026-10-14, original Windows checkout, dev at 376b479d. User author
 - C01: 현재 gated descriptors/readiness·대상/port/program manifest를 공통 role selector/catalog/discovery로 워커·플래너에 전달한다. paging/filter/describe와 context bound로 수백 카드 부담을 줄이고 정적 프로그램 allowlist/필수 Kali 행동열을 만들지 않는다.
 - C02: proposal→Control→gateway→protected supervisor/job→원본 수집의 기존 경로를 통과하고 approval 후 같은 invocation을 한 번 이어간다. exit/stdout/stderr/truncation/timeout/script digest/owner/route/gate refs를 원본에 저장한다.
 - C03: bounded 원본 출력과 source/action/invocation·target·UNKNOWN을 다음 워커와 Planner가 소비한다. shell gate 증명과 프로그램 주장·관측·Finding을 구분하고 arbitrary stdout을 신뢰된 HTTP/session 증명으로 승격하지 않는다.
+- C04: 전달되는 target-ready는 적용되는 공통 ROE를 강제할 수 있다는 검증까지 포함한다. HTTP method/path/header/session 제약을 강제할 수 없는 TCP/UDP route는 worker/Planner에 unavailable 원인으로 전달한다.
 
 ## Constraints
 
@@ -55,6 +56,7 @@ Pending independent plan review and actual test evidence. Record exact tests/art
 | C01 | Pending | Pending | Pending | OPEN |
 | C02 | Pending | Pending | Pending | OPEN |
 | C03 | Pending | Pending | Pending | OPEN |
+| C04 | Pending | Pending | Pending | OPEN |
 
 ## Completion Criteria
 
