@@ -14,6 +14,8 @@ Updated reporting/web-view fixtures use the active type. Tests cover the schema 
 
 Root checks: 61 candidate/planner/atomization tests; 30 active-schema/report/web/diagnostic tests; 11 profile/report tests after retaining the frozen legacy profile; full Ruff; full source/tests mypy (779 files). Groups overlap and are not summed. DeepSeek reviewed the schema and verified no generic producer or admission guard was changed. Fake clients in these tests are explicit offline fixtures.
 
+DeepSeek's broader Windows suite passed 152 tests and failed 9 unchanged legacy-migration tests at `os.O_DIRECTORY`, which is unavailable on Windows. Root reran that entire migration file on Linux with no assertion changes: 10 PASS. Implementation commits are `d8d6087d` (v2 contract/tests) and `1a523f47` (active planner guidance and evidence), pushed to dev.
+
 ## Live reproduction
 
 Existing bank `127.0.0.1:8081`, existing engagement/MCP scope, native-probes profile, OpenCode Go Muse 1.3 Contributor via `openai/responses/muse-spark-1.3-contributor`, effort High, original budgets/approval gates. Bank container healthy. No automatic approval clicks or scope/Control relaxation.
