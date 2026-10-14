@@ -249,15 +249,25 @@ at the same per-stage size):
 | --- | ---: | ---: |
 | Planner base | 44,594–44,608 | 44,594–44,608 |
 | Atomizer | 25,645–25,657 | 25,645–25,657 |
-| Native worker (own Task + `context.query` schema) | 40,602 | 40,602 |
-| All requests, cumulative | 110,841–110,867 (3 calls) | 206,068–206,138 (5 calls) |
+| Native worker (own Task + `context.query` schema) | 39,238 | 39,238 |
+| All requests, cumulative | 109,477–109,503 (3 calls) | 204,704–204,774 (5 calls) |
 
 The before fixture at 100 Tasks sent 316,349 bytes across three requests
 (pre-8b). The native worker's own request grew from the 8a baseline's 36,705
-bytes to 40,602 bytes (+3,897 bytes, ~10.6%) once `context.query` is advertised
+bytes to 39,238 bytes (+2,533 bytes, ~6.9%) once `context.query` is advertised
 on every turn, even when the worker never calls it -- this is the plan8c
 schema-exposure cost; it is otherwise still flat with historical Task count
 (the pre-existing `context_for_probe` per-Task filtering, unchanged here).
+`probes.context_for_probe` previously also repeated the exact same Task body
+under both `active_task` and `investigation_tasks` (1,364 bytes of pure
+duplication, found and removed after the first 8c measurement);
+`investigation_tasks` now carries only `{task_id, see: "active_task"}` for the
+worker, since nothing reads its body separately from `active_task`
+(`test_probe_workers.py` only checks `task_id`/list length). `probe.purpose`/
+`probe.return_conditions` still duplicate `active_task.objective`/
+`completion_criteria` -- left as is because `worker.md`'s prompt text names
+"return conditions" directly, so removing the field needs a matching prompt
+edit and version bump, not attempted here.
 Optional Planner lookup round trips add about 95 KiB in this fixture, so
 lookup should be requested only when needed. A worker-initiated `context.query`
 round trip (an extra `complete_native` call) is not yet in this cumulative

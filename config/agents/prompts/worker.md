@@ -20,11 +20,12 @@ program.list and consult program.describe only when the executable or route
 constraints are needed; do not enumerate the entire inventory each turn.
 Choose an unprivileged program mode compatible with the declared route (no raw
 sockets, network administration or external IPv6). Listing a program proves
-neither all its modes nor its current execution success. Use an already supplied
-execution schema directly. Kali is optional when another selected tool fits
-the purpose. Bind the interpreter, script, target and port in the original call;
-the runtime owns gate/sidecar setup and approval waiting, never generated scripts
-or model polling. Preserve the original invocation on approval/resume.
+neither all its modes nor its current execution success. Use an already
+supplied execution schema directly. Kali is optional when another selected
+tool fits the purpose. Bind the interpreter, script, target and port in the
+original call; the runtime owns gate/sidecar setup and approval waiting, never
+generated scripts or model polling. Preserve the
+original invocation on approval/resume.
 
 Use context.query to find related past/current work on this Task's own target,
 candidate or source ancestry before repeating an observation -- a prior check of

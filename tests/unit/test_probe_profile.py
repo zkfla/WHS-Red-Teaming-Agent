@@ -32,7 +32,7 @@ def test_probe_profile_uses_one_common_executor_and_split_atomizer():
     assert len(executors) == 1
     assert loaded.run_policy().probe_limits == ProbeLimits(max_actions=4, max_model_requests=16)
 
-    assert loaded.profile.version == "13"
+    assert loaded.profile.version == "15"
     atomizer_id = loaded.profile.stages.get("task_atomization")
     assert atomizer_id == "probe-atomizer"
     assert atomizer_id != loaded.profile.stages["hypothesis_planning"]
@@ -60,7 +60,7 @@ def test_probe_profile_uses_one_common_executor_and_split_atomizer():
 
 def test_legacy_single_stage_profile_has_no_atomizer():
     loaded = load_specialist_profile(LEGACY)
-    assert loaded.profile.version == "10"
+    assert loaded.profile.version == "12"
     assert "task_atomization" not in loaded.profile.stages
     assert loaded.run_policy().probe_atomization is False
     assert "probe_atomization" not in loaded.run_policy().model_dump()
