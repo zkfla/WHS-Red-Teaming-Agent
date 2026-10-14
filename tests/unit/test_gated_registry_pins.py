@@ -100,6 +100,14 @@ def test_manifest_shape() -> None:
     assert gated_purpose_for_operation("shell_run") is None
 
 
+def test_manifest_rejects_a_target_ref_source_that_does_not_match_the_route():
+    descriptors = build_gated_descriptors(None)
+    descriptors[0].target_binding = descriptors[2].target_binding
+
+    with pytest.raises(ValueError, match="unexpected target_ref source"):
+        validate_gated_descriptors(descriptors, None)
+
+
 def _invocation(*, tool_name: str, approved: TargetRef | None) -> ToolInvocation:
     now = datetime.now(timezone.utc)
     context = ExecutionContext(

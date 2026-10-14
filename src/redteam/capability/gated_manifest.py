@@ -9,14 +9,15 @@ are untouched and stay network-closed.
 All three are MEDIUM: the execution is bounded exactly like the local
 tools, and explicit operator policy plus ROE govern. "requires_target" is
 True and "target_types" is exactly the list the actual resolver supports;
-asset, device, and principal kinds are excluded. Selection travels as
-"target_ref" (a registry or mirror name) matched by the existing generic
-target_ref alias binding, plus an explicit "port" for target runs that is
-never defaulted from a registry IP tuple alone. Install runs take a
-mirror name only; the reachable port comes from operator configuration.
+asset, device, and principal kinds are excluded. Target routes use the
+approved logical host as "target_ref" plus an explicit "port" that is
+never defaulted from a registry IP tuple alone. Install routes take a
+mirror reference only; the reachable port comes from operator configuration.
 """
 
 from __future__ import annotations
+
+from typing import Literal
 
 from redteam.capability.manifest import validate_tool_manifest
 from redteam.capability.shell_manifest import (
@@ -152,10 +153,9 @@ def _target_ref_property(install: bool) -> dict:
         "minLength": 1,
         "maxLength": 256,
         "description": (
-            "Operator registry name for the approved target. Matched "
-            "against the approved proposal target by the existing "
-            "target_ref alias binding. Enforcement uses only the "
-            "operator-pinned IPs for this name, never a caller IP."
+            "Logical host of the approved target. The compiler supplies this "
+            "value from the approved target, and admission requires an exact "
+            "host match; enforcement uses only the operator-pinned IPs for it."
         ),
     }
 
@@ -208,6 +208,7 @@ def _descriptor_for(
     input_schema: dict,
     output_schema: dict,
     description: str,
+    target_ref_source: Literal["mcp_ref", "logical_host"],
 ) -> ToolDescriptor:
     """Gated identity first, existing closed-provider body tag second."""
     return ToolDescriptor(
@@ -224,7 +225,10 @@ def _descriptor_for(
         retry_safe=False,
         argument_bindings={},
         outbound_text_fields=[],
-        target_binding=ToolTargetBinding(binds_target_arguments=True),
+        target_binding=ToolTargetBinding(
+            target_ref_source=target_ref_source,
+            binds_target_arguments=True,
+        ),
         requires_target=True,
         command_fields=["language", "script"],
         availability_impact=False,
@@ -243,6 +247,7 @@ def build_gated_descriptors(policy: ShellWorkroomPolicy | None = None) -> list:
             input_schema=target_schema,
             output_schema=dict(RUN_OUTPUT_SCHEMA),
             description=_TARGET_RUN_DESCRIPTION,
+            target_ref_source="logical_host",
         ),
         _descriptor_for(
             tool_name=SHELL_TARGET_JOB_START,
@@ -251,6 +256,7 @@ def build_gated_descriptors(policy: ShellWorkroomPolicy | None = None) -> list:
             input_schema=target_schema,
             output_schema=dict(JOB_START_OUTPUT_SCHEMA),
             description=_TARGET_JOB_START_DESCRIPTION,
+            target_ref_source="logical_host",
         ),
         _descriptor_for(
             tool_name=SHELL_INSTALL_RUN,
@@ -259,6 +265,7 @@ def build_gated_descriptors(policy: ShellWorkroomPolicy | None = None) -> list:
             input_schema=install_schema,
             output_schema=dict(RUN_OUTPUT_SCHEMA),
             description=_INSTALL_RUN_DESCRIPTION,
+            target_ref_source="mcp_ref",
         ),
     ]
 
@@ -328,6 +335,11 @@ def validate_gated_descriptors(
             or list(descriptor.target_types) != TARGET_TYPES
         ):
             raise ValueError("gated descriptor differs from the pinned manifest")
+        expected_ref_source = (
+            "mcp_ref" if descriptor.tool_name == SHELL_INSTALL_RUN else "logical_host"
+        )
+        if descriptor.target_binding.target_ref_source != expected_ref_source:
+            raise ValueError("gated descriptor has an unexpected target_ref source")
         _check_key_pattern(descriptor)
         properties = descriptor.input_schema.get("properties", {})
         if "target_ref" not in properties:

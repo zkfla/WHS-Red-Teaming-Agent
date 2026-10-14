@@ -1376,6 +1376,7 @@ def validate_argument_target(
     operation_bindings=None,
     argument_bindings=None,
     target_binding=None,
+    target_ref_binding=None,
 ) -> None:
     """Check addresses and Asset references without granting execution permission."""
     location = known_location(("arguments",))
@@ -1401,8 +1402,18 @@ def validate_argument_target(
                 if value
             }
         )
+        ref_binding = target_ref_binding if target_ref_binding is not None else target_binding
+        if getattr(ref_binding, "target_ref_source", "mcp_ref") == "logical_host":
+            # Logical selectors are derived from the approved target identity;
+            # engagement deployment aliases are a separate source and must not
+            # be unioned into this accepted form.
+            allowed = {identity.host} if identity is not None else set()
         if arguments.get("target_ref") is not None and str(arguments["target_ref"]) not in allowed:
-            raise ValueError("tool target reference differs from proposal target binding")
+            raise DecisionRuleError(
+                "target_ref does not match the descriptor-declared source for the selected target.",
+                code="target_ref_source_mismatch",
+                location=known_location(("arguments", "target_ref")),
+            )
         bindings = (
             asset_bindings
             or {field: {str(target.asset_id)} for field in ("asset_ref", "apk_ref", "artifact_ref")}
@@ -1417,7 +1428,16 @@ def validate_argument_target(
                 continue
             permitted = allowed if field == "target_ref" else bindings.get(field)
             if permitted is not None and str(arguments[remote]) not in permitted:
+                if field == "target_ref":
+                    raise DecisionRuleError(
+                        "target_ref does not match the descriptor-declared source for "
+                        "the selected target.",
+                        code="target_ref_source_mismatch",
+                        location=known_location(("arguments", remote)),
+                    )
                 raise ValueError("tool reference differs from proposal target binding")
+    except DecisionRuleError:
+        raise
     except (ValueError, TypeError):
         raise DecisionRuleError(
             "Tool arguments do not match the selected target binding.",
@@ -1677,6 +1697,7 @@ async def validate_current_action(deps, runtime, step, proposal=None) -> list[st
                     if tool and step.binding_mode == "selected_tool"
                     else None
                 ),
+                target_ref_binding=tool.target_binding if tool else None,
             )
         validate_principal_arguments(current, step.principal_ref, step.arguments, assessment)
         if (

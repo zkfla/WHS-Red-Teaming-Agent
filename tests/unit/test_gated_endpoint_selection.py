@@ -15,7 +15,11 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from redteam.capability.gated_manifest import SHELL_INSTALL_RUN, SHELL_TARGET_RUN
+from redteam.capability.gated_manifest import (
+    SHELL_INSTALL_RUN,
+    SHELL_TARGET_JOB_START,
+    SHELL_TARGET_RUN,
+)
 from redteam.capability.gated_network_policy import (
     SUPPORTED_GATED_PRESETS,
     EndpointRestriction,
@@ -31,7 +35,7 @@ from redteam.capability.gated_network_policy import (
 )
 from redteam.capability.gated_strategy import GatedExecutionPolicy, GatedRoute
 from redteam.core.contracts.network import GrantRefused, NetworkCapacity, NetworkPurpose
-from redteam.core.contracts.target import DomainTarget
+from redteam.core.contracts.target import DomainTarget, EndpointTarget
 from redteam.core.contracts.tool import ExecutionContext, ToolInvocation
 from redteam.core.ids import ActionId, AgentInstanceId, EngagementId, InvocationId, RunId, ToolId
 
@@ -95,12 +99,12 @@ def _harness(policy, scope=_allow):
     return extension, GatedExecutionPolicy(extension, scope_validator=scope, evidence_store=None)
 
 
-def _invocation(tool_name, *, target="t", port=8080):
+def _invocation(tool_name, *, target="t", port=8080, approved=None):
     context = ExecutionContext(
         engagement_id=EngagementId("eng_001"),
         run_id=RunId("run_001"),
         instance_id=AgentInstanceId("inst_001"),
-        approved_target=DomainTarget(domain="t"),
+        approved_target=approved or DomainTarget(domain="t"),
     )
     return ToolInvocation(
         invocation_id=InvocationId("inv_001"),
@@ -477,7 +481,14 @@ def test_loaded_restricted_policy_refuses_a_registry_name_without_a_selection():
         restriction=restriction,
     )
     _, strategy = _harness(policy)
-    result = strategy.resolve(_invocation(SHELL_TARGET_RUN, target="u", port=443))
+    result = strategy.resolve(
+        _invocation(
+            SHELL_TARGET_RUN,
+            target="u",
+            port=443,
+            approved=DomainTarget(domain="u"),
+        )
+    )
     assert isinstance(result, GrantRefused)
     assert result.code == "gated_endpoint_not_selected"
 
@@ -595,3 +606,71 @@ async def test_strategy_refusal_persists_after_an_attempted_selection_change():
     route = strategy.resolve(_invocation(SHELL_TARGET_RUN, port=443))
     assert isinstance(route, GatedRoute)
     assert _flows(route) == [(PIN, 443, "tcp")]
+
+
+@pytest.mark.parametrize(
+    ("approved", "target", "port"),
+    [
+        (DomainTarget(domain="t.test"), "deployment-alias", 443),
+        (EndpointTarget(host="t.test", port=443), "t.test", 8443),
+    ],
+)
+async def test_approved_target_mismatch_refuses_before_window_or_ledger(approved, target, port):
+    policy = _built(
+        targets={"t.test": (PIN,), "deployment-alias": ("10.0.0.10",)},
+        endpoints={"t.test": [(443, "tcp")], "deployment-alias": [(443, "tcp")]},
+    )
+    extension, strategy = _harness(policy)
+
+    result = await strategy.execute(
+        _invocation(
+            SHELL_TARGET_RUN,
+            target=target,
+            port=port,
+            approved=approved,
+        ),
+        _parsed(),
+        _never_runs,
+    )
+
+    assert not result.success
+    assert result.error.code == "gated_approved_target_mismatch"
+    assert extension.opened == 0
+
+
+def test_approved_logical_host_resolves_only_its_operator_registry_pins():
+    policy = _built(
+        targets={"t": (PIN,)},
+        endpoints={"t": [(443, "tcp")]},
+    )
+    calls = []
+
+    def scope(target, *, denials_only=False):
+        calls.append((target.host, target.port, denials_only))
+        return True, [], None
+
+    _extension, strategy = _harness(policy, scope)
+    route = strategy.resolve(
+        _invocation(
+            SHELL_TARGET_RUN,
+            target="t",
+            port=443,
+            approved=DomainTarget(domain="T."),
+        )
+    )
+
+    assert isinstance(route, GatedRoute)
+    assert _flows(route) == [(PIN, 443, "tcp")]
+    assert calls == [("t.", 443, False), (PIN, 443, True)]
+
+
+def test_gated_descriptors_declare_target_ref_source_by_route_form():
+    from redteam.capability.gated_manifest import SHELL_INSTALL_RUN, build_gated_descriptors
+
+    sources = {
+        item.tool_name: item.target_binding.target_ref_source
+        for item in build_gated_descriptors()
+    }
+    assert sources[SHELL_TARGET_RUN] == "logical_host"
+    assert sources[SHELL_TARGET_JOB_START] == "logical_host"
+    assert sources[SHELL_INSTALL_RUN] == "mcp_ref"

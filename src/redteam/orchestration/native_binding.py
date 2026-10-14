@@ -91,6 +91,7 @@ async def resolve_native_target(
             candidates[_execution_target_key(target)] = target
 
     matches = []
+    target_ref_rejection: DecisionRuleError | None = None
     for target in candidates.values():
         if tool.target_types and target.kind not in tool.target_types:
             continue
@@ -104,6 +105,10 @@ async def resolve_native_target(
                 argument_bindings=tool.argument_bindings,
                 target_binding=tool.target_binding,
             )
+        except DecisionRuleError as exc:
+            if exc.diagnostic.code == "target_ref_source_mismatch":
+                target_ref_rejection = exc
+            continue
         except (TypeError, ValueError):
             continue
         matches.append(target)
@@ -132,6 +137,8 @@ async def resolve_native_target(
         return exact_paths[0]
     if len(matches) == 1:
         return matches[0]
+    if not matches and target_ref_rejection is not None:
+        raise target_ref_rejection
     raise DecisionRuleError(
         "the tool call must identify exactly one supplied or observed target; "
         "include the target in the tool arguments (for example target_ref or url)",

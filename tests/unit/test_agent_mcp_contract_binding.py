@@ -108,7 +108,9 @@ def test_pinned_arguments_cannot_silently_widen_target(arguments):
     assert "example.test" not in target_aliases(deps, target)
     with pytest.raises(DecisionRuleError) as rejected:
         validate_argument_target(target, arguments, target_aliases(deps, target))
-    assert rejected.value.diagnostic.code == "unresolved_target"
+    assert rejected.value.diagnostic.code == (
+        "target_ref_source_mismatch" if "target_ref" in arguments else "unresolved_target"
+    )
     assert "secret-invalid-port" not in rejected.value.diagnostic.feedback()
 
 

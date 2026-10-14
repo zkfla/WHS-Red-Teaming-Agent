@@ -61,6 +61,7 @@ from redteam.core.ids import (
     RunId,
 )
 from redteam.core.ports.evidence_store import EvidenceStore
+from redteam.core.scope_rules import resolve_target_hostports
 
 
 class ParsedScript(TypedDict, total=False):
@@ -361,6 +362,7 @@ class GatedExecutionPolicy:
         return self._resolve_target(
             name=name,
             args=args,
+            approved_target=invocation.execution_context.approved_target,
             holder_action=holder_action,
             holder_invocation=holder_invocation,
         )
@@ -370,6 +372,7 @@ class GatedExecutionPolicy:
         *,
         name: str,
         args: dict[str, Any],
+        approved_target: AnyTarget,
         holder_action: str,
         holder_invocation: str,
     ) -> GatedRoute | GrantRefused:
@@ -381,14 +384,35 @@ class GatedExecutionPolicy:
             return self._refusal("gated_port_required")
         if not 0 < port <= 65535:
             return self._refusal("gated_port_required")
-        pins = ext.policy.registry.targets.get(name)
+        # A target route is selected by the approved logical authority, not by
+        # a deployment alias or an arbitrary registry entry. Resolve through
+        # Core's canonical target identity before looking up pins or opening
+        # the ledger window.
+        approved_identities, target_error = resolve_target_hostports(approved_target)
+        if target_error or len(approved_identities) != 1:
+            return self._refusal("gated_approved_target_unresolved")
+        approved_host, approved_port = approved_identities[0]
+        canonical_host = approved_host.lower().rstrip(".")
+        if name.lower().rstrip(".") != canonical_host:
+            return self._refusal("gated_approved_target_mismatch")
+        if approved_port is not None and port != approved_port:
+            return self._refusal("gated_approved_target_mismatch")
+        matching_registry_names = [
+            registry_name
+            for registry_name in ext.policy.registry.targets
+            if registry_name.lower().rstrip(".") == canonical_host
+        ]
+        if len(matching_registry_names) != 1:
+            return self._refusal("gated_approved_target_unresolved")
+        registry_name = matching_registry_names[0]
+        pins = ext.policy.registry.targets.get(registry_name)
         if not pins:
             return self._refusal("gated_unknown_registry_name")
         # The selected endpoint set only narrows the original scope; absent means legacy.
         restriction = getattr(ext.policy, "endpoint_restriction", None)
         protocols: tuple[str, ...] = ("tcp", "udp")
         if isinstance(restriction, EndpointRestriction):
-            selected = restriction.protocols_for(name, port)
+            selected = restriction.protocols_for(registry_name, port)
             if selected is None:
                 return self._refusal("gated_endpoint_not_selected")
             protocols = selected
@@ -400,7 +424,7 @@ class GatedExecutionPolicy:
                     return self._refusal("gated_ipv6_unsupported")
                 return self._refusal("gated_pin_invalid")
             canonical.append(item)
-        scope_target = EndpointTarget(host=name, port=port)
+        scope_target = EndpointTarget(host=approved_host, port=port)
         refused = self._check_allowed(scope_target)
         if refused is not None:
             return refused
