@@ -140,7 +140,7 @@ async def test_split_loop_update_only_makes_one_request(tmp_path):
         "contract_version": 2, "hypothesis_id": "local",
         "description": "Access may be unguarded", "target_node_ids": [TARGET],
         "reason": "Assess the preserved response"}}],
-        "questions": [], "reason": "Record premise"}
+        "questions": [], "termination": "replan", "reason": "Record premise"}
     llm = SplitDouble([plan], [])
     async with probe_selection(tmp_path, llm=llm) as (session, llm, tools):
         ids = await SpecialistPlanner(session.deps).advance(session.runtime)
@@ -244,7 +244,9 @@ async def test_split_loop_atomizer_failure_commits_nothing(tmp_path):
             "objective": "Probe", "title": "Probe", "role_id": "probe-worker",
             "target_node_ids": [TARGET],
             "completion_criteria": [{"kind": "observation", "description": "Inspect"}]}]}
-    llm = SplitDouble([_new_candidate_plan()], [bad] * 6)
+    # One initial atomization plus the configured six repair attempts all receive
+    # the same malformed response; avoid exhausting the scripted provider double.
+    llm = SplitDouble([_new_candidate_plan()], [bad] * 7)
     async with probe_selection(tmp_path, llm=llm) as (session, llm, tools):
         state = session.deps.central_state
         with pytest.raises(DecisionFailure) as failed:
@@ -253,8 +255,10 @@ async def test_split_loop_atomizer_failure_commits_nothing(tmp_path):
         assert failed.value.kind == "budget"
         assert failed.value.diagnostic.code == "decision_repair_budget_exhausted"
         structured = [r for r in llm.requests if r["kind"] == "complete_structured"]
-        assert failed.value.attempts == len(structured) == 5
-        assert (await session.status())["usage"]["spent"] == 5
+        assert failed.value.attempts == len(structured) == 8
+        assert (await session.status())["usage"]["spent"] == 8
+        assert failed.value.diagnostic.transport_used == 0
+        assert failed.value.diagnostic.repair_used == 6
         assert await state.list_tasks() == []
         assert await AttackGraphService(session.deps.graph_store).list_hypotheses() == []
         cursor = await state.transaction(lambda tx: tx.hypothesis_planner_cursor(), write=False)

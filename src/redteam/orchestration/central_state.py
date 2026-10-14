@@ -703,7 +703,7 @@ class CentralTransaction:
                 for node in self.graph.query(node_type=GraphNodeType.HYPOTHESIS)}
 
     def check_planner_inventory(self, judgment: dict) -> None:
-        if judgment["termination"] == "continue":
+        if judgment["termination"] in {"continue", "replan"}:
             return  # Candidate-local judgments do not fence unrelated siblings.
         if set(judgment["candidate_inventory"]) != self.hypothesis_candidate_inputs().keys() or (
             set(judgment["task_inventory"]) != {str(task.task_id) for task in self.list_tasks()}

@@ -70,11 +70,13 @@ def _task(key="t1", qid="q1", targets=("n1",), principals=(), criteria=None,
 def _snap():
     return SimpleNamespace(candidates={}, tasks={})
 
-def _bind(draft, issued=None, targets=TARGETS, principals=PRINCIPALS):
+def _bind(draft, issued=None, targets=TARGETS, principals=PRINCIPALS,
+          existing_work_validator=None, snapshot=None):
     issued = {} if issued is None else issued
-    return bind_plan(HypothesisPlanDraft.model_validate(draft), _snap(),
+    return bind_plan(HypothesisPlanDraft.model_validate(draft), snapshot or _snap(),
                      issued=issued, targets=set(targets),
-                     principals=set(principals), max_tasks=MAX_TASKS)
+                     principals=set(principals), max_tasks=MAX_TASKS,
+                     existing_work_validator=existing_work_validator)
 
 
 def test_plan_draft_rejects_tasks_field():
@@ -108,11 +110,38 @@ def test_exhausted_plan_skips_atomizer():
 
 def test_update_only_plan_skips_atomizer():
     updates, questions, versions = _bind(
-        {"updates": [_update()], "questions": [], "reason": "Record premise"})
+        {"updates": [_update()], "questions": [], "termination": "replan",
+         "reason": "Record premise"})
     assert updates is not None and questions == [] and versions
     draft = HypothesisPlanDraft.model_validate(
-        {"updates": [_update()], "questions": [], "reason": "Record premise"})
+        {"updates": [_update()], "questions": [], "termination": "replan",
+         "reason": "Record premise"})
     assert needs_atomization(draft, questions) is False
+
+
+@pytest.mark.parametrize("updates", [[], [_update()]])
+def test_pathless_continue_requires_explicit_existing_work_validator(updates):
+    with pytest.raises(AtomizationProposalError) as caught:
+        _bind({"updates": updates, "questions": [], "reason": "No progress path"})
+    assert caught.value.code == "continue_requires_proposed_or_existing_work"
+
+
+def test_continue_accepts_existing_work_only_through_validator():
+    snapshot = SimpleNamespace(candidates={}, tasks={"task-1": object()})
+    draft = {
+        "updates": [], "questions": [], "reviewed_task_ids": ["task-1"],
+        "reason": "Continue the existing executable work",
+    }
+
+    def validate_work(task_ids, versions):
+        assert task_ids == ["task-1"]
+        assert versions == {}
+        return {"task-1"}
+
+    updates, questions, versions = _bind(
+        draft, snapshot=snapshot, existing_work_validator=validate_work,
+    )
+    assert updates is None and questions == [] and versions == {}
 
 
 def test_questions_require_continue_judgment():

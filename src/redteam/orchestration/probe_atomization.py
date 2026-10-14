@@ -22,6 +22,7 @@ Preservation rules:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -125,7 +126,7 @@ class HypothesisPlanDraft(BaseModel):
     reviewed_task_ids: list[str] = Field(default_factory=list)
     reviewed_hypothesis_ids: list[str] = Field(default_factory=list)
     reason: str = Field(min_length=1)
-    termination: Literal["continue", "held", "exhausted", "goal_achieved"] = "continue"
+    termination: Literal["continue", "replan", "held", "exhausted", "goal_achieved"] = "continue"
     resume_conditions: list[str] = Field(default_factory=list)
 
 
@@ -156,6 +157,7 @@ def bind_plan(
     targets: set[str],
     principals: set[str],
     max_tasks: int,
+    existing_work_validator: Callable[[list[str], dict[str, int]], set[str]] | None = None,
 ) -> tuple[list[HypothesisUpdate] | None, list[PlannedInvestigationQuestion], dict[str, int]]:
     """Resolve local references for stage-1 updates+questions without mutating originals.
 
@@ -235,8 +237,15 @@ def bind_plan(
         set(draft.reviewed_hypothesis_ids) - snapshot.candidates.keys()
     ):
         raise AtomizationProposalError("reviewed_reference_not_in_snapshot")
+    if draft.termination == "continue" and not questions:
+        if existing_work_validator is None or not existing_work_validator(
+            draft.reviewed_task_ids, versions,
+        ):
+            raise AtomizationProposalError("continue_requires_proposed_or_existing_work")
     if not (updates or questions):
-        if draft.termination == "continue" or not draft.resume_conditions:
+        if draft.termination not in {"continue", "replan", "goal_achieved"} and (
+            not draft.resume_conditions
+        ):
             raise AtomizationProposalError("empty_judgment_needs_termination_and_resume_conditions")
         return None, [], versions
     return updates, questions, versions

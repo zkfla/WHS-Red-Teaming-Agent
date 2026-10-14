@@ -129,7 +129,8 @@ async def test_candidate_probe_partial_followup_and_reviewed_verdict(tmp_path, v
             current=current.model_dump(mode="json"),
             status="confirmed" if verdict == "success" else "rejected",
             evidence=[str(source.evidence_id)], review=str(receipt.evidence_id),
-        )], "reason": "The bound independent review supports this limited candidate verdict"})
+        )], "termination": "replan",
+            "reason": "The bound independent review supports this limited candidate verdict"})
         assert await planner.advance(session.runtime) == []
         saved = await service.get_hypothesis(current.hypothesis_id)
         assert saved.revision == 3 and saved.status == (
@@ -194,6 +195,7 @@ async def test_planner_snapshot_rejects_related_updates_only(tmp_path, related):
                                    hypotheses={"local": 1})
         current = (await AttackGraphService(session.deps.graph_store).list_hypotheses())[0]
         llm.decisions = [{"updates": [candidate(current=current.model_dump(mode="json"))],
+                          "termination": "replan",
                           "reason": "Review one captured candidate"}]
         llm.request_release.clear()
         running = asyncio.create_task(SpecialistPlanner(session.deps).advance(session.runtime))
@@ -338,7 +340,8 @@ async def test_partial_gap_cannot_supply_a_candidate_verdict_receipt(tmp_path):
         llm.decisions.append({"updates": [candidate(
             current=current.model_dump(mode="json"), status="rejected",
             evidence=task.result.evidence_ids, review=task.result.evidence_ids[-1],
-        )], "reason": "Attempt to use an unresolved limitation as proof"})
+        )], "termination": "replan",
+            "reason": "Attempt to use an unresolved limitation as proof"})
         with pytest.raises(DecisionFailure) as rejected:
             await planner.advance(session.runtime)
         assert rejected.value.diagnostic.code == "hypothesis_admission_rejected"
