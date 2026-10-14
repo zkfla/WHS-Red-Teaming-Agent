@@ -46,6 +46,8 @@ TASK-07-3: Root integrates, runs minimum risk-based checks, commits this stage o
 
 Initial plan created; implementation not yet claimed. Model assignment ledger is in parent plan. New findings update this document before dependent work.
 
+2026-10-15 root readonly environment revalidation: current Docker context desktop-linux resolves npipe:////./pipe/dockerDesktopLinuxEngine. Exact Kali image sha256:a85c97d7b47bf7c0cc290e380c74dda9a8c5a4a6374658183adc0a7821ecb7b7 and sidecar sha256:8092cce5aa8856b9b44016973a835c8e255b46f2cf3f071b5c7ff635cdba23e8 remain present. Preparation cache record is under records/e947feaa41eeef6033fa06df59873a9497104704b75103a5a2948f762d3e332f.json (not cache root); matching manifests/e947...json identifies the same immutable Kali and19 installed program records. Historical record contains endpoint/manifest_path/policy only, not current richer readiness/fingerprint fields; do not infer new preparation completion from its filename or recast it as a current prepared runtime. Fresh proof must use current preparation entry and a test-owned bounded policy. Image presence and these readonly checks prove neither target delivery nor gate closure/common-worker integration.
+
 ## Review Log / Validation Log
 
 Pending independent plan review and actual test evidence. Record exact tests/artifacts and distinguish fake, physical provider, live LLM and Finding evidence.
