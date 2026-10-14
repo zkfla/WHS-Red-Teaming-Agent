@@ -19,7 +19,11 @@ from redteam.orchestration.agents.registry import AgentRegistry
 from redteam.orchestration.central_completion import goal_inputs, goal_snapshot
 from redteam.orchestration.central_results import result_for
 from redteam.orchestration.coordination import StateConflict, content_hash
-from redteam.orchestration.specialist_tasks import HypothesisProbeProposal, register_probe_tasks
+from redteam.orchestration.specialist_tasks import (
+    HypothesisProbeProposal,
+    SpecialistProposalError,
+    register_probe_tasks,
+)
 from tests.unit.test_central_state import BINDING, ENG, MISSION, RUN, original, task, world
 
 
@@ -225,6 +229,22 @@ async def test_bad_admission_has_no_partial_writes(tmp_path, mode):
         update["hypothesis"]["status"] = "confirmed"
     with pytest.raises((StateConflict, ValidationError)):
         await admit(deps, service, "bad", updates=[update], tasks=[proposed])
+    assert await deps.central_state.list_tasks() == []
+    assert await service.get_hypothesis("candidate-a") is None
+
+
+async def test_specialist_registration_rejects_same_candidate_conflict_before_writes(tmp_path):
+    deps, service = await setup(tmp_path)
+    proposed = probe()
+    proposed["completion_criteria"] = [
+        {"kind": "hypothesis_confirmed", "description": "Confirm", "hypothesis_id": "candidate-a"},
+        {"kind": "hypothesis_refuted", "description": "Refute", "hypothesis_id": "candidate-a"},
+    ]
+
+    with pytest.raises(SpecialistProposalError) as caught:
+        await admit(deps, service, "contradictory", updates=[candidate()], tasks=[proposed])
+
+    assert caught.value.condition_conflicts[0].hypothesis_id == "candidate-a"
     assert await deps.central_state.list_tasks() == []
     assert await service.get_hypothesis("candidate-a") is None
 

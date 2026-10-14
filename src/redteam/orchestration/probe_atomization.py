@@ -27,7 +27,11 @@ from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from redteam.core.contracts.completion import CompletionCriterion, criterion_id
+from redteam.core.contracts.completion import (
+    CompletionCriterion,
+    completion_condition_conflicts,
+    criterion_id,
+)
 from redteam.core.contracts.graph import HypothesisUpdate
 from redteam.core.contracts.specialists import ProbeLimits
 from redteam.core.ids import new_id
@@ -217,6 +221,17 @@ def bind_plan(
                 hypothesis_ref, hypothesis_ref
             ) not in revisions:
                 raise AtomizationProposalError("plan_question_criterion_outside_purpose")
+        resolved_criteria = [condition.model_copy(update={
+            "hypothesis_id": (
+                issued.get(condition.hypothesis_id, condition.hypothesis_id)
+                if condition.hypothesis_id is not None else None),
+        }) for condition in question.completion_criteria]
+        conflicts = completion_condition_conflicts(resolved_criteria)
+        if conflicts:
+            raise AtomizationProposalError(
+                "same_candidate_completion_condition_conflict",
+                condition_conflicts=conflicts,
+            )
         if question.source_task_id:
             source = snapshot.tasks.get(question.source_task_id)
             if source is None or source.result is None or (
@@ -227,11 +242,7 @@ def bind_plan(
             "hypothesis_revisions": revisions,
             "goal_required_hypothesis_ids": [issued.get(ref, ref)
                                              for ref in question.goal_required_hypothesis_ids],
-            "completion_criteria": [condition.model_copy(update={
-                "hypothesis_id": (
-                    issued.get(condition.hypothesis_id, condition.hypothesis_id)
-                    if condition.hypothesis_id is not None else None),
-            }) for condition in question.completion_criteria],
+            "completion_criteria": resolved_criteria,
         }))
     if set(draft.reviewed_task_ids) - snapshot.tasks.keys() or (
         set(draft.reviewed_hypothesis_ids) - snapshot.candidates.keys()

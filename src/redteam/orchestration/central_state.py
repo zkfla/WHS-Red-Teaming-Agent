@@ -21,7 +21,11 @@ from typing import Any, TypeVar
 
 from redteam.attack_graph.stores.central import GRAPH_SCHEMA, GraphTransaction
 from redteam.core.config import PLANNER_REPLAN_MAX_PASSES_CEILING
-from redteam.core.contracts.completion import completion_contract_hash
+from redteam.core.contracts.completion import (
+    CompletionConditionConflict,
+    completion_condition_conflicts,
+    completion_contract_hash,
+)
 from redteam.core.contracts.engagement import EngagementScope
 from redteam.core.contracts.events import EventEnvelope, EventType
 from redteam.core.contracts.evidence import EvidenceRecord
@@ -69,6 +73,16 @@ from redteam.sqlite_support import connect, run_sqlite, run_transaction
 
 T = TypeVar("T")
 ActivityCheck = Callable[[sqlite3.Connection, str, str, Sequence[str], bool], bool]
+
+
+class TaskCompletionConditionConflict(StateConflict):
+    """A new canonical Task had contradictory criteria for one candidate."""
+
+    def __init__(self, conflicts: tuple[CompletionConditionConflict, ...]) -> None:
+        self.condition_conflicts = conflicts
+        super().__init__("task_completion_condition_conflict")
+
+
 SCHEMA_VERSION = 3
 _CLOSED = {MissionStatus.COMPLETED, MissionStatus.FAILED, MissionStatus.CANCELLED}
 _RESOLVED = {ExecutionState.SUCCEEDED, ExecutionState.FAILED, ExecutionState.CANCELLED}
@@ -513,6 +527,9 @@ class CentralTransaction:
             saved = self.get_task(previous[0])
             assert saved is not None
             return saved
+        conflicts = completion_condition_conflicts(task.completion_criteria)
+        if conflicts:
+            raise TaskCompletionConditionConflict(conflicts)
         self.admit()
         self.add_evidence_refs(checked)
         self._require_refs(task.evidence_ids)

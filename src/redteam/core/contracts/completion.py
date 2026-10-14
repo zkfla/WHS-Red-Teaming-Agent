@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
@@ -13,6 +15,7 @@ ALLOWED_CRITERION_KINDS = frozenset({
     "coverage", "poc", "semantic",
 })
 UNKNOWN_CRITERION_KIND = "unknown"
+MAX_COMPLETION_CONDITION_CONFLICTS = 8
 
 
 class CompletionCriterion(BaseModel):
@@ -31,6 +34,60 @@ class CompletionCriterion(BaseModel):
 
     def is_known(self) -> bool:
         return self.kind in ALLOWED_CRITERION_KINDS
+
+
+@dataclass(frozen=True)
+class CompletionConditionConflict:
+    """One bounded, structured same-candidate verdict contradiction."""
+
+    hypothesis_id: str
+    criterion_ids: tuple[str, str]
+
+
+def completion_condition_conflicts(
+    criteria: Sequence[CompletionCriterion],
+) -> tuple[CompletionConditionConflict, ...]:
+    """Find explicit confirmation/refutation pairs for one candidate.
+
+    Only structured kinds and matching hypothesis IDs participate. Descriptions,
+    observations, established facts, and verdicts for separate candidates are
+    intentionally left alone. Results are sorted and capped for safe diagnostics.
+    """
+    by_hypothesis: dict[str, dict[str, str | None]] = {}
+    for criterion in criteria:
+        if criterion.kind not in {"hypothesis_confirmed", "hypothesis_refuted"}:
+            continue
+        if not criterion.hypothesis_id:
+            continue
+        verdicts = by_hypothesis.setdefault(criterion.hypothesis_id, {
+            "hypothesis_confirmed": None, "hypothesis_refuted": None,
+        })
+        identity = criterion_id(criterion)
+        current = verdicts[criterion.kind]
+        if current is None or identity < current:
+            verdicts[criterion.kind] = identity
+
+    conflicts: list[CompletionConditionConflict] = []
+    for hypothesis_id, verdicts in sorted(by_hypothesis.items()):
+        confirmed, refuted = verdicts["hypothesis_confirmed"], verdicts["hypothesis_refuted"]
+        if not confirmed or not refuted:
+            continue
+        conflicts.append(CompletionConditionConflict(
+            hypothesis_id=_diagnostic_reference(hypothesis_id),
+            criterion_ids=(confirmed, refuted),
+        ))
+        if len(conflicts) == MAX_COMPLETION_CONDITION_CONFLICTS:
+            break
+    return tuple(conflicts)
+
+
+def _diagnostic_reference(value: str) -> str:
+    """Keep references bounded and identifier-shaped before exposing diagnostics."""
+    if len(value) > 100 or not value or any(
+        not (char.isascii() and (char.isalnum() or char in "_-")) for char in value
+    ):
+        return "invalid_reference"
+    return value
 
 
 def _digest(value: Any) -> str:

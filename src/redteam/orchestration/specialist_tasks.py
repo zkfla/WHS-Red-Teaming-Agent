@@ -6,7 +6,12 @@ from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from redteam.core.contracts.completion import CompletionCriterion, criterion_id
+from redteam.core.contracts.completion import (
+    CompletionConditionConflict,
+    CompletionCriterion,
+    completion_condition_conflicts,
+    criterion_id,
+)
 from redteam.core.contracts.events import EventEnvelope, EventType
 from redteam.core.contracts.graph import HypothesisUpdate
 from redteam.core.contracts.mission import MissionTask, Provenance
@@ -54,8 +59,40 @@ class StrategyTasks(BaseModel):
 class SpecialistProposalError(ValueError):
     """Code-owned validation label; never contains model text or secrets."""
 
-    def __init__(self, code: str) -> None:
+    def __init__(
+        self, code: str, *,
+        condition_conflicts: tuple[CompletionConditionConflict, ...] = (),
+    ) -> None:
         self.code = code
+        self.condition_conflicts = condition_conflicts
+        if condition_conflicts:
+            from redteam.orchestration.diagnostics import DecisionDiagnostic
+
+            self.diagnostic = DecisionDiagnostic(
+                code=code,
+                stage="hypothesis_planning",
+                kind="validation",
+                summary=(
+                    "One investigation purpose contains both confirmation and refutation "
+                    "conditions for the same hypothesis."
+                ),
+                retryable=True,
+                cause_scope="model_input",
+                owner="planner",
+                repair_condition=(
+                    "Keep only one candidate verdict condition in each AND condition set; "
+                    "preserve observations and conditions for other candidates."
+                ),
+                criterion_ids=sorted({
+                    criterion_id for conflict in condition_conflicts
+                    for criterion_id in conflict.criterion_ids
+                }),
+                trace=[{
+                    "kind": "same_candidate_completion_condition_conflict",
+                    "hypothesis_id": conflict.hypothesis_id,
+                    "criterion_ids": list(conflict.criterion_ids),
+                } for conflict in condition_conflicts],
+            )
         super().__init__(code)
 
 
@@ -95,6 +132,12 @@ def _validate_subjects(
                 raise SpecialistProposalError("specialist_condition_principal_outside_subjects")
             if condition.hypothesis_id and condition.hypothesis_id not in known_hypotheses:
                 raise SpecialistProposalError("specialist_unknown_hypothesis")
+        conflicts = completion_condition_conflicts(item.completion_criteria)
+        if conflicts:
+            raise SpecialistProposalError(
+                "same_candidate_completion_condition_conflict",
+                condition_conflicts=conflicts,
+            )
 
 
 def validate_strategy_tasks(
@@ -394,11 +437,6 @@ async def register_probe_tasks(
     from redteam.orchestration.evidence_validity import capture_validity
 
     proposal = HypothesisProbeProposal.model_validate(proposal.model_dump())
-    known_hypotheses = {
-        item.hypothesis.hypothesis_id for item in proposal.updates
-    } | {identity for task in proposal.tasks for identity in task.hypothesis_revisions}
-    validate_probe_subjects(proposal, known_targets=known_targets,
-                            known_principals=known_principals, known_hypotheses=known_hypotheses)
     state = deps.central_state
     if not proposal_id.strip() or max_tasks < 1 or len(proposal.tasks) > max_tasks:
         raise StateConflict("probe_registration_identity_or_count_invalid")
@@ -408,6 +446,11 @@ async def register_probe_tasks(
     )
     if previous is not None:
         return previous
+    known_hypotheses = {
+        item.hypothesis.hypothesis_id for item in proposal.updates
+    } | {identity for task in proposal.tasks for identity in task.hypothesis_revisions}
+    validate_probe_subjects(proposal, known_targets=known_targets,
+                            known_principals=known_principals, known_hypotheses=known_hypotheses)
     mission_id = await state.transaction(lambda tx: tx.binding()[0], write=False)
     mission = await state.get_mission(mission_id)
     if mission is None:

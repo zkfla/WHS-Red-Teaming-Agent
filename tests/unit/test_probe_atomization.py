@@ -10,6 +10,12 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
+from redteam.core.contracts.completion import (
+    MAX_COMPLETION_CONDITION_CONFLICTS,
+    CompletionCriterion,
+    completion_condition_conflicts,
+    criterion_id,
+)
 from redteam.core.contracts.specialists import ProbeLimits
 from redteam.orchestration.probe_atomization import (
     AtomizationProposalError,
@@ -20,6 +26,12 @@ from redteam.orchestration.probe_atomization import (
     bind_plan,
     needs_atomization,
     validate_atomized_tasks,
+)
+from redteam.orchestration.specialist_tasks import (
+    HypothesisProbeProposal,
+    ProbeTaskProposal,
+    SpecialistProposalError,
+    validate_probe_subjects,
 )
 
 TARGETS = {"n1", "n2"}
@@ -41,6 +53,10 @@ def _update(local_id="local", expected=None, targets=("n1",)):
 def _criterion(desc="Inspect the response", principals=()):
     return {"kind": "observation", "description": desc,
             "principal_refs": list(principals)}
+
+def _verdict(kind, hypothesis_id="h1"):
+    return CompletionCriterion(kind=kind, description="Review candidate",
+                               hypothesis_id=hypothesis_id)
 
 def _question(qid="q1", targets=("n1",), principals=(), criteria=None,
               revisions=None, required=False, required_reason=None, goal_ids=()):
@@ -164,6 +180,75 @@ def test_bind_plan_forwards_new_candidate_issued_id():
     persisted = issued["local"]
     assert persisted != "local" and versions[persisted] == 1
     assert questions[0].hypothesis_revisions == {persisted: 1}
+
+
+def test_bind_plan_rejects_same_candidate_confirmation_and_refutation_with_refs():
+    issued = {}
+    question = _question(
+        criteria=[_verdict("hypothesis_confirmed", "local"),
+                  _verdict("hypothesis_refuted", "local")],
+        revisions={"local": 1},
+    )
+    with pytest.raises(AtomizationProposalError) as caught:
+        _bind({"updates": [_update("local")],
+               "questions": [question.model_dump(mode="json")],
+               "reason": "Check the candidate"}, issued=issued)
+    conflicts = caught.value.condition_conflicts
+    assert len(conflicts) == 1
+    assert conflicts[0].hypothesis_id == issued["local"]
+    assert len(conflicts[0].criterion_ids) == 2
+    assert caught.value.diagnostic.criterion_ids == sorted(conflicts[0].criterion_ids)
+    assert caught.value.diagnostic.trace[0]["hypothesis_id"] == issued["local"]
+    assert set(conflicts[0].criterion_ids) == {
+        criterion_id(_verdict("hypothesis_confirmed", issued["local"])),
+        criterion_id(_verdict("hypothesis_refuted", issued["local"])),
+    }
+
+
+def test_condition_conflict_validator_preserves_distinct_candidates_and_observations():
+    conditions = [
+        _verdict("hypothesis_confirmed", "h1"),
+        _verdict("hypothesis_refuted", "h2"),
+        CompletionCriterion(kind="observation", description="Observe h1", hypothesis_id="h1"),
+    ]
+    assert completion_condition_conflicts(conditions) == ()
+
+
+def test_condition_conflict_diagnostics_are_bounded_and_sanitize_candidate_refs():
+    conditions = [
+        condition
+        for index in range(MAX_COMPLETION_CONDITION_CONFLICTS + 3)
+        for condition in (
+            _verdict("hypothesis_confirmed", f"h{index}"),
+            _verdict("hypothesis_refuted", f"h{index}"),
+        )
+    ]
+    conditions.extend([
+        _verdict("hypothesis_confirmed", "candidate with unsafe text"),
+        _verdict("hypothesis_refuted", "candidate with unsafe text"),
+    ])
+
+    conflicts = completion_condition_conflicts(conditions)
+
+    assert len(conflicts) == MAX_COMPLETION_CONDITION_CONFLICTS
+    assert all(len(item.criterion_ids) == 2 for item in conflicts)
+    assert any(item.hypothesis_id == "invalid_reference" for item in conflicts)
+
+
+def test_probe_subject_validation_rejects_same_candidate_conflict_with_safe_refs():
+    criteria = [_verdict("hypothesis_confirmed"), _verdict("hypothesis_refuted")]
+    proposal = HypothesisProbeProposal(tasks=[ProbeTaskProposal(
+        task_key="probe-1", objective="Check candidate", title="Check candidate",
+        role_id="probe-worker", target_node_ids=["n1"], completion_criteria=criteria,
+    )])
+    with pytest.raises(SpecialistProposalError) as caught:
+        validate_probe_subjects(
+            proposal, known_targets={"n1"}, known_principals=set(),
+            known_hypotheses={"h1"},
+        )
+    conflict = caught.value.condition_conflicts[0]
+    assert conflict.hypothesis_id == "h1"
+    assert set(conflict.criterion_ids) == {criterion_id(item) for item in criteria}
 
 
 def _two_question_setup():
