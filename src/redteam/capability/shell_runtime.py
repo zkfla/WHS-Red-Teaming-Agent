@@ -16,7 +16,9 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING
 
+from redteam.capability.gated_network_policy import GatedNetworkPolicy
 from redteam.capability.settings import MCPConfigurationError
 from redteam.capability.shell_adapter import BuiltinShellAdapter
 from redteam.capability.shell_assembly import build_shell_entries, shell_server_output_limits
@@ -24,6 +26,9 @@ from redteam.capability.shell_manifest import SHELL_SERVER_ID
 from redteam.capability.shell_policy import ShellWorkroomPolicy, load_shell_workroom_policy
 from redteam.core.contracts.tool import ToolDescriptor
 from redteam.core.ports.program_discovery import ShellProgramDiscovery
+
+if TYPE_CHECKING:
+    from redteam.capability.shell_preparation import DockerEndpoint
 
 
 @dataclass(frozen=True)
@@ -42,6 +47,11 @@ class ShellRuntime:
     concurrency: dict[str, int] = field(default_factory=dict)
     output_limits: dict[str, int] = field(default_factory=dict)
     environment_fingerprint: str | None = None
+    preparation_status: str | None = None
+    network_policy: GatedNetworkPolicy | None = None
+    network_policy_hash: str | None = None
+    docker_endpoint: DockerEndpoint | None = None
+    readiness_checked_at: str | None = None
 
 
 def build_shell_runtime(
@@ -81,6 +91,8 @@ def build_shell_runtime(
 
 async def prepare_shell_runtime(
     policy_path: str | None, *, auto_setup: bool = True,
+    program_manifest_path: str | None = None,
+    network_policy_path: str | None = None,
     progress: Callable[[str], None] | None = None,
     expected_fingerprint: str | None = None,
 ) -> ShellRuntime | None:
@@ -89,20 +101,45 @@ async def prepare_shell_runtime(
     Manual mode preserves the prior policy-only behavior. Inspection callers
     continue using build_shell_runtime and never launch or build anything.
     """
+    if policy_path is None and program_manifest_path is not None:
+        from redteam.capability.shell_preparation import ShellPreparationError
+
+        raise ShellPreparationError(
+            "program_manifest_requires_explicit_policy",
+            "Select an explicit Kali image policy before supplying a program manifest.",
+        )
     if not auto_setup:
         if expected_fingerprint is not None:
             raise MCPConfigurationError(
                 "This run requires its prepared execution environment; "
                 "enable REDTEAM_SHELL_AUTO_SETUP to resume it."
             )
-        return build_shell_runtime(policy_path)
+        if network_policy_path is not None:
+            from redteam.capability.shell_preparation import ShellPreparationError
+
+            raise ShellPreparationError(
+                "network_policy_requires_preparation",
+                "Enable REDTEAM_SHELL_AUTO_SETUP to inspect the selected sidecar "
+                "and verify kernel readiness.",
+            )
+        return build_shell_runtime(policy_path, program_manifest_path=program_manifest_path)
     from redteam.capability.shell_preparation import prepare_shell_policy
 
     prepared = await prepare_shell_policy(
-        policy_path, progress=progress, expected_fingerprint=expected_fingerprint,
+        policy_path, program_manifest_path=program_manifest_path,
+        network_policy_path=network_policy_path,
+        progress=progress, expected_fingerprint=expected_fingerprint,
     )
     runtime = build_shell_runtime(
         None, policy=prepared.policy, program_manifest_path=prepared.manifest_path,
     )
     assert runtime is not None
-    return replace(runtime, environment_fingerprint=prepared.fingerprint)
+    return replace(
+        runtime,
+        environment_fingerprint=prepared.fingerprint,
+        preparation_status=prepared.status,
+        network_policy=prepared.network_policy,
+        network_policy_hash=prepared.network_policy_hash,
+        docker_endpoint=prepared.endpoint,
+        readiness_checked_at=prepared.readiness_checked_at,
+    )
