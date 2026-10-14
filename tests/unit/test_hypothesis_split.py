@@ -11,6 +11,7 @@ from redteam.orchestration.probe_atomization import (
     bind_plan,
     build_atomizer_input,
     needs_atomization,
+    resolve_atomized_tasks,
     validate_atomized_tasks,
 )
 
@@ -170,11 +171,12 @@ def test_existing_criterion_hypothesis_id_survives_normalization():
     parsed = TaskAtomizationDraft.model_validate({"tasks": [{
         "task_key": "t1", "question_id": "q1", "objective": "Inspect one response",
         "title": "Response check", "role_id": "probe-role",
-        "target_node_ids": ["host:a"], "completion_criteria": [criterion],
+        "target_node_ids": ["host:a"], "completion_criterion_ids": [expected_id],
         "hypothesis_revisions": {"cand-a": 2},
     }]})
     (stripped,) = validate_atomized_tasks(
-        parsed.tasks, questions=questions, issued=issued, versions=versions,
+        resolve_atomized_tasks(parsed.tasks, questions=questions),
+        questions=questions, issued=issued, versions=versions,
         targets={"host:a"}, principals=set(), roles={"probe-role"},
         limits=ProbeLimits(), snapshot=snapshot, max_tasks=4,
     )

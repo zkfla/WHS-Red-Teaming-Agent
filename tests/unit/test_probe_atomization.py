@@ -10,15 +10,18 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
+from redteam.core.contracts.completion import criterion_id
 from redteam.core.contracts.specialists import ProbeLimits
 from redteam.orchestration.probe_atomization import (
     AtomizationProposalError,
+    AtomizedProbeSelection,
     AtomizedProbeTask,
     HypothesisPlanDraft,
     PlannedInvestigationQuestion,
     TaskAtomizationDraft,
     bind_plan,
     needs_atomization,
+    resolve_atomized_tasks,
     validate_atomized_tasks,
 )
 
@@ -313,3 +316,88 @@ def test_atomization_draft_requires_question_binding():
             "task_key": "t1", "objective": "Probe", "title": "Probe",
             "role_id": "probe-worker", "target_node_ids": ["n1"],
             "completion_criteria": [_criterion()]}]})
+
+
+def _selection(question, *, ids=None, principals=None):
+    body = _task(qid=question.question_id, targets=question.target_node_ids,
+                 principals=question.principal_refs).model_dump(exclude={"completion_criteria"})
+    body["completion_criterion_ids"] = (
+        [criterion_id(item) for item in question.completion_criteria] if ids is None else ids
+    )
+    if principals is not None:
+        body["principal_refs"] = principals
+    return AtomizedProbeSelection.model_validate(body)
+
+
+def _validate_resolved(selections, questions):
+    return validate_atomized_tasks(
+        resolve_atomized_tasks(selections, questions=questions), questions=questions,
+        issued={}, versions={}, targets=TARGETS, principals=PRINCIPALS, roles=ROLES,
+        limits=LIMITS, snapshot=_snap(), max_tasks=MAX_TASKS,
+    )
+
+
+def test_reference_output_excludes_rewritten_conditions_and_restores_whole_original():
+    condition = {**_criterion("Compare both preserved responses exactly", ("A", "B")),
+                 "min_evidence": 3}
+    question = _question(principals=("A", "B"), criteria=[condition])
+    selection = _selection(question)
+    schema = AtomizedProbeSelection.model_json_schema()
+    assert "completion_criteria" not in schema["properties"]
+    assert "completion_criterion_ids" in schema["required"]
+    with pytest.raises(ValidationError):
+        AtomizedProbeSelection.model_validate({**selection.model_dump(),
+                                              "completion_criteria": [condition]})
+    (task,) = _validate_resolved([selection], [question])
+    assert task.completion_criteria[0].model_dump() == question.completion_criteria[0].model_dump()
+    task.completion_criteria[0].description = "mutated copy"
+    assert question.completion_criteria[0].description == condition["description"]
+
+
+@pytest.mark.parametrize("mode", ["unknown", "other_question", "duplicate"])
+def test_condition_selection_is_question_scoped_and_reports_public_repair(mode):
+    question, other = _question(), _question("q2", criteria=[_criterion("Other condition")])
+    valid = criterion_id(question.completion_criteria[0])
+    ids = {"unknown": ["PRIVATE-INVALID-REFERENCE"],
+           "other_question": [criterion_id(other.completion_criteria[0])],
+           "duplicate": [valid, valid]}[mode]
+    with pytest.raises(AtomizationProposalError) as rejected:
+        resolve_atomized_tasks([_selection(question, ids=ids)], questions=[question, other])
+    diagnostic = rejected.value.diagnostic
+    assert diagnostic.location == "$.tasks[0].completion_criterion_ids"
+    assert diagnostic.cause_scope == "model_input" and diagnostic.retryable
+    assert diagnostic.criterion_ids == [valid]
+    assert {"task_key": "t1", "question_id": "q1"}.items() <= diagnostic.trace[0].items()
+    assert "completion_criterion_ids" in diagnostic.feedback()
+    assert valid in diagnostic.feedback()
+    assert "PRIVATE-INVALID-REFERENCE" not in diagnostic.model_dump_json()
+
+
+def test_reference_selection_does_not_allow_missing_condition_or_split_principal_scope():
+    question = _question(criteria=[_criterion("First"), _criterion("Second")])
+    first, second = [criterion_id(item) for item in question.completion_criteria]
+    with pytest.raises(AtomizationProposalError) as rejected:
+        _validate_resolved([_selection(question, ids=[first])], [question])
+    assert rejected.value.code == "atomized_criterion_coverage_mismatch"
+    assert rejected.value.diagnostic.criterion_ids == [second]
+    paired = _question(principals=("A", "B"),
+                       criteria=[_criterion("Compare both", ("A", "B"))])
+    with pytest.raises(AtomizationProposalError) as rejected:
+        _validate_resolved([_selection(paired, principals=["A"])], [paired])
+    assert rejected.value.code == "atomized_criterion_principals_outside_task"
+    assert rejected.value.diagnostic.location == "$.tasks[0].principal_refs"
+    assert rejected.value.diagnostic.trace[0]["differing_fields"] == ["principal_refs"]
+
+
+def test_internal_condition_mismatch_reports_fields_without_condition_text():
+    question = _question(criteria=[_criterion("Original private description")])
+    changed = _task(criteria=[_criterion("Changed private description")])
+    with pytest.raises(AtomizationProposalError) as rejected:
+        validate_atomized_tasks([changed], questions=[question], issued={}, versions={},
+                               targets=TARGETS, principals=PRINCIPALS, roles=ROLES,
+                               limits=LIMITS, snapshot=_snap(), max_tasks=MAX_TASKS)
+    diagnostic = rejected.value.diagnostic
+    assert diagnostic.trace[0]["differing_fields"] == ["description"]
+    assert diagnostic.criterion_ids == [criterion_id(question.completion_criteria[0])]
+    assert "description" in diagnostic.feedback()
+    assert "private description" not in diagnostic.model_dump_json()
