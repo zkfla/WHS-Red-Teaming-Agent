@@ -25,8 +25,10 @@ async def inspect_central_run(path, run_id):
             raise StateConflict(
                 "central_original_configuration_missing_requires_explicit_preparation"
             )
-        return mission, json.loads(row[0]), tx.active_activation_count()
-    mission, config, active_actors = await state.transaction(read, write=False)
+        return mission, json.loads(row[0]), tx.active_activation_count(), tx.planning_diagnostics()
+    mission, config, active_actors, (diagnostic, diagnostic_history) = await state.transaction(
+        read, write=False,
+    )
     evidence = await FilesystemEvidenceStore.inspect_run(config["storage_refs"]["evidence"],
                                                          RunId(str(run_id)))
     if evidence is None:
@@ -40,12 +42,14 @@ async def inspect_central_run(path, run_id):
         run_id=RunId(str(run_id)), engagement_id=EngagementId(state.engagement_id),
         mission_id=mission.mission_id, current_goal=mission.objective,
         started_at=mission.created_at,
-        phase=(AgentPhase.OBSERVE if active_actors else AgentPhase.FINISHED
+        phase=(AgentPhase.OBSERVE if active_actors else AgentPhase.FAILED
+               if mission.termination_reason == "planning_error" else AgentPhase.FINISHED
                if mission.termination_reason or mission.status in {
                    MissionStatus.COMPLETED, MissionStatus.CANCELLED, MissionStatus.FAILED,
                } else AgentPhase.OBSERVE),
         termination_reason=None if active_actors else mission.termination_reason,
         mission_status=mission.status,
+        planning_diagnostic=diagnostic, planning_diagnostic_history=diagnostic_history,
     )
     tasks = await state.list_tasks()
     report = await ReportingAgent().project(

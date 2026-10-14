@@ -10,7 +10,7 @@ as successful completion).
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from redteam.core.enums import EvidenceSourceType
 from redteam.orchestration.analysis import claim_target_is_grounded, is_final_admission_receipt
@@ -26,8 +26,10 @@ from redteam.orchestration.paths import (
     is_known_criterion,
 )
 from redteam.orchestration.session_proof import (
+    actual_receipt_conflict,
     collect_actual_accounts,
     collect_actual_sessions,
+    has_anonymous_receipt,
 )
 
 _ALLOWED_KINDS = ALLOWED_CRITERION_KINDS
@@ -110,17 +112,6 @@ def _evidence_principal_refs(record: Any) -> set[str]:
             if text:
                 out.add(text)
     return out
-
-
-def _is_anonymous_evidence(meta: dict[str, Any]) -> bool:
-    if meta.get("anonymous") is True:
-        return True
-    if _s(meta.get("principal_ref", "")).strip().lower() == "anonymous":
-        return True
-    refs = meta.get("principal_refs")
-    if isinstance(refs, (list, tuple, set)):
-        return any(_s(item).strip().lower() == "anonymous" for item in refs)
-    return False
 
 
 def _evidence_operation_names(meta: dict[str, Any]) -> set[str]:
@@ -1069,32 +1060,10 @@ def _verified_completion_accounts(
     if not cleaned_claimed and not cleaned_required:
         return set()
     expected_sessions = _expected_session_refs(stored_args)
-    raw_principals: set[str] = set()
     # Session names and per-unit accounts come from the shared actual-use
     # collector only; the receipt-vs-echo rule lives in session_proof.
     raw_sessions: set[str] = collect_actual_sessions(meta, raw)
     raw_accounts: set[str] = collect_actual_accounts(meta, raw, expected_sessions)
-    comparison = meta.get("session_comparison")
-    if isinstance(comparison, dict):
-        for key in ("first_principal_ref", "second_principal_ref"):
-            value = comparison.get(key)
-            if isinstance(value, str) and value.strip():
-                raw_principals.add(value.strip())
-    try:
-        output = raw.get("output") if isinstance(raw, dict) else None
-    except Exception:
-        output = None
-    if isinstance(output, dict):
-        for key in ("principal_ref", "first_principal_ref", "second_principal_ref"):
-            value = output.get(key)
-            if isinstance(value, str) and value.strip():
-                raw_principals.add(value.strip())
-        for nested_key in ("first", "second", "authenticated", "anonymous"):
-            nested = output.get(nested_key)
-            if isinstance(nested, dict):
-                value = nested.get("principal_ref")
-                if isinstance(value, str) and value.strip():
-                    raw_principals.add(value.strip())
     # Configured session inventory (session_list rows) is never actual-use
     # proof: it is not merged into the raw receipt sets above. Session to
     # principal binding stays on the separate alias-grounded lookup, and an
@@ -1105,10 +1074,7 @@ def _verified_completion_accounts(
         # lookup (outside this function) may still ground the claim.
         return set()
     verified: set[str] = set()
-    for name in cleaned_claimed:
-        if name in raw_principals:
-            verified.add(name)
-    for name in cleaned_required:
+    for name in cleaned_claimed | cleaned_required:
         if name in raw_accounts:
             verified.add(name)
     for name in cleaned_claimed | cleaned_required:
@@ -1198,18 +1164,38 @@ class CompletionIssues(list[str]):
         code: str,
         summary: str,
         location: str = "$.completion",
+        cause_scope: Literal[
+            "model_input", "target_prerequisite", "policy_wait", "evidence_validity",
+            "runtime_contract", "unknown",
+        ] = "unknown",
+        owner: str = "orchestration.completion",
+        repair_condition: str = (
+            "The cited support is unproven. Preserve originals and return an unresolved gap "
+            "if no independent support is available; rereading does not repair the contract."
+        ),
+        retryable: bool = False,
     ) -> None:
         self.append(message)
         self.diagnostics.append(
             DecisionDiagnostic(
                 code=code,
                 stage="completion_validation",
-                kind="format",
+                kind="validation",
                 location=location,
                 summary=summary,
-                retryable=True,
+                retryable=retryable,
+                cause_scope=cause_scope,
+                owner=owner,
+                repair_condition=repair_condition,
             )
         )
+
+    @classmethod
+    def failure(cls, messages, *, code, summary, **conditions) -> CompletionIssues:
+        result = cls()
+        for message in messages:
+            result.add(message, code=code, summary=summary, **conditions)
+        return result
 
     def deduplicated(self) -> CompletionIssues:
         result = CompletionIssues()
@@ -1306,6 +1292,8 @@ async def validate_completion(
             "outcome must be one of success/refuted/inconclusive/blocked "
             f"(got={proposal.get('outcome')!r})",
             code="completion_outcome_must_be_one_of_success_6",
+            cause_scope="model_input", retryable=True,
+            repair_condition="Correct the completion proposal using existing scoped evidence.",
             summary=("outcome must be one of success/refuted/inconclusive/blocked (got=reference)"),
         )
         outcome = ""
@@ -1314,6 +1302,8 @@ async def validate_completion(
         issues.add(
             "proposal reason is required",
             code="completion_proposal_reason_is_required_7",
+            cause_scope="model_input", retryable=True,
+            repair_condition="Correct the completion proposal using existing scoped evidence.",
             summary="proposal reason is required",
         )
     raw_evidence_ids = proposal.get("evidence_ids", [])
@@ -1328,12 +1318,16 @@ async def validate_completion(
         issues.add(
             "proposal evidence_ids must be a list of evidence id strings",
             code="completion_proposal_evidence_ids_must_be_a_14",
+            cause_scope="model_input", retryable=True,
+            repair_condition="Correct the completion proposal using existing scoped evidence.",
             summary="proposal evidence_ids must be a list of evidence id strings",
         )
     if not evidence_ids:
         issues.add(
             "proposal has no evidence; completion needs real evidence",
             code="completion_proposal_has_no_evidence_completion_needs_8",
+            cause_scope="model_input", retryable=True,
+            repair_condition="Correct the completion proposal using existing scoped evidence.",
             summary="proposal has no evidence; completion needs real evidence",
         )
     if outcome in {"inconclusive", "blocked"}:
@@ -1480,6 +1474,8 @@ async def validate_result_claims(
                 location=reference_location,
                 message=f"evidence '{eid}' does not exist",
                 code="completion_evidence_reference_does_not_exist_15",
+                cause_scope="model_input", retryable=True,
+                repair_condition="Correct the references using existing scoped original evidence.",
                 summary="evidence 'reference' does not exist",
             )
             continue
@@ -1488,6 +1484,8 @@ async def validate_result_claims(
                 location=reference_location,
                 message=f"evidence '{eid}' belongs to a different run",
                 code="completion_evidence_reference_belongs_to_a_different_16",
+                cause_scope="model_input", retryable=True,
+                repair_condition="Correct the references using existing scoped original evidence.",
                 summary="evidence 'reference' belongs to a different run",
             )
             continue
@@ -1499,6 +1497,9 @@ async def validate_result_claims(
                 location=reference_location,
                 message=f"evidence '{eid}' reuse conditions are {validity.status}",
                 code="completion_evidence_reuse_unproven",
+                cause_scope="evidence_validity",
+                repair_condition=("Reassess the binding prerequisites; "
+                                  "rereading preserves the status."),
                 summary="evidence reuse conditions do not support current completion",
             )
             continue
@@ -1535,12 +1536,12 @@ async def validate_result_claims(
         # response's own unit receipts name the accounts it actually used.
         # Scope is judged on both, never on the representative alone.
         observed_principals = ev_principals | collect_actual_accounts(meta, raw)
-        anonymous = _is_anonymous_evidence(meta)
+        anonymous = has_anonymous_receipt(meta, raw)
+        if anonymous:
+            observed_principals.add("anonymous")
         step_principal_lower = {str(item).strip().lower() for item in step_principal_set}
         explicit_anonymous = "anonymous" in step_principal_lower
-        ev_lower = {str(item).strip().lower() for item in ev_principals}
-        has_anonymous_name = "anonymous" in ev_lower
-        if anonymous or has_anonymous_name:
+        if anonymous and not collect_actual_sessions(meta, raw):
             if not step_principal_set or explicit_anonymous:
                 pass
             else:
@@ -1556,7 +1557,7 @@ async def validate_result_claims(
                 )
                 continue
         elif step_principal_set:
-            if not ev_principals:
+            if not observed_principals:
                 issues.add(
                     location=reference_location,
                     message=f"evidence '{eid}' has no principal_ref",
@@ -1689,6 +1690,8 @@ async def validate_result_claims(
                     location=reference_location,
                     message=f"evidence '{eid}' targets a different object",
                     code="completion_evidence_reference_targets_a_different_object_24",
+                cause_scope="model_input", retryable=True,
+                repair_condition="Correct the references using existing scoped original evidence.",
                     summary="evidence 'reference' targets a different object",
                 )
                 continue
@@ -1701,6 +1704,15 @@ async def validate_result_claims(
                 summary=linkage_summary,
             )
         if linkage_errors:
+            continue
+        receipt_conflict = actual_receipt_conflict(meta, raw)
+        if receipt_conflict is not None:
+            issues.add(
+                location=reference_location,
+                message=f"evidence '{eid}' {receipt_conflict}",
+                code="completion_actual_session_receipt_conflict",
+                summary=receipt_conflict,
+            )
             continue
         stored_proposal = meta.get("proposal")
         # Prefer the code-stored step account over tool args (same false-
@@ -1736,13 +1748,22 @@ async def validate_result_claims(
         failed_original = raw_success is False or (
             raw_success is None and isinstance(meta.get("error"), dict) and bool(meta.get("error"))
         )
-        if account_principal_set and not explicit_anonymous:
-            claimed_accounts = {str(item).strip() for item in ev_principals if str(item).strip()}
+        if account_principal_set:
+            claimed_accounts = {str(item).strip() for item in ev_principals
+                                if str(item).strip() and str(item).strip().lower() != "anonymous"}
             required_accounts = {
-                str(item).strip() for item in account_principal_set if str(item).strip()
+                str(item).strip() for item in account_principal_set
+                if str(item).strip() and str(item).strip().lower() != "anonymous"
             }
             stored_args = (
                 stored_proposal.get("arguments") if isinstance(stored_proposal, dict) else None
+            )
+            # Conditions may cite a shared pool of originals from different
+            # accounts. Prove each record's actual account, then let each
+            # condition select its own coverage; unrelated proven accounts
+            # must not fail an anonymous condition.
+            required_accounts |= collect_actual_accounts(
+                meta, raw, _expected_session_refs(stored_args),
             )
             verified_names = _verified_completion_accounts(
                 meta, raw, claimed_accounts, stored_args, required_accounts
@@ -1788,7 +1809,10 @@ async def validate_result_claims(
                         )
                         continue
             grounded_accounts = set(verified_names) | alias_verified
-            if grounded_accounts:
+            unproven_claims = claimed_accounts - grounded_accounts
+            if anonymous:
+                grounded_accounts.add("anonymous")
+            if grounded_accounts and not unproven_claims:
                 verified_by_evidence[eid] = grounded_accounts
             else:
                 issues.add(

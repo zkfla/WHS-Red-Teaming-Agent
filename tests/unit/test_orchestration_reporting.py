@@ -6,7 +6,7 @@ from redteam.attack_graph.hypotheses import prepare_hypothesis_update
 from redteam.attack_graph.service import AttackGraphService
 from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
 from redteam.core.contracts.evidence import EvidenceRecord
-from redteam.core.contracts.graph import Finding, Hypothesis, HypothesisUpdate
+from redteam.core.contracts.graph import CandidateHypothesis, Finding, HypothesisUpdate
 from redteam.core.enums import AgentPhase, EvidenceSourceType
 from redteam.core.ids import AgentId, EngagementId, EvidenceId, GraphNodeId, RunId
 from redteam.orchestration.candidates.models import PriorityScore
@@ -52,7 +52,7 @@ async def test_candidate_projection_is_not_a_finding_or_mission_verdict() -> Non
     store = InMemoryAttackGraphStore()
     await store.add_node(prepare_hypothesis_update(
         None,
-        HypothesisUpdate(hypothesis=Hypothesis(
+        HypothesisUpdate(hypothesis=CandidateHypothesis(
             hypothesis_id="candidate-a",
             description="Authorization may be missing",
             contract_version=2,

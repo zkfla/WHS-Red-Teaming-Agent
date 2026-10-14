@@ -96,8 +96,8 @@ class ConversationAssistant:
         self,
         llm: LLMClient,
         *,
-        timeout_seconds: float = 30.0,
-        max_attempts: int = 3,
+        timeout_seconds: float = 180.0,
+        max_attempts: int = 6,
     ) -> None:
         self._llm = llm
         self._timeout_seconds = float(timeout_seconds)

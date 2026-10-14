@@ -1035,3 +1035,113 @@ unspecified effects are reported and prevent successful goal settlement. Owned
 read-only providers declare empty effects. Arbitrary response text is never
 promoted into cleanup proof. Generic write/HTTP/shell providers without a valid
 resource declaration remain unsupported for successful cleanup settlement.
+
+## Current waits versus investigation history
+
+`InvestigationResult.observations` and `limitations` accumulate investigation
+assertions, including unresolved target/credential prerequisites. They are not
+the authority for execution waits. A code-owned probe suspension now stores
+its invocation/state/wait/original snapshot in the immutable unresolved record's
+diagnostic trace, instead of appending transient pending/uncollected strings to
+the result arrays. Pending suspension reasons likewise remain in that record,
+not in accumulated limitations. No string matching removes model assertions.
+
+After recovery, Planner uses current `execution_history` and reports use
+`executions`; resolved approvals therefore stop appearing as current waits.
+Still-pending approval/job/resource/UNKNOWN entries remain protected by the
+same ledger and recovery gates. No model polling or successful-call replay is
+introduced. Stable result IDs, gap/original references, target limitations and
+result questions survive final return; question resolution still requires the
+existing reviewed follow-up source contract.
+
+Historical Runs are read without rewriting their original snapshots or results.
+Older result arrays may contain execution statements, which remain historical
+assertions; current blocking is always determined from execution rows. The new
+diagnostic/view fields are additive, with defaults for older reports/diagnostics.
+Normal selection fingerprints, including versioned read/settlement contributions,
+must pass before resuming an existing Run; incompatible Runs are not migrated.
+
+## Worker delivery version
+
+The default split schema-3 profile is now `native-probes` version 9, with
+`worker.md` prompt version 4 and `hypothesis-strategy.md` version 3 (combined
+candidate-v2 guidance and bounded original-feedback guidance). The retained single-stage
+profile is version 6
+and uses the same worker prompt version. Their Planner/atomizer responsibilities,
+probe limits and existing independent completion review are unchanged. Prompt
+content hashes and versioned read/settlement contributions change the existing
+selection fingerprints. Historical Runs/results stay readable; an incompatible
+checkpoint cannot execute under new bindings without the normal compatibility
+checks. No historical checkpoint or evidence is rewritten.
+
+### Atomizer condition selection
+
+The split atomizer receives each normalized question's completion conditions with
+their code-owned `criterion_id`. Its output selects `completion_criterion_ids`
+for each task and cannot submit `completion_criteria` bodies. Code resolves those
+IDs against that question alone and attaches deep copies of the original
+conditions before existing subject, principal, coverage, revision, source, limit
+and atomic registration validation. Duplicate, invented or other-question IDs
+are rejected; every original condition must remain covered and a paired
+comparison remains one condition on a task with all its principals.
+
+The profile is version 9 and `probe-atomizer.md` is version 3. The single-stage
+profile's proposal shape and saved canonical Task conditions are unchanged.
+Historical split Runs/results remain readable, but old selection fingerprints
+cannot execute with the new atomizer contract. No stored Run is migrated.
+
+Atomization semantic rejections carry the task/question references, a precise
+`$.tasks[index].field` location, known condition IDs and differing field names
+through the existing `DecisionDiagnostic` feedback and saved planning diagnostic.
+Descriptions, proposed raw values and private reasoning are not copied into that
+diagnostic. Correction uses the existing bounded repair budget; scope, approval
+and completion checks are unchanged.
+
+An offline schema-sensitive double with identical short observation purpose,
+provider and review compared old lazy-schema preconditions against new delivery.
+It required four versus two worker requests; including independent review and
+one actual held Planner judgment, the shared ledger recorded six versus four.
+The first native input increased from approximately 27KiB to 32KiB; cumulative
+native input fell from about 134KiB to 70KiB. Synthetic known usage was 40 versus
+20 tokens and two requests in each scenario retained unknown usage (review and
+Planner); these are fixture accounting values, not live token measurements.
+The test demonstrates removal of mandatory lookup prerequisites and validates
+provided context. It does not prove a live model's call reduction, investigation
+quality or vulnerability-finding ability.
+
+## Candidate feedback input and request attribution
+
+Planner and the existing atomizer receive bounded `original_observations` from
+the original Evidence Store, alongside current Task/result snapshots, validity,
+execution rows, diagnostics, catalog readiness and budgets. No second snapshot
+store or proposal gate is introduced. At most eight recent TOOL originals share
+an 8000-character window allowance (at most 4000 per record); omitted/truncated
+content and provenance are explicit. Repeated invocation references are not
+independent observations. A readable original is not a successful Task, candidate
+verdict or Finding. Fixed-condition proof and candidate exact-revision/purpose
+review remain unchanged. Successful observations survive an inconclusive return.
+
+The split strategy and compatibility planner prompts are version 2, as is the
+atomizer prompt. Runtime guidance and profile prompt snapshots explain untested
+premises, scoped candidate-free follow-ups, UNKNOWN review/unbound validity,
+and diagnostic repair conditions. Source-correction requirements cannot be
+repaired by target calls; independent authorized observations may still be useful.
+The model proposes follow-up purposes or held, while code validates references,
+scope, revisions, original linkage, budgets and atomic registration. No natural
+language task classifier, semantic duplicate blocker or investigation DAG exists.
+
+Each new metered request may record its trusted instruction `stage` in the
+existing `llm_request` payload before dispatch, preserving owner/Task attribution.
+`snapshot.by_stage` derives spent/reserved/known-token/unknown-usage/unknown-dispatch
+counts from those rows. Stage counts sum to the existing totals; undispatched
+release still refunds only the same reservation. Old/direct requests lacking a
+stage remain in `unknown`, without guessing from owner or method. No table,
+cost ledger or historical backfill is added.
+
+Terminal/CLI reports display that breakdown. The read-only web graph recognizes
+both candidate and compatibility planning ownership, displays the recorded live
+planning/atomization stage, and distinguishes a saved held/exhausted judgment
+from waiting. Active Mission status does not imply an executing worker or a
+successful Run; actual activation/execution rows remain the worker-state source.
+Prompt/profile fingerprint checks still reject incompatible execution resumes,
+while old evidence, reports and stage-less request rows remain readable.

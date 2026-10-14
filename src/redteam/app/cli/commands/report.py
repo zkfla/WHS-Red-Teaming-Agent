@@ -120,6 +120,13 @@ def _render_markdown(report: TerminalReportProjection) -> str:
             lines += ["- Resource effects unavailable for tools: "
                       + ", ".join(report.cleanup_unmapped_tools)]
         lines += [""]
+    if report.runtime_records:
+        lines += ["## Historical runtime diagnostics and reviews", "",
+                  "- These records do not prove execution or describe current waits."]
+        for view in report.runtime_records.get("records", []):
+            lines += [f"- {view['evidence_id']}: {view['view_kind']}; "
+                      f"truncated={view['truncated']}", "```json", view["text"], "```"]
+        lines += [f"- Omitted records: {report.runtime_records.get('omitted_count', 0)}", ""]
     if report.candidates:
         lines += ["## Vulnerability candidates", ""]
         for candidate in report.candidates:
@@ -146,6 +153,10 @@ def _render_markdown(report: TerminalReportProjection) -> str:
             f"- Known tokens: {usage['known_tokens']}; unknown usage: {usage['unknown_usage']}",
             "- This ledger, not per-instance decision counters, owns request admission.", "",
         ]
+        for stage, counts in usage.get("by_stage", {}).items():
+            lines += [f"- {stage}: requests={counts['spent']}; "
+                      f"reserved={counts['reserved']}; known tokens={counts['known_tokens']}; "
+                      f"unknown usage={counts['unknown_usage']}"]
     if report.mission is not None:
         contracted = [t for t in report.mission.tasks if t.completion_contract_version == 2]
         if contracted:

@@ -495,6 +495,10 @@ class CentralRun:
             "model_usage_unknown": usage["unknown_usage"],
             "pending_approval_id": pending_approval,
         })
+        await state.transaction(lambda tx: tx.save_planning_diagnostics(
+            final.planning_diagnostic, final.planning_diagnostic_history,
+            termination_reason=reason,
+        ))
         self.runtime = self.runtime.model_copy(update={"mission_status": mission.status})
         return final
 

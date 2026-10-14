@@ -76,16 +76,64 @@ def has_actual_receipt(metadata: Any, raw: Any) -> bool:
 def actual_receipt_conflict(metadata: Any, raw: Any) -> str | None:
     """Public reason when preserved actual receipts disagree across layers.
 
-    Metadata derivations and the raw output answer the same response; a
-    disjoint actual set means the proof cannot be trusted. Echoes never
-    count here: http_observation.session_ref is a request echo by
-    construction, and an echo beside an actual is exclusion, not conflict.
+    Each metadata derivation must match its original request unit, including
+    null vs named receipts. Malformed or contradictory receipts cannot be
+    trusted. Request echoes do not participate in this comparison.
     """
-    meta_actual = _actual_values_from_metadata(metadata)
-    raw_actual = _actual_values_from_raw(raw)
-    if meta_actual and raw_actual and meta_actual.isdisjoint(raw_actual):
-        return "actual session receipts disagree across layers"
+    raw_units = _receipt_units(_output_of(raw))
+    meta_units: dict[str, list[Any]] = {}
+    if isinstance(metadata, dict):
+        http = metadata.get("http_observation")
+        comparison = metadata.get("session_comparison")
+        for value in (http, comparison):
+            for unit, receipts in _receipt_units(value).items():
+                meta_units.setdefault(unit, []).extend(receipts)
+    for units in (raw_units, meta_units):
+        for receipts in units.values():
+            if any(value is not None and _cleaned(value) is None for value in receipts):
+                return "actual session receipt is malformed"
+            if len({None if value is None else _cleaned(value) for value in receipts}) > 1:
+                return "actual session receipts disagree within a request unit"
+    for unit, receipts in meta_units.items():
+        originals = raw_units.get(unit)
+        if not originals:
+            return "derived actual session receipt has no matching original"
+        if _cleaned(receipts[0]) != _cleaned(originals[0]):
+            return "actual session receipts disagree across layers"
     return None
+
+
+def has_anonymous_receipt(metadata: Any, raw: Any) -> bool:
+    """An explicit null on an original request unit, never an echo/declaration.
+
+    A comparison's null side proves only anonymous use on that side. Named
+    account proof remains separate. Missing, malformed and contradictory
+    receipts do not prove anonymous use, including metadata-only receipts.
+    """
+    if not isinstance(raw, dict) or raw.get("success") is not True:
+        return False
+    for layer in (metadata, raw.get("metadata")):
+        if isinstance(layer, dict) and any(layer.get(key) for key in ("mock", "fixture_only")):
+            return False
+    return (actual_receipt_conflict(metadata, raw) is None
+            and any(value is None for values in _receipt_units(_output_of(raw)).values()
+                    for value in values))
+
+
+def _receipt_units(output: Any) -> dict[str, list[Any]]:
+    if not isinstance(output, dict):
+        return {}
+    units: dict[str, list[Any]] = {}
+    for key, unit in (("actual_session_ref", "request"),
+                      ("first_actual_session_ref", "first"),
+                      ("second_actual_session_ref", "second")):
+        if key in output:
+            units.setdefault(unit, []).append(output[key])
+    for unit in _NESTED_UNITS:
+        value = output.get(unit)
+        if isinstance(value, dict) and "actual_session_ref" in value:
+            units.setdefault(unit, []).append(value["actual_session_ref"])
+    return units
 
 
 def collect_actual_accounts(
@@ -96,23 +144,21 @@ def collect_actual_accounts(
     A unit names its account only beside its own actual-use receipt: the
     comparison pair, the top-level answer pair, or a nested unit's own
     actual_session_ref. Echo-only units, inventory rows and a null
-    anonymous side name no account. A response whose whole receipt channel
-    sits outside the requested sessions names accounts nobody asked for,
-    so it grounds none of them.
+    anonymous side name no account. When sessions were requested, only
+    accounts receipted on those sessions contribute, unit by unit.
     """
-    values = _account_values_from_units(metadata, raw)
-    if expected_sessions and values:
-        actual = collect_actual_sessions(metadata, raw)
-        if actual and actual.isdisjoint(expected_sessions):
-            return set()
-    return values
+    return {principal for session, principal in actual_account_pairs(raw)
+            if principal.lower() != _ANONYMOUS_ACCOUNT
+            and (not expected_sessions or session in expected_sessions)}
 
 
-def _account_values_from_units(metadata: Any, raw: Any) -> set[str]:
-    values: set[str] = set()
-    comparison = metadata.get("session_comparison") if isinstance(metadata, dict) else None
-    if isinstance(comparison, dict):
-        _add_account_pairs(values, comparison, _ACCOUNT_PAIRS)
+def actual_account_pairs(raw: Any) -> set[tuple[str, str]]:
+    """Original (session, principal) pairs on the SAME request unit only.
+
+    Derived principal declarations do not add identities to an original.
+    Alias lookup and account coverage consume this same pairing rule.
+    """
+    values: set[tuple[str, str]] = set()
     output = _output_of(raw)
     if isinstance(output, dict):
         _add_account_pairs(values, output, _ACCOUNT_PAIRS)
@@ -120,17 +166,18 @@ def _account_values_from_units(metadata: Any, raw: Any) -> set[str]:
             nested = output.get(nested_key)
             if isinstance(nested, dict):
                 _add_account_pairs(values, nested, _UNIT_ACCOUNT_PAIRS)
-    return {item for item in values if item.lower() != _ANONYMOUS_ACCOUNT}
+    return values
 
 
 def _add_account_pairs(
-    values: set[str], unit: dict[str, Any], pairs: tuple[tuple[str, str], ...]
+    values: set[tuple[str, str]], unit: dict[str, Any], pairs: tuple[tuple[str, str], ...]
 ) -> None:
     for principal_key, session_key in pairs:
         principal = _cleaned(unit.get(principal_key))
-        if principal is None or _cleaned(unit.get(session_key)) is None:
+        session = _cleaned(unit.get(session_key))
+        if principal is None or session is None:
             continue
-        values.add(principal)
+        values.add((session, principal))
 
 
 def _output_of(raw: Any) -> Any | None:

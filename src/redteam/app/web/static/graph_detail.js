@@ -25,7 +25,8 @@ function planner(view) {
     ["직전 판단", p.last_judgment && p.last_judgment.termination],
     ["직전 판단 사유", p.last_judgment && p.last_judgment.reason],
     ["등록한 Task(누적)", p.tasks_registered],
-    ["모델 요청", `${p.usage.requests}건 · 진행 ${p.usage.in_flight} · 토큰 ${p.usage.known_tokens}`],
+    ["모델 요청", `${p.usage.requests}건 · 진행 ${p.usage.in_flight} · 확인된 토큰 ${p.usage.known_tokens} · 사용량 미확인 ${p.usage.unknown_usage}건`],
+    ["단계별 요청", Object.entries(view.usage.by_stage || {}).map(([stage, usage]) => `${stage}: ${usage.spent}건`).join(" · ") || UNKNOWN],
     ["운영자 안내", p.guidance_in_input === true ? "플래너 입력에 포함" :
       p.guidance_in_input === false ? "플래너 판단 입력에 포함되지 않음" : UNKNOWN],
   ]), h("p", { class: "note", text: "저장되지 않는 값은 '알 수 없음'으로 표시합니다." })];

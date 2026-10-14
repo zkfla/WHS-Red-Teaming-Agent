@@ -11,7 +11,7 @@ import pytest
 from redteam.app.web.graph_read import read_graph
 from redteam.attack_graph.hypotheses import prepare_hypothesis_update
 from redteam.core.contracts.execution import ExecutionState
-from redteam.core.contracts.graph import Hypothesis, HypothesisUpdate
+from redteam.core.contracts.graph import CandidateHypothesis, HypothesisUpdate
 from redteam.core.contracts.llm_policy import LLMRequestPolicy
 from redteam.core.tool_binding import execution_fingerprint
 from redteam.evidence.stores.filesystem import FilesystemEvidenceStore
@@ -52,7 +52,7 @@ async def test_planner_state_follows_the_stored_model_request_and_judgment(tmp_p
         (RUN, RUN, json.dumps({"termination": "held", "reason": "no useful question left"})),
     ))
     view = await graph(state)
-    assert view["planner"]["state"] == "waiting"
+    assert view["planner"]["state"] == "held"
     assert view["planner"]["last_judgment"] == {
         "termination": "held", "reason": "no useful question left",
     }
@@ -62,9 +62,33 @@ async def test_planner_state_follows_the_stored_model_request_and_judgment(tmp_p
     }
 
 
+async def test_split_planner_live_stage_and_usage_are_read_from_original_requests(tmp_path):
+    state, ledger = await bound(tmp_path)
+    for stage in ("hypothesis_planning", "task_atomization"):
+        request = await ledger.reserve(RUN, owner="hypothesis_planning",
+                                       kind="complete_structured", stage=stage)
+        view = await graph(state)
+        assert view["planner"]["state"] == "deciding"
+        assert view["planner"]["stage"] == stage
+        await ledger.dispatch(RUN, request)
+        await ledger.settle(RUN, request)
+    view = await graph(state)
+    assert view["planner"]["usage"]["requests"] == 2
+    assert view["usage"]["by_stage"]["hypothesis_planning"]["unknown_usage"] == 1
+    assert view["usage"]["by_stage"]["task_atomization"]["spent"] == 1
+    assert view["usage"]["requests"] == sum(
+        item["spent"] for item in view["usage"]["by_stage"].values()
+    )
+    review = await ledger.reserve(RUN, owner="hypothesis_planning", kind="complete_structured",
+                                  stage="task_completion_review")
+    view = await graph(state)
+    assert view["planner"]["state"] == "waiting" and view["planner"]["usage"]["requests"] == 2
+    await ledger.release_undispatched(RUN, review)
+
+
 async def test_candidate_is_projected_separately_from_tasks_findings_and_mission(tmp_path):
     state, _ = await bound(tmp_path)
-    candidate = Hypothesis(
+    candidate = CandidateHypothesis(
         hypothesis_id="candidate-a",
         description="Authorization may be missing",
         status="open",

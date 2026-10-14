@@ -306,8 +306,8 @@ async def apply_necessity_adjustments(
     return await state.transaction(adjust)
 
 
-class ProbeTaskProposal(BaseModel):
-    """A bounded purpose proposal, not a second Task or mandatory question entity."""
+class ProbeTaskPurpose(BaseModel):
+    """Shared purpose fields for condition selection and canonical probe proposals."""
 
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
     task_key: str = Field(min_length=1)
@@ -316,7 +316,6 @@ class ProbeTaskProposal(BaseModel):
     role_id: str = Field(min_length=1)
     target_node_ids: list[str] = Field(min_length=1)
     principal_refs: list[str] = Field(default_factory=list)
-    completion_criteria: list[CompletionCriterion] = Field(min_length=1)
     evidence_ids: list[str] = Field(default_factory=list)
     hypothesis_revisions: dict[str, int] = Field(default_factory=dict)
     required: bool = False
@@ -335,6 +334,12 @@ class ProbeTaskProposal(BaseModel):
         if self.required and not (self.required_reason or "").strip():
             raise ValueError("goal-required probe needs an explicit reason")
         return self
+
+
+class ProbeTaskProposal(ProbeTaskPurpose):
+    """A bounded purpose with canonical conditions, not a second Task entity."""
+
+    completion_criteria: list[CompletionCriterion] = Field(min_length=1)
 
 
 class HypothesisProbeProposal(BaseModel):

@@ -92,6 +92,7 @@ async def build_central_development(engagement, *, llm, tools, settings, jobs=No
                 metered,
                 evidence,
                 graph,
+                settings=settings,
             ),
         )
         components = specialists.assemble(components, include_code_artifacts=False)

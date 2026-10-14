@@ -10,6 +10,7 @@ from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
+from pydantic_core import PydanticCustomError
 
 from redteam.core.enums import GraphEdgeType, GraphNodeType
 from redteam.core.ids import GraphEdgeId, GraphNodeId
@@ -35,6 +36,11 @@ class GraphEdge(BaseModel):
 
 
 class Hypothesis(BaseModel):
+    """Historical, legacy read-compatible hypothesis type.
+
+    The active planner/update contract uses :class:`CandidateHypothesis`.
+    """
+
     model_config = ConfigDict(hide_input_in_errors=True)
 
     hypothesis_id: str
@@ -89,6 +95,16 @@ class Hypothesis(BaseModel):
         return result
 
 
+class CandidateHypothesis(Hypothesis):
+    """Active planner/update contract for v2 candidate hypotheses."""
+
+    contract_version: Literal[2]
+    status: Literal["open", "confirmed", "rejected", "inconclusive", "held"] = "open"
+    confidence: float = Field(default=0.0, ge=0, le=1)
+    target_node_ids: list[str] = Field(min_length=1)
+    reason: str = Field(min_length=1)
+
+
 class HypothesisUpdate(BaseModel):
     """Code-bound candidate proposal, consumed by atomic graph/Task admission.
 
@@ -97,16 +113,17 @@ class HypothesisUpdate(BaseModel):
     """
 
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
-    hypothesis: Hypothesis
+    hypothesis: CandidateHypothesis
     expected_revision: int | None = Field(default=None, ge=0, strict=True)
     review_evidence_id: str | None = None
 
     @model_validator(mode="after")
-    def _version(self):
-        if self.hypothesis.contract_version != 2:
-            raise ValueError("candidate updates require hypothesis contract v2")
+    def _candidate_review(self):
         if self.hypothesis.status in {"confirmed", "rejected"} and not self.review_evidence_id:
-            raise ValueError("candidate verdict requires an independent review receipt")
+            raise PydanticCustomError(
+                "candidate_verdict_requires_review",
+                "candidate verdict requires an independent review receipt",
+            )
         return self
 
 

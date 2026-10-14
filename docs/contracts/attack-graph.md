@@ -104,11 +104,14 @@ Engagement-scoped graph. The shared fields include target/principal references,
 premise, supporting/refuting original evidence references, source hypotheses,
 current judgment reason and a code-owned revision. Status values are `open`,
 `held`, `inconclusive`, `confirmed`, and `rejected` (a refuted candidate). Confidence
-alone grants no verdict. Version 1 records, including legacy status strings,
-remain readable with their original serialization.
+alone grants no verdict. Active planner candidate updates use a v2-only output
+contract; the schema and runtime validation require the same version and fields.
+The legacy v1 implementation is retained for inactive historical code paths,
+but is not an active planner output format. This prototype does not promise v1
+Run migration or resume compatibility.
 
-New candidates expect absence; updates expect the current revision. An explicit
-expectation of zero can upgrade a v1 hypothesis without converting existing Runs.
+New candidates expect absence; updates expect the current revision. Existing
+v1-upgrade code remains retained and is not the normal planner workflow.
 Accepted writes increment the revision, replace current candidate facts independently
 of worker-local steps, retain original evidence references and record TARGETS
 relations. Source hypotheses preserve candidate lineage without imposing a DAG.

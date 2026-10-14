@@ -28,8 +28,11 @@ LEGACY = PROFILE.with_name("native-probes-legacy.yaml")
 def test_probe_profile_uses_one_common_executor_and_split_atomizer():
     loaded = load_specialist_profile(PROBES)
     executors = [role for role in loaded.profile.roles if role.definition.schedulable]
-    assert len(executors) == 1 and loaded.run_policy().probe_limits == ProbeLimits()
-    assert loaded.profile.version == "5"
+
+    assert len(executors) == 1
+    assert loaded.run_policy().probe_limits == ProbeLimits(max_actions=4, max_model_requests=16)
+
+    assert loaded.profile.version == "9"
     atomizer_id = loaded.profile.stages.get("task_atomization")
     assert atomizer_id == "probe-atomizer"
     assert atomizer_id != loaded.profile.stages["hypothesis_planning"]
@@ -57,7 +60,7 @@ def test_probe_profile_uses_one_common_executor_and_split_atomizer():
 
 def test_legacy_single_stage_profile_has_no_atomizer():
     loaded = load_specialist_profile(LEGACY)
-    assert loaded.profile.version == "4"
+    assert loaded.profile.version == "6"
     assert "task_atomization" not in loaded.profile.stages
     assert loaded.run_policy().probe_atomization is False
     assert "probe_atomization" not in loaded.run_policy().model_dump()

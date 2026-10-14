@@ -4,7 +4,7 @@
 
 ![STATE, EXECUTION, EVIDENCE 분리](assets/state-execution-evidence.png)
 
-*세 저장 영역(STATE, EXECUTION, EVIDENCE)의 분리를 보여준다. 상태는 중앙 DB에, 실행 원본은 Evidence에 남고, 결과가 다음 점검으로 되돌아간다.*
+*상태(Goal/Scope, Task/Owner, Attack Graph)는 중앙에서 관리하고, 실행(Worker, Control Gate, Tool/MCP)의 원본 결과는 Evidence로 남긴다. Tool 실행 성공만으로 취약점을 확정하지 않고, Evidence가 확인된 결과만 Finding으로 반영한다.*
 
 | 주요 테이블 | 의미 |
 | --- | --- |

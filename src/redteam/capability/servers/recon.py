@@ -185,6 +185,7 @@ def create_server(policy: ServerPolicy) -> MCPServer:
             raise ToolInputError("HTML inventory requires HTTP 200 and text/html")
         return {
             "target_ref": target_ref,
+            **response.summary(),
             **html_observations(
                 response.body, policy.targets[target_ref], path, response.headers["content-type"],
             ),

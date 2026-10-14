@@ -45,6 +45,28 @@ class Provider:
         return StructuredCompletion(value={"ok": True}, total_tokens=7)
 
 
+async def test_metered_stage_attribution_and_historical_unknown_remain_separate(tmp_path):
+    from redteam.orchestration.prompts import instruction_scope
+
+    w = await world(tmp_path, "sqlite")
+    ledger = RunRequestLedger(coordinator_for(w.tasks, w.paths))
+    await ledger.bind(RUN, LLMRequestPolicy(mode="unlimited_requests"))
+    client = RunMeteredLLM(Provider(), ledger)
+    for stage in ("hypothesis_planning", "task_atomization", "task_completion_review"):
+        with llm_request_scope(RUN, "same-owner"), instruction_scope(stage):
+            await client.complete_structured(messages=[], response_schema={})
+    # Legacy/direct calls did not record a stage: method/owner are not guessed as stage.
+    with llm_request_scope(RUN, "hypothesis_planning"):
+        await client.complete_native(messages=[], tools=[])
+    usage = await ledger.snapshot(RUN)
+    assert usage["spent"] == 4 and usage["known_tokens"] == 21 and usage["unknown_usage"] == 1
+    assert usage["by_stage"]["unknown"]["spent"] == 1
+    assert usage["by_stage"]["task_atomization"]["known_tokens"] == 7
+    keys = ("spent", "reserved", "known_tokens", "unknown_usage", "unknown_dispatch")
+    for key in keys:
+        assert sum(value[key] for value in usage["by_stage"].values()) == usage[key]
+
+
 @pytest.mark.parametrize("payload", [
     {}, {"mode": "bounded"}, {"mode": "bounded", "max_requests": 0},
     {"mode": "bounded", "max_requests": -1}, {"mode": "bounded", "max_requests": True},
@@ -62,7 +84,7 @@ def test_config_preserves_request_policy_and_other_limits():
     })
     settings = OrchestrationSettings.from_config(config)
     assert settings.max_steps == 9
-    assert settings.decision_max_attempts == 3
+    assert settings.decision_max_attempts == 6
     assert settings.llm_request_policy.mode == "unlimited_requests"
 
 

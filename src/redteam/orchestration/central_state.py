@@ -45,6 +45,7 @@ from redteam.orchestration.coordination import (
     StateConflict,
     content_hash,
 )
+from redteam.orchestration.diagnostics import DecisionDiagnostic
 from redteam.orchestration.execution_journal import checked_receipt, preserved_result
 from redteam.orchestration.llm_requests import (
     RequestAdmissionError,
@@ -280,6 +281,58 @@ class CentralTransaction:
         if row is None:
             raise CoordinationError("run_binding_missing_or_mismatched")
         return row[0], row[1]
+
+    def save_planning_diagnostics(
+        self, diagnostic: DecisionDiagnostic | None,
+        history: Sequence[DecisionDiagnostic], *, termination_reason: str,
+    ) -> None:
+        """Bind safe terminal diagnostics to the current mission revision."""
+        mission = self.get_mission(self.binding()[0])
+        if mission is None:
+            raise StateConflict("central_original_mission_missing")
+        if (self.active_activation_count() or not mission.termination_reason
+                or mission.termination_reason != termination_reason):
+            # A partial settlement must not publish a terminal diagnostic or
+            # fail an existing stop path whose mission has no terminal reason.
+            return
+        payload = {
+            "mission_id": str(mission.mission_id), "mission_revision": mission.revision,
+            "mission_status": mission.status.value, "termination_reason": termination_reason,
+            "diagnostic": diagnostic.model_dump(mode="json") if diagnostic else None,
+            "history": [item.model_dump(mode="json") for item in history],
+        }
+        self.db.execute(
+            "INSERT INTO state_requests VALUES(?,'planning_diagnostics',?,?) "
+            "ON CONFLICT(run_id,kind,identity) DO UPDATE SET payload=excluded.payload",
+            (self.run_id, self.run_id, json.dumps(payload)),
+        )
+
+    def planning_diagnostics(self) -> tuple[DecisionDiagnostic | None, list[DecisionDiagnostic]]:
+        """Read matching diagnostics only; resume/live state cannot reuse an old failure."""
+        mission = self.get_mission(self.binding()[0])
+        if mission is None:
+            raise StateConflict("central_original_mission_missing")
+        if self.active_activation_count() or not mission.termination_reason:
+            return None, []
+        row = self.db.execute(
+            "SELECT payload FROM state_requests WHERE run_id=? "
+            "AND kind='planning_diagnostics' AND identity=?", (self.run_id, self.run_id),
+        ).fetchone()
+        if row is None:
+            return None, []
+        payload = json.loads(row[0])
+        expected = (str(mission.mission_id), mission.revision, mission.status.value,
+                    mission.termination_reason)
+        actual = tuple(payload.get(key) for key in (
+            "mission_id", "mission_revision", "mission_status", "termination_reason",
+        ))
+        if actual != expected:
+            return None, []
+        raw = payload.get("diagnostic")
+        return (
+            DecisionDiagnostic.model_validate(raw) if raw is not None else None,
+            [DecisionDiagnostic.model_validate(item) for item in payload.get("history", [])],
+        )
 
     @property
     def graph(self) -> GraphTransaction:

@@ -51,6 +51,7 @@ from redteam.core.enums import EvidenceSourceType, TaskStatus
 from redteam.core.ids import EvidenceId, new_id
 from redteam.event_bus.publisher import EventPublisher
 from redteam.orchestration.completion import (
+    CompletionIssues,
     check_record_linkage,
     preserved_target_is_absent,
     validate_completion,
@@ -704,16 +705,19 @@ async def _pending_execution_errors(
         active = getattr(runtime, "active_task_id", None)
         if active is not None and str(active).strip():
             resolved_task_id = str(active)
-    from redteam.core.contracts.execution import ExecutionState
+    from redteam.orchestration.central_completion import unsafe
 
     history = await engine.deps.central_state.list_executions(
         task_id=None if goal_scope else resolved_task_id,
     )
-    if any(
-        item.state in {ExecutionState.PENDING, ExecutionState.RUNNING, ExecutionState.UNKNOWN}
-        or item.wait_reason or item.resource_execution_pending for item in history
-    ):
-        return ["unfinished execution records remain"]
+    if any(unsafe(item) for item in history):
+        return CompletionIssues.failure(
+            ["unfinished execution records remain"], code="completion_execution_wait",
+            summary="Original executions still require approval, job collection or recovery.",
+            cause_scope="policy_wait", owner="orchestration.central_runtime",
+            repair_condition="Resume only when authoritative ledger recovery permits it; "
+                             "preserve original invocation identities and UNKNOWN protection.",
+        )
     return []
 
 
@@ -769,14 +773,28 @@ async def complete_task(
             return await settle_unresolved(
                 engine, path, proposal, runtime, token=token, task=task,
             )
+    pending = await _pending_execution_errors(engine, runtime, scope="task", task=task)
+    if pending:
+        return pending
     evidence_ids = select_task_evidence_ids(decision, path)
     if not evidence_ids:
-        return ["task completion needs related stored evidence"]
+        return CompletionIssues.failure(
+            ["task completion needs related stored evidence"], code="completion_evidence_required",
+            summary="Cite related stored originals for the completion proposal.",
+            cause_scope="model_input", retryable=True,
+            repair_condition="Correct the proposal references or return an unresolved gap.",
+        )
     from redteam.orchestration.evidence_validity import capture_validity
 
     validity_read, errors = await capture_validity(engine.deps, evidence_ids)
     if errors:
-        return errors
+        return CompletionIssues.failure(
+            errors, code="completion_validity_unproven",
+            summary="Current evidence reuse conditions do not support completion.",
+            cause_scope="evidence_validity", owner="orchestration.evidence_validity",
+            repair_condition="Reassess the binding prerequisites; unbound is absence of a "
+                             "binding, not a false observation. Rereading changes no binding.",
+        )
     verified: list[Any] = []
     excerpt_notes: list[dict[str, Any]] = []
     task_edge_proof: dict[str, str] = {}
@@ -801,7 +819,12 @@ async def complete_task(
             excerpt_notes.append(_excerpt_of(record))
             task_edge_proof.update(proof)
     if not verified:
-        return ["task completion needs related stored evidence"]
+        return CompletionIssues.failure(
+            ["task completion needs related stored evidence"], code="completion_evidence_required",
+            summary="Cite related stored originals for the completion proposal.",
+            cause_scope="model_input", retryable=True,
+            repair_condition="Correct the proposal references or return an unresolved gap.",
+        )
     contract_errors = await check_task_conditions(
         task, evidence_ids, deps=engine.deps, run_id=str(runtime.run_id),
     )
@@ -839,7 +862,13 @@ async def complete_task(
         [str(getattr(record, "evidence_id", "")) for record in verified],
     )
     if not review.get("accepted"):
-        return ["semantic completion review rejected the evidence"]
+        return CompletionIssues.failure(
+            ["semantic completion review rejected the evidence"], code="completion_review_rejected",
+            summary="Independent review did not accept the proposed completion support.",
+            cause_scope="target_prerequisite", owner="orchestration.semantic_completion",
+            repair_condition="Preserve successful originals; return the unmet purpose as an "
+                             "unresolved gap unless independent relevant support is available.",
+        )
     contract_errors = await check_task_conditions(
         task, evidence_ids, deps=engine.deps, run_id=str(runtime.run_id), review=review,
     )
@@ -850,7 +879,12 @@ async def complete_task(
     service = AttackGraphService(engine.deps.graph_store)
     for identity, expected in (await capture_result_graph(service, claims)).items():
         if identity in graph_proof and graph_proof[identity] != expected:
-            return ["completion_graph_proof_changed_reassessment_required"]
+            return CompletionIssues.failure(
+                ["completion_graph_proof_changed_reassessment_required"],
+                code="completion_graph_changed", summary="Graph support changed during review.",
+                cause_scope="evidence_validity", owner="orchestration.result_claims",
+                repair_condition="Reassess changed support before proposing completion.",
+            )
         graph_proof[identity] = expected
     errors = await check_result_review(
         claims=claims,
