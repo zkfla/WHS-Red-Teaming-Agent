@@ -2,7 +2,7 @@
 
 ## Status
 
-PLANNING — 2026-10-14. User explicitly requested complete implementation of planner progress/recovery + plan7a–e + concrete ConversationError diagnostics, separate ExecPlans, stage checks/commits, final review→repair→tests. Original Windows checkout C:/Users/qkrgu/Documents/GitHub/WHS-Red-Teaming-Agent, dev376b479d; preserve user changes. Current active goal is authoritative.
+IMPLEMENTING — 2026-10-14. User explicitly requested complete implementation of planner progress/recovery + plan7a–e + concrete ConversationError diagnostics, separate ExecPlans, stage checks/commits, final review→repair→tests. Original Windows checkout C:/Users/qkrgu/Documents/GitHub/WHS-Red-Teaming-Agent, dev376b479d; preserve user changes. Current active goal is authoritative.
 
 ## Authority and Inputs
 
@@ -16,7 +16,7 @@ Implement all requirements in child plans; final completion includes real Kali t
 
 | Stage | ExecPlan | Requirement set |
 |---|---|---|
-| 01 | [대화 오류 진단 보존과 API/답변 수정 재시도 분리](plan7-01-conversation-recovery.md) | D01, D02, D03 |
+| 01 | [대화 오류 진단 보존과 API/답변 수정 재시도 분리](../completed/plan7-01-conversation-recovery.md) | D01, D02, D03 |
 | 02 | [이어갈 경로가 있는 continue와 무진행 처리](plan7-02-planner-progress.md) | P01, P02, P03 |
 | 03 | [Kali 설정·준비·조립 연결](plan7-03-kali-preparation.md) | A01, A02, A03 |
 | 04 | [Docker 대상 route와 네트워크 gate 정합성](plan7-04-kali-route.md) | B01, B02, B03 |
@@ -67,3 +67,6 @@ Research Muse worker improperly delegated three children before the no-further-d
 
 Research confirmed web closed/configured/inherit propagation already exists; standalone CLI saved-selection hydration and new-policy preparation remain to inspect/implement. Existing program discovery/paging/describe and shell evidence windows are reused. Current managed Kali image a85c97d7... is Kali2026.3 and matching cached manifest has19 program records including curl/nmap/sqlmap; old repository fixture manifest targets a different d9d2... image and must not be mixed with it. Kernel readiness and42 existing operator-policy/CLI-preparation tests passed; actual target packets/common-worker proof remain pending.
 
+
+
+Stage01 completed with scoped Sol reviews, one timeout repair/recheck and root tests/type/lint/JS gates. Stage02-A is implementing after reviewed concrete packets; remaining stages and final physical proof are open. Plan01 moved to completed; this is not whole-goal completion.

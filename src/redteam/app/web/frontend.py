@@ -8,16 +8,25 @@ and records display items. It never submits, approves or classifies anything.
 from __future__ import annotations
 
 import asyncio
+import json
 from collections import OrderedDict
 from collections.abc import Callable
 from typing import Any, TextIO
 
+from redteam.app.cli.conversation import conversation_failure_label
 from redteam.app.cli.display import safe_text
 from redteam.app.web.events import EventLog, runtime_event_data
+from redteam.orchestration.diagnostics import DecisionDiagnostic
 
 _SENT_LIMIT = 1024
 _DECISION_TEXT = 2000
 POLL_INTERVAL = 0.2
+
+#: Bounded scalar fields flattened from a receipt diagnostic so the nested
+#: cause rule/location survive the event-log depth bound. No provider
+#: bodies, prompts, keys, or exception messages travel here.
+_DIAGNOSTIC_TEXT_LIMIT = 200
+_DIAGNOSTIC_LIST_LIMIT = 3
 
 
 def binding_data(binding: Any) -> dict[str, str | None] | None:
@@ -42,6 +51,72 @@ def _decision_data(decision: Any) -> dict[str, Any] | None:
     if isinstance(decision, str):
         return {"mode": "execute", "objective": safe_text(decision, limit=1000)}
     return None
+
+
+def _scalar(value: Any) -> str:
+    """One bounded display scalar; absent/blank stays absent, never 'None'."""
+    if value is None:
+        return ""
+    text = value if isinstance(value, str) else str(value)
+    if not text.strip():
+        return ""
+    return safe_text(text, limit=_DIAGNOSTIC_TEXT_LIMIT)
+
+
+def _diagnostic_view(diagnostic: Any) -> dict[str, Any] | None:
+    """Flattened public diagnostic projection for an input receipt.
+
+    The full ``DecisionDiagnostic`` stays on the receipt; only bounded
+    cause/rule/location/provider-status scalars travel here so the
+    nested ``last_cause.validation_issues`` survive the event-log depth
+    bound (events.DEPTH_LIMIT) without relaxing it. Every field is a
+    shallow scalar: no nested dicts, no lists of dicts.
+    """
+    if diagnostic is None:
+        return None
+    dump = diagnostic.model_dump(mode="json") if hasattr(diagnostic, "model_dump") else {}
+    if not isinstance(dump, dict):
+        return None
+    typed_dump: dict[str, Any] = dump
+    cause_raw = typed_dump.get("last_cause")
+    cause: dict[str, Any] = cause_raw if isinstance(cause_raw, dict) else {}
+    issues_raw = typed_dump.get("validation_issues")
+    issues: list[Any] = issues_raw if isinstance(issues_raw, list) else []
+    cause_issues_raw = cause.get("validation_issues")
+    cause_issues: list[Any] = (
+        cause_issues_raw if isinstance(cause_issues_raw, list) else []
+    )
+
+    def first_rule(rows: Any) -> str:
+        for row in rows[:_DIAGNOSTIC_LIST_LIMIT]:
+            if isinstance(row, dict) and str(row.get("rule") or "").strip():
+                return _scalar(row.get("rule"))
+        return ""
+
+    cause_code = _scalar(cause.get("code")) if cause.get("code") else ""
+    status = dump.get("provider_status")
+    if status is None:
+        status = cause.get("provider_status")
+    if not isinstance(status, int) or isinstance(status, bool):
+        status = None
+    attempts = dump.get("attempts")
+    if not isinstance(attempts, int) or isinstance(attempts, bool) or attempts < 0:
+        attempts = 0
+    view: dict[str, Any] = {
+        "code": _scalar(dump.get("code")),
+        "stage": _scalar(dump.get("stage")),
+        "kind": _scalar(dump.get("kind")),
+        "attempts": attempts,
+        "location": _scalar(dump.get("location") or cause.get("location")),
+        "rule": first_rule(issues) or first_rule(cause_issues),
+        "cause_code": cause_code,
+        "provider_status": status,
+        "label": safe_text(
+            conversation_failure_label(diagnostic, fallback="unknown"),
+            limit=_DIAGNOSTIC_TEXT_LIMIT * 2,
+        ),
+    }
+    return {key: value for key, value in view.items() if value not in ("", None)}
 
 
 class WebFrontend:
@@ -171,10 +246,18 @@ class WebFrontend:
         for key, receipt in list(controller.receipts.items()):
             envelope = receipt.envelope
             decision = _decision_data(receipt.decision)
+            diagnostic = getattr(receipt, "diagnostic", None)
+            if diagnostic is not None and not isinstance(diagnostic, DecisionDiagnostic):
+                diagnostic = None
+            diagnostic_view = _diagnostic_view(diagnostic)
             signature = (
                 receipt.state, receipt.reason,
                 decision.get("mode") if decision else None,
                 decision.get("response") if decision else None,
+                # Immutable snapshot of every bounded view field: a changed
+                # rule/location/status republishes even when the truncated
+                # label text is identical.
+                json.dumps(diagnostic_view, sort_keys=True) if diagnostic_view else None,
             )
             if self._sent.get(key) == signature:
                 continue
@@ -182,15 +265,21 @@ class WebFrontend:
             self._sent.move_to_end(key)
             while len(self._sent) > _SENT_LIMIT:
                 self._sent.popitem(last=False)
+            reason = safe_text(receipt.reason, limit=500)
+            if diagnostic is not None and (
+                not reason.strip() or reason.strip() in {"ConversationError"}
+            ):
+                reason = diagnostic_view.get("label", "unknown") if diagnostic_view else "unknown"
             self.log.append(
                 "input",
                 {
                     "input_id": str(envelope.input_id),
                     "text": safe_text(envelope.text, limit=4000),
                     "state": receipt.state,
-                    "reason": safe_text(receipt.reason, limit=500),
+                    "reason": reason,
                     "received_at": envelope.received_at.isoformat(),
                     "binding": binding_data(envelope.binding),
                     "decision": decision,
+                    "diagnostic": diagnostic_view,
                 },
             )

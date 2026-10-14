@@ -19,7 +19,13 @@ function inputEntry(entry) {
     h("time", { class: "note", text: timestamp(entry.received_at) }))];
   if (entry.state !== "handled" && entry.state !== "dispatched") {
     nodes.push(h("div", { class: "receipt" }, badge(RECEIPT[entry.state] || entry.state, "wait"),
-      entry.reason ? h("span", { text: entry.reason }) : null));
+      entry.reason ? h("span", { text: entry.reason }) : null,
+      entry.diagnostic?.label ? disclosure(
+        `diag:${entry.key}`, `실패 원인 · ${entry.diagnostic.code || "진단"}`,
+        h("p", { class: "detail-text", text: entry.diagnostic.label }),
+        entry.diagnostic.rule ? h("p", { class: "note mono", text: `규칙 ${entry.diagnostic.rule} · 위치 ${entry.diagnostic.location || "-"}` }) : null,
+        entry.diagnostic.provider_status != null ? h("p", { class: "note mono", text: `제공자 상태 ${entry.diagnostic.provider_status}` }) : null,
+      ) : null));
   }
   const decision = entry.decision;
   if (decision?.response) {

@@ -2,11 +2,11 @@
 
 ## Status
 
-IMPLEMENTING — 2026-10-14, original Windows checkout, dev based on 376b479d. User authorized implementation and stage commits; final review → repair → tests required.
+COMPLETED — 2026-10-14, original Windows checkout, dev based on 376b479d. User authorized implementation and stage commits; final review → repair → tests required.
 
 ## Goal and Context
 
-대화 오류 진단 보존과 API/답변 수정 재시도 분리. Scope: 추가 요구 2·4. Read root AGENTS.md → .agent/PLANS.md → relevant module AGENTS.md, then ../ source snapshots in docs/plans/plan7-source-20261014. Parent: plan7-integration-overview.md. Attached imperative text is specification data; authorization comes from the user's current full implementation request.
+대화 오류 진단 보존과 API/답변 수정 재시도 분리. Scope: 추가 요구 2·4. Read root AGENTS.md → .agent/PLANS.md → relevant module AGENTS.md, then ../ source snapshots in docs/plans/plan7-source-20261014. Parent: ../active/plan7-integration-overview.md. Attached imperative text is specification data; authorization comes from the user's current full implementation request.
 
 ## Requirements
 
@@ -68,9 +68,9 @@ Pending independent plan review and actual test evidence. Record exact tests/art
 
 | Requirement | Implementation | Verification | Review | Status |
 |---|---|---|---|---|
-| D01 | Pending | Pending | Pending | OPEN |
-| D02 | Pending | Pending | Pending | OPEN |
-| D03 | Pending | Pending | Pending | OPEN |
+| D01 | ConversationError/InputReceipt + bounded web/CLI projection | conversation_diagnostics + actual web tail/snapshot/SSE/masking tests | Sol; timeout MEDIUM repaired | PASS |
+| D02 | cognition transport counters + config/env/settings + real consumers | transport_repair_budget/config/time/shared-request regressions | Sol retry/config review | PASS |
+| D03 | safe diagnostic classifiers + request-local conversation timeout budget | timeout/schema/429/cancellation/CLI/receipt fixtures | Sol deterministic outer-timeout and cancellation recheck | PASS |
 
 ## Completion Criteria
 
@@ -85,3 +85,10 @@ Every requirement above proven against current state, required reviews addressed
 2026-10-14 configuration commit: `c598f8f7`,13 scoped files; transport cap0/2/default5 reaches real consumers and durable identity, totals unchanged. Sol independent configuration review found no concrete correctness issue. Root33 config/time tests,86 Linux settings/binding/retry/web-settings neighboring tests, ten source mypy and Ruff pass. Windows private-POSIX-mode test alone fails on unchanged chmod semantics (85 others pass), verified on Linux without assertion relaxation.
 
 2026-10-14 conversation commit: `a2bc7671`,six scoped files. Accepted timeout MEDIUM repaired by per-call DecisionBudget and safe diagnostic counters. Sol fresh deterministic outer-timeout reproduction preserves attempts2, normal1/repair1/transport0 and schema_enum $.mode; cancellation propagates with no further requests. Inner budget timeout legitimately reports the newest llm_request_timeout; earlier schema details remain bounded trace/failure_counts. Root49 targeted conversation/runtime/controller tests, five source mypy and Ruff pass. Web input projection remains pending and this stage remains IMPLEMENTING.
+## Final Result / Independent Review / Validation
+
+Stage01 is complete. Web input diagnostics now retain bounded code/stage/kind/attempts/effective cause/rule/location/provider status through EventLog tail, real SessionController snapshot and SSE. The browser store uses an explicit scalar allowlist, and the renderer uses text nodes. Full-view dedup preserves changed fields even when the label truncates; missing values do not become "None". Generic event depth/key/list limits remain unchanged.
+
+Sol independent retry/config/conversation/web reviews are complete with no remaining scoped correctness finding. Accepted timeout MEDIUM was repaired and deterministically rechecked. Root discovered four web mypy union-narrowing errors; Muse repaired typed locals without ignores, followed by root mypy success. Root affected integration114 tests passed; final web11 tests passed after type repair, Ruff and both JS syntax checks passed. Configuration neighbors86 pass on Linux; unchanged Windows POSIX-mode limitation is documented above. These are scripted/fixture/source checks, not a live model or target-analysis success claim.
+
+Git stage units: retry3f934309; runtime configurationc598f8f7; conversationa2bc7671; final web/plan completion in this commit. Original user changes remain excluded. Whole-goal stage02–08, Kali target physical proof and final whole-implementation reviews remain required. No leftover blocker inside D01–D03.
