@@ -19,10 +19,10 @@ Implement all requirements in child plans; final completion includes real Kali t
 | 01 | [대화 오류 진단 보존과 API/답변 수정 재시도 분리](../completed/plan7-01-conversation-recovery.md) | D01, D02, D03 |
 | 02 | [이어갈 경로가 있는 continue와 무진행 처리](plan7-02-planner-progress.md) | P01, P02, P03 |
 | 03 | [Kali 설정·준비·조립 연결](plan7-03-kali-preparation.md) | A01, A02, A03 |
-| 04 | [Docker 대상 route와 네트워크 gate 정합성](plan7-04-kali-route.md) | B01, B02, B03 |
-| 05 | [공통 워커 Kali 선택·실행·원본 피드백](plan7-05-kali-worker-feedback.md) | C01, C02, C03 |
+| 04 | [Docker 대상 route와 네트워크 gate 정합성](plan7-04-kali-route.md) | B01, B02, B03, B04 |
+| 05 | [공통 워커 Kali 선택·실행·원본 피드백](plan7-05-kali-worker-feedback.md) | C01, C02, C03, C04 |
 | 06 | [모순 완료 조건과 정당한 원본 재사용](plan7-06-observation-completion.md) | K01, K02, K03, K04 |
-| 07 | [실제 Kali 전체 실행 경로와 상태·재개 검증](plan7-07-kali-physical-proof.md) | E01, E02, E03, E04 |
+| 07 | [실제 Kali 전체 실행 경로와 상태·재개 검증](plan7-07-kali-physical-proof.md) | E01, E02, E03, E04, E05 |
 | 08 | [최종 독립 리뷰·수정·테스트](plan7-08-final-review.md) | F01, F02, F03 |
 
 01→02 for recovery semantics; 03→04→05→06→07 retains plan7a–e implementation order. Read-only discovery and disjoint01/03 packages may run in parallel after plan review. 08 follows all implementation, then independent review→repair→test. Stages expose actual dependencies and file owners before dispatch. Scope shared-contract edits serially; fake model/real provider execution distinguish explicitly.
@@ -86,3 +86,31 @@ Continuation audit2026-10-15: previous goal turn classified PROGRESS (04Nsourcec
 2026-10-15 Bacceptedcommitda27d0d2 afterhistoricalsettingsrepair andLinux52/type6/freshSol; C authorizedsameLuna toactualsettlement/report/resume/prompt afterBfreeze. Nacceptedcommit4ddcece8;04C/R stillinterfacegated. U/06handles reactivated once and confirmedactuallyrunning undercurrentordinaryusageavailability, partialchangespreserved. Fullgoalphysical/finalreview remains unproven.
 
 Latest user model override2026-10-15: Claude quota returned; prospective implementation workers use GPT6-Luna XHigh and anthropic/claude-haiku-5-5 XHigh in equal meaningful dispatch/work proportions. Existing running Luna ownership continues unchanged; no restart solely to rebalance. Orchestrator remains gpt-6.1-sol low, primary reviewer SolHigh and auxiliary agy Gemini3.8FlashHigh unchanged. This supersedes the earlier Luna-only rule for new worker assignments; no DeepSeek/Muse/Sonnet coordinator resumption.
+
+### Atomic integration queue — latest user parallelization/atomization steering
+
+Each row delivers one reviewable result. Existing live owners retain their files; splitting a queue is not permission to send two writers into the same file. Exact interfaces, paths and negative criteria remain in the child ExecPlans. Independent read-only packet/review work runs now; source mutation follows its interface review and predecessor freeze. Root alone integrates checked commits. New eligible implementation assignments alternate Haiku/Luna XHigh with comparable scopes; do not create filler agents or interrupt existing Luna work to adjust counts.
+
+| Atomic task | Single result / boundary | Dependency and verification | Current disposition |
+|---|---|---|---|
+| 02C-settlement | Durable latest-progress→actual settlement/report/resume | Existing02B public status; stop/pause/goal precedence and stale exhaustion tests | Current Luna owner, goal diagnostic handoff pending |
+| 02C-specialist | Legacy planner actionable judgment plus attached repair diagnostic | Actual strategy/atomization consumer, bounded transport/repair, no pathless continue | Same file owner; trace-order regression repair pending |
+| 03U-selection | Pure web form and request-local startup/resume selection | Selected/recorded policy hashes, closed/inherit, DNS/environment drift, actual CLI/web consumers | Source review/final freeze pending; root82 fixtures pass |
+| 04C-abort | Cancel-safe original-window UNKNOWN settlement | Same grant, bounded shielding, cleanup/settlement failure and idempotent retry | Existing Capability Luna owner authorized |
+| 04C-observation | Read-only prepared-endpoint/owned physical closure observation | Complete inventory, HOST drift, foreign/legacy labels, absent/neverattached | Same Capability owner; no setup/adoption |
+| 04C-reconciler | Original outstanding-grant→per-window settlement/release facts | Frozen Control read port and closure predicate, no actor-ready authority | Serial after Capability interface freeze |
+| 04C-host | Locked original-instance recovery hook before actor CAS | Frozen reconciler; U assembly handoff; success and UNKNOWN actor-transfer tests | RuntimeDeps/driver/assembly handoff pending |
+| 04R-projection | Verified operator-origin applicability projection | Actual deployment/provider-owned source and existing identity seam; no name/args heuristic | Read-only packet recon active, plan review pending |
+| 04R-admission | Applicable HTTP-origin raw-route refusal before grant | Frozen projection, all transport same origin, sibling port independent | Not yet source-authorized |
+| 04R-resume | Existing durable component binding includes restriction digest | Frozen projection and app owner handoff; fake/manual applicability persistence and drift refusal | Not yet source-authorized |
+| 05-chain | Scripted common-worker→Control/gateway→original→next worker/Planner proof | Frozen04 interface; paging/discovery/approval exact invocation retained | Read-only packet builder active |
+| 06A-consumer | Shared contradiction guard reaches concrete repair feedback | Existing frozen4-source/3-test package plus02C wrapper review | Root65 fixtures/type4 pass; consumer recheck pending |
+| 06B-restore | Criterion-ID selection→exact original condition restoration | A/probe and C prompt/profile freeze, unknown/duplicate/cross-question/coverage negatives | Pending predecessor acceptance |
+| 06C-task-CAS | Typed final source-row refusal→native completion feedback | Existing original proof/Task CAS, immediate-commit mutation and rollback | Current Luna repair owner |
+| 06C-goal-CAS | Same typed refusal→actual held/report/resume diagnostic | Frozen carrier, serial02C central_run owner | Handoff pending; no duplicate writer |
+| 06D-chain | Actual Task observation/review→graph reviewer receipt→Planner judgment | Producer/reuse freeze; actual verifier route, no fabricated graph status | Independent read-only packet requested |
+| 07-P | Real immutable Kali/mock provider allow/deny/window evidence | Reviewed physical packet and03/04 accepted, exact owned resource scope | Independent Sol plan review active, no execution yet |
+| 07-W | Real provider through scripted common-worker consuming chain | P+05+06 accepted; approval once, originals and criterion restoration | Pending physical/consumer prerequisites |
+| 07-I | Original identity/status/count/unknown-usage acceptance | P/W authoritative artifacts, existing projections/ledgers | Pending actual proof |
+| 08-review | Independent Sol plus agy final requirement/source review | All source frozen; concrete findings then owner-scoped repair | Pending integration |
+| 08-finish | Risk-based final checks, full requirement audit, commit/push | Accepted reviews/repairs plus actual physical proof; no partial PASS | Goal active, completion unproven |
