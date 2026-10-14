@@ -10,6 +10,7 @@ from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
+from pydantic_core import PydanticCustomError
 
 from redteam.core.enums import GraphEdgeType, GraphNodeType
 from redteam.core.ids import GraphEdgeId, GraphNodeId
@@ -104,9 +105,14 @@ class HypothesisUpdate(BaseModel):
     @model_validator(mode="after")
     def _version(self):
         if self.hypothesis.contract_version != 2:
-            raise ValueError("candidate updates require hypothesis contract v2")
+            raise PydanticCustomError(
+                "candidate_update_requires_v2", "candidate updates require hypothesis contract v2",
+            )
         if self.hypothesis.status in {"confirmed", "rejected"} and not self.review_evidence_id:
-            raise ValueError("candidate verdict requires an independent review receipt")
+            raise PydanticCustomError(
+                "candidate_verdict_requires_review",
+                "candidate verdict requires an independent review receipt",
+            )
         return self
 
 
