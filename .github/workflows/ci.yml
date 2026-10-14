@@ -67,6 +67,8 @@ jobs:
           tests/integration/test_llm_connection_resume.py \
           tests/unit/test_llm_chatgpt_streaming.py \
           tests/unit/test_llm_native_tools.py \
+          tests/unit/test_reasoning_effort.py \
+          tests/unit/test_native_continuation_echo.py \
           tests/unit/test_llm_usage.py \
           tests/unit/test_shared_llm_requests.py \
           tests/unit/test_run_execution_ownership.py \

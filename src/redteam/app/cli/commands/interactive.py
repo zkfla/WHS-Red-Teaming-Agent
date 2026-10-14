@@ -237,13 +237,29 @@ async def _ensure_runtime_config(
                 console.print(f"[red]{exc}[/red]")
                 continue
         break
+    from redteam.core.config import REASONING_EFFORTS, normalize_reasoning_effort
+
+    effort = os.environ.get("REDTEAM_LLM_REASONING_EFFORT")
+    if effort is None:
+        while True:
+            raw_effort = console.input(
+                "Reasoning effort (" + "/".join(sorted(REASONING_EFFORTS))
+                + "; empty uses provider default): "
+            )
+            try:
+                effort = normalize_reasoning_effort(raw_effort)
+            except ValueError:
+                console.print("[red]Choose a listed reasoning effort or leave it empty.[/red]")
+                continue
+            break
     # Preserve an already-configured key-variable reference; otherwise default
     # to OPENCODE_API_KEY for opencode-go and LLM_API_KEY for litellm.
     api_key_env_var = os.environ.get("REDTEAM_LLM_API_KEY_ENV_VAR") or (
         OPENCODE_GO_API_KEY_ENV_VAR if provider == OPENCODE_GO_PROVIDER else "LLM_API_KEY"
     )
     llm_config = LLMConfig(
-        provider=provider, default_model=model, api_key_env_var=api_key_env_var
+        provider=provider, default_model=model, api_key_env_var=api_key_env_var,
+        reasoning_effort=effort,
     )
     if not llm_config.resolve_api_key():
         # A `chatgpt/...` model authenticates via the OAuth device flow
@@ -263,6 +279,9 @@ async def _ensure_runtime_config(
     os.environ["REDTEAM_LLM_PROVIDER"] = llm_config.provider
     write_env_var(DEFAULT_ENV_PATH, "REDTEAM_LLM_MODEL", llm_config.default_model)
     os.environ["REDTEAM_LLM_MODEL"] = llm_config.default_model
+    if llm_config.reasoning_effort is not None:
+        write_env_var(DEFAULT_ENV_PATH, "REDTEAM_LLM_REASONING_EFFORT", llm_config.reasoning_effort)
+        os.environ["REDTEAM_LLM_REASONING_EFFORT"] = llm_config.reasoning_effort
     if llm_config.api_key_env_var != "LLM_API_KEY":
         # Persist a non-default key-variable reference (OPENCODE_API_KEY for
         # opencode-go, or an operator-preset REDTEAM_LLM_API_KEY_ENV_VAR) so

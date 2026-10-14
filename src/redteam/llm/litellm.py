@@ -315,6 +315,10 @@ def _responses_input_from_chat(messages: list[dict[str, Any]]) -> list[dict[str,
             converted.append({"role": role, "content": message.get("content", "")})
             continue
         if role == "assistant":
+            continuation = message.get("provider_continuation")
+            if continuation:
+                for item in continuation:
+                    converted.append(_validated_reasoning_item(item))
             content = message.get("content")
             if isinstance(content, str) and content:
                 converted.append({"role": "assistant", "content": content})
@@ -367,6 +371,7 @@ def _build_native_completion(
     total_tokens: Any,
     missing_call_id: bool = False,
     missing_tool_name: bool = False,
+    continuation: tuple[dict[str, Any], ...] = (),
 ) -> NativeCompletion:
     protocol_error: str | None = None
     if missing_call_id:
@@ -381,7 +386,112 @@ def _build_native_completion(
         text=cleaned_text,
         total_tokens=total_tokens,
         protocol_error=protocol_error,
+        continuation=continuation,
     )
+
+
+
+def _encrypted_continuation(message: Any) -> tuple[dict[str, Any], ...]:
+    """Provider-native encrypted reasoning blocks, or () when absent.
+
+    Only omitted thinking (empty plaintext + signature) or redacted thinking
+    (ciphertext in ``data``) is accepted; any plaintext -- including
+    whitespace-only -- is rejected, and a malformed non-empty entry raises
+    rather than being skipped.
+    """
+    raw = _chunk_field(message, "thinking_blocks")
+    if raw is None:
+        return ()
+    if isinstance(raw, str) and not raw.strip():
+        return ()
+    if not isinstance(raw, (list, tuple)):
+        raise ValueError("native provider thinking blocks are malformed")
+    return tuple(_validated_continuation_block(entry) for entry in raw)
+
+
+_ALLOWED_THINKING_KEYS = frozenset({"type", "thinking", "signature"})
+_ALLOWED_REDACTED_KEYS = frozenset({"type", "data"})
+
+
+def _validated_continuation_block(entry: Any) -> dict[str, Any]:
+    """Exact protocol allow-keys/types; no forged scrub, no extra plaintext."""
+    if not isinstance(entry, dict):
+        raise ValueError("native provider continuation block is malformed")
+    kind = entry.get("type")
+    if kind == "thinking":
+        if set(entry) - _ALLOWED_THINKING_KEYS:
+            raise ValueError("native provider thinking block has unsupported keys")
+        if entry.get("thinking") != "":
+            raise ValueError(
+                "native provider returned plaintext thinking; encrypted omission required"
+            )
+        signature = entry.get("signature")
+        if not isinstance(signature, str) or not signature:
+            raise ValueError("native provider thinking block carries no signature")
+        return {"type": "thinking", "thinking": "", "signature": signature}
+    if kind == "redacted_thinking":
+        if set(entry) - _ALLOWED_REDACTED_KEYS:
+            raise ValueError("native provider redacted block has unsupported keys")
+        data = entry.get("data")
+        if not isinstance(data, str) or not data:
+            raise ValueError("native provider redacted block carries no ciphertext")
+        return {"type": "redacted_thinking", "data": data}
+    raise ValueError("native provider thinking block type is unsupported")
+
+
+def _validated_reasoning_item(entry: Any) -> dict[str, Any]:
+    if not isinstance(entry, dict) or entry.get("type") != "reasoning":
+        raise ValueError("native provider reasoning continuation is malformed")
+    if set(entry) - {"type", "id", "encrypted_content", "summary"}:
+        raise ValueError("native provider reasoning continuation has unsupported keys")
+    encrypted = entry.get("encrypted_content")
+    if not isinstance(encrypted, str) or not encrypted or entry.get("summary", []) != []:
+        raise ValueError("native provider reasoning continuation requires encrypted content")
+    item: dict[str, Any] = {"type": "reasoning", "encrypted_content": encrypted, "summary": []}
+    if "id" in entry:
+        if not isinstance(entry["id"], str) or not entry["id"]:
+            raise ValueError("native provider reasoning continuation has invalid id")
+        item["id"] = entry["id"]
+    return item
+
+
+def _encrypted_reasoning_items(
+    output: Any, *, required: bool = False
+) -> tuple[dict[str, Any], ...]:
+    """Encrypted Responses reasoning items only; summary text is ignored."""
+    if not isinstance(output, (list, tuple)):
+        return ()
+    items: list[dict[str, Any]] = []
+    for entry in output:
+        if _chunk_field(entry, "type") != "reasoning":
+            continue
+        encrypted = _chunk_field(entry, "encrypted_content")
+        if not isinstance(encrypted, str) or not encrypted:
+            if required:
+                raise ValueError("native provider reasoning item is missing encrypted content")
+            continue
+        item: dict[str, Any] = {
+            "type": "reasoning", "encrypted_content": encrypted, "summary": []
+        }
+        entry_id = _chunk_field(entry, "id")
+        if isinstance(entry_id, str) and entry_id:
+            item["id"] = entry_id
+        items.append(item)
+    return tuple(items)
+
+
+def _replay_chat_message(message: dict[str, Any]) -> dict[str, Any]:
+    """Re-attach a validated opaque continuation as provider chat blocks."""
+    if "provider_continuation" not in message:
+        return message
+    continuation = message.get("provider_continuation")
+    replayed = {key: value for key, value in message.items() if key != "provider_continuation"}
+    if not continuation:
+        return replayed
+    replayed["thinking_blocks"] = [
+        _validated_continuation_block(block) for block in continuation
+    ]
+    return replayed
 
 
 def _normalize_chat_tool_calls(raw_calls: Any) -> tuple[list[NativeToolCall], bool, bool]:
@@ -561,15 +671,38 @@ class LiteLLMClient:
         api_key: str | None = None,
         num_retries: int = 0,
         use_responses_api: bool = False,
+        reasoning_effort: str | None = None,
+        api_key_env_var: str | None = None,
         **default_kwargs: Any,
     ) -> None:
+        from redteam.core.contracts.llm_config import normalize_reasoning_effort
+
+        effort = normalize_reasoning_effort(reasoning_effort)
+        if effort is not None and bool(default_kwargs.get("drop_params", False)):
+            raise ValueError(
+                "reasoning_effort with drop_params enabled would silently "
+                "downgrade unsupported levels; disable drop_params instead"
+            )
         self._model = model
         self._api_key = api_key
         self._num_retries = num_retries
+        self._reasoning_effort = effort
+        # Credential REFERENCE for the secret-free connection identity only;
+        # the value is never read here.
+        self._api_key_env_var = api_key_env_var
+        if effort is not None:
+            default_kwargs["reasoning_effort"] = effort
         self._default_kwargs = default_kwargs
         self._use_responses_api = bool(use_responses_api)
 
         import litellm
+
+        if effort is not None and bool(getattr(litellm, "drop_params", False)):
+            raise ValueError(
+                "reasoning_effort with litellm.drop_params enabled would "
+                "silently downgrade unsupported levels; disable drop_params "
+                "instead"
+            )
 
         # Resolved once at construction via litellm's own provider
         # resolver (not a hand-maintained prefix string) -- the returned
@@ -620,9 +753,112 @@ class LiteLLMClient:
             litellm.register_model(subscription_models)
 
     def _call_kwargs(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        from redteam.core.contracts.llm_config import normalize_reasoning_effort
+
         merged: dict[str, Any] = {**self._default_kwargs, **kwargs}
         merged.setdefault("num_retries", self._num_retries)
+        if "reasoning_effort" in kwargs:
+            level = normalize_reasoning_effort(kwargs["reasoning_effort"])
+            pinned = self._reasoning_effort
+            if pinned is None:
+                # Unpinned config: an explicit per-call value is normalized
+                # and forwarded; historical callers pass nothing at all.
+                if level is None:
+                    merged.pop("reasoning_effort", None)
+                else:
+                    merged["reasoning_effort"] = level
+            elif level != pinned:
+                raise ValueError(
+                    "per-call reasoning_effort " + repr(kwargs["reasoning_effort"])
+                    + " conflicts with the pinned " + repr(pinned)
+                    + "; rebuild the client for a different effort"
+                )
+        if merged.get("reasoning_effort") is not None:
+            if bool(merged.get("drop_params", False)):
+                raise ValueError(
+                    "reasoning_effort with drop_params enabled would silently "
+                    "downgrade unsupported levels; disable drop_params instead"
+                )
+            import litellm
+
+            # The global can flip after construction; re-check per request.
+            # Verified SDK behavior (gpt_5/anthropic maps use
+            # ``litellm.drop_params or drop_params``): a global True cannot
+            # be overridden per call, so refuse loudly instead of downgrading.
+            if bool(getattr(litellm, "drop_params", False)):
+                raise ValueError(
+                    "reasoning_effort with litellm.drop_params enabled would "
+                    "silently downgrade unsupported levels; disable drop_params "
+                    "instead"
+                )
+            if not (self._use_responses_api or self._is_chatgpt_subscription):
+                # Derive protocol-native thinking from the SDK's selected
+                # provider configuration. Providers without this native field
+                # keep their own effort mapping; no model allowlist is added.
+                thinking = merged.get("thinking")
+                if thinking is None:
+                    from litellm.types.utils import LlmProviders
+                    from litellm.utils import ProviderConfigManager
+
+                    try:
+                        sdk_model, provider, _, _ = litellm.get_llm_provider(self._model)
+                    except ValueError:
+                        # Custom models may have no catalog entry. The actual
+                        # request resolver remains responsible for support.
+                        provider = ""
+                    try:
+                        resolved_provider = LlmProviders(provider)
+                    except ValueError:
+                        resolved_provider = None
+                    if resolved_provider is not None:
+                        config = ProviderConfigManager.get_provider_chat_config(
+                            model=sdk_model, provider=resolved_provider
+                        )
+                        if config is not None:
+                            mapped = config.map_openai_params(
+                                non_default_params={
+                                    "reasoning_effort": merged["reasoning_effort"]
+                                },
+                                optional_params={}, model=sdk_model, drop_params=False,
+                            )
+                            thinking = mapped.get("thinking")
+                if isinstance(thinking, dict) and thinking.get("type") != "disabled":
+                    merged["thinking"] = {**thinking, "display": "omitted"}
+                    # The provider's own mapper understands these protocol
+                    # fields even for models missing from the SDK catalog.
+                    # Forward them explicitly; let the API reject unsupported
+                    # model capabilities instead of dropping the selection.
+                    allowed = list(merged.get("allowed_openai_params") or [])
+                    for name in ("reasoning_effort", "thinking"):
+                        if name not in allowed:
+                            allowed.append(name)
+                    merged["allowed_openai_params"] = allowed
         return merged
+
+    @property
+    def connection_fingerprint(self) -> str | None:
+        """Secret-free connection identity; None when effort is unset.
+
+        Mirrors the shared resume preflight for explicit LiteLLM effort so
+        a changed effort alters the binding and refuses resume. Unset
+        effort stays unpinned (historical None).
+        """
+        if self._reasoning_effort is None:
+            return None
+        from types import SimpleNamespace
+
+        from redteam.llm.reasoning_effort import (
+            litellm_connection_fingerprint_for_config,
+        )
+
+        return litellm_connection_fingerprint_for_config(
+            SimpleNamespace(
+                provider="litellm",
+                default_model=self._model,
+                api_key_env_var=self._api_key_env_var or "",
+                reasoning_effort=self._reasoning_effort,
+            )
+        )
 
     async def complete(
         self,
@@ -641,13 +877,18 @@ class LiteLLMClient:
 
         import litellm
 
-        full_messages = ([{"role": "system", "content": system}] if system else []) + messages
+        full_messages = ([{"role": "system", "content": system}] if system else []) + [
+            _replay_chat_message(message) for message in messages
+        ]
+        # Guard evaluation stays outside try: client misconfiguration must
+        # fail loudly, never normalize into a provider failure.
+        call_kwargs = self._call_kwargs(kwargs)
         try:
             response = await litellm.acompletion(
                 model=self._model,
                 messages=full_messages,
                 api_key=self._api_key,
-                **self._call_kwargs(kwargs),
+                **call_kwargs,
             )
         except LLMProviderFailure:
             raise
@@ -786,7 +1027,9 @@ class LiteLLMClient:
     ) -> NativeCompletion:
         import litellm
 
-        full_messages = ([{"role": "system", "content": system}] if system else []) + messages
+        full_messages = ([{"role": "system", "content": system}] if system else []) + [
+            _replay_chat_message(message) for message in messages
+        ]
         call_kwargs = self._call_kwargs(kwargs)
         call_kwargs.pop("previous_response_id", None)
         call_kwargs.pop("tools", None)
@@ -817,6 +1060,7 @@ class LiteLLMClient:
             total_tokens=_extract_total_tokens(response),
             missing_call_id=missing_id,
             missing_tool_name=missing_name,
+            continuation=_encrypted_continuation(message),
         )
 
     async def _responses_complete_native(
@@ -838,6 +1082,14 @@ class LiteLLMClient:
         call_kwargs.pop("text", None)
         call_kwargs.pop("text_format", None)
         call_kwargs.setdefault("stream", self._is_chatgpt_subscription)
+        if self._reasoning_effort is not None:
+            existing_include = call_kwargs.get("include")
+            merged_include = (
+                list(existing_include) if isinstance(existing_include, (list, tuple)) else []
+            )
+            if "reasoning.encrypted_content" not in merged_include:
+                merged_include.append("reasoning.encrypted_content")
+            call_kwargs["include"] = merged_include
         streaming = bool(call_kwargs.get("stream"))
         tools_param = _responses_tools_param(tools)
         if tools_param is not None:
@@ -870,6 +1122,9 @@ class LiteLLMClient:
                     total_tokens=_extract_total_tokens(response),
                     missing_call_id=missing_id,
                     missing_tool_name=missing_name,
+                    continuation=_encrypted_reasoning_items(
+                        output, required=self._reasoning_effort is not None
+                    ),
                 )
             return await self._accumulate_responses_stream_native(response)
         except LLMProviderFailure:
@@ -941,6 +1196,7 @@ class LiteLLMClient:
         text_parts: list[str] = []
         pending: dict[Any, dict[str, Any]] = {}
         completed = False
+        continuation: tuple[dict[str, Any], ...] = ()
 
         def _pending_key(output_index: Any, item_id: Any) -> Any:
             if isinstance(output_index, int) and not isinstance(output_index, bool):
@@ -953,6 +1209,11 @@ class LiteLLMClient:
             event_type = _chunk_field(chunk, "type")
             if event_type == "response.completed":
                 completed = True
+                final = _chunk_field(chunk, "response")
+                final_output = _chunk_field(final, "output") or _chunk_field(chunk, "output")
+                continuation = _encrypted_reasoning_items(
+                    final_output, required=self._reasoning_effort is not None
+                )
             elif event_type in ("response.failed", "error"):
                 raise _stream_protocol_failure()
             elif event_type == "response.incomplete":
@@ -1047,6 +1308,7 @@ class LiteLLMClient:
             total_tokens=None,
             missing_call_id=missing_id,
             missing_tool_name=missing_name,
+            continuation=continuation,
         )
 
     async def _responses_text(

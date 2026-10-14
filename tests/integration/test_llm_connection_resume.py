@@ -16,8 +16,9 @@ from tests.integration.test_central_development import gateway
 from tests.integration.test_central_recovery import start
 
 
-def go_config(model="openai/model-a", key="TEST_GO_KEY"):
-    return LLMConfig(provider="opencode-go", default_model=model, api_key_env_var=key)
+def go_config(model="openai/model-a", key="TEST_GO_KEY", effort=None):
+    return LLMConfig(provider="opencode-go", default_model=model, api_key_env_var=key,
+                     reasoning_effort=effort)
 
 
 class PinnedFakeClient(FakeLLMClient):
@@ -40,19 +41,23 @@ def cli_config(session, llm):
 
 
 @pytest.mark.parametrize(
-    "changed",
+    "original,changed",
     [
-        go_config("openai/model-b"),
-        go_config("anthropic/model-a"),
-        go_config(key="OTHER_KEY"),
-        LLMConfig(),
+        (go_config(), go_config("openai/model-b")),
+        (go_config(), go_config("anthropic/model-a")),
+        (go_config(), go_config(key="OTHER_KEY")),
+        (go_config(), LLMConfig()),
+        (go_config(), go_config(effort="high")),
+        (go_config(effort="high"), go_config(effort="low")),
+        (go_config(effort="high"), go_config()),
+        (LLMConfig(reasoning_effort="high"), LLMConfig(reasoning_effort="low")),
+        (LLMConfig(reasoning_effort="high"), LLMConfig()),
     ],
 )
 @pytest.mark.parametrize("collect", [False, True])
 async def test_changed_connection_refused_before_any_rebuild(
-    tmp_path, monkeypatch, changed, collect
+    tmp_path, monkeypatch, original, changed, collect
 ):
-    original = go_config()
     async with selection(
         tmp_path, llm=PinnedFakeClient(original), tools=OriginalProtocolDouble(gateway(risk="high"))
     ) as (session, llm):
@@ -80,8 +85,9 @@ async def test_changed_connection_refused_before_any_rebuild(
         build.assert_not_awaited()
 
 
-async def test_same_go_connection_and_key_rotation_can_rebuild(tmp_path, monkeypatch):
-    config = go_config()
+@pytest.mark.parametrize("effort", [None, "high"])
+async def test_same_go_connection_and_key_rotation_can_rebuild(tmp_path, monkeypatch, effort):
+    config = go_config(effort=effort)
     async with selection(tmp_path, llm=PinnedFakeClient(config)) as (session, llm):
         _, stored, _ = await inspect_central_run(
             session.deps.central_state.path, session.runtime.run_id

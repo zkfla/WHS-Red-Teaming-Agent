@@ -142,7 +142,21 @@
     <p class="note" id="settings-intro"></p>
     <label>LLM 모델
       <input id="s-model" name="model" autocomplete="off" spellcheck="false" placeholder="예: provider/model-name">
+      <span class="note">일반 모델 API는 제공자/모델 형식(예: openai/gpt-4o-mini)으로, OpenCode Go는 openai/모델·openai/responses/모델·anthropic/모델 형식으로 입력하세요.</span>
     </label>
+    <div class="grid2">
+      <label>LLM 제공자
+        <select id="s-provider" name="provider">
+          <option value="litellm">일반 모델 API (OpenAI·Anthropic·Google 등)</option>
+          <option value="opencode-go">OpenCode Go</option>
+        </select>
+      </label>
+      <label>추론 강도 (effort)
+        <select id="s-effort" name="reasoning_effort">
+          <option value="">모델 기본값</option>
+        </select>
+      </label>
+    </div>
     <label>API 키 <span class="note">(저장 후 다시 표시되지 않습니다)</span>
       <input id="s-key" name="api_key" type="password" autocomplete="off" spellcheck="false">
     </label>

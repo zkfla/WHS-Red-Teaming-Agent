@@ -6,6 +6,7 @@ plan, and a free-text answer is not a confirmed task or mission outcome.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from dataclasses import asdict
@@ -20,7 +21,7 @@ from redteam.core.contracts.evidence import EvidenceRecord
 from redteam.core.contracts.mission import redact_secret_material
 from redteam.core.enums import EvidenceSourceType
 from redteam.core.ids import ActionId, EvidenceId, ToolId, new_id
-from redteam.core.ports.llm import NativeToolSpec
+from redteam.core.ports.llm import NativeCompletion, NativeToolSpec
 from redteam.orchestration.agents.base import PlanStep
 from redteam.orchestration.candidates.compiler import CandidateCompiler
 from redteam.orchestration.candidates.models import CandidateDraft
@@ -90,6 +91,9 @@ def _safe(value: Any) -> Any:
 async def _result_messages(messages: list[dict[str, Any]], *, deps: RuntimeDeps,
                            runtime: Any) -> list[dict[str, Any]]:
     """Read bounded originals for delivery, keeping checkpoint messages reference-only."""
+    # Non-tool messages (assistant with provider_continuation) are appended
+    # unchanged; only executed tool bodies gain original_results. No redaction
+    # is applied to assistant messages so signatures stay byte-identical.
     delivered = []
     reader = EvidenceReader(deps.evidence_store)
     # Distribute the existing total window across every retained executed
@@ -151,6 +155,7 @@ async def _result_messages(messages: list[dict[str, Any]], *, deps: RuntimeDeps,
 
 def _message_history(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Trim complete conversation rounds, anchored on user turns.
+    # Slicing only; assistant provider_continuation blocks ride along untouched.
 
     Every stored round is: user context, then assistant, then tool
     results (the user context message is persisted now). Slicing at a
@@ -176,6 +181,8 @@ def _compact_context_messages(
     messages: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """Keep one full state snapshot per request.
+    # Assistant and tool messages (including provider_continuation) pass through
+    # by reference; only user snapshots are replaced. No redaction here.
 
     Every user message is a complete engine context snapshot, and each new
     snapshot already contains the cumulative state; older copies are
@@ -366,6 +373,25 @@ async def _bind_call(call: NativeCallState, *, deps: RuntimeDeps, runtime, conte
         correlation_id=str(proposal.action_id),
     )
     call.dispatch.last_event_id = event.event_id
+
+
+def _echo_provider_continuation(response: Any) -> list[dict[str, Any]] | None:
+    # Replay-safe deepcopy of the opaque provider continuation, or None when empty.
+    # Validation reuses the strict core NativeCompletion continuation shape: a
+    # non-empty malformed continuation raises ValueError (surfaced by model_node
+    # as a native-protocol diagnostic) instead of silently dropping signed state.
+    # Redaction and masking are never applied here so signature text
+    # stays byte-identical for the next request.
+    blocks = getattr(response, "continuation", ())
+    if not blocks:
+        return None
+    try:
+        validated = NativeCompletion(tool_calls=(), text="", continuation=blocks).continuation
+    except ValueError as exc:
+        raise ValueError("native provider continuation: " + str(exc)) from exc
+    if not validated:
+        return None
+    return copy.deepcopy(list(validated))
 
 
 async def model_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
@@ -560,6 +586,12 @@ async def model_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             # investigation, never an implicit success. Terminate cleanly
             # instead of nudging the model until the step/stall ceiling.
             runtime.termination_reason = TerminationReason.INVESTIGATION_HELD
+        # Echo the opaque provider continuation onto the checkpointed assistant
+        # message only. Never merged into content or tool_calls; empty stays
+        # absent for backward compatibility. No redaction here.
+        echoed_continuation = _echo_provider_continuation(response)
+        if echoed_continuation:
+            assistant["provider_continuation"] = echoed_continuation
         # Only a pending local call still executes from these arguments.
         # Bound external calls use dispatch's original execution envelope;
         # rejected calls never execute. Keep the masked declaration above,

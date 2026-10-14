@@ -811,3 +811,77 @@ def test_build_rejects_missing_key(_sdk, monkeypatch):
 
 def test_build_canonicalizes_padded_model(_sdk):
     assert go.build(_config("  openai/gpt-pad  ")).model == "openai/gpt-pad"
+
+
+@pytest.mark.parametrize("model,mode", [("cl-x", "enabled"), ("claude-opus-4-6", "adaptive")])
+async def test_effort_messages_omits_thinking_and_replays_signature(_sdk, model, mode):
+    signature = "encrypted-signature-fixture"
+    def first(body):
+        payload = _messages_payload(body)
+        payload["content"] = [
+            {"type": "thinking", "thinking": "", "signature": signature},
+            {"type": "tool_use", "id": "call-one", "name": "inspect", "input": {}},
+        ]
+        payload["stop_reason"] = "tool_use"
+        return payload
+    RESPONDERS["messages"] = first
+    client = go.build(LLMConfig(
+        provider="opencode-go", default_model="anthropic/" + model,
+        api_key_env_var=_KEY_ENV, reasoning_effort="high",
+    ))
+    tools = [NativeToolSpec("inspect", "Read fixture", {"type": "object"})]
+    result = await client.complete_native(messages=[{"role": "user", "content": "inspect"}],
+                                          tools=tools)
+    body = CAPTURED[-1]["body"]
+    assert body["thinking"]["type"] == mode
+    assert body["thinking"]["display"] == "omitted"
+    if mode == "enabled":
+        assert body["thinking"]["budget_tokens"] == 4096  # SDK's high mapping
+    assert body["output_config"]["effort"] == "high"
+    assert result.continuation == ({"type": "thinking", "thinking": "", "signature": signature},)
+    RESPONDERS["messages"] = lambda body: _messages_payload(body)
+    await client.complete_native(messages=[
+        {"role": "user", "content": "inspect"},
+        {"role": "assistant", "content": "", "provider_continuation": list(result.continuation),
+         "tool_calls": [{"id": "call-one", "type": "function",
+                         "function": {"name": "inspect", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "call-one", "content": "fixture result"},
+    ], tools=tools)
+    assert CAPTURED[-1]["body"]["messages"][1]["content"][0] == result.continuation[0]
+
+
+async def test_effort_responses_requests_and_replays_encrypted_items(_sdk):
+    encrypted = {"type": "reasoning", "id": "reason-one",
+                 "encrypted_content": "ciphertext-fixture", "summary": []}
+    RESPONDERS["responses"] = lambda body: _responses_payload(body, output=[
+        encrypted,
+        {"type": "function_call", "id": "item-one", "call_id": "call-one",
+         "name": "inspect", "arguments": "{}", "status": "completed"},
+    ])
+    client = go.build(LLMConfig(
+        provider="opencode-go", default_model="openai/responses/gpt-x",
+        api_key_env_var=_KEY_ENV, reasoning_effort="high",
+    ))
+    tools = [NativeToolSpec("inspect", "Read fixture", {"type": "object"})]
+    result = await client.complete_native(messages=[{"role": "user", "content": "inspect"}],
+                                          tools=tools)
+    assert "reasoning.encrypted_content" in CAPTURED[-1]["body"]["include"]
+    assert CAPTURED[-1]["body"]["reasoning"]["effort"] == "high"
+    assert result.continuation == (encrypted,)
+    RESPONDERS["responses"] = lambda body: _responses_payload(body)
+    await client.complete_native(messages=[
+        {"role": "assistant", "provider_continuation": list(result.continuation),
+         "tool_calls": [{"id": "call-one", "type": "function",
+                         "function": {"name": "inspect", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "call-one", "content": "fixture result"},
+    ], tools=tools)
+    assert CAPTURED[-1]["body"]["input"][0] == encrypted
+
+
+async def test_effort_chat_reaches_http_body(_sdk):
+    client = go.build(LLMConfig(
+        provider="opencode-go", default_model="openai/gpt-x",
+        api_key_env_var=_KEY_ENV, reasoning_effort="high",
+    ))
+    assert await client.complete(messages=[{"role": "user", "content": "fixture"}]) == "hello-chat"
+    assert CAPTURED[-1]["body"]["reasoning_effort"] == "high"

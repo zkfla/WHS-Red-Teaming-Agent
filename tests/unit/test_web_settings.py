@@ -7,6 +7,8 @@ import json
 import pytest
 
 from redteam.app.web.settings import (
+    ENV_EFFORT,
+    ENV_KEY_VAR,
     ENV_MODEL,
     ENV_POLICY,
     ENV_PROFILE,
@@ -74,8 +76,8 @@ def test_repository_web_settings_select_candidate_profile_by_default(tmp_path):
 
 def test_profiles_list_ids_and_labels_and_skip_broken_files(store):
     assert store.profiles() == [
-        {"id": "alpha", "label": "alpha-profile"},
-        {"id": "beta", "label": "beta-profile"},
+        {"id": "alpha", "label": "alpha-profile (alpha)"},
+        {"id": "beta", "label": "beta-profile (beta)"},
     ]
 
 
@@ -222,3 +224,349 @@ def test_storage_failure_leaves_the_process_environment_unchanged(store, tmp_pat
         complete(store)
     assert (caught.value.field, caught.value.code) == ("storage", "write_failed")
     assert store.env == {}
+
+
+def test_model_only_apply_preserves_litellm_default(store):
+    store.apply({"model": "provider/model-1"})
+    assert store.env[ENV_PROVIDER] == "litellm"
+    assert store.summary()["provider"] == "litellm"
+
+
+def test_model_only_apply_preserves_existing_opencode_provider(store):
+    store.env[ENV_PROVIDER] = "opencode-go"
+    store.apply({"model": "openai/gpt-x"})
+    assert store.env[ENV_PROVIDER] == "opencode-go"
+
+
+def test_opencode_go_selectable_with_effort(store):
+    store.apply(
+        {
+            "provider": "opencode-go",
+            "model": "openai/gpt-x",
+            "api_key": SECRET,
+            "reasoning_effort": "high",
+            "profile_id": "alpha",
+            "max_requests": 50,
+            "max_concurrent_requests": 2,
+        }
+    )
+    assert store.env[ENV_PROVIDER] == "opencode-go"
+    assert store.env[ENV_EFFORT] == "high"
+    assert store.summary()["provider"] == "opencode-go"
+    assert store.summary()["reasoning_effort"] == "high"
+    assert store.problems() == []
+
+
+def test_unknown_provider_is_rejected_atomically(store):
+    with pytest.raises(SettingsError) as caught:
+        store.apply({"provider": "openai"})
+    assert (caught.value.field, caught.value.code) == ("provider", "unsupported")
+    assert store.env == {}
+    assert not store.state_path.exists()
+
+
+@pytest.mark.parametrize("effort", ["turbo", "ultra", 123, True, ["high"]])
+def test_invalid_effort_is_rejected_atomically(store, effort):
+    with pytest.raises(SettingsError) as caught:
+        store.apply({"reasoning_effort": effort})
+    assert (caught.value.field, caught.value.code) == ("reasoning_effort", "invalid")
+    assert store.env == {}
+    assert not store.state_path.exists()
+
+
+@pytest.mark.parametrize("clear", ["", "   ", None])
+def test_effort_clearing_removes_env_and_saved_key(store, clear):
+    store.apply(
+        {
+            "provider": "opencode-go",
+            "model": "openai/gpt-x",
+            "api_key": SECRET,
+            "reasoning_effort": "medium",
+            "profile_id": "alpha",
+            "max_requests": 50,
+            "max_concurrent_requests": 2,
+        }
+    )
+    assert store.env[ENV_EFFORT] == "medium"
+    store.apply({"reasoning_effort": clear})
+    assert ENV_EFFORT not in store.env
+    assert store.summary()["reasoning_effort"] is None
+    assert "reasoning_effort" not in json.loads(store.state_path.read_text(encoding="utf-8"))
+    assert store.env[ENV_PROVIDER] == "opencode-go"
+
+
+def test_effort_reload_reflects_persisted_value(store):
+    store.apply(
+        {
+            "provider": "opencode-go",
+            "model": "openai/gpt-x",
+            "api_key": SECRET,
+            "reasoning_effort": "xhigh",
+            "profile_id": "alpha",
+            "max_requests": 50,
+            "max_concurrent_requests": 2,
+        }
+    )
+    fresh = SettingsStore(
+        env={},
+        state_path=store.state_path,
+        profile_dir=store.profile_dir,
+        env_path=store.env_path,
+    )
+    fresh.load_saved()
+    assert fresh.env[ENV_PROVIDER] == "opencode-go"
+    assert fresh.env[ENV_EFFORT] == "xhigh"
+    assert fresh.summary()["reasoning_effort"] == "xhigh"
+    assert fresh.env[ENV_KEY_VAR] == "OPENCODE_API_KEY"
+    assert fresh.summary()["api_key_env_var"] == "OPENCODE_API_KEY"
+
+
+def test_effort_value_is_normalized(store):
+    store.apply({"reasoning_effort": "HIGH"})
+    assert store.env[ENV_EFFORT] == "high"
+    assert store.summary()["reasoning_effort"] == "high"
+
+
+def test_invalid_persisted_effort_does_not_break_reload(store):
+    complete(store)
+    saved = json.loads(store.state_path.read_text(encoding="utf-8"))
+    saved["reasoning_effort"] = "turbo"
+    store.state_path.write_text(json.dumps(saved), encoding="utf-8")
+    fresh = SettingsStore(
+        env={},
+        state_path=store.state_path,
+        profile_dir=store.profile_dir,
+        env_path=store.env_path,
+    )
+    fresh.load_saved()
+    assert ENV_EFFORT not in fresh.env
+
+
+def test_summary_reports_unset_effort_as_none(store):
+    complete(store)
+    assert store.summary()["reasoning_effort"] is None
+
+
+def test_profiles_disambiguate_when_id_differs_from_filename(store, tmp_path):
+    (store.profile_dir / "same.yaml").write_text("profile_id: same\n", encoding="utf-8")
+    (store.profile_dir / "legacy.yaml").write_text("profile_id: same\n", encoding="utf-8")
+    by_id = {item["id"]: item["label"] for item in store.profiles()}
+    assert by_id["same"] == "same"
+    assert by_id["legacy"] == "same (legacy)"
+    assert by_id["alpha"] == "alpha-profile (alpha)"
+
+
+def test_summary_exposes_effort_options_from_core(store):
+    from redteam.core.config import REASONING_EFFORTS
+
+    assert store.summary()["reasoning_effort_options"] == sorted(REASONING_EFFORTS)
+    assert set(store.summary()["reasoning_effort_options"]) == {
+        "none", "minimal", "low", "medium", "high", "xhigh", "max",
+    }
+
+
+def test_go_save_resolves_opencode_key_default(store):
+    from redteam.core.config import LLMConfig
+    from redteam.llm.opencode_go_config import OPENCODE_GO_API_KEY_ENV_VAR
+
+    store.apply(
+        {
+            "provider": "opencode-go",
+            "model": "openai/gpt-x",
+            "api_key": SECRET,
+            "profile_id": "alpha",
+            "max_requests": 50,
+            "max_concurrent_requests": 2,
+        }
+    )
+    assert store.env[ENV_PROVIDER] == "opencode-go"
+    assert store.env[OPENCODE_GO_API_KEY_ENV_VAR] == SECRET
+    assert "LLM_API_KEY" not in store.env
+    summary = store.summary()
+    assert summary["api_key_env_var"] == OPENCODE_GO_API_KEY_ENV_VAR
+    assert summary["api_key_set"] is True
+    assert store.problems() == []
+
+    consumer = LLMConfig.from_environment(store.env)
+    assert consumer.api_key_env_var == OPENCODE_GO_API_KEY_ENV_VAR
+    assert consumer.api_key_env_var == summary["api_key_env_var"]
+    assert store.env[consumer.api_key_env_var] == SECRET
+
+
+def test_go_save_factory_receives_opencode_key_reference(store, monkeypatch):
+    import redteam.app.bootstrap as bootstrap
+    from redteam.core.config import LLMConfig
+    from redteam.llm.opencode_go_config import OPENCODE_GO_API_KEY_ENV_VAR
+
+    store.apply(
+        {
+            "provider": "opencode-go",
+            "model": "openai/gpt-x",
+            "api_key": SECRET,
+            "profile_id": "alpha",
+            "max_requests": 50,
+            "max_concurrent_requests": 2,
+        }
+    )
+    seen = {}
+
+    def fake_factory(llm_config):
+        seen["api_key_env_var"] = llm_config.api_key_env_var
+        return object()
+
+    monkeypatch.setattr(bootstrap, "build_llm_client", fake_factory)
+    bootstrap.build_llm_client(LLMConfig.from_environment(store.env))
+    assert seen["api_key_env_var"] == OPENCODE_GO_API_KEY_ENV_VAR
+
+
+def test_go_to_litellm_switch_drops_generated_go_reference(store):
+    import json as _json
+
+    from redteam.core.config import LLMConfig
+
+    store.apply(
+        {
+            "provider": "opencode-go",
+            "model": "openai/gpt-x",
+            "api_key": SECRET,
+            "profile_id": "alpha",
+            "max_requests": 50,
+            "max_concurrent_requests": 2,
+        }
+    )
+    store.apply({"provider": "litellm", "model": "provider/model-1"})
+    assert store.env[ENV_KEY_VAR] == "LLM_API_KEY"
+    saved = _json.loads(store.state_path.read_text(encoding="utf-8"))
+    assert "api_key_env_var" not in saved
+    consumer = LLMConfig.from_environment(store.env)
+    assert consumer.api_key_env_var == "LLM_API_KEY"
+    assert consumer.api_key_env_var == store.summary()["api_key_env_var"]
+
+
+def test_explicit_key_reference_survives_go_to_litellm_switch(store):
+    explicit = SettingsStore(
+        env={ENV_KEY_VAR: "CUSTOM_KEY_VAR"},
+        state_path=store.state_path,
+        profile_dir=store.profile_dir,
+        env_path=store.env_path,
+    )
+    explicit.apply(
+        {
+            "provider": "opencode-go",
+            "model": "openai/gpt-x",
+            "api_key": SECRET,
+            "profile_id": "alpha",
+            "max_requests": 50,
+            "max_concurrent_requests": 2,
+        }
+    )
+    assert explicit.env["CUSTOM_KEY_VAR"] == SECRET
+    explicit.apply({"provider": "litellm", "model": "provider/model-1"})
+    assert explicit.env[ENV_KEY_VAR] == "CUSTOM_KEY_VAR"
+    assert explicit.summary()["api_key_env_var"] == "CUSTOM_KEY_VAR"
+
+
+def test_explicit_default_matching_ref_retained_on_litellm_to_go_switch(store):
+    import json as _json
+
+    from redteam.core.config import LLMConfig
+
+    explicit = SettingsStore(
+        env={ENV_KEY_VAR: "LLM_API_KEY"},
+        state_path=store.state_path,
+        profile_dir=store.profile_dir,
+        env_path=store.env_path,
+    )
+    explicit.apply(
+        {
+            "model": "provider/model-1",
+            "api_key": SECRET,
+            "profile_id": "alpha",
+            "max_requests": 50,
+            "max_concurrent_requests": 2,
+        }
+    )
+    assert explicit.env[ENV_KEY_VAR] == "LLM_API_KEY"
+    explicit.apply({"provider": "opencode-go", "model": "openai/gpt-x"})
+    assert explicit.env[ENV_KEY_VAR] == "LLM_API_KEY"
+    saved = _json.loads(store.state_path.read_text(encoding="utf-8"))
+    assert saved.get("api_key_env_var") == "LLM_API_KEY"
+    consumer = LLMConfig.from_environment(explicit.env)
+    assert consumer.api_key_env_var == "LLM_API_KEY"
+    assert consumer.api_key_env_var == explicit.summary()["api_key_env_var"]
+
+
+def test_go_save_preserves_explicit_key_var(store):
+    explicit = SettingsStore(
+        env={ENV_KEY_VAR: "CUSTOM_KEY_VAR"},
+        state_path=store.state_path,
+        profile_dir=store.profile_dir,
+        env_path=store.env_path,
+    )
+    explicit.apply(
+        {
+            "provider": "opencode-go",
+            "model": "anthropic/model-y",
+            "api_key": SECRET,
+            "profile_id": "alpha",
+            "max_requests": 50,
+            "max_concurrent_requests": 2,
+        }
+    )
+    assert explicit.env["CUSTOM_KEY_VAR"] == SECRET
+    assert explicit.summary()["api_key_env_var"] == "CUSTOM_KEY_VAR"
+    assert explicit.problems() == []
+
+
+def test_candidate_provider_key_uses_candidate_not_old_provider(store):
+    from redteam.llm.opencode_go_config import OPENCODE_GO_API_KEY_ENV_VAR
+
+    store.apply({"model": "provider/model-1", "api_key": SECRET})
+    assert store.env["LLM_API_KEY"] == SECRET
+    store.apply({"provider": "opencode-go", "model": "openai/gpt-x", "api_key": SECRET})
+    assert store.env[OPENCODE_GO_API_KEY_ENV_VAR] == SECRET
+    assert store.summary()["api_key_env_var"] == OPENCODE_GO_API_KEY_ENV_VAR
+
+
+@pytest.mark.parametrize("model", ["bad-model", "openai/", "openai/a/b", "gpt-4o-mini", ""])
+def test_malformed_go_model_rejected_atomically(store, model):
+    with pytest.raises(SettingsError) as caught:
+        store.apply({"provider": "opencode-go", "model": model})
+    assert (caught.value.field, caught.value.code) == ("model", "invalid")
+    assert store.env == {}
+    assert not store.state_path.exists()
+
+
+def test_malformed_go_model_surfaces_problem_entry(store):
+    store.env[ENV_PROVIDER] = "opencode-go"
+    store.env[ENV_MODEL] = "not-a-qualified-model"
+    assert {"field": "model", "code": "invalid"} in store.problems()
+    assert store.summary()["ready"] is False
+
+
+def test_switch_to_go_with_incompatible_existing_model_rejected(store):
+    store.env[ENV_MODEL] = "provider/model-1"
+    with pytest.raises(SettingsError) as caught:
+        store.apply({"provider": "opencode-go"})
+    assert (caught.value.field, caught.value.code) == ("model", "invalid")
+    assert store.env[ENV_MODEL] == "provider/model-1"
+    assert ENV_PROVIDER not in store.env
+
+
+def test_litellm_model_shape_not_go_validated(store):
+    store.apply({"model": "provider/model-1", "api_key": SECRET})
+    assert store.env[ENV_PROVIDER] == "litellm"
+    assert store.env[ENV_MODEL] == "provider/model-1"
+
+
+def test_go_first_startup_publishes_derived_key_reference(store):
+    from redteam.core.config import LLMConfig
+
+    initial = SettingsStore(
+        env={ENV_PROVIDER: "opencode-go", ENV_MODEL: "openai/gpt-x", "OPENCODE_API_KEY": SECRET},
+        state_path=store.state_path, profile_dir=store.profile_dir, env_path=store.env_path,
+    )
+    initial.load_saved()
+    assert LLMConfig.from_environment(initial.env).api_key_env_var == "OPENCODE_API_KEY"
+    initial.apply({"provider": "litellm", "model": "provider/model-1"})
+    assert LLMConfig.from_environment(initial.env).api_key_env_var == "LLM_API_KEY"

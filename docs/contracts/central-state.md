@@ -1063,8 +1063,10 @@ must pass before resuming an existing Run; incompatible Runs are not migrated.
 
 ## Worker delivery version
 
-The default split schema-3 profile is now `native-probes` version 7, with
-`worker.md` prompt version 4. The retained single-stage profile is version 6
+The default split schema-3 profile is now `native-probes` version 8, with
+`worker.md` prompt version 4 and `hypothesis-strategy.md` version 3 (combined
+candidate-v2 guidance and bounded original-feedback guidance). The retained single-stage
+profile is version 6
 and uses the same worker prompt version. Their Planner/atomizer responsibilities,
 probe limits and existing independent completion review are unchanged. Prompt
 content hashes and versioned read/settlement contributions change the existing

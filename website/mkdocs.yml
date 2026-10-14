@@ -50,6 +50,8 @@ markdown_extensions:
 
 nav:
   - 개요: index.md
+  - 들어가기 전에: concepts.md
+  - 한 번의 점검 따라가기: walkthrough.md
   - 아키텍처: architecture.md
   - 도메인 계약: contracts.md
   - 실행 모델: orchestration.md
