@@ -21,6 +21,9 @@
 | `EvidenceSourceType` | `tool, agent, system, operator` |
 | `ApprovalStatus` | `pending, approved, rejected, expired` |
 
+!!! info "주요 상태 전이"
+    `TaskStatus`는 `PENDING → READY`(할당 가능해짐) → `RUNNING`으로 가고, 선행 작업이나 자원을 기다리면 `BLOCKED`가 된다. `ExecutionState.UNKNOWN`은 결과가 불명확한 실행으로, 재개 시 `ExecutionRecoveryProvider.query_execution`으로 원본 상태를 다시 조회해 `SUCCEEDED`나 `FAILED`로 확정하거나 보류한다. 종료 상태만으로 점유 자원을 자동 해제하지 않는다.
+
 ## ActionProposal, 에이전트의 유일한 실행 요청
 
 에이전트는 Capability Layer를 직접 호출하지 못한다. `ActionProposal`을 만들어 `ControlContext`와 함께 Control Plane에 넘긴다. ALLOW 결정만 `ToolInvocation`이 될 수 있다.
@@ -92,6 +95,8 @@ class ToolResult(BaseModel):
 `ToolDescriptor`는 도구 메타데이터(능력 태그, target과 resource 바인딩)를 담고 `ToolCatalog` 포트로 조회한다. 실제 MCP 원격 도구 이름은 `tool_id`로부터 `ToolDescriptor`에서 해석된다.
 
 ## EvidenceRecord
+
+관측의 원본 기록이다. 본문은 보존하되 큰 바이너리는 `artifact_ref`로 외부를 가리키고, `digest`로 무결성을, `action_id`와 `invocation_id`, `hypothesis_id`로 어떤 행동과 관측이 어떤 가설을 뒷받침하는지를 연결한다.
 
 ```python
 class EvidenceRecord(BaseModel):

@@ -12,11 +12,26 @@
 
 각 작업 인스턴스는 MODEL → TOOLS → SETTLE 네이티브 ReAct 루프를 반복한다. MODEL은 다음 행동을 판단하고, TOOLS는 요청을 검증해 정책 검사와 도구 호출을 수행하며, SETTLE은 실행 상태를 정리해 계속할지 종료할지 결정한다.
 
-역할 수와 실행 인스턴스 수는 다르다. 기본 프로필은 두 워커(`max_instances: 2`, `max_activations: 8`)를 쓰며, 같은 역할도 동시성 한도 안에서 여러 인스턴스로 동작한다. 등록 성공은 실행 권한이 아니다. 가용성, 선택, admission, 실제 실행을 구분한다.
+역할 수와 실행 인스턴스 수는 다르다. 기본 프로필은 두 워커(`max_instances: 2`, `max_activations: 8`)를 쓰며, 같은 역할도 동시성 한도 안에서 여러 인스턴스로 동작한다. 동시성 한도는 세 겹으로 작동한다. `max_instances`(프로필)는 워커 인스턴스 수를, `RateLimitPolicy.max_concurrent_actions`는 동시에 진행 중인 행동 수를, `RuleOfEngagement.max_parallel_actions`는 ROE 차원의 병렬 상한을 제한한다. 등록 성공은 실행 권한이 아니다. 가용성, 선택, admission, 실제 실행을 구분한다.
 
 ![역할 분업 구조](assets/roles.png)
 
 *역할 분업 구조. 전체 프로필은 7개 역할이며, 이 글은 Web 배포 기준 6개 역할(대화, 공격경로 계획, 작업 원자화, Web 실행, 리서치와 증거, 코드)을 중심으로 설명한다.*
+
+## 역할별 책임
+
+`config/agents`의 프로필이 역할과 담당 단계(stage)를 연결한다.
+
+| 역할 | 책임 | 담당 단계 |
+| --- | --- | --- |
+| 대화 (conversation) | 사용자 요청 해석, 실행 문맥 연결 | conversation_decide |
+| 플래너 (strategy) | 공격 경로와 가설 제안, 후속 조사 판단 | attack_path_proposal |
+| 작업 원자화 (atomization) | 가설을 검증 가능한 Probe로 분해 | task_atomization |
+| Web 실행 (web_execution) | Web/API와 Recon 도구로 관측 수집 | native_action |
+| 리서치와 증거 (research_evidence) | 관측과 증거 유효성, 완료 판정 검토 | analysis_verify, task_completion_review, goal_completion_review 등 |
+| 코드 (code_artifact) | 근거를 참조하는 재현 코드 산출 | 코드 산출 단계 |
+
+중요한 구분이 하나 있다. 이 중 동시성 한도 아래 여러 인스턴스로 실제로 도는 것은 **Web 실행(web_execution)뿐**이다(schedulable). 나머지는 특정 단계에서 호출되는 전문 역할이라, 앞에서 말한 "두 워커"는 사실상 두 개의 Web 실행 인스턴스를 뜻한다. 전체 프로필은 여기에 Mobile 실행이 더해져 7개이지만 Mobile 역량은 아직 후보다.
 
 ## 진행 보증과 종료 조건
 
@@ -38,4 +53,4 @@
 
 ![조사 흐름 그래프](assets/graph-ui.png)
 
-*조사 흐름 그래프. 가설(Planner)에서 검증 작업(Probe)과 실행 워커, 증거로 이어지는 흐름과 각 작업의 상태(승인 대기, 진행 중, 완료)를 보여준다.*
+*조사 흐름 그래프. 노드는 작업과 워커이고, 색으로 상태(승인 대기, 진행 중, 완료)를 구분한다.*
