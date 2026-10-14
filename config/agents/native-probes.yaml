@@ -32,7 +32,7 @@ roles:
       capabilities: []
       tool_selection: {}
       context_profile: {profile_id: hypothesis_planning}
-    prompt: {path: prompts/hypothesis-strategy.md, version: '1'}
+    prompt: {path: prompts/hypothesis-strategy.md, version: '2'}
   - definition:
       agent_id: probe-atomizer
       role: atomization
