@@ -15,13 +15,24 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
 from redteam.core.ports.llm import LLMClient
 from redteam.core.redaction import redact_sensitive_text
-from redteam.orchestration.cognition import DecisionFailure, StructuredDecisionClient
+from redteam.orchestration.cognition import (
+    DecisionBudget,
+    DecisionFailure,
+    StructuredDecisionClient,
+)
+from redteam.orchestration.diagnostics import (
+    DecisionDiagnostic,
+    diagnostic_for_exception,
+    error_type_for,
+    exception_chain_for,
+)
 from redteam.orchestration.engagement_planner import sanitize_objective
 from redteam.orchestration.state import RuntimeState
 
@@ -80,17 +91,114 @@ class ConversationDecision(BaseModel):
         ]
 
 
+_CONVERSATION_STAGE = "conversation_decide"
+_DECISION_SCHEMA = ConversationDecision.model_json_schema()
+
+
 class ConversationError(Exception):
     """Raised when the dialogue model cannot produce a displayable decision.
 
     Transport, schema, and classification failures are delivered as this
-    error with zero executions. ``asyncio.CancelledError`` is never
-    converted to this error and always propagates.
+    error with zero executions. The diagnostic attribute carries the safe
+    DecisionDiagnostic (stage, kind, code, rule, location, provider status,
+    attempt counts and the nested last cause). It never carries provider
+    bodies, prompts, keys, or exception messages. Callers chain the original
+    exception with from exc. asyncio.CancelledError is never converted to
+    this error and always propagates.
     """
+
+    def __init__(
+        self,
+        message: str = "conversation decision failed",
+        *,
+        diagnostic: DecisionDiagnostic | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.diagnostic = diagnostic
+
+
+def conversation_failure_label(
+    diagnostic: DecisionDiagnostic | None, *, fallback: str = "unknown"
+) -> str:
+    """One operator-facing line built only from safe diagnostic fields."""
+
+    if diagnostic is None:
+        return fallback
+    cause = diagnostic.last_cause
+    rule = next((str(item.get("rule") or "") for item in diagnostic.validation_issues[:1]), "")
+    location = diagnostic.location
+    if cause is not None:
+        if not rule:
+            rule = next(
+                (str(item.get("rule") or "") for item in cause.validation_issues[:1]), ""
+            )
+        location = location or cause.location
+    parts = [diagnostic.code, diagnostic.stage, diagnostic.kind]
+    if diagnostic.attempts:
+        parts.append(f"attempts {diagnostic.attempts}")
+    if cause is not None:
+        parts.append(f"cause {cause.code}")
+    if rule:
+        parts.append(f"rule {rule}")
+    if location:
+        parts.append(f"at {location}")
+    status = diagnostic.provider_status
+    if status is None and cause is not None:
+        status = cause.provider_status
+    if status is not None:
+        parts.append(f"status {status}")
+    if diagnostic.error_type:
+        parts.append(f"type {diagnostic.error_type}")
+    return " · ".join(part for part in parts if part)
+
+
+def _timeout_diagnostic(
+    timeout_seconds: float, exc: BaseException, budget: DecisionBudget
+) -> DecisionDiagnostic:
+    """Outer-deadline cause that keeps the request-local counters the budget recorded."""
+
+    return DecisionDiagnostic(
+        code="conversation_timeout",
+        stage=_CONVERSATION_STAGE,
+        kind="transport",
+        attempts=budget.used,
+        summary=f"The conversation decision did not finish within {timeout_seconds:g} seconds.",
+        retryable=False,
+        last_cause=budget.last_failure,
+        error_type=error_type_for(exc),
+        exception_chain=exception_chain_for(exc),
+        **budget.diagnostic_details(),
+    )
+
+
+def _unexpected_diagnostic(exc: BaseException) -> DecisionDiagnostic:
+    attached = getattr(exc, "diagnostic", None)
+    if isinstance(attached, DecisionDiagnostic):
+        return attached
+    return DecisionDiagnostic(
+        code="conversation_failed",
+        stage=_CONVERSATION_STAGE,
+        kind="unknown",
+        summary="The conversation decision failed before a valid reply was produced.",
+        retryable=False,
+        error_type=error_type_for(exc),
+        exception_chain=exception_chain_for(exc),
+    )
 
 
 class ConversationAssistant:
-    """Maintains bounded chat history and delegates interpretation to the configured LLM."""
+    """Maintains bounded chat history and delegates interpretation to the configured LLM.
+
+    timeout_seconds bounds one whole decision chain (default 180 s).
+    max_attempts is the shared normal plus repair request total (default 6).
+    transport_limit caps transport retries inside that total (default 5) and
+    is counted apart from format and semantic repairs. These are constructor
+    semantics; global OrchestrationSettings are not read here.
+
+    Each decide call builds its own DecisionBudget from these values, so
+    concurrent calls never share counters, and the outer timeout keeps the
+    budget's counters when it cancels a call.
+    """
 
     def __init__(
         self,
@@ -98,12 +206,23 @@ class ConversationAssistant:
         *,
         timeout_seconds: float = 180.0,
         max_attempts: int = 6,
+        transport_limit: int = 5,
     ) -> None:
+        timeout = float(timeout_seconds)
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout_seconds must be finite and > 0")
+        if int(transport_limit) < 0:
+            raise ValueError("transport_limit must be non-negative")
         self._llm = llm
-        self._timeout_seconds = float(timeout_seconds)
+        self._timeout_seconds = timeout
         self._max_attempts = int(max_attempts)
+        self._transport_limit = int(transport_limit)
         self._history: list[dict[str, str]] = []
-        self._client = StructuredDecisionClient(self._llm, max_attempts=self._max_attempts)
+        self._client = StructuredDecisionClient(
+            self._llm,
+            max_attempts=self._max_attempts,
+            transport_limit=self._transport_limit,
+        )
 
     async def decide(
         self,
@@ -138,18 +257,32 @@ class ConversationAssistant:
             "user_message": safe_message,
             "history": list(self._history[-16:]),
         }
+        # One budget per decide call: concurrent inputs never share counters, and
+        # the outer timeout can cancel the call without losing them.
+        budget = DecisionBudget(
+            self._max_attempts,
+            transport_limit=self._transport_limit,
+            timeout_seconds=self._timeout_seconds,
+        )
         try:
             # Request-local override: concurrent inputs never swap the shared
             # assistant's client or leak a previous Run's accounting context.
             client = self._client if llm_override is None else StructuredDecisionClient(
-                llm_override, max_attempts=self._max_attempts,
+                llm_override,
+                max_attempts=self._max_attempts,
+                transport_limit=self._transport_limit,
             )
+            # Two deadlines race by design: this outer timeout and the budget deadline
+            # checked between attempts and used as the per-attempt timeout. Either may
+            # fire first. The outer path reports conversation_timeout, the budget path
+            # reports decision_time_budget_exhausted; both keep the budget counters.
             raw = await asyncio.wait_for(
                 client.ask(
                     stage="conversation_decide",
                     payload=payload,
                     response_schema=ConversationDecision.model_json_schema(),
                     system=_SYSTEM_PROMPT,
+                    budget=budget,
                 ),
                 timeout=self._timeout_seconds,
             )
@@ -157,24 +290,41 @@ class ConversationAssistant:
             raise
         except asyncio.TimeoutError as exc:
             raise ConversationError(
-                f"conversation decision timed out after {self._timeout_seconds:g}s"
+                f"conversation decision timed out after {self._timeout_seconds:g}s",
+                diagnostic=_timeout_diagnostic(self._timeout_seconds, exc, budget),
             ) from exc
         except DecisionFailure as exc:
-            raise ConversationError(
-                f"conversation decision failed kind={exc.kind} "
-                f"stage={exc.stage} attempts={exc.attempts}"
-            ) from exc
+            diagnostic = (
+                exc.diagnostic
+                if isinstance(exc.diagnostic, DecisionDiagnostic)
+                else _unexpected_diagnostic(exc)
+            )
+            if diagnostic.code == "decision_time_budget_exhausted":
+                message = (
+                    f"conversation decision timed out after {self._timeout_seconds:g}s "
+                    f"attempts={diagnostic.attempts} code={diagnostic.code}"
+                )
+            else:
+                message = (
+                    f"conversation decision failed kind={exc.kind} "
+                    f"stage={exc.stage} attempts={exc.attempts} code={diagnostic.code}"
+                )
+            raise ConversationError(message, diagnostic=diagnostic) from exc
         except ConversationError:
             raise
         except Exception as exc:
             raise ConversationError(
-                f"conversation decision failed {type(exc).__name__}"
+                f"conversation decision failed {type(exc).__name__}",
+                diagnostic=_unexpected_diagnostic(exc),
             ) from exc
         try:
             decision = ConversationDecision.model_validate(raw)
         except Exception as exc:
             raise ConversationError(
-                f"invalid conversation decision {type(exc).__name__}"
+                f"invalid conversation decision {type(exc).__name__}",
+                diagnostic=diagnostic_for_exception(
+                    exc, stage=_CONVERSATION_STAGE, schema=_DECISION_SCHEMA
+                ),
             ) from exc
         if decision.mode == "execute" and not decision.objective:
             decision = decision.model_copy(update={"objective": safe_message})

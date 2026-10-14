@@ -13,6 +13,7 @@ from uuid import uuid4
 from rich.markdown import Markdown
 from rich.text import Text
 
+from redteam.app.cli.conversation import conversation_failure_label
 from redteam.app.cli.display import safe_text
 from redteam.app.cli.input_router import CONTROL_COMMANDS, InputRouter, command
 from redteam.app.cli.output_coordinator import OutputCoordinator
@@ -24,6 +25,7 @@ from redteam.app.cli.session_types import (
     RunResult,
     SessionPhase,
 )
+from redteam.orchestration.diagnostics import DecisionDiagnostic, operational_exception_diagnostic
 
 INPUT_CAPACITY = 64
 CONTROL_CAPACITY = 16
@@ -31,6 +33,21 @@ RECEIPT_CAPACITY = 512
 DISPATCH_TIMEOUT = 10.0
 CLOSE_TIMEOUT = 10.0
 _UNSET = object()
+
+
+def input_failure_diagnostic(exc: BaseException) -> DecisionDiagnostic:
+    """Safe receipt cause for an input that failed inside the session.
+
+    A conversation failure keeps its own safe diagnostic. Any other exception
+    contributes only a fixed code and its type name, never its message.
+    """
+
+    return operational_exception_diagnostic(
+        exc,
+        stage="cli_input",
+        code="input_processing_failed",
+        summary="The input could not be processed by the session.",
+    )
 
 
 class SessionController:
@@ -407,7 +424,10 @@ class SessionController:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                self._receipt(receipt, "not_applied", f"입력 처리 실패: {type(exc).__name__}")
+                diagnostic = input_failure_diagnostic(exc)
+                receipt.diagnostic = diagnostic
+                label = conversation_failure_label(diagnostic, fallback=type(exc).__name__)
+                self._receipt(receipt, "not_applied", f"입력 처리 실패: {label}")
             finally:
                 queue.task_done()
                 if self.run_task is None and not self.deferred:

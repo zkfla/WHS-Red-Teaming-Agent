@@ -52,7 +52,12 @@ from redteam.app.cli._shared import (
     load_app_config_for_run,
     mask_secrets,
 )
-from redteam.app.cli.conversation import ConversationAssistant, catalog_tool_labels
+from redteam.app.cli.conversation import (
+    ConversationAssistant,
+    ConversationError,
+    catalog_tool_labels,
+    conversation_failure_label,
+)
 from redteam.capability.settings import (
     MCPConfigurationError,
     automatic_shell_setup_from_environment,
@@ -605,12 +610,12 @@ class OperatorConsole:
                                   if self._deps.settings.llm_request_policy is not None else None),
                 )
         except Exception as exc:  # noqa: BLE001 - chat is advisory; the active run continues
-            logging.getLogger(__name__).warning(
-                "Operator chat interpretation failed (%s)", type(exc).__name__
-            )
+            diagnostic = exc.diagnostic if isinstance(exc, ConversationError) else None
+            label = conversation_failure_label(diagnostic, fallback=type(exc).__name__)
+            logging.getLogger(__name__).warning("Operator chat interpretation failed (%s)", label)
             self._echo(
                 renderer.operator_notice_text(
-                    "could not interpret that as guidance; the run continues"
+                    f"could not interpret that as guidance; the run continues ({label})"
                 )
             )
             return
