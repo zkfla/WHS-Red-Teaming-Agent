@@ -25,7 +25,11 @@ from redteam.core.contracts.network import (
     WindowSettlement,
     WindowState,
 )
-from redteam.sqlite_support import run_transaction
+from redteam.core.ports.network_grants import (
+    NetworkGrantLedgerReadError,
+    OutstandingNetworkWindow,
+)
+from redteam.sqlite_support import run_sqlite, run_transaction
 
 _MAX_SQLITE_INTEGER = 2**63 - 1
 
@@ -428,6 +432,123 @@ class SQLiteNetworkGrantLedger:
             return NetworkGrant.model_validate_json(row[0])
 
         return await run_transaction(self._path, read, write=False)
+
+    async def outstanding_windows(
+        self, *, run_id: str, instance_id: str
+    ) -> tuple[OutstandingNetworkWindow, ...]:
+        """Read outstanding grants for this engagement and exact Run instance.
+
+        This uses a SQLite read-only connection so a missing store cannot be
+        created as a side effect and mistaken for a successful empty result.
+        Invalid/corrupt state is surfaced with a stable reason code.
+        """
+        if not isinstance(run_id, str) or not run_id.strip() or (
+            not isinstance(instance_id, str) or not instance_id.strip()
+        ):
+            raise NetworkGrantLedgerReadError("network_window_query_identity_invalid")
+
+        def read() -> tuple[OutstandingNetworkWindow, ...]:
+            uri = f"{self._path.resolve().as_uri()}?mode=ro"
+            db = sqlite3.connect(uri, timeout=1.0, uri=True)
+            db.row_factory = sqlite3.Row
+            try:
+                db.execute("PRAGMA busy_timeout=1000")
+                db.execute("PRAGMA foreign_keys=ON")
+                db.execute("BEGIN")
+                exists = db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='network_windows'"
+                ).fetchone()
+                if exists is None:
+                    raise NetworkGrantLedgerReadError("network_window_schema_unavailable")
+                pools = [dict(row) for row in db.execute(
+                    "SELECT * FROM network_pools WHERE engagement=?",
+                    (self._engagement,),
+                ).fetchall()]
+                windows = [dict(row) for row in db.execute(
+                    "SELECT * FROM network_windows WHERE engagement=?",
+                    (self._engagement,),
+                ).fetchall()]
+                seq_log = [dict(row) for row in db.execute(
+                    "SELECT s.* FROM network_seq_log AS s "
+                    "JOIN network_windows AS w ON w.window_id=s.window_id "
+                    "WHERE w.engagement=?",
+                    (self._engagement,),
+                ).fetchall()]
+                try:
+                    # Reuse Control's owner validation for caps, committed
+                    # admission counts, settlements, and reservation totals.
+                    check_network_snapshot({
+                        "network_pools": pools,
+                        "network_windows": windows,
+                        "network_seq_log": seq_log,
+                    })
+                except (IndexError, KeyError, TypeError, ValueError) as exc:
+                    raise NetworkGrantLedgerReadError(
+                        "network_window_record_invalid"
+                    ) from exc
+
+                rows = sorted(
+                    (row for row in windows if row["run_id"] == run_id
+                     and row["instance_id"] == instance_id),
+                    key=lambda row: (row["epoch"], row["window_id"]),
+                )
+                result: list[OutstandingNetworkWindow] = []
+                for row in rows:
+                    try:
+                        state = WindowState(row["state"])
+                    except (TypeError, ValueError) as exc:
+                        raise NetworkGrantLedgerReadError(
+                            "network_window_record_invalid"
+                        ) from exc
+                    if state is WindowState.RELEASED:
+                        continue
+                    if state not in {WindowState.OPEN, WindowState.QUARANTINED}:
+                        raise NetworkGrantLedgerReadError("network_window_record_invalid")
+
+                    try:
+                        grant = NetworkGrant.model_validate_json(row["grant_json"])
+                        settlement = (
+                            WindowSettlement.model_validate_json(row["settlement_json"])
+                            if row["settlement_json"] is not None else None
+                        )
+                        if state is WindowState.OPEN and settlement is not None:
+                            raise NetworkGrantLedgerReadError(
+                                "network_window_record_invalid"
+                            )
+                        if settlement is not None and state is WindowState.QUARANTINED and (
+                            settlement.state is not WindowState.QUARANTINED
+                            or settlement.charged_deliveries != grant.reserved_deliveries
+                            or settlement.charged_bytes != grant.reserved_bytes
+                            or settlement.released_deliveries != 0
+                            or settlement.released_bytes != 0
+                        ):
+                            raise NetworkGrantLedgerReadError(
+                                "network_window_record_invalid"
+                            )
+                    except NetworkGrantLedgerReadError:
+                        raise
+                    except (TypeError, ValueError) as exc:
+                        raise NetworkGrantLedgerReadError(
+                            "network_window_record_invalid"
+                        ) from exc
+                    result.append(OutstandingNetworkWindow(
+                        grant=grant, state=state, settlement=settlement,
+                    ))
+                return tuple(result)
+            except BaseException:
+                db.rollback()
+                raise
+            finally:
+                db.close()
+
+        try:
+            return await run_sqlite(read)
+        except NetworkGrantLedgerReadError:
+            raise
+        except sqlite3.Error as exc:
+            raise NetworkGrantLedgerReadError(
+                "network_window_ledger_unavailable"
+            ) from exc
 
     async def release_quarantine(self, *, window_id: str, verified_closed: bool) -> bool:
         if not verified_closed:

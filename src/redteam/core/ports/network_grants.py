@@ -8,6 +8,7 @@ Kernel inspection, scope resolution and wire protocol are provider concerns.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Protocol
 
 from redteam.core.contracts.network import (
@@ -17,7 +18,29 @@ from redteam.core.contracts.network import (
     NetworkGrant,
     WindowCaps,
     WindowSettlement,
+    WindowState,
 )
+
+
+class NetworkGrantLedgerReadError(Exception):
+    """Stable, machine-readable failure from a read-only grant inventory.
+
+    A failed or corrupt read is never represented as an empty inventory.
+    ``reason_code`` is deliberately independent of backend exception text.
+    """
+
+    def __init__(self, reason_code: str) -> None:
+        super().__init__(reason_code)
+        self.reason_code = reason_code
+
+
+@dataclass(frozen=True)
+class OutstandingNetworkWindow:
+    """One exact original grant still OPEN or QUARANTINED in Control."""
+
+    grant: NetworkGrant
+    state: WindowState
+    settlement: WindowSettlement | None
 
 
 class NetworkGrantLedger(Protocol):
@@ -60,6 +83,18 @@ class NetworkGrantLedger(Protocol):
         Read-only identity lookup at the connection boundary: recovery paths
         verify a retained record against this original (run, instance, epoch,
         purpose) before settling. Never authorizes transmission.
+        """
+        ...
+
+    async def outstanding_windows(
+        self, *, run_id: str, instance_id: str
+    ) -> tuple[OutstandingNetworkWindow, ...]:
+        """Read exact-run/instance OPEN and QUARANTINED grants.
+
+        The ledger is already bound to one engagement. An empty tuple means a
+        successful query found no outstanding rows; invalid scope, storage
+        failure, or corrupt row data raises ``NetworkGrantLedgerReadError``.
+        This query grants no transmission or settlement authority.
         """
         ...
 
