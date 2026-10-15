@@ -69,6 +69,8 @@ def _plan_with_candidate():
 
 def _atomize_new_candidate(payload):
     candidate_id = payload["issued_candidate_ids"]["local-candidate"]
+    question = next(item for item in payload["questions"]
+                    if item["question_id"] == "question-local")
     return {"tasks": [{
         "task_key": "candidate-probe",
         "question_id": "question-local",
@@ -76,10 +78,9 @@ def _atomize_new_candidate(payload):
         "title": "Candidate response probe",
         "role_id": "probe-worker",
         "target_node_ids": [TARGET],
-        "completion_criteria": [{
-            "kind": "observation",
-            "description": "Inspect the candidate response",
-        }],
+        "completion_criterion_ids": [
+            criterion["criterion_id"] for criterion in question["completion_criteria"]
+        ],
         "hypothesis_revisions": {candidate_id: 1},
         "probe_limits": {"max_actions": 1, "max_model_requests": 4},
     }]}
@@ -163,8 +164,10 @@ async def test_default_v3_rejects_non_v2_candidate_at_nested_contract_field(
         "questions": [],
         "reason": "Do not admit a candidate without the active contract version",
     }
-    llm = CapturingPlannerLLM(plans=[response] * 6)
+    llm = CapturingPlannerLLM()
     async with probe_selection(tmp_path, llm=llm) as (session, _, _):
+        # One normal request plus every repair attempt, from the planner's own settings.
+        llm.responses["plan"] = [response] * (session.deps.settings.decision_max_attempts + 1)
         with pytest.raises(DecisionFailure) as rejected:
             await SpecialistPlanner(session.deps).advance(session.runtime)
 

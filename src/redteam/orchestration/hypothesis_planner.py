@@ -525,11 +525,13 @@ _SPLIT_PLAN_SYSTEM = FEEDBACK_SYSTEM + (
 
 _SPLIT_ATOMIZE_SYSTEM = (
     "Decompose each planned question into probe tasks. Reference each task to its plan-local "
-    "question_id and preserve that question's subjects, completion criteria, candidate "
-    "revisions, required meaning and source refs on every task. A task's subjects must stay "
+    "question_id and preserve that question's subjects, candidate revisions, required meaning "
+    "and source refs on every task. Select completion_criterion_ids only from that question's "
+    "own completion_criteria; code restores each selected original condition, so never write, "
+    "reword or split a condition. A task's subjects must stay "
     "within its question; together the tasks must cover the question's subjects and every "
-    "completion criterion exactly. Keep a paired-comparison criterion as one condition on one "
-    "task, never split the condition itself. Use only ready roles, captured subjects and the "
+    "completion criterion exactly. Keep a paired-comparison criterion as one selected ID on one "
+    "task. Use only ready roles, captured subjects and the "
     "candidate revisions from the plan, including the issued IDs for new candidates. Never "
     "prescribe tool-call order, invent subjects or overwrite active work."
 )
@@ -609,9 +611,10 @@ async def _advance_split(planner, runtime, schema, snapshot, engine, budget, pay
                 raise DecisionValidationError(_proposal_validation_diagnostic(
                     exc, stage="task_atomization",
                     summary="Cover every planned question with at least one "
-                    "probe task. Preserve each question's subjects, completion criteria, "
+                    "probe task. Select completion_criterion_ids only from the question's own "
+                    "criteria and never write or reword a condition; preserve its subjects, "
                     "candidate revisions, required meaning and source refs; keep a "
-                    "paired-comparison criterion as one condition on one task.",
+                    "paired-comparison criterion as one selected ID on one task.",
                     schema=TaskAtomizationDraft.model_json_schema(),
                 )) from exc
 

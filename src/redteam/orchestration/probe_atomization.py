@@ -22,7 +22,8 @@ Preservation rules:
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import copy
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -135,7 +136,7 @@ class HypothesisPlanDraft(BaseModel):
 
 
 class AtomizedProbeTask(ProbeTaskProposal):
-    """A probe task bound to its plan-local question; question_id is coverage-only."""
+    """Internal restored probe: original conditions plus a plan-local question_id."""
 
     question_id: str = Field(min_length=1)
 
@@ -146,11 +147,101 @@ class AtomizedProbeTask(ProbeTaskProposal):
         return self
 
 
+class StandaloneAtomizedProbeTaskSelection(BaseModel):
+    """Stage-2 atomizer selection: names original conditions by criterion_id only.
+
+    Binding fields mirror AtomizedProbeTask. Conditions are never accepted from
+    the model; restore_atomized_tasks copies them from the bound question.
+    """
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+    question_id: str = Field(min_length=1)
+    task_key: str = Field(min_length=1)
+    objective: str = Field(min_length=1)
+    title: str = Field(min_length=1)
+    role_id: str = Field(min_length=1)
+    target_node_ids: list[str] = Field(min_length=1)
+    principal_refs: list[str] = Field(default_factory=list)
+    completion_criterion_ids: list[str] = Field(min_length=1)
+    evidence_ids: list[str] = Field(default_factory=list)
+    hypothesis_revisions: dict[str, int] = Field(default_factory=dict)
+    required: bool = False
+    required_reason: str | None = None
+    goal_required_hypothesis_ids: list[str] = Field(default_factory=list)
+    source_task_id: str | None = None
+    source_result_id: str | None = None
+    source_question_id: str | None = None
+    probe_limits: ProbeLimits | None = None
+
+    @model_validator(mode="after")
+    def _binding(self):
+        if not all(value.strip() for value in (
+            self.question_id, self.task_key, self.objective, self.title, self.role_id,
+            *self.target_node_ids, *self.completion_criterion_ids,
+        )):
+            raise ValueError("probe purpose and references must be nonblank")
+        if self.required and not (self.required_reason or "").strip():
+            raise ValueError("goal-required probe needs an explicit reason")
+        return self
+
+
 class TaskAtomizationDraft(BaseModel):
     """Stage-2 judgment: probe tasks only, each referencing a plan-local question."""
 
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
-    tasks: list[AtomizedProbeTask] = Field(min_length=1)
+    tasks: list[StandaloneAtomizedProbeTaskSelection] = Field(min_length=1)
+
+
+def _question_payload(question: PlannedInvestigationQuestion) -> dict:
+    """Full question purpose; every condition carries the ID the atomizer selects."""
+    payload = question.model_dump(mode="json")
+    payload["completion_criteria"] = [
+        {"criterion_id": criterion_id(condition), **condition.model_dump(mode="json")}
+        for condition in question.completion_criteria
+    ]
+    return payload
+
+
+def restore_atomized_tasks(
+    selections: Sequence[StandaloneAtomizedProbeTaskSelection],
+    *,
+    questions: list[PlannedInvestigationQuestion],
+) -> list[AtomizedProbeTask]:
+    """Restore each selected condition from its own bound question, before validation.
+
+    An ID must belong to the selection's question and appear once per task. It
+    resolves to a deep copy of the original condition, so model text can never
+    rewrite, drop or replace a condition.
+    """
+    originals: dict[str, dict[str, CompletionCriterion]] = {}
+    owner: dict[str, str] = {}
+    for question in questions:
+        by_id: dict[str, CompletionCriterion] = {}
+        for condition in question.completion_criteria:
+            identity = criterion_id(condition)
+            by_id.setdefault(identity, condition)
+            owner.setdefault(identity, question.question_id)
+        originals[question.question_id] = by_id
+    restored: list[AtomizedProbeTask] = []
+    for selection in selections:
+        if selection.question_id not in originals:
+            raise AtomizationProposalError("atomized_unknown_question")
+        identities = selection.completion_criterion_ids
+        if len(set(identities)) != len(identities):
+            raise AtomizationProposalError("atomized_criterion_duplicate_in_task")
+        scope = originals[selection.question_id]
+        conditions: list[CompletionCriterion] = []
+        for identity in identities:
+            if identity not in scope:
+                if identity in owner:
+                    raise AtomizationProposalError("atomized_criterion_cross_question")
+                raise AtomizationProposalError("atomized_criterion_unknown")
+            conditions.append(copy.deepcopy(scope[identity]))
+        restored.append(AtomizedProbeTask.model_validate({
+            **selection.model_dump(exclude={"completion_criterion_ids"}),
+            "completion_criteria": conditions,
+        }))
+    return restored
 
 
 def bind_plan(
@@ -270,7 +361,7 @@ def needs_atomization(
 
 
 def validate_atomized_tasks(
-    tasks: list[AtomizedProbeTask],
+    selections: Sequence[StandaloneAtomizedProbeTaskSelection],
     *,
     questions: list[PlannedInvestigationQuestion],
     issued: dict[str, str],
@@ -289,6 +380,7 @@ def validate_atomized_tasks(
     subjects and criteria; each task stays within its question. A criterion
     with explicit principal_refs must land on ONE task carrying all of them.
     """
+    tasks = restore_atomized_tasks(selections, questions=questions)
     qmap = {question.question_id: question for question in questions}
     keys = [task.task_key for task in tasks]
     if not tasks or max_tasks < 1 or len(tasks) > max_tasks or len(set(keys)) != len(keys):
@@ -395,7 +487,7 @@ def build_atomizer_input(
         strategy_updates.append(entry)
     return {
         **payload,
-        "questions": [question.model_dump(mode="json") for question in questions],
+        "questions": [_question_payload(question) for question in questions],
         "strategy": {
             "updates": strategy_updates,
             "reason": plan.reason,

@@ -19,12 +19,13 @@ from redteam.core.contracts.completion import (
 from redteam.core.contracts.specialists import ProbeLimits
 from redteam.orchestration.probe_atomization import (
     AtomizationProposalError,
-    AtomizedProbeTask,
     HypothesisPlanDraft,
     PlannedInvestigationQuestion,
+    StandaloneAtomizedProbeTaskSelection,
     TaskAtomizationDraft,
     bind_plan,
     needs_atomization,
+    restore_atomized_tasks,
     validate_atomized_tasks,
 )
 from redteam.orchestration.specialist_tasks import (
@@ -70,18 +71,24 @@ def _question(qid="q1", targets=("n1",), principals=(), criteria=None,
         body["goal_required_hypothesis_ids"] = list(goal_ids)
     return PlannedInvestigationQuestion.model_validate(body)
 
+def _ids(criteria):
+    """Atomizer selections name original conditions by their stable criterion_id."""
+    return [criterion_id(CompletionCriterion.model_validate(item)) for item in criteria]
+
+
 def _task(key="t1", qid="q1", targets=("n1",), principals=(), criteria=None,
           role="probe-worker", revisions=None, required=False, goal_ids=()):
     body = {"task_key": key, "question_id": qid, "objective": "Probe " + key,
             "title": "Probe " + key, "role_id": role,
             "target_node_ids": list(targets), "principal_refs": list(principals),
-            "completion_criteria": criteria if criteria is not None else [_criterion()],
+            "completion_criterion_ids": _ids(
+                criteria if criteria is not None else [_criterion()]),
             "hypothesis_revisions": dict(revisions or {})}
     if required:
         body["required"] = True
         body["required_reason"] = "Goal needs this answer"
         body["goal_required_hypothesis_ids"] = list(goal_ids)
-    return AtomizedProbeTask.model_validate(body)
+    return StandaloneAtomizedProbeTaskSelection.model_validate(body)
 
 def _snap():
     return SimpleNamespace(candidates={}, tasks={})
@@ -306,18 +313,67 @@ def test_validate_rejects_unknown_question_id():
 
 
 def test_validate_rejects_dropped_criterion():
-    questions, versions = _two_question_setup()
+    question = _question("q1", criteria=[_criterion("Inspect n1"),
+                                         _criterion("Second n1")])
+    _, questions, versions = _bind(
+        {"updates": [], "questions": [question.model_dump(mode="json")],
+         "reason": "Two conditions on one question"}, issued={})
     tasks = [_task("t1", qid="q1", targets=("n1",),
-                   criteria=[_criterion("Something else")]),
-             _task("t2", qid="q2", targets=("n2",),
-                   criteria=[_criterion("Inspect n2")])]
+                   criteria=[_criterion("Inspect n1")])]
     with pytest.raises(AtomizationProposalError,
-                       match="atomized_criterion_outside_question"):
+                       match="atomized_criterion_coverage_mismatch"):
         validate_atomized_tasks(tasks, questions=questions, issued={},
                                 versions=versions, targets=TARGETS,
                                 principals=PRINCIPALS, roles=ROLES,
                                 limits=LIMITS, snapshot=_snap(),
                                 max_tasks=MAX_TASKS)
+
+
+def test_validate_rejects_unknown_cross_question_and_duplicate_criterion_ids():
+    questions, versions = _two_question_setup()
+    other_question = criterion_id(CompletionCriterion.model_validate(
+        _criterion("Inspect n2")))
+    invented = "criterion_" + "0" * 64
+    for identity, code in (
+            (other_question, "atomized_criterion_cross_question"),
+            (invented, "atomized_criterion_unknown")):
+        task = _task("t1", qid="q1", targets=("n1",)).model_copy(
+            update={"completion_criterion_ids": [identity]})
+        with pytest.raises(AtomizationProposalError, match=code):
+            validate_atomized_tasks([task], questions=questions, issued={},
+                                    versions=versions, targets=TARGETS,
+                                    principals=PRINCIPALS, roles=ROLES,
+                                    limits=LIMITS, snapshot=_snap(),
+                                    max_tasks=MAX_TASKS)
+    repeated = _task("t1", qid="q1", targets=("n1",)).model_copy(update={
+        "completion_criterion_ids": [criterion_id(CompletionCriterion.model_validate(
+            _criterion("Inspect n1")))] * 2})
+    with pytest.raises(AtomizationProposalError,
+                       match="atomized_criterion_duplicate_in_task"):
+        restore_atomized_tasks([repeated], questions=questions)
+
+
+def test_restore_returns_deep_original_conditions_and_leaves_questions_unmutated():
+    questions, _ = _two_question_setup()
+    original = questions[0].completion_criteria[0]
+    before = original.model_dump(mode="json")
+    (restored,) = restore_atomized_tasks(
+        [_task("t1", qid="q1", targets=("n1",), criteria=[_criterion("Inspect n1")])],
+        questions=questions)
+    (condition,) = restored.completion_criteria
+    assert condition == original
+    assert condition is not original
+    assert condition.model_dump(mode="json") == before
+    assert questions[0].completion_criteria[0].model_dump(mode="json") == before
+
+
+def test_atomizer_selection_rejects_full_condition_objects():
+    with pytest.raises(ValidationError):
+        TaskAtomizationDraft.model_validate({"tasks": [{
+            "task_key": "t1", "question_id": "q1", "objective": "Probe",
+            "title": "Probe", "role_id": "probe-worker", "target_node_ids": ["n1"],
+            "completion_criterion_ids": ["criterion_" + "0" * 64],
+            "completion_criteria": [_criterion()]}]})
 
 
 def test_paired_principals_must_ride_one_task():
