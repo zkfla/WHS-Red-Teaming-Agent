@@ -1,5 +1,16 @@
 # ExecPlan 07 — 실제 Kali 전체 실행 경로와 상태·재개 검증
 
+## Latest user decision — direct target execution (2026-10-15)
+
+The user explicitly selected the teammate's direct-program provider as the preferred default and authorized adapting the plans and importing that implementation with concrete bug fixes. This decision supersedes earlier acceptance requirements that mandate a packet gate, sidecar/NFQUEUE, byte/flow network ledger, or deny target readiness solely because arbitrary programs cannot enforce HTTP method/path/header/session restrictions. Original source plan snapshots remain historical design data, not an override of this decision.
+
+The integration target is origin/dev 38179561 direct_target / prepare_kali_network / production bootstrap, preserving verified planner, atomizer, structured diagnostic, original-evidence and completion fixes. Validate actual selected Docker endpoint/bridge identity, declared target/port and explicit scope/deny admission, ordinary human approval, execution request/time/output budgets, same-instance exclusion, cancellation/timeout and network detach, protected original results, truthful UNKNOWN, and configuration-bound resume. Target-ready means measured direct-route readiness and must retain truthful network_enforcement=none; it must not claim packet isolation or per-request HTTP enforcement. No model NET_ADMIN/NET_RAW or automatic scope expansion is introduced by this choice.
+
+Physical acceptance now exercises the actual direct provider through the production assembly/common-worker path against an explicitly owned local fixture, including admission refusal, delivery, timeout/cancellation/detach and stored result/report/resume. Old gated-wire deny and verified gate-settlement tests are not prerequisites for the new default. Existing dormant gate code and unfinished gate-specific repair are preserved at a safe checkpoint; they are not claimed complete or silently activated. Do not add a new alternate-mode framework merely to retain the abandoned design.
+
+Import is staged after current writers freeze, preserving unrelated local files and staged boundaries. Review teammate code for concrete errors rather than rejecting its chosen architecture. Reconcile overlapping planner/context/provenance changes and avoid duplicate descriptor registration. Re-run applicable checks after integration and retain the final review/repair/test/commit/push requirements. The earlier instruction to postpone remote inspection/integration is superseded to the extent required to bring in the implementation the user now selected.
+
+
 ## Status
 
 PLANNING — 2026-10-14, original Windows checkout, dev at 376b479d. User authorized implementation and stage commits; final review → repair → tests required.
