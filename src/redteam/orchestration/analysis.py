@@ -293,12 +293,14 @@ def _grounding_source(record: Any) -> str | None:
 async def grounding_edge_for(
     graph_service: Any, record: Any, target_node_id: str
 ):
-    """Exact measured edge proving record's source reaches target, else None.
+    """Exact measured relation tying this original to a subject, else None.
 
     Single owner of the grounding meaning: a source-target match needs no
     edge (None); otherwise exactly one direct relation edge whose relation
     snapshot equals the edge endpoints, witnessed MEASURED by this same run
-    and this exact evidence record. claim_target_is_grounded reuses this.
+    and this exact evidence record. A reference/declaration relation proves
+    subject linkage, not remote contact or content. Independent claim review
+    owns the claimed meaning. claim_target_is_grounded reuses this.
     """
     source = _grounding_source(record)
     if source is None or not target_node_id or source == target_node_id:
@@ -342,7 +344,10 @@ async def grounding_edge_for(
 async def claim_target_is_grounded(
     graph_service: Any, record: Any, target_node_id: str, *, evidence_store: Any = None,
 ) -> bool:
-    """A source target or a measured, source-backed direct relation.
+    """A source target or an exact same-original measured direct relation.
+
+    A document reference or declaration establishes subject linkage only,
+    never endpoint reachability or response content.
 
     A program needs its protected original-holder route binding before even
     naming a remote subject. This does not validate stdout or prove contact;

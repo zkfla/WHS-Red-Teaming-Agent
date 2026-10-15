@@ -57,12 +57,22 @@ def _source_edge(
 ) -> list[EdgeMutation]:
     if str(source_id) == str(discovered_id):
         return []
+    # Same canonical relation snapshot the HOSTS mappers write, so the shared
+    # grounding reader can consume it. It proves only that the source document
+    # held a same-origin reference, not reachability or content.
     return [
         EdgeMutation(
             GraphEdgeType.OBSERVED,
             source_id,
             discovered_id,
-            {"relation": "surface_discovery"},
+            {
+                "relation": {
+                    "type": GraphEdgeType.OBSERVED.value,
+                    "source_node_id": str(source_id),
+                    "target_node_id": str(discovered_id),
+                },
+                "discovery_kind": "surface_discovery",
+            },
         )
     ]
 
