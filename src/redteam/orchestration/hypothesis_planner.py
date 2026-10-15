@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from redteam.attack_graph.predicates import facts_of
 from redteam.attack_graph.service import AttackGraphService
+from redteam.core.contracts.completion import ALLOWED_CRITERION_KINDS
 from redteam.core.contracts.events import EventType
 from redteam.core.contracts.graph import GraphNode, Hypothesis, HypothesisUpdate
 from redteam.core.contracts.mission import MissionPlan, MissionTask, redact_secret_material
@@ -91,17 +92,46 @@ class HypothesisProposalError(ValueError):
         super().__init__(code)
 
 
+_CRITERION_KIND_TEXT = ", ".join(sorted(ALLOWED_CRITERION_KINDS))
+
+# Code-owned repair guidance keyed by proposal error code: (contract field, guidance).
+# Fields name the judgment contract only; they never carry model-supplied refs or values.
+_REPAIR_GUIDANCE: dict[str, tuple[str, str]] = {
+    "continue_requires_proposed_or_existing_work": (
+        "$.termination",
+        "Continue is valid only with proposed tasks/questions or referenced existing work "
+        "that is still claimable/running, ready, unsuppressed and current in candidate "
+        "purpose. Updates alone are not progress. Otherwise use replan, held with an external "
+        "prerequisite, or exhausted. Goal_achieved only proposes the separate completion gate.",
+    ),
+    "new_work_requires_continue_judgment": (
+        "$.termination",
+        "Proposed questions or tasks require termination continue. Use held, exhausted, "
+        "replan or goal_achieved only for a judgment that proposes neither.",
+    ),
+    "empty_judgment_needs_termination_and_resume_conditions": (
+        "$.resume_conditions",
+        "An empty judgment with termination held or exhausted needs at least one nonblank "
+        "resume_condition naming what would change the decision. Continue, replan and "
+        "goal_achieved do not need one.",
+    ),
+    "judgment_reason_or_resume_condition_blank": (
+        "$",
+        "The reason and every resume_condition must be nonblank text.",
+    ),
+    "plan_question_unknown_completion_condition": (
+        "$.questions[].completion_criteria[].kind",
+        "Each completion criterion needs one kind from: " + _CRITERION_KIND_TEXT + ", and a "
+        "nonblank description. Use only these kind names.",
+    ),
+}
+
+
 def _proposal_repair_summary(exc: BaseException, fallback: str) -> str:
-    if getattr(exc, "code", None) != "continue_requires_proposed_or_existing_work":
-        return fallback
-    return (
-        "Continue is valid only with proposed tasks/questions or a referenced existing "
-        "claimable/running task whose readiness, suppression state and candidate purpose "
-        "remain current; candidate updates alone are not progress. Use continue only with "
-        "that path, replan for a candidate/empty follow-up, held for an external prerequisite, "
-        "exhausted when no useful work remains, or goal_achieved only as a proposal for the "
-        "separate completion gate."
-    )
+    """Shared single-stage and split repair text; unmapped codes keep the caller's fallback."""
+    code = getattr(exc, "code", None)
+    rule = _REPAIR_GUIDANCE.get(code) if isinstance(code, str) else None
+    return rule[1] if rule is not None else fallback
 
 
 def _judgment_controls(planner, roles) -> dict:
@@ -192,12 +222,12 @@ def _proposal_validation_diagnostic(
             "exception_chain": base.exception_chain or exception_chain_for(exc),
         })
     code = getattr(exc, "code", None) or "hypothesis_proposal_invalid"
-    return base.model_copy(update={
-        "code": code,
-        "summary": summary,
-        "kind": "validation",
-        "retryable": True,
-    })
+    update = {"code": code, "summary": summary, "kind": "validation", "retryable": True}
+    rule = _REPAIR_GUIDANCE.get(code)
+    if rule is not None:
+        update["location"] = rule[0]
+        update["validation_issues"] = [{"rule": code, "location": rule[0]}]
+    return base.model_copy(update=update)
 
 
 @dataclass
@@ -694,10 +724,14 @@ async def _advance_split(planner, runtime, schema, snapshot, engine, budget, pay
         except (ValueError, SpecialistProposalError) as exc:
             raise DecisionValidationError(_proposal_validation_diagnostic(
                 exc, stage="hypothesis_planning",
-                summary="Use captured subjects, candidate revisions and original "
-                "source results. A new candidate key is local to this proposal; questions carry "
-                "purpose only, never worker tasks. Empty judgments need a termination reason "
-                "and resume_conditions.",
+                summary=_proposal_repair_summary(
+                    exc,
+                    "Use captured subjects, candidate revisions and original "
+                    "source results. A new candidate key is local to this proposal; "
+                    "questions carry "
+                    "purpose only, never worker tasks. Empty judgments need a termination reason "
+                    "and resume_conditions.",
+                ),
                 schema=HypothesisPlanDraft.model_json_schema(),
             )) from exc
 
