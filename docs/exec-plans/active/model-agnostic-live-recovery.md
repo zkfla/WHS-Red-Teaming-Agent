@@ -80,3 +80,9 @@ Admission diagnostic repair verified: 51 targeted tests, scoped Ruff and fresh-c
 
 
 2026-10-15 22:04 KST infrastructure gate: new live attempt did not start. Docker backend log confirms21:50:11 engine failure from insufficient host disk space writing init.log; current C: about90MiB free and Docker cannot start. Bank health times out. Recover host space, restore Docker and verify target health before launch. This does not retroactively diagnose the earlier21:40 admission failure. No cache-deletion workaround or Docker data reset was used.
+
+
+2026-10-15 resumed after explicit user request: host C: now about20GiB free, Docker bank healthy and /health returns200. Obsolete images/build cache were removed with current project images, all9 containers and12 volumes preserved; offline Docker data VHD compaction succeeded41.62→28.35GiB. Build-cache GC threshold20→5GB is host configuration, not runtime budget or source change. Source remains frozen at c32ae547 (HEAD11eab9a9 documentation); catjam_post_contract_live owns one fresh bounded post-admission-diagnostic live run with original approval mechanism and1800s Run duration. Existing dirty .gitignore remains untouched.
+
+
+Post-recovery Run760dd reproduced final admission StateConflict after validated plan+atomization and0 corrections. A safe module/function/line projection now preserves raise-site provenance in the existing bounded trace; owner codes/gates/retryability unchanged. Root22 targeted plus13 full planner integration tests passed, worker47+57 neighboring checks and scoped Ruff/mypy passed. Source frozen for one new bounded live attempt after commit.

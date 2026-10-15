@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import math
 from itertools import islice
+from types import TracebackType
 from typing import Any, Literal
 
 from jsonschema import ValidationError as SchemaValidationError
@@ -86,16 +87,24 @@ def error_type_for(exc: BaseException) -> str:
     return _identifier(type(exc).__name__, "unknown")
 
 
-def exception_chain_for(exc: BaseException, *, limit: int = 5) -> list[str]:
-    """Current-first type-name chain, max 5, no messages or tracebacks."""
-    chain: list[str] = []
+_ORIGIN_MODULE_PREFIX = "redteam."
+_ORIGIN_MODULE_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_."
+)
+_ORIGIN_LIMIT = 5
+_ORIGIN_FRAME_LIMIT = 500
+
+
+def _cause_chain(exc: BaseException, *, limit: int) -> list[BaseException]:
+    """Current exception, then its __cause__ or unsuppressed __context__, bounded by limit."""
+    chain: list[BaseException] = []
     seen: set[int] = set()
     current: BaseException | None = exc
     while current is not None and len(chain) < limit:
         if id(current) in seen:
             break
         seen.add(id(current))
-        chain.append(_identifier(type(current).__name__, "unknown"))
+        chain.append(current)
         cause = getattr(current, "__cause__", None)
         context = getattr(current, "__context__", None)
         nxt: BaseException | None = None
@@ -107,6 +116,59 @@ def exception_chain_for(exc: BaseException, *, limit: int = 5) -> list[str]:
             nxt = context
         current = nxt
     return chain
+
+
+def exception_chain_for(exc: BaseException, *, limit: int = 5) -> list[str]:
+    """Current-first type-name chain, at most `limit` entries (default 5). Type names only:
+    no messages, args, tracebacks or traceback objects are copied."""
+    return [_identifier(type(item).__name__, "unknown") for item in _cause_chain(exc, limit=limit)]
+
+
+def _trusted_module_label(module: object) -> str | None:
+    """The module __name__ when it is redteam-owned and made of plain name characters."""
+    if not isinstance(module, str) or not module.startswith(_ORIGIN_MODULE_PREFIX):
+        return None
+    if len(module) > 160 or not set(module) <= _ORIGIN_MODULE_CHARS:
+        return None
+    return module
+
+
+def _innermost_trusted_frame(tb: TracebackType | None) -> dict[str, Any] | None:
+    """Deepest redteam-owned frame among the first 500 traceback frames: module, code name and
+    line only. Frames beyond that scan window are ignored."""
+    found: dict[str, Any] | None = None
+    steps = 0
+    while tb is not None and steps < _ORIGIN_FRAME_LIMIT:
+        steps += 1
+        module = _trusted_module_label(tb.tb_frame.f_globals.get("__name__"))
+        line = tb.tb_lineno
+        if (module is not None and isinstance(line, int) and not isinstance(line, bool)
+                and line > 0):
+            found = {
+                "module": module,
+                "function": _identifier(str(tb.tb_frame.f_code.co_name), "unknown"),
+                "line": line,
+            }
+        tb = tb.tb_next
+    return found
+
+
+def exception_origins_for(
+    exc: BaseException, *, limit: int = _ORIGIN_LIMIT,
+) -> list[dict[str, Any]]:
+    """Innermost redteam-owned raise site per current/cause exception, at most five entries.
+
+    Explicit projection from traceback metadata: validated module name, code object name and
+    positive line number. Traceback objects, paths, source text, locals, messages and str(exc)
+    are never read into the result. Foreign frames are skipped, and an exception without a
+    trusted frame contributes no entry.
+    """
+    origins: list[dict[str, Any]] = []
+    for index, item in enumerate(_cause_chain(exc, limit=min(limit, _ORIGIN_LIMIT))):
+        origin = _innermost_trusted_frame(item.__traceback__)
+        if origin is not None:
+            origins.append({"scope": "current" if index == 0 else "cause", **origin})
+    return origins
 
 
 class ParseErrorContext(BaseModel):

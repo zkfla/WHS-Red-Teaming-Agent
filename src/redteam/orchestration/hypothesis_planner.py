@@ -33,6 +33,7 @@ from redteam.orchestration.diagnostics import (
     diagnostic_for_exception,
     error_type_for,
     exception_chain_for,
+    exception_origins_for,
 )
 from redteam.orchestration.engine import InvestigationEngine
 from redteam.orchestration.investigation_context import context_bytes, context_rule_diagnostic
@@ -197,8 +198,11 @@ def _admission_rejection_diagnostic(exc: BaseException, budget) -> DecisionDiagn
         "repair_used": spent["repair_used"],
         "transport_used": spent["transport_used"],
     }
-    if not base.trace:
-        update["trace"] = spent["trace"]
+    # Prefer owner trace over budget trace; retain newest rows within existing bound before
+    # appending safe origin.
+    trace = list(base.trace or spent["trace"])
+    origin_row = {"outcome": "admission_exception_origin", "origins": exception_origins_for(exc)}
+    update["trace"] = [*(trace[-19:] if len(trace) >= 20 else trace), origin_row]
     if not base.failure_counts:
         update["failure_counts"] = spent["failure_counts"]
     if not base.error_type:
