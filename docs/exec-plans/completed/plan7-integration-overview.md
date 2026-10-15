@@ -1,5 +1,9 @@
 # Plan7 integration overview
 
+## Final status — COMPLETE (2026-10-15)
+
+All eight stages are completed under the latest direct-provider decision. Source-backed reviews, accepted repairs, exact test outcomes, physical Kali evidence, live Cat Jam limits and original requirement mapping are in `docs/agent/plan7-integrated-verification-20261015.md`. Normal dev push38179561→2b786a79 succeeded after a fresh teammate-change check; the final closure-document commit is published separately. Historical open-state ledger entries below describe earlier checkpoints and are retained for provenance. User `.gitignore`, secrets, original engagements/Runs and unrelated local artifacts are preserved.
+
 ## Latest user decision — direct target execution (2026-10-15)
 
 The user explicitly selected the teammate's direct-program provider as the preferred default and authorized adapting the plans and importing that implementation with concrete bug fixes. This decision supersedes earlier acceptance requirements that mandate a packet gate, sidecar/NFQUEUE, byte/flow network ledger, or deny target readiness solely because arbitrary programs cannot enforce HTTP method/path/header/session restrictions. Original source plan snapshots remain historical design data, not an override of this decision.

@@ -13,7 +13,7 @@ Import is staged after current writers freeze, preserving unrelated local files 
 
 ## Status
 
-IMPLEMENTING — 2026-10-14, original Windows checkout, dev at 376b479d. User authorized implementation and stage commits; final review → repair → tests required.
+COMPLETE — 2026-10-15. See the final integrated verification report; historical progress entries below are retained.
 
 ## Goal and Context
 
