@@ -81,6 +81,14 @@ User live-model selection2026-10-15: actual LLM live tests use Cat Jam Free with
 
 Pending independent plan review and actual test evidence. Record exact tests/artifacts and distinguish fake, physical provider, live LLM and Finding evidence.
 
+### Actual direct production chain proof (2026-10-15)
+
+Commitcf059163 adds two opt-in owned-resource Docker tests. The gateway route fixture verifies immutable local Kali preparation, a local internal bridge, actual mock receipt (one ACCEPT/12bytes), stdout and detach, scope refusal and no model NET_ADMIN/NET_RAW. The production-chain fixture uses real open_central_run→build_application(direct_target_shell), real Control with an explicit medium approval threshold, scripted model tool selection, operator resolution, same invocation recovery, one successful physical execution, protected TOOL evidence and Task result, worker follow-up, and actual Planner original-observation consumption. Root final production-chain run PASS in29.36seconds; owned container/network label inventory is empty afterward. Models in this proof are explicitly scripted, not paid LLMs, and the mock response is not a verified Finding.
+
+The fixture initially used the unrelated unit.local Task target and was correctly refused, then used an action budget of1 and was auto-settled at the execution boundary. The final fixture binds its Task to the explicit owned mock target and reserves2 actions so a worker follow-up can occur; actual execution count remains1. No production scope, Control, evidence gate or runtime budget was weakened to make the proof pass. Planner output projection carries exit status under execution.accounting, while stdout remains program_output.
+
+Root is extending the route fixture with actual timeout/cancellation detach checks and an exact unselected-port rejection assertion. These checks are not claimed passed before their run finishes. Final integrated suite and final review/remote reconciliation remain required in08.
+
 ## Requirement Traceability
 
 | Requirement | Implementation | Verification | Review | Status |
