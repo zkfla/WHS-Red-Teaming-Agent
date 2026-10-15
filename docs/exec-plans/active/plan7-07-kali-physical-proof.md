@@ -89,6 +89,10 @@ The fixture initially used the unrelated unit.local Task target and was correctl
 
 Root is extending the route fixture with actual timeout/cancellation detach checks and an exact unselected-port rejection assertion. These checks are not claimed passed before their run finishes. Final integrated suite and final review/remote reconciliation remain required in08.
 
+Final route extension71403dfc PASS in53.21seconds: unselected port is rejected by the gateway schema with shell_invalid_arguments before admission; scope refusal is direct_target_scope_denied; an internal program timeout returns timed_out=true and detaches; cancellation after observed network attachment propagates CancelledError and detaches. This cancellation proof does not assert that a child had already started before cancellation. An initial test used the outer gateway deadline and truthfully got execution_uncertain with no output; the final timeout test instead supplies the program timeout under a longer gateway deadline to verify protected timeout output. Both timeout meanings remain distinct.
+
+Fresh independent Sol physical source review CLEAR for production approval/same-invocation/original consumer proof and route preadmission/cleanup assertions. Root lint across full CI paths and full src/tests mypy pass after the final physical changes. Final owned container and network inventories are empty. Original run/customer target state is untouched. A final fetch found origin/dev still38179561 with no remote-only commits (local77 ahead at that observation); normal push is still withheld pending integrated regression resolution.
+
 ## Requirement Traceability
 
 | Requirement | Implementation | Verification | Review | Status |
