@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
+from typing import Literal
 
 import pytest
 from pydantic import ValidationError
@@ -20,7 +21,7 @@ from redteam.orchestration.knowledge_validation import InternalAssessment, Inter
 from redteam.orchestration.native_binding import resolve_native_target
 
 
-def _tool(source: str = "mcp_ref") -> ToolDescriptor:
+def _tool(source: Literal["mcp_ref", "logical_host"] = "mcp_ref") -> ToolDescriptor:
     return ToolDescriptor(
         tool_id=ToolId("recon.lookup"),
         server_id="synthetic",

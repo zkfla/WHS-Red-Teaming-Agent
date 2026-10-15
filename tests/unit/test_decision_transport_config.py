@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -15,14 +16,21 @@ from redteam.app.runtime_components import (
 )
 from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
 from redteam.core.config import OrchestrationConfig
+from redteam.core.ids import EngagementId, RunId
+from redteam.event_bus import InMemoryEventBus
 from redteam.llm.fake import FakeLLMClient
 from redteam.orchestration.analysis import StructuredLLMAnalysisVerifier
 from redteam.orchestration.analysis_budget import verification_budget
+from redteam.orchestration.central_state import CentralStateStore
 from redteam.orchestration.cognition import DecisionBudget
+from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.engine import InvestigationEngine
 from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.specialist_planner import SpecialistPlanner
+from redteam.orchestration.state import GraphState, RuntimeState
+from tests.fakes.control_plane import FakeControlPlane
 from tests.fakes.evidence_store import FakeEvidenceStore
+from tests.fakes.tool_gateway import DummyToolGateway
 
 
 def test_transport_cap_default_is_five() -> None:
@@ -122,16 +130,41 @@ def test_planner_default_and_non_default_land() -> None:
     assert tuned.client._transport_limit == 2
 
 
-def test_verification_budget_carries_configured_cap() -> None:
-    state = {"plan_step": None, "runtime": SimpleNamespace(delegations={})}
+def _runtime_deps(settings: OrchestrationSettings, tmp_path: Path) -> RuntimeDeps:
+    return RuntimeDeps(
+        control_plane=FakeControlPlane(),
+        tool_gateway=DummyToolGateway(),
+        event_bus=InMemoryEventBus(),
+        graph_store=InMemoryAttackGraphStore(),
+        evidence_store=FakeEvidenceStore(),
+        llm_client=FakeLLMClient(),
+        central_state=CentralStateStore(
+            tmp_path / "state.db",
+            run_id="run-transport-cap",
+            engagement_id="engagement-transport-cap",
+        ),
+        settings=settings,
+    )
+
+
+def _graph_state() -> GraphState:
+    runtime = RuntimeState(
+        run_id=RunId("run-transport-cap"),
+        engagement_id=EngagementId("engagement-transport-cap"),
+    )
+    return {"plan_step": None, "runtime": runtime}
+
+
+def test_verification_budget_carries_configured_cap(tmp_path: Path) -> None:
+    state = _graph_state()
     default_settings = OrchestrationSettings()
     tuned_settings = OrchestrationSettings(decision_transport_max_attempts=2)
     disabled_settings = OrchestrationSettings(decision_transport_max_attempts=0)
-    defaulted = verification_budget(state, deps=SimpleNamespace(settings=default_settings))
+    defaulted = verification_budget(state, deps=_runtime_deps(default_settings, tmp_path))
     assert defaulted.transport_limit == 5
-    tuned = verification_budget(state, deps=SimpleNamespace(settings=tuned_settings))
+    tuned = verification_budget(state, deps=_runtime_deps(tuned_settings, tmp_path))
     assert tuned.transport_limit == 2
-    disabled = verification_budget(state, deps=SimpleNamespace(settings=disabled_settings))
+    disabled = verification_budget(state, deps=_runtime_deps(disabled_settings, tmp_path))
     assert disabled.transport_limit == 0
     assert disabled.permits(transport=True) is False
 
@@ -178,25 +211,11 @@ def test_verifier_defaults_keep_client_default() -> None:
     assert disabled._decider._transport_limit == 0
 
 
-def test_context_fallback_verifier_carries_cap() -> None:
-    from redteam.orchestration.central_state import CentralStateStore
-    from redteam.orchestration.context import RuntimeDeps
-    central_state = CentralStateStore(
-        "test-transport-cap-state.db",
-        run_id="run-transport-cap",
-        engagement_id="engagement-transport-cap",
-    )
-    deps = RuntimeDeps(
-        control_plane=None,
-        tool_gateway=None,
-        event_bus=None,
-        graph_store=InMemoryAttackGraphStore(),
-        evidence_store=FakeEvidenceStore(),
-        llm_client=FakeLLMClient(),
-        central_state=central_state,
-        settings=OrchestrationSettings(decision_transport_max_attempts=2),
-    )
-    assert deps.verifier._decider._transport_limit == 2
+def test_context_fallback_verifier_carries_cap(tmp_path: Path) -> None:
+    deps = _runtime_deps(OrchestrationSettings(decision_transport_max_attempts=2), tmp_path)
+    verifier = deps.verifier
+    assert isinstance(verifier, StructuredLLMAnalysisVerifier)
+    assert verifier._decider._transport_limit == 2
 
 
 @pytest.mark.asyncio

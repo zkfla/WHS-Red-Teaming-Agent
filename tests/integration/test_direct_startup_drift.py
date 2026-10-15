@@ -17,6 +17,7 @@ from redteam.app import web_policy as web_policy_module
 from redteam.app.cli._shared import EXIT_CONFIG_ERROR, EXIT_OK, load_app_config_for_run
 from redteam.app.cli.commands import run as run_command
 from redteam.app.cli.commands import validate as validate_command
+from redteam.app.cli.conversation import ConversationAssistant
 from redteam.app.cli.interactive_commands import InteractiveSession
 from redteam.app.cli.session_runtime import run_session
 from redteam.app.cli.terminal_frontend import ConsoleFrontend
@@ -24,9 +25,11 @@ from redteam.app.web.engagement import EngagementStore
 from redteam.app.web_policy import select_engagement_startup
 from redteam.core.config import load_engagement_config
 from redteam.core.environment import environment_context
+from redteam.llm.fake import FakeLLMClient
 
+NAME = "local lab"
 DRAFT = {
-    "name": "local lab",
+    "name": NAME,
     "allowed_hosts": ["https://127.0.0.1:8443"],
     "allowed_capabilities": ["web"],
     "max_actions": 5,
@@ -83,7 +86,7 @@ async def _run_once(store: EngagementStore):
     return await run_session(
         Console(file=io.StringIO()),
         config,
-        conversation=None,
+        conversation=ConversationAssistant(FakeLLMClient()),
         session=session,
         objective="startup regression",
         frontend=_NoInputFrontend(Console(file=io.StringIO())),
@@ -100,7 +103,7 @@ async def _restart_once(store: EngagementStore):
     return await run_session(
         Console(file=io.StringIO()),
         config,
-        conversation=None,
+        conversation=ConversationAssistant(FakeLLMClient()),
         session=session,
         objective="startup regression",
         frontend=_NoInputFrontend(Console(file=io.StringIO())),
@@ -118,7 +121,7 @@ async def _validate(store: EngagementStore, monkeypatch) -> int:
 
 def _operator_edit(path: Path) -> None:
     text = path.read_text(encoding="utf-8")
-    edited = text.replace(DRAFT["name"], "operator edit")
+    edited = text.replace(NAME, "operator edit")
     assert edited != text
     path.write_text(edited, encoding="utf-8")
     assert load_engagement_config(path).name == "operator edit"
