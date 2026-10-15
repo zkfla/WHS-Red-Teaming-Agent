@@ -132,3 +132,7 @@ Fresh Sol04C revised plan/interface CLEAR: root authorizes implementation in sta
 ### Superseded gated recovery checkpoint
 
 The latest user decision adopts the teammate direct provider and stops further gate-specific implementation. The capability work is frozen and preserved only as an integration checkpoint: endpoint binding/read-only inventory and experimental interrupted-window recovery are not approved for activation. Fresh Sol review found unresolved committed-reservation cancellation, unchecked Docker remove outcomes/interrupted network creation, and serial cleanup preventing independent UNKNOWN settlement. Earlier fake-ledger tests do not close those findings. The default direct integration must not activate this partial gate recovery or advertise it as verified; retain history rather than spending additional implementation on the superseded default. This checkpoint is not a stage04 completion claim.
+
+### Direct integration preservation checkpoint for optional projection
+
+The previously scoped HTTP restriction projection and shared verified deployment loader are preserved as inactive code only. Worker46 same-checkout Linux tests, isolated mypy2 and Ruff3 passed; root scoped Ruff also passes. No bootstrap, strategy or direct-provider consumer was connected. Under the latest user-selected direct design this projection is not a readiness blocker and is not a new mandatory enforcement feature. Preserve its history, avoid activating or extending it during import, and keep the existing deployment artifact/scope/environment checks unchanged.
