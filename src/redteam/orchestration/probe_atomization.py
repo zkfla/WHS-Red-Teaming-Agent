@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from redteam.core.contracts.completion import (
+    ALLOWED_CRITERION_KINDS,
     CompletionCriterion,
     completion_condition_conflicts,
     completion_conditions,
@@ -83,6 +84,32 @@ def _task_rejection(code, *, index, task, field, question, criterion_ids=(),
         trace=[{"task_key": safe_feedback(task.task_key, 80),
                 "question_id": safe_feedback(question.question_id, 80),
                 "criterion_ids": references, "differing_fields": list(differing_fields)}],
+    ))
+
+
+_CONDITION_CODE = "plan_question_unknown_completion_condition"
+
+
+def _condition_rejection(*, question_index: int, condition_index: int, unknown_kind: bool):
+    """Field-precise stage-1 rejection; never echoes the model's kind or description text."""
+    field = "kind" if unknown_kind else "description"
+    location = f"$.questions[{question_index}].completion_criteria[{condition_index}].{field}"
+    if unknown_kind:
+        summary = (
+            "Each completion criterion kind must be one of: "
+            + ", ".join(sorted(ALLOWED_CRITERION_KINDS))
+            + ". Correct the kind at the location named in the diagnostic."
+        )
+    else:
+        summary = (
+            "Each completion criterion needs a nonblank description. Give the criterion at "
+            "the location named in the diagnostic a nonblank description."
+        )
+    return AtomizationProposalError(_CONDITION_CODE, diagnostic=DecisionDiagnostic(
+        code=_CONDITION_CODE, stage="hypothesis_planning", kind="validation", retryable=True,
+        cause_scope="model_input", owner="orchestration.probe_atomization",
+        location=location, summary=summary,
+        validation_issues=[{"rule": _CONDITION_CODE, "location": location}],
     ))
 
 
@@ -276,7 +303,7 @@ def bind_plan(
     versions.update({update.hypothesis.hypothesis_id: (update.expected_revision or 0) + 1
                      for update in updates})
     questions: list[PlannedInvestigationQuestion] = []
-    for question in draft.questions:
+    for question_index, question in enumerate(draft.questions):
         revisions = {issued.get(identity, identity): revision
                      for identity, revision in question.hypothesis_revisions.items()}
         if any(versions.get(identity) != revision for identity, revision in revisions.items()):
@@ -293,9 +320,12 @@ def bind_plan(
         identities = [criterion_id(item) for item in question.completion_criteria]
         if len(identities) != len(set(identities)):
             raise AtomizationProposalError("plan_question_duplicate_completion_condition")
-        for condition in question.completion_criteria:
+        for condition_index, condition in enumerate(question.completion_criteria):
             if not condition.is_known() or not condition.description.strip():
-                raise AtomizationProposalError("plan_question_unknown_completion_condition")
+                raise _condition_rejection(
+                    question_index=question_index, condition_index=condition_index,
+                    unknown_kind=not condition.is_known(),
+                )
             if set(condition.principal_refs) - set(question.principal_refs):
                 raise AtomizationProposalError(
                     "plan_question_condition_principal_outside_subjects")

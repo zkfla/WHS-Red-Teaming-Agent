@@ -7,7 +7,6 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from redteam.attack_graph.predicates import facts_of
 from redteam.attack_graph.service import AttackGraphService
-from redteam.core.contracts.completion import ALLOWED_CRITERION_KINDS
 from redteam.core.contracts.events import EventType
 from redteam.core.contracts.graph import GraphNode, Hypothesis, HypothesisUpdate
 from redteam.core.contracts.mission import MissionPlan, MissionTask, redact_secret_material
@@ -92,8 +91,6 @@ class HypothesisProposalError(ValueError):
         super().__init__(code)
 
 
-_CRITERION_KIND_TEXT = ", ".join(sorted(ALLOWED_CRITERION_KINDS))
-
 # Code-owned repair guidance keyed by proposal error code: (contract field, guidance).
 # Fields name the judgment contract only; they never carry model-supplied refs or values.
 _REPAIR_GUIDANCE: dict[str, tuple[str, str]] = {
@@ -119,11 +116,6 @@ _REPAIR_GUIDANCE: dict[str, tuple[str, str]] = {
     "judgment_reason_or_resume_condition_blank": (
         "$",
         "The reason and every resume_condition must be nonblank text.",
-    ),
-    "plan_question_unknown_completion_condition": (
-        "$.questions[].completion_criteria[].kind",
-        "Each completion criterion needs one kind from: " + _CRITERION_KIND_TEXT + ", and a "
-        "nonblank description. Use only these kind names.",
     ),
 }
 

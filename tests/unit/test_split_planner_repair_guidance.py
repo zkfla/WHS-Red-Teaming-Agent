@@ -1,9 +1,7 @@
 """Split stage-1 repair feedback: code-owned guidance, then a valid retry commits."""
 
-from redteam.core.contracts.completion import ALLOWED_CRITERION_KINDS
 from redteam.orchestration.diagnostics import DecisionDiagnostic, safe_feedback
-from redteam.orchestration.hypothesis_planner import _REPAIR_GUIDANCE, _proposal_repair_summary
-from redteam.orchestration.probe_atomization import AtomizationProposalError
+from redteam.orchestration.hypothesis_planner import _REPAIR_GUIDANCE
 from redteam.orchestration.specialist_planner import SpecialistPlanner
 from tests.integration.test_probe_workers import selection as probe_selection
 from tests.integration.test_v3_atomization import SplitDouble, _atom_two_tasks, _plan_two_questions
@@ -67,17 +65,6 @@ async def test_held_without_resume_condition_gets_resume_guidance_then_commits(t
     assert "RAW-REASON-MARKER-7d1e" not in llm.plan_feedback[1]
 
 
-def test_unknown_criterion_kind_guidance_names_contract_path_and_allowed_kinds():
-    # The planner adds an enum hint to the shared str schema. Cognition checks it
-    # before bind_plan; the planner-owned fallback also covers blank descriptions.
-    text = _proposal_repair_summary(
-        AtomizationProposalError("plan_question_unknown_completion_condition"), "fallback",
-    )
-    assert text != "fallback"
-    assert all(kind in text for kind in ALLOWED_CRITERION_KINDS)
-    assert _REPAIR_GUIDANCE["plan_question_unknown_completion_condition"][0] == (
-        "$.questions[].completion_criteria[].kind"
-    )
 def test_repair_guidance_fits_diagnostic_limit_and_validates_on_construction():
     for code, (location, guidance) in _REPAIR_GUIDANCE.items():
         assert len(guidance) <= 500, code
