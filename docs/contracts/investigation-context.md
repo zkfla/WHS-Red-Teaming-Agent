@@ -172,6 +172,14 @@ and source refs remain intact; successful local-tool delivery is not a successfu
 comparison. A valid baseline has no mismatch reason, including when the current
 response itself is uninterpretable.
 
+Split-planner follow-up repair guidance follows its wire contract: for an existing
+captured source Task with a result, omit `source_result_id` so code copies that
+result. An explicit null is still invalid when `source_task_id` is given. Missing
+or resultless source Tasks are rejected at `source_task_id`; no source is guessed.
+The internal canonical question still requires the exact paired references.
+Candidate-free observations may use `candidate_refs: []`; a new candidate must
+be explicitly declared as an update before a question cites its local key.
+
 ## Planner structured lookup (plan8b)
 
 Both the split strategy profile and the single-stage compatibility profile accept

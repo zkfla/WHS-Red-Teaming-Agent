@@ -94,6 +94,16 @@ _FOLLOWUP_SUMMARY = (
     "Source linkage is paired: give source_task_id and source_result_id together, copied "
     "from the captured Task result, or leave both null. source_question_id needs that pair."
 )
+_WIRE_FOLLOWUP_SUMMARY = (
+    "For a captured source_task_id, omit source_result_id (do not send null); code copies that "
+    "Task's one result. If there is no source, omit or null source_task_id, source_result_id "
+    "and source_question_id. Correct the location named in the diagnostic."
+)
+_SOURCE_TASK_SUMMARY = (
+    "source_task_id must name a captured Task that has a result in this snapshot. Choose a "
+    "listed captured Task, or remove the source fields for a question with no source. "
+    "Do not guess a Task or result. Correct the location named in the diagnostic."
+)
 _DUPLICATE_SUMMARY = (
     "Each completion criterion must be distinct within a question. Remove the repeated "
     "criterion at the location named in the diagnostic and keep one copy."
@@ -481,6 +491,7 @@ def _bind_plan_questions(
     versions: dict[str, int],
     candidate_views: Mapping[str, Hypothesis],
     relation_field: str = "hypothesis_revisions",
+    followup_summary: str = _FOLLOWUP_SUMMARY,
 ) -> list[PlannedInvestigationQuestion]:
     """Shared per-question route: revisions, subjects, required, criteria and source gates."""
     questions: list[PlannedInvestigationQuestion] = []
@@ -516,13 +527,13 @@ def _bind_plan_questions(
             raise _plan_rejection(
                 "plan_question_followup_invalid",
                 location=f"$.questions[{question_index}].{field}",
-                summary=_FOLLOWUP_SUMMARY,
+                summary=followup_summary,
             )
         if question.source_question_id and not question.source_task_id:
             raise _plan_rejection(
                 "plan_question_followup_invalid",
                 location=f"$.questions[{question_index}].source_question_id",
-                summary=_FOLLOWUP_SUMMARY,
+                summary=followup_summary,
             )
         seen_criteria = set()
         for condition_index, item in enumerate(question.completion_criteria):
@@ -611,9 +622,11 @@ def _finish_plan_judgment(
 
 
 _UNKNOWN_CANDIDATE_REF_SUMMARY = (
-    "Each candidate_refs entry must name a candidate from the snapshot or this proposal. "
-    "Use a captured ID or this proposal's local key at the location named in the diagnostic. "
-    "Do not write revision numbers; code copies the revision this pass yields."
+    "Each candidate_refs entry must name a captured candidate ID or a local hypothesis_id "
+    "declared in this proposal's updates. Use [] for an observation that concerns no candidate. "
+    "For a new premise, add an explicit update with a local hypothesis_id and cite that same "
+    "key. Do not invent IDs or write revision numbers; code copies each revision. Correct the "
+    "location named in the diagnostic."
 )
 _DUPLICATE_CANDIDATE_REF_SUMMARY = (
     "Each candidate_refs entry must name a distinct candidate within its question. Remove the "
@@ -637,9 +650,16 @@ def _hydrate_question(index: int, question: PlannedQuestionSelection, snapshot: 
                                   summary=_DUPLICATE_CANDIDATE_REF_SUMMARY)
         revisions[identity] = versions[identity]
     source_result_id = question.source_result_id
-    if "source_result_id" not in question.model_fields_set and question.source_task_id:
+    if question.source_task_id:
         source = snapshot.tasks.get(question.source_task_id)
-        if source is not None and source.result is not None:
+        if source is None or source.result is None:
+            raise _plan_rejection(
+                "plan_question_source_not_in_snapshot",
+                location=f"$.questions[{index}].source_task_id",
+                summary=_SOURCE_TASK_SUMMARY,
+            )
+        # An explicit null stays null, so the paired-field gate reports it with wire guidance.
+        if "source_result_id" not in question.model_fields_set:
             source_result_id = source.result.result_id
     values = {name: deepcopy(getattr(question, name))
               for name in PlannedInvestigationQuestion.model_fields
@@ -682,6 +702,7 @@ def bind_plan_selection(
         draft.questions, snapshot, issued=issued, targets=targets, principals=principals,
         versions=versions, candidate_views=post_update_candidates(snapshot, updates),
         relation_field="candidate_refs",
+        followup_summary=_WIRE_FOLLOWUP_SUMMARY,
     )
     finished_updates, questions, versions = _finish_plan_judgment(
         draft, updates, questions, versions, snapshot, existing_work_validator,

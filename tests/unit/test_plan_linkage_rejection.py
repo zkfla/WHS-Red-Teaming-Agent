@@ -86,6 +86,7 @@ async def test_malformed_source_pair_is_repaired_then_valid_plan_commits(tmp_pat
     assert len(ids) == 2 and spent == 3
     assert len(llm.atom_inputs) == 1
     feedback = llm.plan_feedback[1]
-    assert "$.questions[0].source_result_id" in feedback
-    assert "Source linkage is paired" in feedback
+    assert "$.questions[0].source_task_id" in feedback
+    assert "plan_question_source_not_in_snapshot" in feedback
+    assert "captured Task that has a result" in feedback
     assert TASK_MARKER not in feedback

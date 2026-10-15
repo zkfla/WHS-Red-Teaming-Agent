@@ -127,6 +127,9 @@ hypothesis ID or this proposal's local key. Include every candidate a completion
 criterion names. Never write revision numbers; code copies the revision this pass
 yields. For a followup of a captured Task, give source_task_id and omit
 source_result_id; code copies that Task's result. An explicit null is not derived.
+If no candidate applies to an observation, use an empty candidate_refs list.
+A new premise needs an explicit update declaring its local hypothesis_id before
+a question can cite it. Never invent an undeclared reference to satisfy a field.
 
 When independent captured reads are known together, use context_request version 2
 with one to four queries instead of requesting each in a separate model turn.
