@@ -188,7 +188,10 @@ async def test_direct_target_route_allowed_call_and_refusals(tmp_path, monkeypat
             # Owned-fixture hook: makes no Control decision; no rejection is raised.
             return None
 
-        def invoke(suffix: str, target_ref: str, port: int, approved_host: str, script: str):
+        def invoke(
+            suffix: str, target_ref: str, port: int, approved_host: str, script: str,
+            timeout: float = 60,
+        ):
             invocation = ToolInvocation(
                 invocation_id=InvocationId("inv_" + tag + "_" + suffix),
                 action_id=ActionId("act_" + tag + "_" + suffix),
@@ -201,6 +204,7 @@ async def test_direct_target_route_allowed_call_and_refusals(tmp_path, monkeypat
                     "port": port,
                     "language": "python3",
                     "script": script,
+                    "timeout_seconds": timeout,
                 },
                 execution_context=ExecutionContext(
                     engagement_id=EngagementId("direct-proof"),
@@ -243,6 +247,9 @@ async def test_direct_target_route_allowed_call_and_refusals(tmp_path, monkeypat
             ALLOWED_SCRIPT.format(host=mock_ip, port=TARGET_PORT + 1),
         )
         assert not refused_port.success and refused_port.output is None, refused_port
+        assert refused_port.error is not None
+        assert refused_port.error.code == "shell_invalid_arguments", refused_port.error
+        assert refused_port.error.details["source"] == "gateway"
         # Out-of-scope name on the selected IP: the direct policy must refuse with the scope code.
         refused_scope = await invoke(
             "scope", DENIED_NAME, TARGET_PORT, DENIED_NAME, allowed_script
@@ -252,6 +259,33 @@ async def test_direct_target_route_allowed_call_and_refusals(tmp_path, monkeypat
 
         receipt_final = await _receipt(mock_name, "mock-tcp.log")
         assert receipt_final.count("ACCEPT") == 1, "refused calls must not reach the mock"
+        assert await _attached_networks(room_name) == {}
+        # The direct route must close even when the program exceeds its timeout.
+        timed = await invoke(
+            "timeout", mock_ip, TARGET_PORT, mock_ip,
+            "import time; print('timeout-start', flush=True); time.sleep(30)", timeout=2,
+        )
+        assert timed.output is not None and timed.output["timed_out"] is True, timed
+        assert await _attached_networks(room_name) == {}
+
+        # Cancellation also propagates only after the owned network is detached.
+        cancelled = asyncio.create_task(invoke(
+            "cancel", mock_ip, TARGET_PORT, mock_ip,
+            "import time; time.sleep(30)",
+        ))
+        for _ in range(100):
+            if await _attached_networks(room_name):
+                break
+            if cancelled.done():
+                pytest.fail("program exited before cancellation admission")
+            await asyncio.sleep(0.1)
+        else:
+            cancelled.cancel()
+            await asyncio.gather(cancelled, return_exceptions=True)
+            pytest.fail("program never attached its owned route")
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
         assert await _attached_networks(room_name) == {}
     finally:
         if runtime is not None:
