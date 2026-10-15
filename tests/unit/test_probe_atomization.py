@@ -322,7 +322,11 @@ def test_atomization_draft_requires_question_binding():
 
 def _selection(question, *, ids=None, principals=None):
     body = _task(qid=question.question_id, targets=question.target_node_ids,
-                 principals=question.principal_refs).model_dump(exclude={"completion_criteria"})
+                 principals=question.principal_refs).model_dump(exclude={
+                     "completion_criteria", "hypothesis_revisions", "required",
+                     "goal_required_hypothesis_ids", "source_task_id",
+                     "source_result_id", "source_question_id",
+                 })
     body["completion_criterion_ids"] = (
         [criterion_id(item) for item in question.completion_criteria] if ids is None else ids
     )

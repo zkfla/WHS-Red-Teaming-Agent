@@ -173,7 +173,6 @@ def test_existing_criterion_hypothesis_id_survives_normalization():
         "task_key": "t1", "question_id": "q1", "objective": "Inspect one response",
         "title": "Response check", "role_id": "probe-role",
         "target_node_ids": ["host:a"], "completion_criterion_ids": [expected_id],
-        "hypothesis_revisions": {"cand-a": 2},
     }]})
     (stripped,) = validate_atomized_tasks(
         resolve_atomized_tasks(parsed.tasks, questions=questions),

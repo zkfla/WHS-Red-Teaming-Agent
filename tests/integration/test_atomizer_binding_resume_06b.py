@@ -73,7 +73,6 @@ def _atom_two_tasks():
                 "role_id": "probe-worker",
                 "target_node_ids": [TARGET],
                 "completion_criterion_ids": [_obs("Inspect first")],
-                "hypothesis_revisions": {},
                 "probe_limits": {"max_actions": 1, "max_model_requests": 4},
             },
             {
@@ -84,7 +83,6 @@ def _atom_two_tasks():
                 "role_id": "probe-worker",
                 "target_node_ids": [TARGET],
                 "completion_criterion_ids": [_obs("Inspect second")],
-                "hypothesis_revisions": {},
                 "probe_limits": {"max_actions": 1, "max_model_requests": 4},
             },
         ]

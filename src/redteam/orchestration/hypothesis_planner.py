@@ -647,13 +647,15 @@ _SPLIT_ATOMIZE_SYSTEM = (
     "Decompose each planned question into probe tasks. Reference each task to its plan-local "
     "question_id and select completion_criterion_ids from that question's supplied "
     "completion_criteria entries. Never emit or rewrite completion_criteria bodies; code "
-    "restores the original conditions. Preserve that question's subjects, candidate "
-    "revisions, required meaning and source refs on every task. A task's subjects must stay "
+    "restores the original conditions. Select each task's subjects within its question; code "
+    "copies its candidate revisions, required flag, goal-required IDs and source refs. An "
+    "optional task required_reason may explain the selected purpose; when omitted or null, "
+    "code copies the question's reason. A task's "
+    "subjects must stay "
     "within its question; together the tasks must cover the question's subjects and every "
     "completion criterion exactly. Keep a paired-comparison criterion as one condition on one "
-    "task, never split the condition itself. Use only ready roles, captured subjects and the "
-    "candidate revisions from the plan, including the issued IDs for new candidates. Never "
-    "prescribe tool-call order, invent subjects or overwrite active work."
+    "task, never split the condition itself. Use only ready roles and captured subjects from "
+    "the plan. Never prescribe tool-call order, invent subjects or overwrite active work."
 )
 
 
@@ -688,16 +690,6 @@ def _split_plan_response_schema(schema: dict[str, Any]) -> dict[str, Any]:
         criterion["required"] = list(dict.fromkeys([
             *criterion.get("required", []), *criterion_required,
         ]))
-    return schema
-
-
-def _atomizer_response_schema(schema: dict[str, Any]) -> dict[str, Any]:
-    """Model-facing stage-2 schema: every task states its revision map ({} when none)."""
-    schema = deepcopy(schema)
-    selection = schema.get("$defs", {}).get("AtomizedProbeSelection")
-    if selection is not None:
-        required = list(selection.get("required", []))
-        selection["required"] = list(dict.fromkeys([*required, "hypothesis_revisions"]))
     return schema
 
 
@@ -839,9 +831,7 @@ async def _advance_split(planner, runtime, schema, snapshot, engine, budget, pay
         with llm_request_scope(str(runtime.run_id), "hypothesis_planning"):
             tasks_raw = await planner.client.ask(
                 stage="task_atomization", payload=atom_payload, budget=budget,
-                response_schema=_atomizer_response_schema(
-                    schema(TaskAtomizationDraft.model_json_schema())
-                ),
+                response_schema=schema(TaskAtomizationDraft.model_json_schema()),
                 validate_response=validate_tasks, before_call=engine.guard_reasoning,
                 system=_SPLIT_ATOMIZE_SYSTEM,
             )

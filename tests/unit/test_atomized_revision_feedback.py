@@ -1,8 +1,6 @@
-"""Atomizer revision mismatches name the difference category; a copied map then commits."""
+"""Copied question fields in atomizer output get a schema rejection; wire-only output commits."""
 
 from types import SimpleNamespace
-
-import pytest
 
 from redteam.core.contracts.completion import CompletionCriterion, criterion_id
 from redteam.orchestration.probe_atomization import _task_rejection
@@ -33,52 +31,45 @@ class AtomFeedbackDouble(SplitDouble):
         )
 
 
-def _task(revisions):
-    return {
-        "tasks": [
-            {
-                "task_key": "t1",
-                "question_id": "q1",
-                "objective": "Probe the new premise",
-                "title": "New premise probe",
-                "role_id": "probe-worker",
-                "target_node_ids": [TARGET],
-                "completion_criterion_ids": [
-                    criterion_id(CompletionCriterion(kind="observation", description="Inspect new"))
-                ],
-                **({} if revisions is None else {"hypothesis_revisions": revisions}),
-                "probe_limits": {"max_actions": 1, "max_model_requests": 4},
-            }
-        ]
+def _task(*, copied_map=None):
+    task = {
+        "task_key": "t1",
+        "question_id": "q1",
+        "objective": "Probe the new premise",
+        "title": "New premise probe",
+        "role_id": "probe-worker",
+        "target_node_ids": [TARGET],
+        "completion_criterion_ids": [
+            criterion_id(CompletionCriterion(kind="observation", description="Inspect new"))
+        ],
+        "probe_limits": {"max_actions": 1, "max_model_requests": 4},
     }
+    if copied_map is not None:
+        task["hypothesis_revisions"] = copied_map
+    return {"tasks": [task]}
 
 
-@pytest.mark.parametrize("invalid_map", [None, {}])
-async def test_omitted_revision_map_is_named_as_missing_then_copied_map_commits(
-    tmp_path, invalid_map,
+async def test_copied_revision_map_in_output_is_schema_rejected_then_wire_output_commits(
+    tmp_path,
 ):
     seen_keys = []
 
-    def omitted(payload):
+    def copied_map(payload):
         seen_keys.append(set(payload["issued_candidate_ids"].values()))
-        return _task(invalid_map)
+        return _task(copied_map={})
 
-    def copied(payload):
-        (question,) = payload["questions"]
-        return _task(question["hypothesis_revisions"])
+    def wire_only(payload):
+        return _task()
 
-    llm = AtomFeedbackDouble([_new_candidate_plan()], [omitted, copied])
+    llm = AtomFeedbackDouble([_new_candidate_plan()], [copied_map, wire_only])
     async with probe_selection(tmp_path, llm=llm) as (session, _, _):
         ids = await SpecialistPlanner(session.deps).advance(session.runtime)
         spent = (await session.status())["usage"]["spent"]
     assert len(ids) == 1 and spent == 3
     assert len(llm.atom_inputs) == 2
     feedback = llm.atom_feedback[1]
-    if invalid_map is None:
-        assert "schema_required at $.tasks[0].hypothesis_revisions" in feedback
-    else:
-        assert "missing_candidate_revisions" in feedback
-        assert "expected 1 candidate revisions, submitted 0" in feedback
+    assert "schema_additionalProperties at $.tasks[0]" in feedback
+    assert "Remove unsupported fields." in feedback
 
     issued = {value for keys in seen_keys for value in keys}
     assert not any(key in feedback for key in issued)

@@ -97,13 +97,11 @@ def _plan_two_questions():
 def _atom_two_tasks():
     return {"tasks": [
         {"task_key": "t1", "question_id": "q1", "objective": "Probe first",
-         "hypothesis_revisions": {},
          "title": "First probe", "role_id": "probe-worker",
          "target_node_ids": [TARGET],
          "completion_criterion_ids": [_condition_id("Inspect first")],
          "probe_limits": {"max_actions": 1, "max_model_requests": 4}},
         {"task_key": "t2", "question_id": "q2", "objective": "Probe second",
-         "hypothesis_revisions": {},
          "title": "Second probe", "role_id": "probe-worker",
          "target_node_ids": [TARGET],
          "completion_criterion_ids": [_condition_id("Inspect second")],
@@ -212,7 +210,6 @@ async def test_split_loop_updated_candidate_forwarded_to_atomizer(tmp_path):
                 "objective": "Re-probe the refined premise", "title": "Refined probe",
                 "role_id": "probe-worker", "target_node_ids": [TARGET],
                 "completion_criterion_ids": [_condition_id("Inspect refined", hypothesis_id=pid)],
-                "hypothesis_revisions": {pid: 2},
                 "probe_limits": {"max_actions": 1, "max_model_requests": 4}}]}
         llm.atoms.append(atom_updated)
         ids = await SpecialistPlanner(session.deps).advance(session.runtime)
@@ -323,7 +320,6 @@ async def test_split_loop_related_change_between_stages_discards_all(tmp_path):
                 "objective": "Probe the seeded premise", "title": "Seed probe",
                 "role_id": "probe-worker", "target_node_ids": [TARGET],
                 "completion_criterion_ids": [_condition_id("Inspect seed")],
-                "hypothesis_revisions": {pid: 1},
                 "probe_limits": {"max_actions": 1, "max_model_requests": 4}}]}
         llm.atoms.append(atom_with_related_drift)
         ids = await SpecialistPlanner(session.deps).advance(session.runtime)
@@ -530,7 +526,6 @@ def _new_candidate_atom(payload):
             "objective": "Probe the new premise", "title": "New premise probe",
             "role_id": "probe-worker", "target_node_ids": [TARGET],
             "completion_criterion_ids": [_condition_id("Inspect new")],
-            "hypothesis_revisions": {pid: 1},
             "probe_limits": {"max_actions": 1, "max_model_requests": 4}}]}
 
 

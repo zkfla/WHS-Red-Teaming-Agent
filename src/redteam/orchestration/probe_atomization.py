@@ -42,7 +42,6 @@ from redteam.orchestration.planner_context import PlannerContextRequest
 from redteam.orchestration.specialist_tasks import (
     HypothesisProbeProposal,
     ProbeTaskProposal,
-    ProbeTaskPurpose,
     SpecialistProposalError,
     validate_probe_subjects,
 )
@@ -251,16 +250,28 @@ class AtomizedProbeTask(ProbeTaskProposal):
         return self
 
 
-class AtomizedProbeSelection(ProbeTaskPurpose):
-    """Model selects whole original conditions by ID; code owns their contents."""
+class AtomizedProbeSelection(BaseModel):
+    """Model-facing stage-2 wire selector; code hydrates every question-copied field.
 
+    Unknown or question-copied fields (revisions, required, goal IDs, source trio) are
+    rejected by the schema. Hydration in resolve_atomized_tasks copies them from the
+    captured question, and the internal ProbeTaskProposal re-applies purpose validation.
+    The optional task-specific required_reason is a meaning choice, not a fixed copy;
+    omission or null retains the captured question's reason.
+    """
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+    task_key: str = Field(min_length=1)
+    objective: str = Field(min_length=1)
+    title: str = Field(min_length=1)
+    role_id: str = Field(min_length=1)
+    target_node_ids: list[str] = Field(min_length=1)
+    principal_refs: list[str] = Field(default_factory=list)
+    evidence_ids: list[str] = Field(default_factory=list)
+    probe_limits: ProbeLimits | None = None
+    required_reason: str | None = None
     question_id: str = Field(min_length=1)
     completion_criterion_ids: list[str] = Field(min_length=1)
-    hypothesis_revisions: dict[str, int] = Field(
-        default_factory=dict,
-        description="Copy the question's hypothesis_revisions exactly: the same candidate "
-                    "keys with the same revision numbers, nothing added or omitted.",
-    )
 
 
 class TaskAtomizationDraft(BaseModel):
@@ -299,10 +310,20 @@ def resolve_atomized_tasks(
                 repair="Select each ID once from this question's completion_criteria. "
                        f"Allowed IDs: {', '.join(list(conditions)[:3])}.",
             )
-        values = selection.model_dump(exclude={"completion_criterion_ids"})
+        values = selection.model_dump(exclude={"completion_criterion_ids", "required_reason"})
         values["completion_criteria"] = [
             conditions[identity].model_copy(deep=True) for identity in ids
         ]
+        values["hypothesis_revisions"] = dict(question.hypothesis_revisions)
+        values["required"] = question.required
+        values["goal_required_hypothesis_ids"] = list(question.goal_required_hypothesis_ids)
+        values["source_task_id"] = question.source_task_id
+        values["source_result_id"] = question.source_result_id
+        values["source_question_id"] = question.source_question_id
+        values["required_reason"] = (
+            selection.required_reason if selection.required_reason is not None
+            else question.required_reason
+        )
         tasks.append(AtomizedProbeTask.model_validate(values))
     return tasks
 

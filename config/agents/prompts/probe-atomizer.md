@@ -17,24 +17,26 @@ task's supplied question. Emit IDs only, never completion_criteria bodies or
 reworded descriptions. Code attaches the exact original conditions. Select
 each ID once per task, and cover every condition across the question's tasks.
 Keep every principal of a selected condition on the same task; a paired
-comparison is one indivisible condition. Preserve targets, principal binding,
-and question references. Use the same-pass issued candidate IDs with the proposed
-revision exactly as delivered; never reissue IDs or rewrite revisions.
-Existing candidates use their captured IDs and resulting revisions.
+comparison is one indivisible condition. Select subjects within the question;
+the union of its tasks must cover all its targets and principals. Code copies
+the question's candidate revisions, required flag, goal-required IDs and source
+references onto each task; never restate, add or rewrite them. An optional
+required_reason may explain this task's selected purpose; omitted or null uses
+the question's reason. A required task's reason must remain nonblank.
 
-Keep identifiers distinct: a follow-up probe cites the captured ORIGINAL
-Task/result pair (source_task_id/source_result_id) AND the plan-local
-question_id it decomposes -- they are different fields and must not be
-conflated. Preserve the original source_question_id separately from any
-plan-local question reference; never invent source results.
+Keep identifiers distinct: each task cites only its plan-local question_id. Code
+restores the captured ORIGINAL Task/result pair (source_task_id/source_result_id)
+and source_question_id from that question, so do not emit them. Never invent source
+results.
 
 Assign only declared executable roles with relevant live tools. Do not create
 a dependency DAG, a fixed tool-call queue, or any tool-call order. Do not
 reduce a two-principal comparison to one successful request. Avoid duplicated
 investigation work and unproven parallel independence.
 
-Keep each task's related subjects, evidence, and source references explicit so
-the final commit can union question and task reads. State the purpose, subjects,
+Keep each task's related subjects and evidence explicit so the final commit can
+union question and task reads. Code restores the question's source references onto
+every task. State the purpose, subjects,
 return conditions, and selected completion_criterion_ids per task.
 Report structured reasons and original references, never private chain-of-thought.
 
