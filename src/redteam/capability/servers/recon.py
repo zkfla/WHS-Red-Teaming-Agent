@@ -47,6 +47,8 @@ def create_server(policy: ServerPolicy) -> MCPServer:
     async def tls_inspect(target_ref: str) -> dict[str, Any]:
         """One verified TLS handshake: negotiated protocol, cipher and certificate digest.
 
+        Requires the selected target's configured origin to use HTTPS; an HTTP origin
+        is rejected before a connection is attempted.
         Does not enumerate all ciphers or disable certificate validation.
         """
         async with execution_lock:
@@ -175,6 +177,8 @@ def create_server(policy: ServerPolicy) -> MCPServer:
     async def html_inventory(target_ref: str, path: str) -> dict[str, Any]:
         """One approved GET: list static same-origin link/form/script paths, never follow them.
 
+        Requires a response with status 200 and content type text/html; other responses
+        are rejected rather than interpreted as HTML.
         Query/fragment values and form contents are omitted. Discovered paths are candidates,
         not newly authorized targets. Does not identify financial product versions.
         """
