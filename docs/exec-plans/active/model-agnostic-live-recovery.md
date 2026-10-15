@@ -77,3 +77,6 @@ The explicit-question live Run `run_496f0c1760c5` progressed beyond question gen
 
 
 Admission diagnostic repair verified: 51 targeted tests, scoped Ruff and fresh-cache mypy pass. Independent ARTEX/Shannon comparison supports typed non-retryable conflict diagnostics, not unconditional transaction replay. Commit the diagnostic packet and collect one fresh bounded bank run on frozen source; historical generic rejection remains unknown.
+
+
+2026-10-15 22:04 KST infrastructure gate: new live attempt did not start. Docker backend log confirms21:50:11 engine failure from insufficient host disk space writing init.log; current C: about90MiB free and Docker cannot start. Bank health times out. Recover host space, restore Docker and verify target health before launch. This does not retroactively diagnose the earlier21:40 admission failure. No cache-deletion workaround or Docker data reset was used.
