@@ -92,7 +92,7 @@ def _plan_two_questions():
         {"question_id": "q2", "objective": "Inspect the second response",
          "target_node_ids": [TARGET],
          "completion_criteria": [{"kind": "observation", "description": "Inspect second"}]}],
-        "reason": "Two useful scoped observations"}
+        "reason": "Two useful scoped observations", "termination": "continue"}
 
 def _atom_two_tasks():
     return {"tasks": [
@@ -187,7 +187,7 @@ async def test_split_loop_updated_candidate_forwarded_to_atomizer(tmp_path):
                                         "description": "Inspect refined",
                                         "hypothesis_id": pid}],
                 "hypothesis_revisions": {pid: 2}}],
-            "reason": "Refine and re-probe"})
+            "reason": "Refine and re-probe", "termination": "continue"})
         async def atom_updated(payload):
             (question,) = [item for item in payload["questions"]
                            if item["question_id"] == "q1"]
@@ -310,7 +310,7 @@ async def test_split_loop_related_change_between_stages_discards_all(tmp_path):
                 "completion_criteria": [{"kind": "observation",
                                         "description": "Inspect seed"}],
                 "hypothesis_revisions": {pid: 1}}],
-            "reason": "Probe the seeded premise"})
+            "reason": "Probe the seeded premise", "termination": "continue"})
         async def atom_with_related_drift(payload):
             current = await service.get_hypothesis(pid)
             await _register(session, "changed", updates=[_cand(
@@ -507,7 +507,7 @@ def _new_candidate_plan():
          "target_node_ids": [TARGET],
          "completion_criteria": [{"kind": "observation", "description": "Inspect new"}],
          "hypothesis_revisions": {"local": 1}}],
-        "reason": "Probe the new premise"}
+        "reason": "Probe the new premise", "termination": "continue"}
 
 def _new_candidate_atom(payload):
     issued = payload["issued_candidate_ids"]

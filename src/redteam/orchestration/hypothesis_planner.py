@@ -1,5 +1,6 @@
 """One candidate/probe judgment over captured originals and existing central admission."""
 
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -581,8 +582,9 @@ async def _finalize_hypothesis_pass(deps, snapshot, budget, *, identity, proposa
 FEEDBACK_SYSTEM = (
     "The current context is self-contained but bounded: omitted is not absent. "
     "Use context_request version=1 with exactly one context or evidence query when needed. "
-    "A lookup response must omit updates/questions/tasks/reviewed refs and keep termination "
-    "continue; it commits nothing and consumes the same normal decision budget. Read exact "
+    "A lookup response proposes no updates/questions/tasks/reviewed refs (declared required "
+    "collection fields are []) and keeps termination continue; it commits nothing and consumes "
+    "the same normal decision budget. Read exact "
     "source/results and candidate revisions before relying on them. List/related searches "
     "find omitted records; a no-match is limited to that query scope. Summaries are not full "
     "reads and cannot substitute for independent receipts. New conditions/principals/sources "
@@ -622,7 +624,12 @@ _SPLIT_PLAN_SYSTEM = FEEDBACK_SYSTEM + (
     "observation or reasoned hold. Same evidence can support another useful probe. Never "
     "prescribe tool-call order, invent subjects or overwrite active work. Held/exhausted "
     "judgments must explain reconsideration conditions; goal success remains a separate "
-    "completion gate."
+    "completion gate. "
+    "Every reply sets questions explicitly: [] means no new observation. Completed Tasks, "
+    "including completed inconclusive probes, are not executable witnesses; follow-up work "
+    "needs a new question naming its purpose, otherwise choose held, exhausted or replan with "
+    "a reason. A context lookup sends empty updates and questions with termination continue "
+    "and a context_request."
 )
 
 
@@ -641,6 +648,34 @@ _SPLIT_ATOMIZE_SYSTEM = (
     "candidate revisions from the plan, including the issued IDs for new candidates. Never "
     "prescribe tool-call order, invent subjects or overwrite active work."
 )
+
+
+_SPLIT_PLAN_REQUIRED = ("questions", "termination")
+_SPLIT_PLAN_DESCRIPTIONS = {
+    "questions": (
+        "Required in every reply. Use [] when no new observation is needed. Completed Tasks, "
+        "including completed inconclusive probes, are not executable witnesses; follow-up work "
+        "needs a new question naming its purpose."
+    ),
+    "termination": (
+        "Required. continue with at least one question, or with a referenced claimable or "
+        "running task whose role and purpose are still current. "
+        "held or exhausted when no new work is proposed (resume_conditions required). replan "
+        "for a candidate or empty follow-up. goal_achieved only as a completion proposal. "
+        "A context "
+        "lookup uses continue with empty updates and questions and a context_request."
+    ),
+}
+
+
+def _split_plan_response_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Model-facing stage-1 schema; persisted HypothesisPlanDraft defaults stay unchanged."""
+    schema = deepcopy(schema)
+    required = list(schema.get("required", []))
+    schema["required"] = list(dict.fromkeys([*required, *_SPLIT_PLAN_REQUIRED]))
+    for name, text in _SPLIT_PLAN_DESCRIPTIONS.items():
+        schema["properties"][name]["description"] = text
+    return schema
 
 
 async def _ask_with_context(planner, pass_context, engine, *, payload, budget, **kwargs):
@@ -731,7 +766,9 @@ async def _advance_split(planner, runtime, schema, snapshot, engine, budget, pay
     with llm_request_scope(str(runtime.run_id), "hypothesis_planning"):
         plan_raw = await _ask_with_context(planner, pass_context, engine,
             stage="hypothesis_planning", payload=payload, budget=budget,
-            response_schema=schema(HypothesisPlanDraft.model_json_schema()),
+            response_schema=_split_plan_response_schema(
+                schema(HypothesisPlanDraft.model_json_schema())
+            ),
             validate_response=validate_plan, before_call=engine.guard_reasoning,
             system=_SPLIT_PLAN_SYSTEM,
         )

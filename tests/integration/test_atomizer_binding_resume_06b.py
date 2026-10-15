@@ -58,6 +58,7 @@ def _plan_two_questions():
             },
         ],
         "reason": "Two useful scoped observations",
+        "termination": "continue",
     }
 
 

@@ -14,7 +14,8 @@ from redteam.orchestration.coordination import content_hash
 from redteam.orchestration.hypothesis_planner import PLANNING_INVALIDATED
 from redteam.orchestration.specialist_planner import SpecialistPlanner
 from tests.integration.test_central_development import TARGET
-from tests.integration.test_hypothesis_planner import PlannerDouble, held
+from tests.integration.test_hypothesis_planner import PlannerDouble
+from tests.integration.test_hypothesis_planner import held as legacy_held
 from tests.integration.test_probe_workers import PROFILE, selection
 from tests.integration.test_v3_atomization import (
     SplitDouble,
@@ -26,8 +27,17 @@ from tests.unit.test_central_state import task
 
 
 def lookup(**query):
+    return {"reason": "Read the relevant original", "questions": [], "termination": "continue",
+            "context_request": {"version": 1, "context": query}}
+
+
+def single_lookup(**query):
     return {"reason": "Read the relevant original", "context_request": {
         "version": 1, "context": query}}
+
+
+def held():
+    return {**legacy_held(), "questions": []}
 
 
 async def seed_history(state, count=100):
@@ -62,7 +72,8 @@ def followup(payload):
     q = _plan_two_questions()["questions"][0]
     q.update(source_task_id="z-source", source_result_id="old-result")
     return {"questions": [q], "reviewed_task_ids": ["z-source"],
-            "reason": "Test a different premise using the existing original"}
+            "reason": "Test a different premise using the existing original",
+            "termination": "continue"}
 
 
 def atom(payload):
@@ -161,8 +172,10 @@ async def test_hidden_reviewed_ids_repair_but_valid_source_is_not_projection_gat
     q = _plan_two_questions()["questions"][0]
     q.update(source_task_id="z-source", source_result_id="old-result")
     llm = SplitDouble([
-        {"questions": [q], "reviewed_task_ids": ["z-source"], "reason": "Claim hidden review"},
-        {"questions": [q], "reason": "Use a valid supplied source reference"},
+        {"questions": [q], "reviewed_task_ids": ["z-source"], "reason": "Claim hidden review",
+         "termination": "continue"},
+        {"questions": [q], "reason": "Use a valid supplied source reference",
+         "termination": "continue"},
     ], [atom])
     async with selection(tmp_path, llm=llm) as (session, llm, _):
         await seed_history(session.deps.central_state)
@@ -172,7 +185,7 @@ async def test_hidden_reviewed_ids_repair_but_valid_source_is_not_projection_gat
 
 
 async def test_single_stage_compatibility_consumes_optional_lookup(tmp_path):
-    llm = PlannerDouble([lookup(kind="task", mode="list"), held()])
+    llm = PlannerDouble([single_lookup(kind="task", mode="list"), legacy_held()])
     async with selection(tmp_path, llm=llm, profile=PROFILE.with_name(
             "native-probes-legacy.yaml")) as (session, llm, _):
         assert await SpecialistPlanner(session.deps).advance(session.runtime) == []
@@ -225,13 +238,15 @@ async def test_omitted_terminal_candidate_and_public_receipt_are_readable(tmp_pa
         def search_receipts(payload):
             detail = payload["context_lookup_result"]["result"]["records"][0]["data"]
             assert detail["status"] == "rejected" and detail["revision"] == 1
-            return {"reason": "Find the independent original", "context_request": {"evidence": {
+            return {"reason": "Find the independent original", "questions": [],
+                    "termination": "continue", "context_request": {"evidence": {
                 "mode": "list", "hypothesis_id": "z-archive", "record_kind": "review_receipt"}}}
 
         def read_receipt(payload):
             page = payload["context_lookup_result"]["result"]
             assert page["records"][0]["evidence_id"] == "old-public-review"
-            return {"reason": "Read that public receipt", "context_request": {"evidence": {
+            return {"reason": "Read that public receipt", "questions": [],
+                    "termination": "continue", "context_request": {"evidence": {
                 "mode": "read", "evidence_id": "old-public-review"}}}
 
         def finish(payload):
@@ -300,7 +315,8 @@ async def test_historical_receipt_index_stays_bounded_but_searchable(tmp_path):
         assert len(json.dumps(payload)) < 50000
         return held()
 
-    request = {"reason": "Search historical public reviews", "context_request": {"evidence": {
+    request = {"reason": "Search historical public reviews", "questions": [],
+               "termination": "continue", "context_request": {"evidence": {
         "mode": "list", "record_kind": "review_receipt", "count": 2}}}
     llm = SplitDouble([request, finish], [])
     async with selection(tmp_path, llm=llm) as (session, llm, _):

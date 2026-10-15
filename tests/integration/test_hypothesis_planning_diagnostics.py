@@ -72,6 +72,7 @@ def _valid_plan():
             }],
         }],
         "reason": "One scoped observation is useful",
+        "termination": "continue",
     }
 
 
@@ -125,6 +126,7 @@ async def test_split_outer_schema_gate_keeps_declared_field_location(tmp_path):
                 "description": "Inspect the preserved response",
             }],
         }],
+        "termination": "continue",
         # The missing required reason sends this through the normal outer JSON Schema gate.
     }
     llm = PlannerResponseLLM(plan=response)

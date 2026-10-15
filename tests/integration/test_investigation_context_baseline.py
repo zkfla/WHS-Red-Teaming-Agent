@@ -30,10 +30,12 @@ class MeasuredDouble(SplitDouble):
     def __init__(self, *, lookups=False):
         super().__init__([_new_candidate_plan()], [_new_candidate_atom])
         if lookups:
-            self.plans[:0] = [{"reason": "Find a past purpose", "context_request": {
+            self.plans[:0] = [{"reason": "Find a past purpose", "questions": [],
+                               "termination": "continue", "context_request": {
                 "context": {"kind": "task", "mode": "list", "text": "Historical observation",
                             "count": 1}}},
-                {"reason": "Read its original conditions", "context_request": {"context": {
+                {"reason": "Read its original conditions", "questions": [],
+                 "termination": "continue", "context_request": {"context": {
                     "kind": "task", "mode": "read",
                     "refs": [{"kind": "task", "identity": "history-0"}]}}}]
         self.envelopes = []

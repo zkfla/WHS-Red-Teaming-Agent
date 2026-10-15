@@ -218,6 +218,7 @@ async def test_anonymous_observation_candidate_probe_same_candidate_feedback_and
                 question("check", revisions={"premise": 1}, source=source, evidence=evidence)
             ],
             "reason": "Test the stated uncertainty",
+            "termination": "continue",
         }
 
     def reconsider(payload):
@@ -244,7 +245,11 @@ async def test_anonymous_observation_candidate_probe_same_candidate_feedback_and
 
     llm = FeedbackDouble(
         [
-            {"questions": [question("initial")], "reason": "Collect initial context"},
+            {
+                "questions": [question("initial")],
+                "reason": "Collect initial context",
+                "termination": "continue",
+            },
             propose,
             reconsider,
         ]
@@ -323,15 +328,25 @@ async def test_runtime_defect_preserves_originals_and_reaches_planner_independen
             return {
                 "questions": [question("independent", source=source)],
                 "reason": "Narrow a separate response premise from the preserved observation",
+                "termination": "continue",
             }
         return {
             "reason": "All useful next work depends on handler source correction",
+            "questions": [],
             "termination": "held",
             "resume_conditions": ["Correct the handler implementation"],
         }
 
     llm = FeedbackDouble(
-        [{"questions": [question("initial")], "reason": "Observe context"}, next_plan], defect=True
+        [
+            {
+                "questions": [question("initial")],
+                "reason": "Observe context",
+                "termination": "continue",
+            },
+            next_plan,
+        ],
+        defect=True,
     )
     async with selection(tmp_path, tools=provider([response(), response()]), llm=llm) as (
         session,
