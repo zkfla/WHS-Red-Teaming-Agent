@@ -1,28 +1,24 @@
-"""C handoff evidence: legacy empty-continue behavior remains unchanged for this packet.
-
-This test uses the repository's FakeLLMClient and development harness only. After B's bounded
-follow-up interface is frozen, C should make an empty legacy `continue` with no questions and no
-existing-work witness produce the same structured repair used by the probe planner. That future
-expectation is intentionally not asserted here; this test pins the currently accepted behavior.
-"""
+"""Legacy investigation planning uses the shared bounded progression contract."""
 
 import asyncio
-import json
 
 from redteam.attack_graph.service import AttackGraphService
 from redteam.llm.fake import FakeLLMClient
 from redteam.orchestration.central_runtime import ready_workers
 from redteam.orchestration.hypothesis_planner import PLANNING_INVALIDATED
 from redteam.orchestration.specialist_planner import SpecialistPlanner
+from tests.integration.test_central_development import register as register_legacy_task
 from tests.integration.test_hypothesis_planner import PlannerDouble, selection
 from tests.integration.test_probe_workers import PROFILE, register
 from tests.integration.test_probe_workers import selection as profile_selection
 
 
-async def test_legacy_empty_continue_is_currently_persisted_without_questions(tmp_path):
-    llm = FakeLLMClient(structured_responses=[{
-        "questions": [], "reason": "No questions were proposed", "termination": "continue",
-    }])
+async def test_legacy_pathless_continue_repairs_to_one_bounded_replan(tmp_path):
+    llm = FakeLLMClient(structured_responses=[
+        {"questions": [], "reason": "No questions were proposed", "termination": "continue"},
+        {"questions": [], "reason": "Request one finite reconsideration",
+         "termination": "replan"},
+    ])
     async with profile_selection(
         tmp_path, profile=PROFILE.with_name("native-specialists.yaml"), llm=llm,
     ) as (session, llm, tools):
@@ -32,18 +28,39 @@ async def test_legacy_empty_continue_is_currently_persisted_without_questions(tm
         assert await planner.advance(session.runtime) == []
 
         tasks_after = await session.deps.central_state.list_tasks()
-        saved = await session.deps.central_state.transaction(
-            lambda tx: json.loads(tx.db.execute(
-                "SELECT payload FROM state_requests WHERE run_id=? "
-                "AND kind='planner_termination' AND identity=?",
-                (tx.run_id, tx.run_id),
-            ).fetchone()[0]),
-            write=False,
+        status = await session.deps.central_state.planner_progress_status()
+        sequence = await session.deps.central_state.transaction(
+            lambda tx: tx.latest_event_sequence([PLANNING_INVALIDATED]), write=False,
         )
-        assert len(llm.requests) == 1
+        assert len(llm.requests) == 2
         assert tasks_after == tasks_before
-        assert saved["termination"] == "continue"
-        assert saved["reason"] == "No questions were proposed"
+        assert status is not None and status.kind == "replan_queued"
+        assert (status.replan_count, status.replan_limit) == (1, 3)
+        assert status.cause_code == "planner_replan_requested"
+        assert sequence == 1
+
+
+async def test_legacy_continue_requires_a_canonical_claimable_task_witness(tmp_path):
+    llm = FakeLLMClient()
+    async with profile_selection(
+        tmp_path, profile=PROFILE.with_name("native-specialists.yaml"), llm=llm,
+    ) as (session, llm, tools):
+        task_id, = await register_legacy_task(session, "legacy-continue-witness")
+        llm._canned_structured = {
+            "questions": [],
+            "reason": "Continue with the registered ready investigation",
+            "termination": "continue",
+            "reviewed_task_ids": [task_id],
+        }
+
+        assert await SpecialistPlanner(session.deps).advance(session.runtime) == []
+
+        status = await session.deps.central_state.planner_progress_status()
+        assert status is not None and status.kind == "existing_work"
+        assert (status.replan_count, status.replan_limit) == (0, 3)
+        assert await session.deps.central_state.transaction(
+            lambda tx: tx.latest_event_sequence([PLANNING_INVALIDATED]), write=False,
+        ) == 0
 
 
 async def test_referenced_ready_work_drift_invalidates_continue_snapshot(tmp_path):

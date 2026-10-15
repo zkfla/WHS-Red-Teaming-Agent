@@ -8,7 +8,7 @@ import asyncio
 from copy import deepcopy
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from redteam.attack_graph.service import AttackGraphService
 from redteam.core.contracts.completion import ALLOWED_CRITERION_KINDS
@@ -19,6 +19,7 @@ from redteam.orchestration.cognition import (
     DecisionValidationError,
     StructuredDecisionClient,
 )
+from redteam.orchestration.coordination import PlanningInputsChanged
 from redteam.orchestration.diagnostics import DecisionDiagnostic
 from redteam.orchestration.engine import InvestigationEngine
 from redteam.orchestration.knowledge_validation import known_principals, known_target_ids
@@ -30,7 +31,6 @@ from redteam.orchestration.specialist_tasks import (
     SpecialistProposalError,
     StrategyTasks,
     TaskNecessityProposal,
-    apply_necessity_adjustments,
     validate_necessity_proposals,
     validate_strategy_questions,
     validate_strategy_tasks,
@@ -41,8 +41,28 @@ class StrategyDraft(BaseModel):
     model_config = ConfigDict(extra="forbid")
     questions: list[InvestigationQuestion]
     reason: str = Field(min_length=1)
-    termination: Literal["continue", "exhausted", "goal_achieved", "held"] = "continue"
+    termination: Literal["continue", "replan", "exhausted", "goal_achieved", "held"] = "continue"
+    reviewed_task_ids: list[str] = Field(default_factory=list)
+    resume_conditions: list[str] = Field(default_factory=list)
     task_adjustments: list[TaskNecessityProposal] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _judgment_shape(self) -> "StrategyDraft":
+        if not self.reason.strip():
+            raise ValueError("planner_reason_blank")
+        if len(set(self.reviewed_task_ids)) != len(self.reviewed_task_ids):
+            raise ValueError("planner_reviewed_task_ids_duplicate")
+        if any(not item.strip() for item in self.reviewed_task_ids):
+            raise ValueError("planner_reviewed_task_id_blank")
+        if self.termination != "continue" and (self.questions or self.reviewed_task_ids):
+            raise ValueError("planner_terminal_judgment_has_work")
+        if self.termination in {"held", "exhausted"} and not any(
+            item.strip() for item in self.resume_conditions
+        ):
+            raise ValueError("planner_resume_condition_required")
+        if any(not item.strip() for item in self.resume_conditions):
+            raise ValueError("planner_resume_condition_blank")
+        return self
 
 
 class AtomizationDraft(BaseModel):
@@ -72,10 +92,10 @@ def _schema_with_completion_criterion_hint(schema: dict[str, Any]) -> dict[str, 
 def specialist_planning_inputs(deps) -> dict:
     """Assembler-owned input identity, also checked before reservation recovery."""
     inputs = {
-        # Schema 3 is the candidate-planner/common-worker meaning.  Keeping the
-        # old value for historical profiles prevents a stored schema-2 Run from
-        # being silently reinterpreted when bindings are compared on resume.
-        "schema_version": 3 if deps.specialist_policy.probe_limits is not None else 2,
+        # Schema 3 is the candidate-planner/common-worker meaning. Schema 4 adds
+        # bounded progression to the legacy investigation planner; prior snapshots
+        # keep their original identity and are not reinterpreted on resume.
+        "schema_version": 3 if deps.specialist_policy.probe_limits is not None else 4,
         # Assembly assigns a fresh created_at on every CLI rebuild. It is not
         # scope/policy and must not stale an otherwise identical saved Run.
         # All substantive fields, including the original engagement ID, remain.
@@ -165,11 +185,12 @@ class SpecialistPlanner:
         from redteam.core.contracts.events import EventType
         from redteam.orchestration.central_results import RESULT_UPDATED
         from redteam.orchestration.central_runtime import ACTOR_RETURNED
+        from redteam.orchestration.planner_progress import PLANNING_INVALIDATED
 
         return frozenset({RESULT_UPDATED, ACTOR_RETURNED, EventType.GRAPH_UPDATED,
                           EventType.EVIDENCE_CREATED, EventType.EVIDENCE_VALIDITY_CHANGED,
                           EventType.TASK_COMPLETED,
-                          EventType.OPERATOR_INTENT_APPLIED})
+                          EventType.OPERATOR_INTENT_APPLIED, PLANNING_INVALIDATED})
 
     async def advance(self, runtime) -> list[str]:
         """Propose current work under the selected planning contract and shared Run budget."""
@@ -188,12 +209,26 @@ class SpecialistPlanner:
         """Judge current investigations at a notification, without graph-digest gates."""
         from redteam.orchestration.agents.tool_access import role_readiness
         from redteam.orchestration.central_completion import goal_snapshot
-        from redteam.orchestration.central_runtime import process_controls, runtime_token
+        from redteam.orchestration.central_runtime import (
+            process_controls,
+            runtime_token,
+            task_is_claimable,
+        )
+        from redteam.orchestration.planner_progress import PLANNING_INVALIDATED
         from redteam.orchestration.specialist_tasks import register_investigation_tasks
 
         await process_controls(self.deps)
         await runtime_token(self.deps, runtime, require_task=False)
         runtime = runtime.model_copy(update={"active_task_id": None, "current_agent": None})
+        wake_kinds = tuple(self.wake_events())
+        sequence = await self.deps.central_state.transaction(
+            lambda tx: tx.latest_event_sequence(wake_kinds), write=False,
+        )
+        consumed = await self.deps.central_state.transaction(
+            lambda tx: tx.hypothesis_planner_cursor(), write=False,
+        )
+        if consumed is not None and sequence <= consumed:
+            return []
         stamp = await self.deps.central_state.transaction(
             lambda tx: goal_snapshot(tx, include_assessment=False)[2], write=False,
         )
@@ -209,12 +244,17 @@ class SpecialistPlanner:
         targets, principals = known_target_ids(material), known_principals(material)
         hypotheses = await AttackGraphService(self.deps.graph_store).list_hypotheses()
         hypothesis_ids = frozenset(h.hypothesis_id for h in hypotheses)
+        candidate_revisions = {str(item.hypothesis_id): item.revision for item in hypotheses}
+        readiness = await role_readiness(self.deps)
+        eligible_roles = {
+            item["role_id"] for item in readiness if item["activation_eligible"]
+        }
         payload = redact_secret_material({
             "goal": context["goal"], "success_criteria": context["success_criteria"],
             "constraints": context.get("engagement_constraints"),
             "knowledge": context["knowledge"], "roles": context["roles"],
             "tools_by_role": context["tools_by_role"], "tool_cards": context["tool_cards"],
-            "role_readiness": await role_readiness(self.deps),
+            "role_readiness": readiness,
             "evidence_index": context["evidence_index"], "evidence": context["evidence"],
             "evidence_validity": context["evidence_validity"],
             "investigations": context["investigation_tasks"],
@@ -237,11 +277,29 @@ class SpecialistPlanner:
                     known_principals=principals, known_hypotheses=hypothesis_ids,
                     investigation_only=True,
                 )
+                if set(draft.reviewed_task_ids) - existing_tasks.keys():
+                    raise SpecialistProposalError("planner_reviewed_task_unknown")
+                if draft.termination == "continue" and not draft.questions:
+                    if not draft.reviewed_task_ids:
+                        raise SpecialistProposalError("planner_continue_requires_progress")
+                    if not any(
+                        task_is_claimable(
+                            existing_tasks[identity], eligible_roles=eligible_roles,
+                            mission=mission, require_probe_limits=False,
+                            candidate_revisions=candidate_revisions, allow_running=True,
+                        )
+                        for identity in draft.reviewed_task_ids
+                    ):
+                        raise SpecialistProposalError(
+                            "planner_continue_without_claimable_work",
+                        )
                 validate_necessity_proposals(
                     draft.task_adjustments, mission=mission, tasks_by_id=existing_tasks,
                     evidence_ids=set(context["evidence_index"]),
                 )
-            except SpecialistProposalError as exc:
+            except (ValueError, SpecialistProposalError) as caught:
+                exc = (caught if isinstance(caught, SpecialistProposalError)
+                       else SpecialistProposalError("specialist_invalid_proposal"))
                 if exc.code.startswith("planner_adjustment_"):
                     raise DecisionValidationError(DecisionDiagnostic(
                         code=exc.code, stage="attack_path_proposal", kind="validation",
@@ -264,6 +322,49 @@ class SpecialistPlanner:
             except SpecialistProposalError as exc:
                 raise self._rejection(exc, "task_atomization") from exc
 
+        async def commit_pass(atomization):
+            """One planner commit: admitted inputs, adjustments, Tasks and judgment together."""
+            identity = new_id("planner_pass")
+            judgment = {
+                **strategy.model_dump(mode="json"),
+                "sequence": sequence,
+                "tasks": [] if atomization is None else [
+                    item.task_key for item in atomization.tasks],
+                "replan_max_passes": self.deps.settings.planner_replan_max_passes,
+                "witness_inputs": {
+                    "eligible_roles": sorted(eligible_roles),
+                    "require_probe_limits": False,
+                },
+            }
+
+            def guard(tx):
+                tx.admit()
+                # Any wake-kind event or goal change since the snapshot makes these inputs stale.
+                return (tx.latest_event_sequence(wake_kinds) == sequence
+                        and goal_snapshot(tx, include_assessment=False)[2] == stamp)
+
+            registration = None if atomization is None else StrategyTasks(
+                questions=strategy.questions, tasks=atomization.tasks)
+            try:
+                identities = await register_investigation_tasks(
+                    self.deps.central_state, proposal_id=identity, proposal=registration,
+                    agents=self.deps.agents, known_targets=targets, known_principals=principals,
+                    known_hypotheses=hypothesis_ids, max_tasks=self.policy.max_tasks_per_strategy,
+                    evidence_store=self.deps.evidence_store, expected_revision=mission.revision,
+                    necessity=strategy.task_adjustments, planner_judgment=judgment,
+                    planning_guard=guard,
+                )
+            except PlanningInputsChanged:
+                from redteam.orchestration.central_runtime import event
+
+                await self.deps.central_state.transaction(lambda tx: tx.queue(event(
+                    self.deps.central_state, PLANNING_INVALIDATED,
+                    {"pass_id": identity, "reason_code": "related_planning_inputs_changed"},
+                )))
+                identities = []
+            await self.deps.event_bus.flush()
+            return identities
+
         with llm_request_scope(str(runtime.run_id), "specialist_planning"), llm_request_guard(
             admission_guard
         ):
@@ -276,9 +377,14 @@ class SpecialistPlanner:
                 before_call=admission_guard,
                 system="Propose useful investigation questions from current tasks, results and "
                        "their follow-up questions. Reinvestigation may reuse the same evidence. "
-                       "Do not create ordering dependencies or paths. If no useful investigation "
-                       "remains, propose termination=exhausted and justify it from the supplied "
-                       "results and unresolved questions. Empty questions otherwise means held. "
+                       "Do not create ordering dependencies or paths. Continue only with new "
+                       "questions or reviewed_task_ids for currently claimable/running work. "
+                       "Use replan with no questions to request one bounded follow-up judgment "
+                       "when useful work may become clear; it spends the Run's finite allowance. "
+                       "Use held with a precise resume_conditions entry when work needs an "
+                       "external prerequisite. Use exhausted with resume_conditions when no "
+                       "useful authorized investigation remains. goal_achieved is only a proposal "
+                       "for the separate completion review. Do not prescribe tool order. "
                        "Prefer investigations named by operator_guidance. A registered task that "
                        "is no longer needed may be proposed under task_adjustments with "
                        "goal, criterion or result grounds. "
@@ -286,28 +392,7 @@ class SpecialistPlanner:
                        "Tools and text do not grant execution permission.",
             ))
             if not strategy.questions:
-                await apply_necessity_adjustments(
-                    self.deps.central_state, strategy.task_adjustments,
-                    expected_revision=mission.revision,
-                    evidence_store=self.deps.evidence_store,
-                )
-
-                def record_judgment(tx):
-                    import json
-                    tx.admit()
-                    if goal_snapshot(tx, include_assessment=False)[2] != stamp:
-                        # The next notification/scan evaluates the new originals.
-                        return
-                    tx.db.execute(
-                        "INSERT INTO state_requests VALUES(?,'planner_termination',?,?) "
-                        "ON CONFLICT(run_id,kind,identity) DO UPDATE SET payload=excluded.payload",
-                        (tx.run_id, tx.run_id, json.dumps({
-                            "termination": strategy.termination,
-                            "reason": strategy.reason, "inputs": stamp,
-                        })),
-                    )
-                await self.deps.central_state.transaction(record_judgment)
-                return []
+                return await commit_pass(None)
             atomization = AtomizationDraft.model_validate(await self.client.ask(
                 stage="task_atomization", budget=budget,
                 payload={**payload, "questions": [q.model_dump(mode="json")
@@ -323,24 +408,18 @@ class SpecialistPlanner:
                        "from the original result item. Only registered ready roles "
                        "and known subjects.",
             ))
-        await apply_necessity_adjustments(
-            self.deps.central_state, strategy.task_adjustments,
-            expected_revision=mission.revision,
-            evidence_store=self.deps.evidence_store,
-        )
-        identities = await register_investigation_tasks(
-            self.deps.central_state, proposal_id=new_id("registration"),
-            proposal=StrategyTasks(questions=strategy.questions, tasks=atomization.tasks),
-            agents=self.deps.agents, known_targets=targets, known_principals=principals,
-            known_hypotheses=hypothesis_ids, max_tasks=self.policy.max_tasks_per_strategy,
-            evidence_store=self.deps.evidence_store, expected_revision=mission.revision,
-        )
-        await self.deps.event_bus.flush()
-        return identities
+        return await commit_pass(atomization)
 
 
     @staticmethod
     def _rejection(error, stage):
+        location = "$.questions" if stage == "attack_path_proposal" else "$.tasks"
+        diagnostic = getattr(error, "diagnostic", None)
+        if isinstance(diagnostic, DecisionDiagnostic):
+            return DecisionValidationError(diagnostic.model_copy(update={
+                "stage": stage,
+                "location": location,
+            }))
         summary = _REJECTION_SUMMARIES.get(
             error.code,
             "The proposal failed the captured subject, dependency or condition contract.",
@@ -348,7 +427,7 @@ class SpecialistPlanner:
         return DecisionValidationError(DecisionDiagnostic(
             code=error.code, stage=stage, kind="validation", retryable=True,
             summary=summary,
-            location="$.questions" if stage == "attack_path_proposal" else "$.tasks",
+            location=location,
         ))
 
 
@@ -358,6 +437,14 @@ class SpecialistPlanner:
 #: the contract gives the model nothing to act on (section 5: code decides, but a
 #: validation failure still owes the proposer an actionable reason).
 _REJECTION_SUMMARIES: dict[str, str] = {
+    "specialist_invalid_proposal": "Return a judgment that matches the supplied schema and "
+        "preserves the stated work and progress conditions.",
+    "planner_reviewed_task_unknown": "reviewed_task_ids must name Tasks in this Run.",
+    "planner_continue_requires_progress": "Continue requires proposed questions or a reviewed "
+        "claimable/running Task; use replan for one bounded follow-up judgment, held for an "
+        "external prerequisite, or exhausted when no useful work remains.",
+    "planner_continue_without_claimable_work": "Continue requires a reviewed Task that remains "
+        "claimable or running for an eligible role; otherwise choose a different disposition.",
     "specialist_duplicate_identity": "question_id/task_key values must be unique.",
     "specialist_blank_subject": "objective and every target_node_ids entry must be non-blank.",
     "specialist_blank_title": "title must be non-blank.",

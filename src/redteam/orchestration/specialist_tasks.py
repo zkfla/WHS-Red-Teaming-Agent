@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -20,9 +20,6 @@ from redteam.core.enums import TaskStatus
 from redteam.core.ids import AgentId, EventId, EvidenceId, GraphNodeId, HypothesisId, RunId, TaskId
 from redteam.orchestration.agents.registry import AgentRegistry
 from redteam.orchestration.coordination import content_hash
-
-if TYPE_CHECKING:
-    from redteam.orchestration.central_state import CheckedEvidence
 
 
 class InvestigationQuestion(BaseModel):
@@ -183,28 +180,49 @@ def validate_strategy_tasks(
 
 
 async def register_investigation_tasks(
-    state, *, proposal_id: str, proposal: StrategyTasks, agents: AgentRegistry,
+    state, *, proposal_id: str, proposal: StrategyTasks | None, agents: AgentRegistry,
     known_targets: set[str], known_principals: set[str], max_tasks: int,
     evidence_store, expected_revision: int | None = None,
     known_hypotheses: frozenset[str] = frozenset(),
+    necessity=(), planner_judgment: dict | None = None, planning_guard=None,
 ) -> list[str]:
-    """Exact registration identity, without semantic deduplication or a Work queue."""
+    """Exact registration identity, without semantic deduplication or a Work queue.
+
+    Planner passes add necessity adjustments, Tasks and their judgment here, so the three
+    commit in one transaction after `planning_guard(tx)` admits the planning inputs. A
+    refused guard writes nothing and returns []. A None proposal registers no Tasks.
+    """
     from redteam.orchestration.central_state import check_evidence
     from redteam.orchestration.coordination import StateConflict
 
-    keys = validate_strategy_tasks(
-        proposal, agents=agents, known_targets=known_targets,
-        known_principals=known_principals, max_tasks=max_tasks,
-        known_hypotheses=known_hypotheses, investigation_only=True,
-    )
-    proposal = proposal.model_copy(deep=True)
-    checked = await check_evidence(
-        evidence_store, run_id=state.run_id, engagement_id=state.engagement_id,
-        evidence_ids=[ref for task in proposal.tasks for ref in task.evidence_ids],
-    )
-    payload_hash = content_hash(proposal)
+    keys: list[str] = []
+    checked = ()
+    if proposal is not None:
+        keys = validate_strategy_tasks(
+            proposal, agents=agents, known_targets=known_targets,
+            known_principals=known_principals, max_tasks=max_tasks,
+            known_hypotheses=known_hypotheses, investigation_only=True,
+        )
+        proposal = proposal.model_copy(deep=True)
+        checked = await check_evidence(
+            evidence_store, run_id=state.run_id, engagement_id=state.engagement_id,
+            evidence_ids=[ref for task in proposal.tasks for ref in task.evidence_ids],
+        )
+    adjustment_checked = await _necessity_evidence(state, evidence_store, necessity)
 
     def register(tx):
+        if planning_guard is not None and not planning_guard(tx):
+            return []
+        if necessity:
+            _adjust_necessity_in_tx(
+                tx, necessity, expected_revision=expected_revision,
+                checked=adjustment_checked,
+            )
+        if proposal is None:
+            if planner_judgment is not None:
+                tx.finish_hypothesis_judgment(proposal_id, planner_judgment)
+            return []
+        payload_hash = content_hash(proposal)
         mission = tx.get_mission(tx.binding()[0])
         if expected_revision is not None and mission.revision != expected_revision:
             raise StateConflict("planning_goal_changed")
@@ -241,8 +259,49 @@ async def register_investigation_tasks(
                 source="orchestration.specialist_tasks", correlation_id=state.run_id,
                 payload={"mission_id": str(mission.mission_id), "task_id": str(task.task_id)},
             ))
+        if planner_judgment is not None:
+            tx.finish_hypothesis_judgment(proposal_id, planner_judgment)
         return [str(task.task_id) for task in saved]
     return await state.transaction(register)
+
+
+async def _necessity_evidence(state, evidence_store, proposals) -> tuple:
+    """Verified evidence refs for necessity adjustments, checked before the transaction."""
+    from redteam.orchestration.central_state import check_evidence
+    from redteam.orchestration.coordination import CoordinationError
+
+    refs = sorted({ref for item in proposals for ref in item.evidence_ids if ref.strip()})
+    if not refs:
+        return ()
+    if evidence_store is None:
+        raise CoordinationError("planner_adjustment_evidence_unverifiable")
+    return await check_evidence(
+        evidence_store, run_id=state.run_id, engagement_id=state.engagement_id,
+        evidence_ids=refs,
+    )
+
+
+def _adjust_necessity_in_tx(tx, proposals, *, expected_revision, checked) -> list[str]:
+    """Apply reviewed necessity adjustments inside an open transaction; the caller commits."""
+    from redteam.orchestration.coordination import StateConflict
+
+    mission = tx.get_mission(tx.binding()[0])
+    if expected_revision is not None and mission.revision != expected_revision:
+        raise StateConflict("planning_goal_changed")
+    if checked:
+        tx.add_evidence_refs(checked)
+    applied = []
+    for item in proposals:
+        updated = tx.adjust_task_necessity(
+            item.task_id, action=item.action, required=item.required, reason=item.reason,
+            goal_revision=item.goal_revision, owner=item.owner, version=item.version,
+            criterion_refs=item.criterion_refs, evidence_ids=item.evidence_ids,
+            source_task_id=item.source_task_id,
+            source_result_id=item.source_result_id,
+            source_question_id=item.source_question_id,
+        )
+        applied.append(str(updated.task_id))
+    return applied
 
 
 class TaskNecessityProposal(BaseModel):
@@ -315,38 +374,10 @@ async def apply_necessity_adjustments(
 ) -> list[str]:
     if not proposals:
         return []
-    from redteam.orchestration.central_state import check_evidence
-    from redteam.orchestration.coordination import CoordinationError, StateConflict
-
-    refs = sorted({ref for item in proposals for ref in item.evidence_ids if ref.strip()})
-    checked: tuple[CheckedEvidence, ...] = ()
-    if refs:
-        if evidence_store is None:
-            raise CoordinationError("planner_adjustment_evidence_unverifiable")
-        checked = await check_evidence(
-            evidence_store, run_id=state.run_id, engagement_id=state.engagement_id,
-            evidence_ids=refs,
-        )
-
-    def adjust(tx):
-        mission = tx.get_mission(tx.binding()[0])
-        if expected_revision is not None and mission.revision != expected_revision:
-            raise StateConflict("planning_goal_changed")
-        if checked:
-            tx.add_evidence_refs(checked)
-        applied = []
-        for item in proposals:
-            updated = tx.adjust_task_necessity(
-                item.task_id, action=item.action, required=item.required, reason=item.reason,
-                goal_revision=item.goal_revision, owner=item.owner, version=item.version,
-                criterion_refs=item.criterion_refs, evidence_ids=item.evidence_ids,
-                source_task_id=item.source_task_id,
-                source_result_id=item.source_result_id,
-                source_question_id=item.source_question_id,
-            )
-            applied.append(str(updated.task_id))
-        return applied
-    return await state.transaction(adjust)
+    checked = await _necessity_evidence(state, evidence_store, proposals)
+    return await state.transaction(lambda tx: _adjust_necessity_in_tx(
+        tx, proposals, expected_revision=expected_revision, checked=checked,
+    ))
 
 
 class ProbeTaskProposal(BaseModel):
