@@ -6,7 +6,7 @@ import asyncio
 import io
 import json
 import time
-from types import SimpleNamespace
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -22,10 +22,22 @@ from redteam.app.cli.conversation import (
 from redteam.app.cli.session_controller import SessionController
 from redteam.app.cli.session_types import RunResult
 from redteam.app.cli.terminal_frontend import ConsoleFrontend
+from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
+from redteam.core.enums import MissionStatus
 from redteam.core.ids import EngagementId, MissionId, RunId
 from redteam.core.ports.llm import LLMProviderFailure
+from redteam.event_bus import InMemoryEventBus
+from redteam.llm.fake import FakeLLMClient
+from redteam.orchestration.central_state import CentralStateStore
 from redteam.orchestration.cognition import DecisionFailure
+from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.diagnostics import DecisionDiagnostic
+from redteam.orchestration.operator_intents.models import IntentExplanation, IntentStatusReport
+from redteam.orchestration.operator_intents.service import OperatorIntentService
+from redteam.orchestration.settings import OrchestrationSettings
+from tests.fakes.control_plane import FakeControlPlane
+from tests.fakes.evidence_store import FakeEvidenceStore
+from tests.fakes.tool_gateway import DummyToolGateway
 
 SECRET = "sk-live-conversation-diagnostic-marker"
 QUESTION = "지금 어떤 상태야?"
@@ -82,12 +94,19 @@ class _RaisingConversation:
         raise RuntimeError(f"raw provider body {SECRET}")
 
 
-class _FakeIntentService:
-    async def status(self, *, mission_id: Any) -> Any:
-        return SimpleNamespace(summary="status")
+class _FakeIntentService(OperatorIntentService):
+    """Public status/explain surface; the store-backed constructor is not run."""
 
-    async def explain(self, *, mission_id: Any, run_id: Any) -> Any:
-        return SimpleNamespace(summary="explain")
+    def __init__(self) -> None:
+        pass
+
+    async def status(self, *, mission_id: MissionId) -> IntentStatusReport:
+        return IntentStatusReport(mission_id=mission_id, mission_status=MissionStatus.ACTIVE)
+
+    async def explain(self, *, mission_id: MissionId, run_id: RunId) -> IntentExplanation:
+        return IntentExplanation(
+            mission_id=mission_id, summary="explain", mission_status=MissionStatus.ACTIVE
+        )
 
 
 def _rate_limited() -> LLMProviderFailure:
@@ -215,6 +234,8 @@ async def test_concurrent_decisions_keep_separate_budgets() -> None:
     first, second = await asyncio.gather(_decide_error(assistant), _decide_error(assistant))
 
     assert len(llm.calls) == 12
+    assert first.diagnostic is not None
+    assert second.diagnostic is not None
     assert first.diagnostic.attempts == 6
     assert second.diagnostic.attempts == 6
     assert first.diagnostic.stage_attempts == {"conversation_decide": 6}
@@ -249,6 +270,7 @@ async def test_provider_exception_message_never_reaches_the_diagnostic() -> None
 
     error = await _decide_error(ConversationAssistant(llm))
 
+    assert error.diagnostic is not None
     dumped = error.diagnostic.model_dump_json()
     assert SECRET not in dumped
     assert "raw response body" not in dumped
@@ -365,10 +387,24 @@ def test_initial_interpretation_notice_shows_the_safe_cause() -> None:
 
 
 @pytest.mark.asyncio
-async def test_operator_chat_failure_keeps_the_cause_and_the_run_continues() -> None:
+async def test_operator_chat_failure_keeps_the_cause_and_the_run_continues(
+    tmp_path: Path,
+) -> None:
     lines: list[str] = []
+    deps = RuntimeDeps(
+        control_plane=FakeControlPlane(),
+        tool_gateway=DummyToolGateway(),
+        event_bus=InMemoryEventBus(),
+        graph_store=InMemoryAttackGraphStore(),
+        evidence_store=FakeEvidenceStore(),
+        llm_client=FakeLLMClient(),
+        central_state=CentralStateStore(
+            tmp_path / "state.db", run_id="run_operator", engagement_id="eng_operator"
+        ),
+        settings=OrchestrationSettings(),
+    )
     console = run_command.OperatorConsole(
-        SimpleNamespace(settings=SimpleNamespace(llm_request_policy=None), tool_catalog=None),
+        deps,
         lines.append,
         identity=run_command.RuntimeIdentity(
             run_id=RunId("run_operator"),
