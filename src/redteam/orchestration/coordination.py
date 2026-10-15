@@ -15,6 +15,7 @@ from collections.abc import Callable, Coroutine, Hashable, Iterable, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from datetime import datetime
+from enum import Enum
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar, runtime_checkable
 
 from redteam.core.contracts.mission import MissionPlan, MissionTask
@@ -38,8 +39,32 @@ class StateConflict(PathVersionConflict):
     """A reviewed snapshot no longer describes the canonical state."""
 
 
+class PlanningInputChangeCode(str, Enum):
+    """Bounded causes emitted by the planning snapshot validators."""
+
+    GOAL_OR_BINDING_CHANGED = "planning_goal_or_binding_changed"
+    CANDIDATE_GRAPH_CHANGED = "candidate_related_graph_changed"
+    PROBE_RESULT_CHANGED = "probe_related_result_changed"
+    CONTEXT_EDGE_CHANGED = "planner_context_edge_changed"
+    CONTEXT_EXECUTION_CHANGED = "planner_context_execution_changed"
+    TERMINAL_INVENTORY_CHANGED = "planning_terminal_inventory_changed"
+    EXISTING_WORK_CHANGED = "planner_existing_work_changed"
+
+
+_PLANNING_INPUT_CHANGE_CODES = frozenset(item.value for item in PlanningInputChangeCode)
+_UNKNOWN_PLANNING_INPUT_CHANGE = "planning_inputs_changed"
+
+
 class PlanningInputsChanged(StateConflict):
     """A related planner input changed after its captured decision snapshot."""
+
+    def __init__(self, code: str) -> None:
+        # Preserve only owner-defined causes. Unknown strings may contain arbitrary data.
+        self.code = (
+            code if isinstance(code, str) and code in _PLANNING_INPUT_CHANGE_CODES
+            else _UNKNOWN_PLANNING_INPUT_CHANGE
+        )
+        super().__init__(self.code)
 
 
 class CandidateAdmissionConflict(StateConflict):

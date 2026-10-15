@@ -683,10 +683,12 @@ async def _finalize_hypothesis_pass(deps, snapshot, budget, *, identity, proposa
                 tx.finish_hypothesis_judgment(identity, judgment)
             await state.transaction(commit)
             identities = []
-    except PlanningInputsChanged:
+    except PlanningInputsChanged as exc:
+        cause_code = exc.code
         await state.transaction(lambda tx: tx.queue(event(
             state, PLANNING_INVALIDATED,
-            {"pass_id": identity, "reason_code": "related_planning_inputs_changed"},
+            {"pass_id": identity, "reason_code": "related_planning_inputs_changed",
+             "cause_code": cause_code},
         )))
         identities = []
     except CandidateAdmissionConflict as exc:
