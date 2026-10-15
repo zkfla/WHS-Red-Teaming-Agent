@@ -59,6 +59,14 @@ Initial plan created; implementation not yet claimed. Model assignment ledger is
 
 Pending independent plan review and actual test evidence. Record exact tests/artifacts and distinguish fake, physical provider, live LLM and Finding evidence.
 
+### 2026-10-15 integrated review and repair checkpoint
+
+Independent Sol reviewed the retained progress, admission diagnostics, source reuse, context-root capture, direct detach and read-only startup validation. Auxiliary agy/Gemini final review completed (job1792035226578649100-f6eb1b2d55f16c1ffc26b3d9). Concrete cache-loss false detach and empty context-root issues were accepted and repaired; a proposed closed-Run network bypass was rejected because canonical selection binding refuses before actual attachment. A separate explicit migration adapter defect was repaired: historical schema2 identity is reconstructed only for legacy schema4 source validation, while the native binding remains current. Candidate policy/substantive drift and entered executions remain refused. Sol accepted the narrow repair; root16 migration regressions passed.
+
+Root merged-state evidence:33 transport/config/target/context tests;25 conversation/transport/completion diagnostic tests;30 progress/reuse/web projection tests;32 central CLI/resume/collect/process tests; worker38 recovery/environment/preparation tests. Full source/test lint passed before the latest actively edited physical fixture. Source/test mypy passed before that new fixture; its remaining annotation is assigned. Both compose contracts pass. Earlier full suite4477PASS/132SKIP/25FAIL is retained as a failing baseline; targeted repairs do not claim a new full-suite PASS. PTY and two intermediate-planner regressions are still being repaired/rechecked.
+
+Actual Cat Jam High bank run executed2 GETs and stopped at high-risk approval; another run exhausted planner correction attempts. Neither establishes full analysis completion. Physical direct gateway proof reached an owned mock and detached, but the production assembly/Control/common-worker physical chain is not yet passing. F02/F03 therefore remain OPEN; final push and remote reconciliation remain pending. Parent integration plan contains the source commits and detailed dispositions.
+
 ## Requirement Traceability
 
 | Requirement | Implementation | Verification | Review | Status |
