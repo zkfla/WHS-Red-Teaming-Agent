@@ -424,7 +424,10 @@ async def test_selected_network_ledger_keeps_pool_window_sequence_on_reopen(tmp_
 
 
 async def test_stop_drains_parallel_calls_and_keeps_unconfirmed_resources():
-    llm = FakeLLMClient(canned_structured={"questions": [], "reason": "Await investigation"})
+    llm = FakeLLMClient(canned_structured={
+        "questions": [], "reason": "Held for current worker results", "termination": "held",
+        "resume_conditions": ["New worker result is committed"],
+    })
     tools = gateway(resource=True)
     tools.release.clear()
     async with build_central_development(
@@ -438,7 +441,18 @@ async def test_stop_drains_parallel_calls_and_keeps_unconfirmed_resources():
                 discover(TOOL), turn(inspect(f"call-{index}", account=f"session-{index}")),
             ]
         running = asyncio.create_task(selection.run())
-        await asyncio.wait_for(tools.wait_for_invocations(2), timeout=2)
+        try:
+            # Startup needs scheduler and worker time; the stop deadline below stays 2 seconds.
+            await asyncio.wait_for(tools.wait_for_invocations(2), timeout=10)
+        except asyncio.TimeoutError:
+            states = [(str(item.state), item.resource_execution_pending)
+                      for item in await selection.deps.central_state.list_executions()]
+            tasks = await selection.deps.central_state.list_tasks()
+            statuses = [str(item.status) for item in tasks]
+            raise AssertionError(
+                f"expected 2 started tool invocations within 10s, saw {len(tools.invocations)}; "
+                f"running_done={running.done()}; tasks={statuses}; executions={states}"
+            ) from None
         await selection.deps.central_state.append(IntentRecord(
             run_id=selection.runtime.run_id, correlation_id="stop-workers",
             intent=OperatorIntent(
