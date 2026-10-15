@@ -87,6 +87,20 @@ def _native_chat_completion_format(response_schema: dict[str, Any]) -> dict[str,
     }
 
 
+def _schema_json_system(system: str | None, response_schema: dict[str, Any]) -> str:
+    """Trusted schema instruction for providers that do not enforce the schema natively."""
+    instruction = (
+        "Respond with a single JSON object only -- no prose, no "
+        "markdown fences -- matching this JSON Schema: "
+        + json.dumps(response_schema)
+    )
+    return f"{system}\n\n{instruction}" if system else instruction
+
+
+def _is_native_schema_format(response_format: Any) -> bool:
+    return isinstance(response_format, Mapping) and response_format.get("type") == "json_schema"
+
+
 def _native_responses_format(response_schema: dict[str, Any]) -> dict[str, Any]:
     return {
         "type": "json_schema",
@@ -920,12 +934,7 @@ class LiteLLMClient:
             # the bare step_id text, not `{"step_id": ...}`) and every
             # `json.loads()` call fails. `response_schema` was already an
             # argument here; it was just never used until now.
-            json_instruction = (
-                "Respond with a single JSON object only -- no prose, no "
-                f"markdown fences -- matching this JSON Schema: "
-                f"{json.dumps(response_schema)}"
-            )
-            augmented_system = f"{system}\n\n{json_instruction}" if system else json_instruction
+            augmented_system = _schema_json_system(system, response_schema)
             text = await self._responses_text(
                 messages,
                 system=augmented_system,
@@ -944,13 +953,20 @@ class LiteLLMClient:
 
         import litellm
 
-        full_messages = ([{"role": "system", "content": system}] if system else []) + messages
         call_kwargs = self._call_kwargs(kwargs)
         if "response_format" not in call_kwargs:
             if _supports_native_json_schema(self._model):
                 call_kwargs["response_format"] = _native_chat_completion_format(response_schema)
             else:
                 call_kwargs["response_format"] = {"type": "json_object"}
+        # A native json_schema format carries the schema structurally. Any other format
+        # (JSON object mode or a caller-supplied one) gets the trusted schema text in the prompt.
+        full_system = system
+        if not _is_native_schema_format(call_kwargs.get("response_format")):
+            full_system = _schema_json_system(system, response_schema)
+        full_messages = (
+            [{"role": "system", "content": full_system}] if full_system else []
+        ) + messages
         try:
             response = await litellm.acompletion(
                 model=self._model,
@@ -1147,12 +1163,7 @@ class LiteLLMClient:
         """
         import litellm
 
-        json_instruction = (
-            "Respond with a single JSON object only -- no prose, no "
-            f"markdown fences -- matching this JSON Schema: "
-            f"{json.dumps(response_schema)}"
-        )
-        augmented_system = f"{system}\n\n{json_instruction}" if system else json_instruction
+        augmented_system = _schema_json_system(system, response_schema)
         converted = _responses_input_from_chat(messages)
         call_kwargs: dict[str, Any] = self._call_kwargs(kwargs)
         call_kwargs.pop("messages", None)
