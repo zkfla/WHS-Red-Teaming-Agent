@@ -24,7 +24,7 @@ from redteam.app.cli.session_types import RunResult
 from redteam.app.cli.terminal_frontend import ConsoleFrontend
 from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
 from redteam.core.enums import MissionStatus
-from redteam.core.ids import EngagementId, MissionId, RunId
+from redteam.core.ids import EngagementId, MissionId, OperatorIntentId, RunId, TaskId
 from redteam.core.ports.llm import LLMProviderFailure
 from redteam.event_bus import InMemoryEventBus
 from redteam.llm.fake import FakeLLMClient
@@ -103,7 +103,13 @@ class _FakeIntentService(OperatorIntentService):
     async def status(self, *, mission_id: MissionId) -> IntentStatusReport:
         return IntentStatusReport(mission_id=mission_id, mission_status=MissionStatus.ACTIVE)
 
-    async def explain(self, *, mission_id: MissionId, run_id: RunId) -> IntentExplanation:
+    async def explain(
+        self, *, mission_id: MissionId, run_id: RunId | None = None,
+        intent_id: OperatorIntentId | None = None,
+        task_ids: list[TaskId] | None = None,
+        endpoint_selectors: list[str] | None = None,
+        subjects: list[str] | None = None,
+    ) -> IntentExplanation:
         return IntentExplanation(
             mission_id=mission_id, summary="explain", mission_status=MissionStatus.ACTIVE
         )
