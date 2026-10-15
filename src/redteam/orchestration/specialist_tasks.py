@@ -7,8 +7,9 @@ from typing import TYPE_CHECKING, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from redteam.core.contracts.completion import (
+    CompletionConditionConflict,
     CompletionCriterion,
-    contradictory_candidate_verdict,
+    completion_condition_conflicts,
     criterion_id,
 )
 from redteam.core.contracts.events import EventEnvelope, EventType
@@ -58,8 +59,40 @@ class StrategyTasks(BaseModel):
 class SpecialistProposalError(ValueError):
     """Code-owned validation label; never contains model text or secrets."""
 
-    def __init__(self, code: str) -> None:
+    def __init__(
+        self, code: str, *,
+        condition_conflicts: tuple[CompletionConditionConflict, ...] = (),
+    ) -> None:
         self.code = code
+        self.condition_conflicts = condition_conflicts
+        if condition_conflicts:
+            from redteam.orchestration.diagnostics import DecisionDiagnostic
+
+            self.diagnostic = DecisionDiagnostic(
+                code=code,
+                stage="hypothesis_planning",
+                kind="validation",
+                summary=(
+                    "One investigation purpose contains both confirmation and refutation "
+                    "conditions for the same hypothesis."
+                ),
+                retryable=True,
+                cause_scope="model_input",
+                owner="planner",
+                repair_condition=(
+                    "Keep only one candidate verdict condition in each AND condition set; "
+                    "preserve observations and conditions for other candidates."
+                ),
+                criterion_ids=sorted({
+                    criterion_id for conflict in condition_conflicts
+                    for criterion_id in conflict.criterion_ids
+                }),
+                trace=[{
+                    "kind": "same_candidate_completion_condition_conflict",
+                    "hypothesis_id": conflict.hypothesis_id,
+                    "criterion_ids": list(conflict.criterion_ids),
+                } for conflict in condition_conflicts],
+            )
         super().__init__(code)
 
 
@@ -99,8 +132,12 @@ def _validate_subjects(
                 raise SpecialistProposalError("specialist_condition_principal_outside_subjects")
             if condition.hypothesis_id and condition.hypothesis_id not in known_hypotheses:
                 raise SpecialistProposalError("specialist_unknown_hypothesis")
-        if contradictory_candidate_verdict(item.completion_criteria) is not None:
-            raise SpecialistProposalError("specialist_contradictory_candidate_verdict")
+        conflicts = completion_condition_conflicts(item.completion_criteria)
+        if conflicts:
+            raise SpecialistProposalError(
+                "same_candidate_completion_condition_conflict",
+                condition_conflicts=conflicts,
+            )
 
 
 def validate_strategy_tasks(
@@ -146,28 +183,49 @@ def validate_strategy_tasks(
 
 
 async def register_investigation_tasks(
-    state, *, proposal_id: str, proposal: StrategyTasks, agents: AgentRegistry,
+    state, *, proposal_id: str, proposal: StrategyTasks | None, agents: AgentRegistry,
     known_targets: set[str], known_principals: set[str], max_tasks: int,
     evidence_store, expected_revision: int | None = None,
     known_hypotheses: frozenset[str] = frozenset(),
+    necessity=(), planner_judgment: dict | None = None, planning_guard=None,
 ) -> list[str]:
-    """Exact registration identity, without semantic deduplication or a Work queue."""
+    """Exact registration identity, without semantic deduplication or a Work queue.
+
+    Planner passes add necessity adjustments, Tasks and their judgment here, so the three
+    commit in one transaction after `planning_guard(tx)` admits the planning inputs. A
+    refused guard writes nothing and returns []. A None proposal registers no Tasks.
+    """
     from redteam.orchestration.central_state import check_evidence
     from redteam.orchestration.coordination import StateConflict
 
-    keys = validate_strategy_tasks(
-        proposal, agents=agents, known_targets=known_targets,
-        known_principals=known_principals, max_tasks=max_tasks,
-        known_hypotheses=known_hypotheses, investigation_only=True,
-    )
-    proposal = proposal.model_copy(deep=True)
-    checked = await check_evidence(
-        evidence_store, run_id=state.run_id, engagement_id=state.engagement_id,
-        evidence_ids=[ref for task in proposal.tasks for ref in task.evidence_ids],
-    )
-    payload_hash = content_hash(proposal)
+    keys: list[str] = []
+    checked: tuple[CheckedEvidence, ...] = ()
+    if proposal is not None:
+        keys = validate_strategy_tasks(
+            proposal, agents=agents, known_targets=known_targets,
+            known_principals=known_principals, max_tasks=max_tasks,
+            known_hypotheses=known_hypotheses, investigation_only=True,
+        )
+        proposal = proposal.model_copy(deep=True)
+        checked = await check_evidence(
+            evidence_store, run_id=state.run_id, engagement_id=state.engagement_id,
+            evidence_ids=[ref for task in proposal.tasks for ref in task.evidence_ids],
+        )
+    adjustment_checked = await _necessity_evidence(state, evidence_store, necessity)
 
     def register(tx):
+        if planning_guard is not None and not planning_guard(tx):
+            return []
+        if necessity:
+            _adjust_necessity_in_tx(
+                tx, necessity, expected_revision=expected_revision,
+                checked=adjustment_checked,
+            )
+        if proposal is None:
+            if planner_judgment is not None:
+                tx.finish_hypothesis_judgment(proposal_id, planner_judgment)
+            return []
+        payload_hash = content_hash(proposal)
         mission = tx.get_mission(tx.binding()[0])
         if expected_revision is not None and mission.revision != expected_revision:
             raise StateConflict("planning_goal_changed")
@@ -204,8 +262,49 @@ async def register_investigation_tasks(
                 source="orchestration.specialist_tasks", correlation_id=state.run_id,
                 payload={"mission_id": str(mission.mission_id), "task_id": str(task.task_id)},
             ))
+        if planner_judgment is not None:
+            tx.finish_hypothesis_judgment(proposal_id, planner_judgment)
         return [str(task.task_id) for task in saved]
     return await state.transaction(register)
+
+
+async def _necessity_evidence(state, evidence_store, proposals) -> tuple:
+    """Verified evidence refs for necessity adjustments, checked before the transaction."""
+    from redteam.orchestration.central_state import check_evidence
+    from redteam.orchestration.coordination import CoordinationError
+
+    refs = sorted({ref for item in proposals for ref in item.evidence_ids if ref.strip()})
+    if not refs:
+        return ()
+    if evidence_store is None:
+        raise CoordinationError("planner_adjustment_evidence_unverifiable")
+    return await check_evidence(
+        evidence_store, run_id=state.run_id, engagement_id=state.engagement_id,
+        evidence_ids=refs,
+    )
+
+
+def _adjust_necessity_in_tx(tx, proposals, *, expected_revision, checked) -> list[str]:
+    """Apply reviewed necessity adjustments inside an open transaction; the caller commits."""
+    from redteam.orchestration.coordination import StateConflict
+
+    mission = tx.get_mission(tx.binding()[0])
+    if expected_revision is not None and mission.revision != expected_revision:
+        raise StateConflict("planning_goal_changed")
+    if checked:
+        tx.add_evidence_refs(checked)
+    applied = []
+    for item in proposals:
+        updated = tx.adjust_task_necessity(
+            item.task_id, action=item.action, required=item.required, reason=item.reason,
+            goal_revision=item.goal_revision, owner=item.owner, version=item.version,
+            criterion_refs=item.criterion_refs, evidence_ids=item.evidence_ids,
+            source_task_id=item.source_task_id,
+            source_result_id=item.source_result_id,
+            source_question_id=item.source_question_id,
+        )
+        applied.append(str(updated.task_id))
+    return applied
 
 
 class TaskNecessityProposal(BaseModel):
@@ -278,38 +377,10 @@ async def apply_necessity_adjustments(
 ) -> list[str]:
     if not proposals:
         return []
-    from redteam.orchestration.central_state import check_evidence
-    from redteam.orchestration.coordination import CoordinationError, StateConflict
-
-    refs = sorted({ref for item in proposals for ref in item.evidence_ids if ref.strip()})
-    checked: tuple[CheckedEvidence, ...] = ()
-    if refs:
-        if evidence_store is None:
-            raise CoordinationError("planner_adjustment_evidence_unverifiable")
-        checked = await check_evidence(
-            evidence_store, run_id=state.run_id, engagement_id=state.engagement_id,
-            evidence_ids=refs,
-        )
-
-    def adjust(tx):
-        mission = tx.get_mission(tx.binding()[0])
-        if expected_revision is not None and mission.revision != expected_revision:
-            raise StateConflict("planning_goal_changed")
-        if checked:
-            tx.add_evidence_refs(checked)
-        applied = []
-        for item in proposals:
-            updated = tx.adjust_task_necessity(
-                item.task_id, action=item.action, required=item.required, reason=item.reason,
-                goal_revision=item.goal_revision, owner=item.owner, version=item.version,
-                criterion_refs=item.criterion_refs, evidence_ids=item.evidence_ids,
-                source_task_id=item.source_task_id,
-                source_result_id=item.source_result_id,
-                source_question_id=item.source_question_id,
-            )
-            applied.append(str(updated.task_id))
-        return applied
-    return await state.transaction(adjust)
+    checked = await _necessity_evidence(state, evidence_store, proposals)
+    return await state.transaction(lambda tx: _adjust_necessity_in_tx(
+        tx, proposals, expected_revision=expected_revision, checked=checked,
+    ))
 
 
 class ProbeTaskPurpose(BaseModel):
@@ -385,6 +456,18 @@ def validate_probe_subjects(proposal, *, known_targets, known_principals, known_
                        frozenset(known_hypotheses))
 
 
+def _candidate_verdict_trace(candidate_id: object, review_id: object) -> list[dict]:
+    """Safe candidate and review identity for a rejected verdict; unsafe values are dropped."""
+    from redteam.orchestration.coordination import safe_identifier
+
+    row = {}
+    for key, value in (("candidate_id", candidate_id), ("review_evidence_id", review_id)):
+        text = safe_identifier(value)
+        if text is not None:
+            row[key] = text
+    return [row] if row else []
+
+
 async def register_probe_tasks(
     deps, *, proposal_id: str, proposal: HypothesisProbeProposal, expected_revision: int,
     expected_binding_hash: str, graph_read: dict[str, str], known_targets: set[str],
@@ -401,15 +484,15 @@ async def register_probe_tasks(
     from redteam.attack_graph.service import AttackGraphService
     from redteam.orchestration.central_state import check_evidence
     from redteam.orchestration.completion import validate_result_claims
-    from redteam.orchestration.coordination import StateConflict
+    from redteam.orchestration.coordination import (
+        CandidateAdmissionConflict,
+        StateConflict,
+        safe_identifiers,
+    )
+    from redteam.orchestration.diagnostics import DecisionDiagnostic
     from redteam.orchestration.evidence_validity import capture_validity
 
     proposal = HypothesisProbeProposal.model_validate(proposal.model_dump())
-    known_hypotheses = {
-        item.hypothesis.hypothesis_id for item in proposal.updates
-    } | {identity for task in proposal.tasks for identity in task.hypothesis_revisions}
-    validate_probe_subjects(proposal, known_targets=known_targets,
-                            known_principals=known_principals, known_hypotheses=known_hypotheses)
     state = deps.central_state
     if not proposal_id.strip() or max_tasks < 1 or len(proposal.tasks) > max_tasks:
         raise StateConflict("probe_registration_identity_or_count_invalid")
@@ -419,6 +502,11 @@ async def register_probe_tasks(
     )
     if previous is not None:
         return previous
+    known_hypotheses = {
+        item.hypothesis.hypothesis_id for item in proposal.updates
+    } | {identity for task in proposal.tasks for identity in task.hypothesis_revisions}
+    validate_probe_subjects(proposal, known_targets=known_targets,
+                            known_principals=known_principals, known_hypotheses=known_hypotheses)
     mission_id = await state.transaction(lambda tx: tx.binding()[0], write=False)
     mission = await state.get_mission(mission_id)
     if mission is None:
@@ -464,13 +552,25 @@ async def register_probe_tasks(
     if verdicts:
         validity_read, errors = await capture_validity(deps, sorted(refs), graph_service=service)
         if errors:
-            raise StateConflict("candidate_evidence_not_current")
+            raise CandidateAdmissionConflict("candidate_evidence_not_current", [DecisionDiagnostic(
+                code="candidate_evidence_not_current", stage="candidate_admission",
+                kind="validation", location="$.updates",
+                summary="Cited evidence validity is not current for the candidate verdict.",
+                retryable=False, cause_scope="evidence_validity",
+                owner="orchestration.specialist_tasks",
+                repair_condition=(
+                    "Reassess current evidence validity from the original records and replan "
+                    "the candidate verdict; rereading unchanged records does not repair this."
+                ),
+                evidence_ids=sorted(refs)[:10],
+            )])
     for update in verdicts:
         candidate = update.hypothesis
         kind = "hypothesis_confirmed" if candidate.status == "confirmed" else "hypothesis_refuted"
+        criterion = CompletionCriterion(kind=kind, description=candidate.description,
+                                        hypothesis_id=candidate.hypothesis_id)
         errors = await validate_result_claims(
-            criteria=[CompletionCriterion(kind=kind, description=candidate.description,
-                                          hypothesis_id=candidate.hypothesis_id)],
+            criteria=[criterion],
             evidence_ids=[*candidate.supporting_evidence_ids, *candidate.refuting_evidence_ids,
                           *([update.review_evidence_id] if update.review_evidence_id else [])],
             target_node_ids=candidate.target_node_ids, principal_refs=candidate.principal_refs,
@@ -480,6 +580,25 @@ async def register_probe_tasks(
             task_graph_store=state, work_store=getattr(deps, "work_store", None),
         )
         if errors:
+            # A stale or wrong review often leaves its own diagnostic without refs. The
+            # cited review and the candidate identity are the safe handles for repair.
+            verdict_trace = _candidate_verdict_trace(candidate.hypothesis_id,
+                                                     update.review_evidence_id)
+            diagnostics = [
+                item.model_copy(update={
+                    "criterion_ids": safe_identifiers(
+                        [*item.criterion_ids, criterion_id(criterion)]
+                    ),
+                    "evidence_ids": safe_identifiers([
+                        update.review_evidence_id or "", *item.evidence_ids,
+                        *candidate.supporting_evidence_ids, *candidate.refuting_evidence_ids,
+                    ]),
+                    "trace": [*item.trace, *verdict_trace][-20:],
+                })
+                for item in list(getattr(errors, "diagnostics", None) or [])
+            ]
+            if diagnostics:
+                raise CandidateAdmissionConflict("candidate_verdict_unproven", diagnostics)
             raise StateConflict("candidate_verdict_unproven")
     policy_limits = getattr(getattr(deps, "specialist_policy", None), "probe_limits", None)
     for item in proposal.tasks:

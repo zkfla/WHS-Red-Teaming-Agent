@@ -13,6 +13,11 @@ from redteam.core.contracts.mission import InvestigationResult, ResultQuestion
 from redteam.core.ids import EvidenceId
 from redteam.orchestration.central_runtime import event, runtime_token
 from redteam.orchestration.central_state import check_evidence
+from redteam.orchestration.completion import (
+    OriginProof,
+    origin_row_hash,
+    origin_task_changed_diagnostic,
+)
 from redteam.orchestration.completion_proposal import (
     CompletionProposal,
     record_unresolved,
@@ -29,6 +34,15 @@ RESULT_UPDATED = "InvestigationResultUpdated"
 class ResultPublication(BaseModel):
     model_config = ConfigDict(extra="forbid")
     result: InvestigationResult
+
+
+class OriginTaskChangedConflict(StateConflict):
+    """A source-row CAS failure carrying its producer-owned safe diagnostic."""
+
+    def __init__(self, origin_task_id: str, diagnostic: DecisionDiagnostic) -> None:
+        self.origin_task_id = str(origin_task_id)
+        self.diagnostic = diagnostic
+        super().__init__(diagnostic.code)
 
 
 def result_for(
@@ -66,7 +80,7 @@ def result_for(
 
 async def commit_result(
     deps, runtime, task, result, token, *, final, validity_read=None, graph_proof=None,
-    edge_proof=None,
+    edge_proof=None, origin_proofs: tuple[OriginProof, ...] = (),
 ):
     checked = await check_evidence(
         deps.evidence_store,
@@ -93,6 +107,17 @@ async def commit_result(
             or content_hash(current) != content_hash(task)
         ):
             raise StateConflict("result_related_inputs_changed")
+        for proof in origin_proofs:
+            if proof.origin_task_id is None:
+                continue
+            current_origin = tx.get_task(proof.origin_task_id)
+            if current_origin is None or origin_row_hash(current_origin) != proof.origin_task_hash:
+                raise OriginTaskChangedConflict(
+                    proof.origin_task_id,
+                    origin_task_changed_diagnostic(
+                        [proof.evidence_id], owner="orchestration.central_results",
+                    ),
+                )
         if validity_read is not None:
             validity_read.check(tx)
         if graph_proof is not None:
@@ -194,7 +219,7 @@ def register_result_tool(registry):
 
 async def complete_reviewed_result(
     deps, runtime, task, token, receipt, proposal, *, validity_read, graph_proof,
-    edge_proof=None,
+    edge_proof=None, origin_proofs: tuple[OriginProof, ...] = (),
 ):
     """The existing positive origin/conditions/claims review has already succeeded."""
     result = result_for(
@@ -206,7 +231,7 @@ async def complete_reviewed_result(
     )
     await commit_result(deps, runtime, task, result, token, final=True,
                         validity_read=validity_read, graph_proof=graph_proof,
-                        edge_proof=edge_proof)
+                        edge_proof=edge_proof, origin_proofs=origin_proofs)
 
 
 async def complete_unresolved_result(deps, runtime, task, token, proposal):

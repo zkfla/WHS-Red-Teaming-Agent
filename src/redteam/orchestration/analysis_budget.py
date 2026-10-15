@@ -29,7 +29,9 @@ def verification_budget(state: GraphState, *, deps: RuntimeDeps) -> DecisionBudg
     if delegation is not None:
         allowance = min(allowance, max(remaining_decisions(delegation) - 1, 0))
     return DecisionBudget(
-        max(allowance, 1), timeout_seconds=deps.settings.decision_timeout_seconds,
+        max(allowance, 1),
+        transport_limit=deps.settings.decision_transport_max_attempts,
+        timeout_seconds=deps.settings.decision_timeout_seconds,
     )
 
 

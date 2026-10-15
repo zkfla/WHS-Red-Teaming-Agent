@@ -61,6 +61,43 @@ Interactive, `run`, and `resume` share this loader. `--max-steps` takes
 precedence over the environment value. Library callers can still supply an
 explicit `OrchestrationConfig` without reading the environment.
 
+### Model decision recovery budgets
+
+The decision chain separates normal calls, output correction and transport
+retries. The configured normal allowance is 12 and output-correction allowance
+is 6; their sum remains the total 18-request ceiling for that chain. Transport
+retries have a separate cap of 5, consumed inside the same total rather than
+added to it. The Run request/token ledger and absolute 900-second chain clock
+also apply; each SDK call is bounded at 180 seconds, clipped by remaining time.
+SDK retries remain zero. A transport retry preserves the current request and
+any prior output-correction feedback, without appending a provider error as
+model-output correction feedback. Target tools are not automatically replayed.
+
+| Environment variable | Default | Validation |
+|---|---|---|
+| `REDTEAM_DECISION_NORMAL_LIMIT` | 12 | 1–32 |
+| `REDTEAM_DECISION_MAX_ATTEMPTS` | 6 | 1–6, output-correction allowance |
+| `REDTEAM_DECISION_TRANSPORT_MAX_ATTEMPTS` | 5 | 0–5, zero disables transport retries |
+| `REDTEAM_DECISION_TIMEOUT_SECONDS` | 900 | finite, greater than 0, at most 3600 |
+| `REDTEAM_LLM_ATTEMPT_TIMEOUT_SECONDS` | 180 | finite, greater than 0, at most 900 |
+
+`DecisionBudget` supplied explicitly without a transport cap retains its
+legacy counter interpretation. New default `StructuredDecisionClient` calls
+use a separate transport cap. Its standalone six-attempt total stays six,
+including transport retries; it is not multiplied by the retry cap.
+`ConversationAssistant` has its own constructor limits: 180 seconds total,
+six requests total and five transport retries within that total. It does not
+read global orchestration settings itself. Cancellation and admission denials
+are not recovery requests.
+
+`ConversationError.diagnostic` preserves the safe `DecisionDiagnostic`,
+including the nested cause, public validation rules/locations, provider status,
+stage and attempt counters. `InputReceipt.diagnostic` attaches that cause to
+the original input and binding. CLI failure notices use those fields instead
+of exception messages. Provider bodies, prompts, keys and private reasoning
+are not diagnostic fields. This preserves the reason for an error; it does not
+promise recovery from a permanent provider failure.
+
 New API/YAML inputs containing `max_retries` or
 `retry_retryable_tool_failures`, and the environment variable
 `REDTEAM_ORCHESTRATION_MAX_RETRIES`, are rejected as removed settings. A

@@ -4,14 +4,17 @@ import asyncio
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
 
+from redteam.app.cli._shared import load_app_config_for_run
+from redteam.app.cli.commands import run as run_command
 from redteam.app.mcp_deployment import DeploymentBinding, synchronize_deployment
 from redteam.app.web.engagement import EngagementError, EngagementStore
 from redteam.app.web.host import RealLauncher
-from redteam.app.web_policy import prepare_web_deployment
+from redteam.app.web_policy import prepare_web_deployment, select_engagement_startup
 from redteam.capability.deployment import DeploymentSpec
 from redteam.capability.servers.config import ServerPolicy, TargetProfile
 from redteam.capability.servers.network import ToolInputError, validate_path
@@ -189,3 +192,35 @@ def test_old_exact_path_policy_encoding_remains_compatible():
     assert not target.allows_path("/login")
     with pytest.raises(ValidationError):
         TargetProfile(origin="https://lab.test", allowed_paths=[])
+
+
+async def test_initial_build_uses_mcp_ids_from_composed_startup_environment(
+    tmp_path, monkeypatch,
+):
+    store = save(tmp_path / "lab-composed-ids.yaml", kali_network_mode="closed")
+    monkeypatch.delenv("REDTEAM_MCP_SERVERS", raising=False)
+    monkeypatch.setenv("REDTEAM_LLM_PROVIDER", "fake")
+    config = load_app_config_for_run(str(store.path))
+    assert "web-http" not in config.capability.mcp_servers
+    captured = {}
+
+    async def no_shell_runtime(policy_path, **kwargs):
+        return None
+
+    async def fake_build_application(app_config, **kwargs):
+        captured["mcp_servers"] = list(app_config.capability.mcp_servers)
+        return object(), SimpleNamespace()
+
+    monkeypatch.setattr(run_command, "prepare_shell_runtime", no_shell_runtime)
+    monkeypatch.setattr(run_command, "build_application", fake_build_application)
+    await run_command.build(config, max_steps=1, engagement_path=store.path)
+
+    assert "web-http" in captured["mcp_servers"]
+
+
+async def test_closed_selection_clears_ambient_policy_path(tmp_path, monkeypatch):
+    store = save(tmp_path / "lab-closed.yaml", kali_network_mode="closed")
+    monkeypatch.setenv("REDTEAM_GATED_NETWORK_POLICY_PATH", "operator-policy.json")
+    selection = await select_engagement_startup(store.path)
+    assert selection.environment["REDTEAM_GATED_NETWORK_POLICY_PATH"] == ""
+    assert selection.network_policy_path is None

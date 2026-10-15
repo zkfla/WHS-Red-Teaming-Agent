@@ -10,10 +10,11 @@ from datetime import datetime, timezone
 import pytest
 
 from redteam.app.bootstrap import build_central_storage
-from redteam.core.contracts.completion import completion_contract_hash
+from redteam.core.contracts.completion import CompletionCriterion, completion_contract_hash
 from redteam.core.contracts.engagement import Engagement, EngagementScope
 from redteam.core.contracts.events import EventEnvelope
 from redteam.core.contracts.execution import ExecutionState, TaskExecution
+from redteam.core.contracts.graph import GraphNode, HypothesisUpdate
 from redteam.core.contracts.llm_policy import LLMRequestPolicy
 from redteam.core.contracts.mission import (
     InvestigationResult,
@@ -25,8 +26,8 @@ from redteam.core.contracts.network import GrantRefused, NetworkGrant
 from redteam.core.contracts.policy import Approval
 from redteam.core.contracts.tool import ToolInvocation, ToolResult
 from redteam.core.convert import digest_payload
-from redteam.core.enums import MissionStatus, TaskStatus
-from redteam.core.ids import MissionId, OperatorIntentId
+from redteam.core.enums import GraphNodeType, MissionStatus, TaskStatus
+from redteam.core.ids import GraphNodeId, MissionId, OperatorIntentId
 from redteam.core.tool_binding import execution_fingerprint
 from redteam.evidence.stores.filesystem import FilesystemEvidenceStore
 from redteam.orchestration.agents.base import PlanStep
@@ -77,6 +78,21 @@ def task(identity="task-a", mission_id=MISSION):
     )
 
 
+def contradictory_task(identity="task-conflict", mission_id=MISSION):
+    return task(identity, mission_id).model_copy(update={
+        "completion_contract_version": 2,
+        "related_hypothesis_ids": ["hyp-a"],
+        "completion_criteria": [
+            CompletionCriterion(
+                kind="hypothesis_confirmed", description="Confirm", hypothesis_id="hyp-a",
+            ),
+            CompletionCriterion(
+                kind="hypothesis_refuted", description="Refute", hypothesis_id="hyp-a",
+            ),
+        ],
+    })
+
+
 async def world(tmp_path, *, run=RUN, engagement=ENG, mission_id=MISSION):
     state = CentralStateStore(tmp_path / "state.db", run_id=run, engagement_id=engagement)
     await state.setup()
@@ -97,6 +113,78 @@ async def owner(state, identity="task-a", worker="worker-a", instance="instance-
         )
     )
     return claimed
+
+
+@pytest.mark.asyncio
+async def test_canonical_task_registration_rejects_new_same_candidate_contradiction(tmp_path):
+    state = await world(tmp_path)
+
+    with pytest.raises(StateConflict, match="task_completion_condition_conflict") as caught:
+        await state.register_task("new-conflict", contradictory_task())
+
+    conflict = caught.value.condition_conflicts[0]
+    assert conflict.hypothesis_id == "hyp-a"
+    assert len(conflict.criterion_ids) == 2
+    assert await state.list_tasks() == []
+
+
+@pytest.mark.asyncio
+async def test_batch_rejection_rolls_back_prior_child_and_registration_rows(tmp_path):
+    state = await world(tmp_path)
+    await state.transaction(lambda tx: tx.graph.add_node(GraphNode(
+        id=GraphNodeId(f"{ENG}\x1fhost:a"), type=GraphNodeType.HOST,
+        created_at=NOW, updated_at=NOW,
+    )))
+    update = HypothesisUpdate.model_validate({
+        "expected_revision": None,
+        "hypothesis": {
+            "contract_version": 2, "hypothesis_id": "hyp-a",
+            "description": "Candidate written before task admission",
+            "target_node_ids": ["host:a"], "reason": "Check the observed target",
+            "status": "open",
+        },
+    })
+
+    def candidate_then_batch(tx):
+        tx.graph.save_hypothesis(update, now=NOW)
+        tx.register_batch("mixed-batch", [task("task-valid"), contradictory_task()])
+
+    with pytest.raises(StateConflict, match="task_completion_condition_conflict"):
+        await state.transaction(candidate_then_batch)
+
+    assert await state.list_tasks() == []
+    candidate = await state.transaction(
+        lambda tx: tx.graph.get_local_node(GraphNodeId("hypothesis:hyp-a")), write=False,
+    )
+    assert candidate is None
+    registration_count = await state.transaction(lambda tx: tx.db.execute(
+        "SELECT count(*) FROM state_registrations WHERE run_id=?", (RUN,),
+    ).fetchone()[0], write=False)
+    assert registration_count == 0
+
+
+@pytest.mark.asyncio
+async def test_historical_contradictory_registration_can_still_replay_and_read(tmp_path):
+    state = await world(tmp_path)
+    historic = contradictory_task("task-historic").redacted_copy()
+    request_hash = content_hash(historic)
+
+    def seed_legacy(tx):
+        tx.db.execute("INSERT INTO state_tasks VALUES(?,?,?)", (
+            RUN, str(historic.task_id), historic.model_dump_json(
+                exclude={"dependency_task_ids", "parent_task_id", "priority"},
+            ),
+        ))
+        tx.db.execute("INSERT INTO state_registrations VALUES(?,?,?,?)", (
+            RUN, "historic-register", str(historic.task_id), request_hash,
+        ))
+
+    await state.transaction(seed_legacy)
+    replayed = await state.register_task("historic-register", historic)
+
+    assert replayed.task_id == historic.task_id
+    assert len(replayed.completion_criteria) == 2
+    assert [item.task_id for item in await state.list_tasks()] == [historic.task_id]
 
 
 async def original(

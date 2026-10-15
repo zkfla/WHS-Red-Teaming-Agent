@@ -5,6 +5,7 @@ functions bind their original identities, ownership and prepared writes to SQL.
 Explicit selection and recovery reuse this boundary; goal close is plan2d.
 """
 
+from collections.abc import Collection, Mapping
 from dataclasses import replace
 from datetime import datetime, timezone
 
@@ -318,6 +319,58 @@ def _candidate_order(tasks, mission):
     return sorted(tasks, key=key)
 
 
+def task_is_claimable(
+    task,
+    *,
+    eligible_roles: Collection[str] | None,
+    mission,
+    require_probe_limits: bool,
+    candidate_revisions: Mapping[str, int] | None = None,
+    allow_running: bool = False,
+) -> bool:
+    """Pure claimability check shared by worker admission and planner witnesses.
+
+    The ordinary path mirrors ``ready_workers``: only pending/ready, unowned,
+    unsuppressed tasks assigned to an eligible role can be claimed; required
+    probe limits and every captured candidate revision must also be current.
+    A planner may opt to recognize an already-running, owned task as a witness.
+    That task keeps its captured purpose and is not rebound to projected candidate
+    revisions. This mode never admits blocked or approval-waiting work.
+    """
+    if eligible_roles is None or mission is None:
+        return False
+    try:
+        roles = {str(role) for role in eligible_roles}
+    except TypeError:
+        return False
+    if not roles:
+        return False
+    status = getattr(task, "status", None)
+    owner = getattr(task, "occupant_owner", None)
+    claimable = status in {TaskStatus.PENDING, TaskStatus.READY} and owner is None
+    running = (
+        allow_running and status == TaskStatus.RUNNING
+        and isinstance(owner, str) and bool(owner.strip())
+        and getattr(task, "ownership_version", 0) > 0
+    )
+    if not (claimable or running):
+        return False
+    assigned = getattr(task, "assigned_agent", None)
+    if assigned is None or str(assigned) not in roles:
+        return False
+    if is_task_suppressed(task, mission):
+        return False
+    if require_probe_limits and getattr(task, "probe_limits", None) is None:
+        return False
+    if running:
+        return True
+    revisions = candidate_revisions or {}
+    return all(
+        identity in revisions and revisions[identity] == revision
+        for identity, revision in getattr(task, "hypothesis_revisions", {}).items()
+    )
+
+
 async def ready_workers(deps, base, *, max_instances=None):
 
     from redteam.orchestration.agents.tool_access import ready_role_ids
@@ -336,31 +389,31 @@ async def ready_workers(deps, base, *, max_instances=None):
             if slots <= 0:
                 break
             task = tx.get_task(str(candidate.task_id))
-            if (
-                task.status not in {TaskStatus.PENDING, TaskStatus.READY}
-                or task.occupant_owner is not None
-                or str(task.assigned_agent) not in eligible
-                or is_task_suppressed(task, mission)
-            ):
-                continue
-            snapshots = None
-            if deps.specialist_policy.probe_limits is not None and task.probe_limits is None:
-                continue
-            if task.probe_limits is not None:
+            snapshots = {}
+            candidate_revisions = {}
+            if task.hypothesis_revisions:
                 from redteam.attack_graph.identity import hypothesis_node_id
                 from redteam.attack_graph.predicates import facts_of
                 from redteam.core.contracts.graph import Hypothesis
 
-                snapshots = {}
-                for identity, revision in task.hypothesis_revisions.items():
+                for identity in task.hypothesis_revisions:
                     node = tx.graph.get_local_node(hypothesis_node_id(identity))
                     candidate = (Hypothesis.model_validate(facts_of(node.properties))
                                  if node else None)
-                    if candidate is None or candidate.revision != revision:
+                    if candidate is None:
                         break
+                    candidate_revisions[identity] = candidate.revision
                     snapshots[identity] = candidate.model_dump(mode="json")
-                if len(snapshots) != len(task.hypothesis_revisions):
-                    continue  # The planner refreshes the changed candidate's probe purpose.
+            if not task_is_claimable(
+                task,
+                eligible_roles=eligible,
+                mission=mission,
+                require_probe_limits=deps.specialist_policy.probe_limits is not None,
+                candidate_revisions=candidate_revisions,
+            ):
+                continue  # The planner refreshes changed purposes; admission stays fail-closed.
+            if not task.hypothesis_revisions or task.probe_limits is None:
+                snapshots = None
             instance = AgentInstanceId(new_id("inst"))
             owner = work_owner_for(base.run_id, instance)
             claimed.append(

@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import pytest
 
 from redteam.app.central_development import build_central_development
+from redteam.app.central_run import bind_run_metadata
 from redteam.core.contracts.execution import ExecutionState
 from redteam.core.enums import TaskStatus
 from redteam.core.ports.llm import NATIVE_PROTOCOL_EMPTY_RESPONSE, NativeCompletion
@@ -443,7 +444,10 @@ async def test_shared_graph_updates_rebase_on_latest_row_and_deletion_stays_fenc
 
 async def test_planner_and_peer_read_intermediate_result_before_source_finishes():
     selected, configured = limits()
-    llm = FakeLLMClient(canned_structured={"questions": [], "reason": "Await investigation"})
+    llm = FakeLLMClient(canned_structured={
+        "questions": [], "reason": "Await investigation", "termination": "held",
+        "resume_conditions": ["New worker result is committed"],
+    })
     tools = gateway()
     tools.release.clear()
     async with build_central_development(
@@ -452,6 +456,7 @@ async def test_planner_and_peer_read_intermediate_result_before_source_finishes(
         tools=tools,
         settings=configured,
     ) as selection:
+        await bind_run_metadata(selection.deps)
         identities = await tasks(selection, llm)
         # Authoritative Task IDs route independent native scripts, not response order.
         published = asyncio.Event()
@@ -474,7 +479,13 @@ async def test_planner_and_peer_read_intermediate_result_before_source_finishes(
                     "reason": "Follow committed intermediate question",
                 },
                 {"tasks": [t.model_dump(mode="json") for t in candidate.tasks]},
-                *[{"questions": [], "reason": "Await evidence"} for _ in range(8)],
+                *[
+                    {
+                        "questions": [], "reason": "Await evidence", "termination": "held",
+                        "resume_conditions": ["New worker result is committed"],
+                    }
+                    for _ in range(8)
+                ],
             ]
             published.set()
 
@@ -535,7 +546,14 @@ async def test_planner_and_peer_read_intermediate_result_before_source_finishes(
 
             await selection.deps.event_bus.subscribe(EventType.EVIDENCE_CREATED, evidence)
             await asyncio.wait_for(published.wait(), 10)
-            await asyncio.wait_for(followup_registered.wait(), 10)
+            try:
+                await asyncio.wait_for(followup_registered.wait(), 10)
+            except TimeoutError:
+                # Surface the planner run outcome (its termination and diagnostic) on failure.
+                if not running.done():
+                    running.cancel()
+                outcome = await asyncio.gather(running, return_exceptions=True)
+                raise AssertionError(f"followup not registered; run outcome={outcome!r}") from None
             peer = next(
                 task for task in await state.list_tasks() if str(task.task_id) == identities[1]
             )

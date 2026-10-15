@@ -47,7 +47,8 @@ from tests.unit.test_checkpoint_threads import _write_thread
 from tests.unit.test_network_ledger import budget, caps
 
 
-async def fixture(tmp_path, *, entered=False, execution=False, network=False):
+async def fixture(tmp_path, *, entered=False, execution=False, network=False,
+                  planning_schema_version=2):
     source = tmp_path / "original"
     source.mkdir()
     refs = {name: source / name for name in ("evidence", "artifact", "audit", "approval")}
@@ -70,7 +71,8 @@ async def fixture(tmp_path, *, entered=False, execution=False, network=False):
     components = RuntimeComponentBinding(component_ids=BUILTIN_COMPONENT_IDS)
     policy = LLMRequestPolicy(mode="bounded", max_requests=8)
     inputs = {
-        "schema_version": 2,
+        # 2 is the historical original identity; other values model current planners.
+        "schema_version": planning_schema_version,
         "engagement": engagement.model_dump(mode="json", exclude={"created_at"}),
         "components": components.model_dump(mode="json"),
         "specialists": {"test": True},

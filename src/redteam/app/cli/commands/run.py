@@ -52,7 +52,12 @@ from redteam.app.cli._shared import (
     load_app_config_for_run,
     mask_secrets,
 )
-from redteam.app.cli.conversation import ConversationAssistant, catalog_tool_labels
+from redteam.app.cli.conversation import (
+    ConversationAssistant,
+    ConversationError,
+    catalog_tool_labels,
+    conversation_failure_label,
+)
 from redteam.capability.settings import (
     MCPConfigurationError,
     automatic_shell_setup_from_environment,
@@ -603,12 +608,12 @@ class OperatorConsole:
                                   if self._deps.settings.llm_request_policy is not None else None),
                 )
         except Exception as exc:  # noqa: BLE001 - chat is advisory; the active run continues
-            logging.getLogger(__name__).warning(
-                "Operator chat interpretation failed (%s)", type(exc).__name__
-            )
+            diagnostic = exc.diagnostic if isinstance(exc, ConversationError) else None
+            label = conversation_failure_label(diagnostic, fallback=type(exc).__name__)
+            logging.getLogger(__name__).warning("Operator chat interpretation failed (%s)", label)
             self._echo(
                 renderer.operator_notice_text(
-                    "could not interpret that as guidance; the run continues"
+                    f"could not interpret that as guidance; the run continues ({label})"
                 )
             )
             return
@@ -784,6 +789,53 @@ class OperatorConsole:
 
 
 async def build(
+    config: AppConfig,
+    *,
+    max_steps: int | None,
+    mcp_stack: AsyncExitStack | None = None,
+    component_profile: ComponentProfile | None = None,
+    component_registry: ComponentRegistry | None = None,
+    central_state=None,
+    original_stores=None,
+    original_settings=None,
+    original_component_binding=None,
+    engagement_path=None,
+    startup_sink=None,
+) -> tuple[Any, RuntimeDeps]:
+    """Apply the selected engagement's request-local inputs, then assemble it."""
+    from redteam.app.web_policy import select_engagement_startup
+    from redteam.capability.settings import mcp_server_ids_from_environment
+    from redteam.core.environment import environment_context
+
+    startup = await select_engagement_startup(
+        config.engagement,
+        engagement_path=engagement_path,
+        require_recorded_preparation=original_stores is not None,
+    )
+    if startup_sink is not None:
+        startup_sink.append(startup)
+    # MCP ids come from the composed startup environment, not the pre-selection snapshot.
+    capability = config.capability.model_copy(update={
+        "mcp_servers": mcp_server_ids_from_environment(source=startup.environment),
+    })
+    selected_config = config.model_copy(
+        update={"engagement": startup.engagement, "capability": capability}
+    )
+    with environment_context(startup.environment):
+        return await _build_selected(
+            selected_config,
+            max_steps=max_steps,
+            mcp_stack=mcp_stack,
+            component_profile=component_profile,
+            component_registry=component_registry,
+            central_state=central_state,
+            original_stores=original_stores,
+            original_settings=original_settings,
+            original_component_binding=original_component_binding,
+        )
+
+
+async def _build_selected(
     config: AppConfig,
     *,
     max_steps: int | None,
@@ -1147,9 +1199,14 @@ async def _run(
     component_registry: ComponentRegistry | None = None,
 ) -> int:
     try:
-        config = load_app_config_for_run(args.engagement_path)
-        from redteam.app.cli._shared import runtime_overrides
-        config = runtime_overrides(config, args)
+        from redteam.app.web_policy import select_engagement_startup
+        from redteam.core.environment import environment_context
+
+        startup = await select_engagement_startup(args.engagement_path)
+        with environment_context(startup.environment):
+            config = load_app_config_for_run(args.engagement_path)
+            from redteam.app.cli._shared import runtime_overrides
+            config = runtime_overrides(config, args)
     except (OSError, ValidationError, ValueError) as exc:
         eprint(f"ERROR: {exc}")
         return EXIT_CONFIG_ERROR
@@ -1166,7 +1223,8 @@ async def _run(
         if component_registry is not None:
             build_options["component_registry"] = component_registry
         engagement, deps = await build(
-            config, max_steps=args.max_steps, mcp_stack=mcp_stack, **build_options
+            config, max_steps=args.max_steps, mcp_stack=mcp_stack,
+            engagement_path=args.engagement_path, **build_options
         )
     except MCPConfigurationError as exc:
         eprint(f"ERROR: MCP configuration invalid: {exc}")

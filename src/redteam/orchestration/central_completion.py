@@ -10,6 +10,11 @@ from redteam.core.contracts.mission import MissionCriterionResult
 from redteam.core.enums import MissionStatus, TaskStatus
 from redteam.orchestration.central_runtime import event, process_controls
 from redteam.orchestration.central_state import check_evidence
+from redteam.orchestration.completion import (
+    CompletionIssues,
+    origin_row_hash,
+    origin_task_changed_diagnostic,
+)
 from redteam.orchestration.coordination import StateConflict, content_hash
 from redteam.orchestration.result_claims import (
     RESULT_REVIEW_INSTRUCTION,
@@ -22,12 +27,16 @@ from redteam.orchestration.semantic_completion import (
     EXCERPT_CHARS,
     MAX_EXCERPTS,
     GoalReview,
+    extend_issues,
     goal_review_payload,
+    legacy_purpose_refusal,
     origin_excerpt,
-    verify_single_origin,
+    origin_refusal_from_proof,
     verify_task_receipt,
 )
 from redteam.orchestration.state import TerminationReason
+
+GOAL_ORIGIN_CHANGED_CODE = "goal_origin_task_changed_reassessment_required"
 
 
 def unsafe(execution):
@@ -110,9 +119,11 @@ def required_questions(tasks):
     return unresolved
 
 
-async def goal_inputs(deps, runtime, *, graph_service=None, validity_reads=None):
+async def goal_inputs(
+    deps, runtime, *, graph_service=None, validity_reads=None, origin_reads=None,
+):
     mission, tasks, stamp = await deps.central_state.transaction(goal_snapshot, write=False)
-    errors = []
+    errors = CompletionIssues()
     if not mission.success_criteria:
         errors.append("goal_has_no_original_criteria")
     if any(task.required and task.status is not TaskStatus.COMPLETED for task in tasks):
@@ -157,7 +168,9 @@ async def goal_inputs(deps, runtime, *, graph_service=None, validity_reads=None)
         if task.status is not TaskStatus.COMPLETED or task.result is None:
             continue
         result = task.result
-        task_checked, task_excerpts, task_errors = [], [], []
+        task_checked, task_excerpts = [], []
+        task_errors = CompletionIssues()
+        task_origin_proofs = []
         refs = list(map(str, result.evidence_ids))
         receipt_id = result.completion_receipt_id
         if result.outcome in {"confirmed", "refuted"}:
@@ -190,15 +203,26 @@ async def goal_inputs(deps, runtime, *, graph_service=None, validity_reads=None)
             record = await deps.evidence_store.get(identity)
             if record is None or not isinstance(record.metadata.get("tool_result"), dict):
                 continue  # System gap notes report uncertainty, never prove success.
-            record, origin_errors = await verify_single_origin(
+            from redteam.orchestration.evidence_validity import prove_original
+
+            record, proof = await prove_original(
                 evidence_store=deps.evidence_store, path_store=deps.path_store,
                 run_id=str(runtime.run_id), engagement_id=str(runtime.engagement_id),
-                mission_id=str(runtime.mission_id), evidence_id=identity, task=task,
+                mission_id=str(runtime.mission_id), evidence_id=identity,
                 task_graph_store=deps.investigations,
             )
-            if origin_errors:
-                task_errors.extend(origin_errors)
+            if proof.issues:
+                extend_issues(task_errors, origin_refusal_from_proof(proof))
                 continue
+            legacy = None
+            if proof.origin_task_id is None:
+                legacy = legacy_purpose_refusal(
+                    getattr(record, "metadata", None) or {}, task, identity,
+                )
+            if legacy is not None:
+                extend_issues(task_errors, legacy)
+                continue
+            task_origin_proofs.append(proof)
             task_checked.extend(await check_evidence(
                 deps.evidence_store, run_id=str(runtime.run_id),
                 engagement_id=str(runtime.engagement_id), evidence_ids=[identity],
@@ -220,9 +244,16 @@ async def goal_inputs(deps, runtime, *, graph_service=None, validity_reads=None)
                 task_reads[identity] = read
             if task_errors:
                 if str(task.task_id) in needed:
-                    errors.extend(task_errors)
+                    extend_issues(errors, task_errors)
                 continue
             mapping[str(task.task_id)] = proven
+            if origin_reads is not None:
+                task_origin_reads = origin_reads.setdefault(str(task.task_id), {})
+                for origin_proof in task_origin_proofs:
+                    origin_id = origin_proof.origin_task_id
+                    origin_hash = origin_proof.origin_task_hash
+                    if origin_id is not None and origin_hash is not None:
+                        task_origin_reads[origin_proof.evidence_id] = (origin_id, origin_hash)
             if validity_reads is not None:
                 validity_reads[str(task.task_id)] = task_reads
             if str(task.task_id) in needed:
@@ -246,8 +277,9 @@ async def complete_goal(deps, runtime, *, budget=None):
         return ["goal_admission_must_close_before_settlement"]
     await process_controls(deps)
     validity_reads = {}
+    origin_reads: dict[str, dict[str, tuple[str, str]]] = {}
     mission, tasks, stamp, errors, mapping, excerpts, checked = await goal_inputs(
-        deps, runtime, validity_reads=validity_reads,
+        deps, runtime, validity_reads=validity_reads, origin_reads=origin_reads,
     )
     if mission.status is not MissionStatus.ACTIVE:
         return ["mission_not_active"]
@@ -305,6 +337,18 @@ async def complete_goal(deps, runtime, *, budget=None):
     needed = goal_required_task_ids(tasks)
     used = needed | {owner for item in results for owner in item.task_ids}
     cited = {identity for item in results for identity in item.evidence_ids}
+    used_origin_reads: dict[str, str] = {}
+    used_origin_evidence: dict[str, list[str]] = {}
+    for owner in used:
+        for evidence_id, (origin_id, expected) in origin_reads.get(owner, {}).items():
+            if owner not in needed and evidence_id not in cited:
+                continue
+            previous = used_origin_reads.setdefault(origin_id, expected)
+            if previous != expected:
+                return [GOAL_ORIGIN_CHANGED_CODE]
+            refs = used_origin_evidence.setdefault(origin_id, [])
+            if evidence_id not in refs:
+                refs.append(evidence_id)
     receipts = {str(task.result.completion_receipt_id) for task in tasks if task.result
                 and task.result.completion_receipt_id}
     current_reads = []
@@ -333,10 +377,25 @@ async def complete_goal(deps, runtime, *, budget=None):
     if fixture_errors:
         return fixture_errors
     now = datetime.now(timezone.utc)
+    from redteam.orchestration.central_results import OriginTaskChangedConflict
 
     def commit(tx):
         current, current_tasks, current_stamp = goal_snapshot(tx)
         tx.admit(settlement=True)
+        # Check the exact source rows captured before review before the broader
+        # goal snapshot. This retains a precise source-CAS diagnostic while the
+        # snapshot remains the existing aggregate guard for all other inputs.
+        for origin_id, expected in used_origin_reads.items():
+            current_origin = tx.get_task(origin_id)
+            if current_origin is None or origin_row_hash(current_origin) != expected:
+                raise OriginTaskChangedConflict(
+                    origin_id,
+                    origin_task_changed_diagnostic(
+                        used_origin_evidence.get(origin_id, []),
+                        code=GOAL_ORIGIN_CHANGED_CODE,
+                        owner="orchestration.central_completion",
+                    ),
+                )
         if current_stamp != stamp:
             raise StateConflict("goal_related_inputs_changed_reassessment_required")
         check_fixture_admissions(tx, fixture_snapshot)

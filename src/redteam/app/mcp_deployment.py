@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -16,6 +17,10 @@ from redteam.capability.deployment import (
     digest,
     encoded,
     role_args,
+)
+from redteam.capability.gated_http_restrictions import (
+    HttpRestrictionProjection,
+    project_deployment,
 )
 from redteam.capability.server_roles import role_spec
 from redteam.capability.settings import MCPServerSettings, MCPTransportKind
@@ -36,16 +41,25 @@ class DeploymentBinding(BaseModel):
         return self
 
 
-def synchronize_deployment(
+@dataclass(frozen=True)
+class VerifiedDeployment:
+    """A deployment that passed every check in the full verifier, never a partial check."""
+
+    engagement: EngagementConfig
+    binding: DeploymentBinding
+    spec: DeploymentSpec
+
+
+def _verify(
     engagement: EngagementConfig,
     server_ids: list[str],
     *,
-    check_environment: bool = True,
-    env: Mapping[str, str] | None = None,
-) -> EngagementConfig:
+    check_environment: bool,
+    env: Mapping[str, str] | None,
+) -> VerifiedDeployment | None:
     raw = engagement.metadata.get("mcp_deployment")
     if raw is None:
-        return engagement  # legacy/manual/remote deployments remain explicit and unchanged
+        return None  # legacy/manual/remote deployments remain explicit and unchanged
     try:
         binding = DeploymentBinding.model_validate(raw)
         source_bytes = Path(binding.source_path).read_bytes()
@@ -105,9 +119,58 @@ def synchronize_deployment(
                     )
                 ):
                     raise ValueError("deployment_transport_settings_mismatch")
-        return engagement.model_copy(update={"metadata": {**engagement.metadata, **public}})
+        public_engagement = engagement.model_copy(
+            update={"metadata": {**engagement.metadata, **public}},
+        )
+        return VerifiedDeployment(public_engagement, binding, spec)
     except (ValueError, OSError):
         # Do not expose input_value, environment contents or a credential-file path via CLI errors.
         raise ValueError(
             "MCP deployment validation failed; approved settings are missing or inconsistent"
         ) from None
+
+
+def synchronize_deployment(
+    engagement: EngagementConfig,
+    server_ids: list[str],
+    *,
+    check_environment: bool = True,
+    env: Mapping[str, str] | None = None,
+) -> EngagementConfig:
+    verified = _verify(
+        engagement, server_ids, check_environment=check_environment, env=env,
+    )
+    if verified is None:
+        return engagement
+    return verified.engagement
+
+
+def verified_deployment(
+    engagement: EngagementConfig,
+    server_ids: list[str],
+    *,
+    check_environment: bool = True,
+    env: Mapping[str, str] | None = None,
+) -> VerifiedDeployment | None:
+    """The complete verifier's result, for consumers that need the verified spec."""
+    return _verify(engagement, server_ids, check_environment=check_environment, env=env)
+
+
+def http_restriction_projection(
+    engagement: EngagementConfig,
+    server_ids: list[str],
+    *,
+    check_environment: bool = True,
+    env: Mapping[str, str] | None = None,
+) -> HttpRestrictionProjection | None:
+    """Projection of the fully verified deployment. Invalid applicable metadata raises."""
+    verified = _verify(
+        engagement, server_ids, check_environment=check_environment, env=env,
+    )
+    if verified is None:
+        return None
+    return project_deployment(
+        verified.spec,
+        source_sha256=verified.binding.source_sha256,
+        policy_sha256=verified.binding.policy_sha256,
+    )

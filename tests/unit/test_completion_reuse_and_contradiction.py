@@ -67,14 +67,16 @@ def test_bind_plan_rejects_a_contradictory_question_before_atomization():
             revisions={"candidate-a": 1},
         )],
     }
+    issued = {}
     with pytest.raises(AtomizationProposalError) as excinfo:
         bind_plan(
-            HypothesisPlanDraft.model_validate(draft), _snap(), issued={},
+            HypothesisPlanDraft.model_validate(draft), _snap(), issued=issued,
             targets=set(TARGETS), principals=set(PRINCIPALS), max_tasks=8,
         )
-    assert excinfo.value.code == "plan_question_contradictory_candidate_verdict"
+    assert excinfo.value.code == "same_candidate_completion_condition_conflict"
     assert excinfo.value.diagnostic is not None
-    assert "candidate-a" in excinfo.value.diagnostic.summary
+    assert excinfo.value.diagnostic.trace[0]["hypothesis_id"] == issued["candidate-a"]
+    assert len(excinfo.value.diagnostic.criterion_ids) == 2
     assert excinfo.value.diagnostic.retryable is True
 
 
@@ -116,7 +118,9 @@ async def test_registration_rejects_a_probe_task_with_both_verdicts_for_one_cand
     )
     with pytest.raises(SpecialistProposalError) as excinfo:
         await admit(deps, service, "contradictory", tasks=[contradictory])
-    assert excinfo.value.code == "specialist_contradictory_candidate_verdict"
+    assert excinfo.value.code == "same_candidate_completion_condition_conflict"
+    assert excinfo.value.diagnostic.trace[0]["hypothesis_id"] == "candidate-a"
+    assert len(excinfo.value.diagnostic.criterion_ids) == 2
 
 
 async def test_registration_allows_two_separate_tasks_each_with_one_verdict(tmp_path):

@@ -156,8 +156,10 @@ class DecisionDiagnostic(BaseModel):
     stage_attempts: dict[str, int] = Field(default_factory=dict)
     normal_limit: int | None = None
     repair_limit: int | None = None
+    transport_limit: int | None = None
     normal_used: int = Field(default=0, ge=0)
     repair_used: int = Field(default=0, ge=0)
+    transport_used: int = Field(default=0, ge=0)
     provider_status: int | None = None
     provider_code: str | None = None
     retry_after: float | None = None

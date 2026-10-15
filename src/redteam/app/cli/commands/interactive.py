@@ -31,6 +31,7 @@ from contextlib import AsyncExitStack
 from pathlib import Path
 
 from rich.console import Console
+from rich.markup import escape
 
 from redteam.app.bootstrap import build_llm_client
 from redteam.app.cli import renderer
@@ -53,6 +54,7 @@ from redteam.app.cli.conversation import (
     ConversationDecision,
     ConversationError,
     catalog_tool_labels,
+    conversation_failure_label,
 )
 from redteam.app.cli.engagement_form import collect_engagement
 from redteam.app.cli.interactive_commands import InteractiveSession
@@ -719,23 +721,8 @@ async def _execute_scoped(
             effective_objective = decision.objective or effective_objective
         except asyncio.CancelledError:
             raise
-        except ConversationError as exc:
-            logging.getLogger(__name__).warning(
-                "Initial conversation decision failed (%s)", type(exc).__name__
-            )
-            console.print(
-                f"[red]Could not interpret the request ({type(exc).__name__}); "
-                "no action started.[/red]"
-            )
-            return EXIT_FAILURE, None
         except Exception as exc:  # noqa: BLE001 - fail closed, no execution
-            logging.getLogger(__name__).warning(
-                "Initial conversation decision failed (%s)", type(exc).__name__
-            )
-            console.print(
-                f"[red]Could not interpret the request ({type(exc).__name__}); "
-                "no action started.[/red]"
-            )
+            _report_initial_interpretation_failure(console, exc)
             return EXIT_FAILURE, None
     else:
         console.print()
@@ -797,6 +784,19 @@ def _scope_values(engagement_config: EngagementConfig) -> list[str]:
         *scope.allowed_networks,
         *scope.allowed_assets,
     ]
+
+
+def _report_initial_interpretation_failure(console: Console, exc: Exception) -> None:
+    """Show the safe cause of a failed first interpretation; no action started."""
+
+    diagnostic = exc.diagnostic if isinstance(exc, ConversationError) else None
+    label = conversation_failure_label(diagnostic, fallback=type(exc).__name__)
+    logging.getLogger(__name__).warning("Initial conversation decision failed (%s)", label)
+    console.print(
+        f"[red]Could not interpret the request ({escape(label)}); no action started.[/red]"
+    )
+    if diagnostic is not None and diagnostic.summary:
+        console.print(f"[dim]{escape(diagnostic.summary)}[/dim]")
 
 
 def _render_conversation_decision(console: Console, decision: ConversationDecision) -> None:

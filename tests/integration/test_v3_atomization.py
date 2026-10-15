@@ -144,7 +144,7 @@ async def test_split_loop_update_only_makes_one_request(tmp_path):
         "contract_version": 2, "hypothesis_id": "local",
         "description": "Access may be unguarded", "target_node_ids": [TARGET],
         "reason": "Assess the preserved response"}}],
-        "questions": [], "reason": "Record premise"}
+        "questions": [], "reason": "Record premise", "termination": "replan"}
     llm = SplitDouble([plan], [])
     async with probe_selection(tmp_path, llm=llm) as (session, llm, tools):
         ids = await SpecialistPlanner(session.deps).advance(session.runtime)
@@ -246,7 +246,7 @@ async def test_split_loop_atomizer_failure_commits_nothing(tmp_path):
             "objective": "Probe", "title": "Probe", "role_id": "probe-worker",
             "target_node_ids": [TARGET],
             "completion_criterion_ids": [_condition_id("Inspect")]}]}
-    llm = SplitDouble([_new_candidate_plan()], [bad] * 6)
+    llm = SplitDouble([_new_candidate_plan()], [bad] * 7)  # decision_max_attempts (6) + initial
     async with probe_selection(tmp_path, llm=llm) as (session, llm, tools):
         state = session.deps.central_state
         with pytest.raises(DecisionFailure) as failed:

@@ -215,7 +215,8 @@ async def test_legacy_coded_semantic_error_preserves_proposal_code(tmp_path):
             await SpecialistPlanner(session.deps).advance(session.runtime)
 
     diagnostic = _rejected(failed.value)
-    assert diagnostic.code == "empty_judgment_needs_termination_and_resume_conditions"
+    # Pathless continue now fails the continue rule (0a3292d3) before the empty-judgment check.
+    assert diagnostic.code == "continue_requires_proposed_or_existing_work"
     assert diagnostic.code not in {"model_validation", "invalid_decision"}
     assert diagnostic.error_type == "HypothesisProposalError"
     assert diagnostic.kind == "validation" and diagnostic.retryable is True

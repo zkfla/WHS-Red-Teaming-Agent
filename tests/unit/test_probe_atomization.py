@@ -111,10 +111,12 @@ def test_exhausted_plan_skips_atomizer():
 
 def test_update_only_plan_skips_atomizer():
     updates, questions, versions = _bind(
-        {"updates": [_update()], "questions": [], "reason": "Record premise"})
+        {"updates": [_update()], "questions": [], "reason": "Record premise",
+         "termination": "replan"})
     assert updates is not None and questions == [] and versions
     draft = HypothesisPlanDraft.model_validate(
-        {"updates": [_update()], "questions": [], "reason": "Record premise"})
+        {"updates": [_update()], "questions": [], "reason": "Record premise",
+         "termination": "replan"})
     assert needs_atomization(draft, questions) is False
 
 

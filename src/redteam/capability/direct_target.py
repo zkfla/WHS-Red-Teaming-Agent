@@ -49,7 +49,13 @@ from redteam.capability.shell_workroom import (
     workroom_key_for,
 )
 from redteam.core.contracts.target import AnyTarget, EndpointTarget
-from redteam.core.contracts.tool import ToolDescriptor, ToolError, ToolInvocation, ToolTargetBinding
+from redteam.core.contracts.tool import (
+    EXECUTION_UNCERTAIN_METADATA_KEY,
+    ToolDescriptor,
+    ToolError,
+    ToolInvocation,
+    ToolTargetBinding,
+)
 from redteam.core.enums import RiskLevel
 from redteam.core.ids import ToolId
 from redteam.core.ports.program_discovery import ProgramExecutionRoute
@@ -319,6 +325,7 @@ async def prepare_target_network(
 
 @dataclass
 class _Attached:
+    room: str
     network_name: str
     holder_invocation_id: str
     created: bool
@@ -402,7 +409,7 @@ class DirectTargetNetworkExtension(ExecutionAdmission):
             )
             if code or timed_out:
                 raise DirectTargetError("direct_target_connect_failed")
-            self._open[key] = _Attached(network_name, holder_invocation_id, created)
+            self._open[key] = _Attached(room, network_name, holder_invocation_id, created)
         except BaseException:
             if room and network_name:
                 await self._disconnect(room, network_name)
@@ -416,8 +423,10 @@ class DirectTargetNetworkExtension(ExecutionAdmission):
         attached = self._open.get(key)
         if attached is None:
             return
-        room = self.manager._known.get(key)
-        if room and not await self._disconnect(room, attached.network_name):
+        # Detach the room recorded at open. The manager cache may already be
+        # gone (remove_workroom pops it before a failed rm), so it never decides
+        # that nothing needs detaching.
+        if not await self._disconnect(attached.room, attached.network_name):
             raise DirectTargetError("direct_target_disconnect_failed")
         if attached.created:
             code, _, _, timed_out, _ = await self.manager._run_docker(
@@ -535,7 +544,25 @@ class DirectTargetExecutionPolicy:
         try:
             await asyncio.shield(self.extension.close(key))
         except Exception:
-            return self._failure("direct_target_disconnect_failed")
+            # The script already ran, so keep its output and mark the attachment
+            # unverified. The holder stays in _open, which keeps later opens busy.
+            delegate_error = result.error.code if result.error is not None else None
+            return replace(
+                result,
+                success=False,
+                error=ToolError(
+                    code="direct_target_disconnect_failed",
+                    message="direct target network detach is unverified",
+                    retryable=False,
+                ),
+                metadata={
+                    **dict(result.metadata or {}),
+                    "direct_target_network": "detach_unverified",
+                    "network_enforcement": "none",
+                    EXECUTION_UNCERTAIN_METADATA_KEY: True,
+                    **({"delegate_error_code": delegate_error} if delegate_error else {}),
+                },
+            )
         metadata = dict(result.metadata or {})
         metadata["direct_target_network"] = "attached_for_execution"
         metadata["network_enforcement"] = "none"
@@ -587,8 +614,9 @@ def _descriptor(policy: ShellWorkroomPolicy, network: DirectTargetConfig) -> Too
         capability_tags=[SHELL_NAMESPACE],
         risk_level=RiskLevel.MEDIUM,
         retry_safe=False,
-        target_binding=ToolTargetBinding(binds_target_arguments=True),
-        argument_bindings={"target_ref": "host"},
+        target_binding=ToolTargetBinding(
+            binds_target_arguments=True, target_ref_source="logical_host",
+        ),
         requires_target=True,
         command_fields=["language", "script"],
         availability_impact=False,

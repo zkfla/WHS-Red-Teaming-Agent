@@ -27,8 +27,9 @@ input/output schema가 유효한 JSON Schema인지 검사하고, required 인자
 다른 작업실 ID를 제출하면 실행을 차단하고 오류 결과를 반환한다. 이 경우 recovery
 reference는 생성하지 않으며, 잘못된 입력만으로 Worker 전체를 종료하지 않는다.
 
-대상 통신용 Kali 도구의 `target_ref`는 제공자가 `argument_bindings`에서 선언한
-host selector다. MCP 정책의 opaque target ID와 혼동하지 않고 실제 host·port로 검증한다.
+대상 통신용 Kali 도구의 `target_ref`는 제공자가 `target_binding.target_ref_source`를
+`logical_host`로 선언한 host selector다. MCP 정책의 opaque target ID와 혼동하지 않고
+실제 host·port로 검증한다.
 opaque reference를 쓰는 다른 도구의 기존 바인딩 검사는 그대로 유지한다.
 
 HTTP MCP의 대상 연결 실패는 MCP transport 연결 실패와 구분한다. 대상 HTTP 요청이

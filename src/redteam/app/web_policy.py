@@ -10,6 +10,7 @@ import asyncio
 import hashlib
 import ipaddress
 import socket
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
@@ -381,3 +382,43 @@ async def prepare_web_deployment(path: Path) -> dict[str, str]:
                 stream.write(content)
         environment["REDTEAM_GATED_NETWORK_POLICY_PATH"] = str(destination)
     return environment
+
+
+@dataclass(frozen=True)
+class EngagementStartupSelection:
+    """Request-local startup environment and the engagement it was resolved for."""
+
+    environment: dict[str, str]
+    engagement: EngagementConfig
+    network_policy_path: str | None = None
+
+
+async def select_engagement_startup(
+    engagement: EngagementConfig | Path | str,
+    *,
+    engagement_path: Path | str | None = None,
+    require_recorded_preparation: bool = False,
+) -> EngagementStartupSelection:
+    """Apply the selected engagement's web startup once, before MCP/Kali assembly.
+
+    Delegates to prepare_web_deployment so the direct-target baseline stays the single
+    source of startup environment; this adapter only supplies the selection contract
+    that run, resume, and session callers consume.
+    """
+    if isinstance(engagement, (str, Path)):
+        path: Path | None = Path(engagement)
+        config = load_engagement_config(engagement)
+    else:
+        config = engagement
+        path = Path(engagement_path) if engagement_path is not None else None
+    if config.metadata.get(WEB_POLICY_KEY) is None:
+        environment = env_snapshot()
+    elif path is None:
+        raise ValueError("web_policy_artifact_location_required")
+    else:
+        if require_recorded_preparation and config.metadata.get("mcp_deployment") is None:
+            raise ValueError("kali_preparation_record_missing")
+        environment = await prepare_web_deployment(path)
+        config = load_engagement_config(path)
+    network_policy_path = environment.get("REDTEAM_GATED_NETWORK_POLICY_PATH") or None
+    return EngagementStartupSelection(environment, config, network_policy_path)

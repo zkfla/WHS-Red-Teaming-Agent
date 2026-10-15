@@ -95,6 +95,7 @@ def _builtin_factory(context: ComponentFactoryContext) -> RuntimeComponents:
         timeout_options = {
             "decision_timeout_seconds": context.settings.decision_timeout_seconds,
             "llm_attempt_timeout_seconds": context.settings.llm_attempt_timeout_seconds,
+            "transport_limit": context.settings.decision_transport_max_attempts,
         }
 
     components = RuntimeComponents(

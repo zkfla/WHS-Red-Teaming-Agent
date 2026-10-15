@@ -8,7 +8,7 @@ No guessed expiry, source rewrite, Task resurrection or automatic target call.
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -23,6 +23,9 @@ from redteam.orchestration.coordination import StateConflict, content_hash
 from redteam.orchestration.evidence_access import raw_from_metadata
 from redteam.orchestration.knowledge import collect_measured_values
 from redteam.orchestration.local_tools import LocalToolContext, LocalToolDescriptor, LocalToolResult
+
+if TYPE_CHECKING:
+    from redteam.orchestration.completion import OriginProof
 
 BINDING_KIND = "evidence_validity_binding_v1"
 SOURCE_ID = "orchestration.evidence_validity"
@@ -69,6 +72,38 @@ class ValidityProjection(BaseModel):
 
 class ConditionUnavailable(ValueError):
     """Current condition is unproven, not a refutation of the old observation."""
+
+
+async def prove_original(
+    *,
+    evidence_store: Any,
+    path_store: Any,
+    run_id: str,
+    engagement_id: str | None,
+    mission_id: str | None,
+    evidence_id: str,
+    require_proposal: bool = True,
+    task_graph_store: Any | None = None,
+    work_store: Any | None = None,
+) -> tuple[Any | None, "OriginProof"]:
+    """Public original-integrity assessment, delegated to the existing verifier.
+
+    Import locally because semantic completion uses this module for validity
+    refreshes; keeping the dependency here lazy avoids an eager cycle.
+    """
+    from redteam.orchestration.semantic_completion import prove_original as verify
+
+    return await verify(
+        evidence_store=evidence_store,
+        path_store=path_store,
+        run_id=run_id,
+        engagement_id=engagement_id,
+        mission_id=mission_id,
+        evidence_id=evidence_id,
+        require_proposal=require_proposal,
+        task_graph_store=task_graph_store,
+        work_store=work_store,
+    )
 
 
 def is_binding(record) -> bool:

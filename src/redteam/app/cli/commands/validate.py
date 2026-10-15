@@ -11,6 +11,8 @@ action for a naming mistake," not "this engagement is safe."
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
+from pathlib import Path
 
 from pydantic import ValidationError
 
@@ -21,9 +23,12 @@ from redteam.app.cli._shared import (
     load_app_config_for_run,
     print_json,
 )
+from redteam.app.mcp_deployment import DeploymentBinding, verified_deployment
+from redteam.app.web_policy import deployment_environment
+from redteam.capability.deployment import DeploymentSpec
 from redteam.capability.settings import MCPConfigurationError, MCPServerSettings
-from redteam.core.config import AppConfig, LLMConfig, load_engagement_config
-from redteam.core.environment import env_snapshot
+from redteam.core.config import AppConfig, EngagementConfig, LLMConfig, load_engagement_config
+from redteam.core.environment import env_snapshot, environment_context
 from redteam.orchestration.action_naming import canonical_action_key
 
 
@@ -44,9 +49,17 @@ async def run(args: argparse.Namespace) -> int:
     checks.append(("Engagement", True, []))
 
     try:
-        # This command never calls an LLM (see module docstring) -- an
-        # unset REDTEAM_LLM_PROVIDER must not block a pure config check.
-        app_config = load_app_config_for_run(args.engagement_path, require_llm=False)
+        # Read-only: a recorded deployment is checked under its composed MCP environment,
+        # in memory only. Nothing is written. This command never calls an LLM (see module
+        # docstring), so an unset REDTEAM_LLM_PROVIDER must not block a pure config check.
+        startup_environment = _recorded_startup_environment(engagement_config)
+        scope = (
+            environment_context(startup_environment)
+            if startup_environment is not None else nullcontext()
+        )
+        with scope:
+            app_config = load_app_config_for_run(args.engagement_path, require_llm=False)
+            capability_problems = check_capability(app_config)
     except (OSError, ValidationError, ValueError) as exc:
         return _fail(args, [*checks, ("Application configuration", False, [str(exc)])])
     checks.append(("Application configuration", True, []))
@@ -60,7 +73,6 @@ async def run(args: argparse.Namespace) -> int:
     roe_problems = check_roe(engagement_config)
     checks.append(("ROE", not roe_problems, roe_problems))
 
-    capability_problems = check_capability(app_config)
     checks.append(("Capability configuration", not capability_problems, capability_problems))
     checks.extend(check_execution_configuration(app_config))
 
@@ -88,6 +100,34 @@ async def run(args: argparse.Namespace) -> int:
         print("Offline checks only; live readiness and execution permission were not checked.")
         return EXIT_OK
     return _fail(args, checks)
+
+
+_SAFE_DEPLOYMENT_FAILURE = (
+    "MCP deployment validation failed; approved settings are missing or inconsistent"
+)
+
+
+def _recorded_startup_environment(engagement_config: EngagementConfig) -> dict[str, str] | None:
+    """Compose a recorded deployment's MCP environment without writing anything.
+
+    Full verification (digests, scope, roles) runs here; the environment-dependent
+    checks run afterwards in load_app_config_for_run under the composed environment.
+    Artifact parse failures are masked: parser messages can echo input or paths.
+    """
+    raw = engagement_config.metadata.get("mcp_deployment")
+    if raw is None:
+        return None
+    try:
+        binding = DeploymentBinding.model_validate(raw)
+        declared = DeploymentSpec.model_validate_json(Path(binding.source_path).read_bytes())
+    except (OSError, ValueError):  # pydantic ValidationError is a ValueError
+        raise ValueError(_SAFE_DEPLOYMENT_FAILURE) from None
+    verified = verified_deployment(
+        engagement_config, list(declared.roles), check_environment=False,
+    )
+    if verified is None:
+        return None
+    return deployment_environment(verified.spec, verified.binding)
 
 
 def _fail(args: argparse.Namespace, checks: list[tuple[str, bool, list[str]]]) -> int:

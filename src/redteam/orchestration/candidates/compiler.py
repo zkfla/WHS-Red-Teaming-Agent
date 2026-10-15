@@ -435,8 +435,9 @@ class CandidateCompiler:
         Only binds what the selected target actually knows: target identity
         (host/target_ref and friends) and an actually known endpoint path
         (concrete Endpoint/URL path). Never invents values. Explicit
-        arguments always win; when no known path exists the argument stays
-        missing so schema validation reports it as missing for the LLM
+        arguments normally win; a logical_host target_ref is always derived
+        from the selected target. When no known path exists the argument
+        stays missing so schema validation reports it as missing for the LLM
         to refill.
         """
 
@@ -481,6 +482,7 @@ class CandidateCompiler:
             return values
         declared = tool.argument_bindings
         identity = network_identity(target)
+        logical_target_ref = False
         if identity is not None:
             target_values.update(
                 host=identity.host
@@ -489,6 +491,17 @@ class CandidateCompiler:
                 target_ref=target.url if isinstance(target, UrlTarget) else identity.authority,
                 port=identity.port,
             )
+            source_binding = getattr(tool, "target_binding", None) or target_binding
+            if source_binding is None:
+                source_binding = operation_target_binding(operation, bindings)
+            logical_target_ref = (
+                getattr(source_binding, "target_ref_source", "mcp_ref") == "logical_host"
+            )
+            if logical_target_ref:
+                # A logical selector names the approved authority. The schema's
+                # separate port field carries a pinned endpoint port; deployment
+                # aliases must not replace this value.
+                target_values["target_ref"] = identity.host
             target_values.update(domain=target_values["host"], hostname=target_values["host"])
         if isinstance(target, UrlTarget):
             target_values.update(base_url=target.url, target_url=target.url)
@@ -503,13 +516,16 @@ class CandidateCompiler:
             # contain the query; a target URL is not a search input.
             target_values = {}
         for name, value in target_values.items():
-            if name in properties and value is not None and name not in values:
-                values[name] = value
+            if name in properties and value is not None:
+                if name not in values or (logical_target_ref and name == "target_ref"):
+                    values[name] = value
         for input_arg, shared in declared.items():
-            if input_arg in values or input_arg not in properties:
+            if input_arg not in properties:
                 continue
             known = target_values.get(str(shared))
-            if known is not None:
+            if known is not None and (
+                input_arg not in values or (logical_target_ref and shared == "target_ref")
+            ):
                 values[input_arg] = known
         if binds_known_path:
             wanted = [

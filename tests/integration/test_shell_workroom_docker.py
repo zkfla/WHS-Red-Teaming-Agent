@@ -495,6 +495,16 @@ async def test_foreign_uid_writes_and_executes_in_workroom(room):
         await foreign.remove_workroom(key + ".uid31")
 
 
+def _worker_report(code1, out1, err1, code2, out2, err2):
+    """Both worker exit codes and streams, attached to failing assertions."""
+    return (
+        f"worker1 rc={code1} stdout={out1.decode(errors='replace')!r} "
+        f"stderr={err1.decode(errors='replace')[-2000:]!r}; "
+        f"worker2 rc={code2} stdout={out2.decode(errors='replace')!r} "
+        f"stderr={err2.decode(errors='replace')[-2000:]!r}"
+    )
+
+
 async def test_process_level_cap_with_two_managers(room, tmp_path):
     """Two OS processes racing a cap of 1 leave exactly one container."""
     import sys
@@ -514,12 +524,13 @@ async def test_process_level_cap_with_two_managers(room, tmp_path):
         env={**os.environ, "PYTHONPATH": os.path.join(os.getcwd(), "src")},
     )
     try:
-        (out1, _), (out2, _) = await asyncio.gather(first.communicate(), second.communicate())
+        (out1, err1), (out2, err2) = await asyncio.gather(first.communicate(), second.communicate())
+        report = _worker_report(first.returncode, out1, err1, second.returncode, out2, err2)
         wins = [o for o in (out1.decode(), out2.decode()) if o.startswith("OK")]
         losses = [o for o in (out1.decode(), out2.decode()) if o.startswith("FAIL")]
-        assert len(wins) == 1
-        assert len(losses) == 1
-        assert "shell_too_many_workrooms" in losses[0]
+        assert len(wins) == 1, report
+        assert len(losses) == 1, report
+        assert "shell_too_many_workrooms" in losses[0], report
         listed = await manager._list_managed()
         mine = [context for _name, context in listed if context.startswith(prefix)]
         assert len(mine) == 1

@@ -14,9 +14,19 @@ from redteam.core.enums import GraphNodeType
 from redteam.core.ids import GraphNodeId, new_id
 from redteam.orchestration.agents.tool_access import role_readiness
 from redteam.orchestration.central_results import RESULT_UPDATED
-from redteam.orchestration.central_runtime import event, process_controls, runtime_token
+from redteam.orchestration.central_runtime import (
+    event,
+    process_controls,
+    runtime_token,
+    task_is_claimable,
+)
 from redteam.orchestration.cognition import DecisionFailure, DecisionValidationError
-from redteam.orchestration.coordination import PlanningInputsChanged, StateConflict, content_hash
+from redteam.orchestration.coordination import (
+    CandidateAdmissionConflict,
+    PlanningInputsChanged,
+    StateConflict,
+    content_hash,
+)
 from redteam.orchestration.diagnostics import (
     DecisionDiagnostic,
     diagnostic_for_exception,
@@ -68,7 +78,7 @@ class HypothesisDecision(BaseModel):
     reviewed_task_ids: list[str] = Field(default_factory=list)
     reviewed_hypothesis_ids: list[str] = Field(default_factory=list)
     reason: str = Field(min_length=1)
-    termination: Literal["continue", "held", "exhausted", "goal_achieved"] = "continue"
+    termination: Literal["continue", "replan", "held", "exhausted", "goal_achieved"] = "continue"
     resume_conditions: list[str] = Field(default_factory=list)
     context_request: PlannerContextRequest | None = None
 
@@ -79,6 +89,88 @@ class HypothesisProposalError(ValueError):
     def __init__(self, code: str):
         self.code = code
         super().__init__(code)
+
+
+def _proposal_repair_summary(exc: BaseException, fallback: str) -> str:
+    if getattr(exc, "code", None) != "continue_requires_proposed_or_existing_work":
+        return fallback
+    return (
+        "Continue is valid only with proposed tasks/questions or a referenced existing "
+        "claimable/running task whose readiness, suppression state and candidate purpose "
+        "remain current; candidate updates alone are not progress. Use continue only with "
+        "that path, replan for a candidate/empty follow-up, held for an external prerequisite, "
+        "exhausted when no useful work remains, or goal_achieved only as a proposal for the "
+        "separate completion gate."
+    )
+
+
+def _judgment_controls(planner, roles) -> dict:
+    """Planning-time controls stored with the judgment, so its commit enforces them."""
+    return {
+        "replan_max_passes": planner.deps.settings.planner_replan_max_passes,
+        "witness_inputs": {
+            "eligible_roles": sorted(roles),
+            "require_probe_limits": planner.policy.probe_limits is not None,
+        },
+    }
+
+
+def _existing_work_witnesses(
+    reviewed_task_ids, snapshot, *, eligible_roles, require_probe_limits, candidate_revisions,
+    allow_running=True,
+):
+    """Select only referenced work that still has a canonical execution path."""
+    return {
+        identity for identity in reviewed_task_ids
+        if identity in snapshot.tasks and task_is_claimable(
+            snapshot.tasks[identity],
+            eligible_roles=eligible_roles,
+            mission=snapshot.mission,
+            require_probe_limits=require_probe_limits,
+            candidate_revisions=candidate_revisions,
+            allow_running=allow_running,
+        )
+    }
+
+
+_SECONDARY_KEY = "related_admission_diagnostics"
+
+
+def _generic_admission_rejection() -> DecisionDiagnostic:
+    return DecisionDiagnostic(
+        code="hypothesis_admission_rejected", stage="hypothesis_planning", kind="validation",
+        summary="The candidate/probe proposal failed original evidence, verdict, scope "
+                "or source admission. No candidate/task change was committed.",
+        retryable=False,
+    )
+
+
+def _related_projection(item: DecisionDiagnostic) -> dict:
+    return {
+        "code": item.code, "owner": item.owner, "cause_scope": item.cause_scope,
+        "criterion_ids": list(item.criterion_ids[:10]),
+        "evidence_ids": list(item.evidence_ids[:10]),
+        "repair_condition": item.repair_condition,
+    }
+
+
+def _candidate_admission_diagnostic(exc: CandidateAdmissionConflict, budget) -> DecisionDiagnostic:
+    """Primary owner diagnostic with planner stage/attempts and one bounded secondary trace row."""
+    if not exc.diagnostics:
+        return _generic_admission_rejection()
+    primary, *related = exc.diagnostics
+    diagnostic = primary.model_copy(
+        update={"stage": "hypothesis_planning", "attempts": budget.used},
+    )
+    if not related:
+        return diagnostic
+    projections = [_related_projection(item) for item in related[:7]]
+    trace = list(diagnostic.trace)
+    if len(trace) < 20:
+        trace.append({_SECONDARY_KEY: projections})
+    elif _SECONDARY_KEY not in trace[-1]:
+        trace[-1] = {**trace[-1], _SECONDARY_KEY: projections}
+    return diagnostic.model_copy(update={"trace": trace})
 
 
 def _proposal_validation_diagnostic(
@@ -207,8 +299,16 @@ def bind_decision(decision, snapshot, *, issued, targets, principals, roles, max
         set(decision.reviewed_hypothesis_ids) - snapshot.candidates.keys()
     ):
         raise HypothesisProposalError("reviewed_reference_not_in_snapshot")
+    witnesses = _existing_work_witnesses(
+        decision.reviewed_task_ids, snapshot, eligible_roles=roles,
+        require_probe_limits=limits is not None, candidate_revisions=versions,
+    )
+    if decision.termination == "continue" and not tasks and not witnesses:
+        raise HypothesisProposalError("continue_requires_proposed_or_existing_work")
     if not (updates or tasks):
-        if decision.termination == "continue" or not decision.resume_conditions:
+        if decision.termination not in {"continue", "replan", "goal_achieved"} and (
+            not decision.resume_conditions
+        ):
             raise HypothesisProposalError("empty_judgment_needs_termination_and_resume_conditions")
         return None
     proposal = HypothesisProbeProposal(updates=updates, tasks=tasks)
@@ -217,7 +317,8 @@ def bind_decision(decision, snapshot, *, issued, targets, principals, roles, max
     return proposal
 
 
-def related_reads(decision, proposal, snapshot, records, *, questions=(), issued=None):
+def related_reads(decision, proposal, snapshot, records, *, questions=(), issued=None,
+                  eligible_roles=(), require_probe_limits=False):
     hypotheses = set(decision.reviewed_hypothesis_ids)
     tasks = set(decision.reviewed_task_ids)
     subjects = set()
@@ -249,10 +350,32 @@ def related_reads(decision, proposal, snapshot, records, *, questions=(), issued
         evidence.update(question.evidence_ids)
         if question.source_task_id:
             tasks.add(question.source_task_id)
-    if decision.termination != "continue":
+    if decision.termination not in {"continue", "replan"}:
         # A global stop/exhaustion judgment consumed all current work, not one candidate.
         hypotheses.update(snapshot.candidates)
         tasks.update(snapshot.tasks)
+    elif decision.termination == "continue" and not (
+        (proposal is not None and proposal.tasks) or questions
+    ):
+        # A claimable task's candidate revisions are part of the witness contract.
+        # Running work retains its captured purpose, so only pending/ready witnesses
+        # consume candidate graph inputs here.
+        candidate_revisions = {
+            identity: candidate.revision
+            for identity, candidate in snapshot.candidates.items()
+        }
+        if proposal is not None:
+            candidate_revisions.update({
+                update.hypothesis.hypothesis_id: (update.expected_revision or 0) + 1
+                for update in proposal.updates
+            })
+        claimable_witness_ids = _existing_work_witnesses(
+            decision.reviewed_task_ids, snapshot, eligible_roles=eligible_roles,
+            require_probe_limits=require_probe_limits,
+            candidate_revisions=candidate_revisions, allow_running=False,
+        )
+        for identity in claimable_witness_ids:
+            hypotheses.update(set(snapshot.tasks[identity].hypothesis_revisions) - new)
     for record in records:
         if str(record.evidence_id) in evidence:
             identity = record.metadata.get("mission_task_id")
@@ -330,7 +453,10 @@ async def advance_hypotheses(planner, runtime, schema):
             roles=roles, max_tasks=planner.policy.max_tasks_per_strategy,
             limits=planner.policy.probe_limits,
         )
-        return decision, proposal, related_reads(decision, proposal, snapshot, records)
+        return decision, proposal, related_reads(
+            decision, proposal, snapshot, records, eligible_roles=roles,
+            require_probe_limits=planner.policy.probe_limits is not None,
+        )
 
     def validate(raw):
         try:
@@ -338,9 +464,14 @@ async def advance_hypotheses(planner, runtime, schema):
         except (ValueError, SpecialistProposalError) as exc:
             raise DecisionValidationError(_proposal_validation_diagnostic(
                 exc, stage="hypothesis_planning",
-                summary="Use captured subjects, ready roles, candidate revisions "
-                "and original source results. A new candidate key is local to this proposal. "
-                "Empty judgments need a termination reason and resume_conditions.",
+                summary=_proposal_repair_summary(exc, (
+                    "Use captured subjects, ready roles, candidate revisions and original "
+                    "source results. A new candidate key is local to this proposal. Continue "
+                    "requires proposed tasks or a referenced executable existing task; candidate "
+                    "updates alone are not progress. Use replan for a candidate/empty follow-up, "
+                    "held for an external prerequisite, exhausted when no useful work remains, "
+                    "or goal_achieved only as a completion proposal."
+                )),
                 schema=HypothesisDecision.model_json_schema(),
             )) from exc
 
@@ -359,7 +490,8 @@ async def advance_hypotheses(planner, runtime, schema):
     judgment = {**decision.model_dump(mode="json"), "sequence": snapshot.sequence,
                 "issued_candidate_ids": issued, "graph_read": graph_read, "task_read": task_read,
                 "candidate_inventory": sorted(snapshot.candidates),
-                "task_inventory": sorted(snapshot.tasks), **pass_context.auxiliary_reads()}
+                "task_inventory": sorted(snapshot.tasks), **pass_context.auxiliary_reads(),
+                **_judgment_controls(planner, roles)}
     return await _finalize_hypothesis_pass(
         deps, snapshot, budget, identity=identity, proposal=proposal, judgment=judgment,
         graph_read=graph_read, task_read=task_read, targets=targets, principals=principals,
@@ -395,6 +527,9 @@ async def _finalize_hypothesis_pass(deps, snapshot, budget, *, identity, proposa
             {"pass_id": identity, "reason_code": "related_planning_inputs_changed"},
         )))
         identities = []
+    except CandidateAdmissionConflict as exc:
+        raise DecisionFailure("hypothesis_planning", "format", budget.used,
+                              diagnostic=_candidate_admission_diagnostic(exc, budget)) from exc
     except (StateConflict, ValueError) as exc:
         raise DecisionFailure("hypothesis_planning", "format", budget.used,
                               diagnostic=DecisionDiagnostic(
@@ -574,6 +709,13 @@ async def _advance_split(planner, runtime, schema, snapshot, engine, budget, pay
     deps = planner.deps
     issued: dict[str, str] = {}
 
+    def validate_existing_work(task_ids, versions):
+        return _existing_work_witnesses(
+            task_ids, snapshot, eligible_roles=roles,
+            require_probe_limits=planner.policy.probe_limits is not None,
+            candidate_revisions=versions,
+        )
+
     def bind_stage_one(raw):
         draft = HypothesisPlanDraft.model_validate(raw)
         if lookup_only(draft):
@@ -582,6 +724,7 @@ async def _advance_split(planner, runtime, schema, snapshot, engine, budget, pay
         updates, questions, versions = bind_plan(
             draft, snapshot, issued=issued, targets=targets, principals=principals,
             max_tasks=planner.policy.max_tasks_per_strategy,
+            existing_work_validator=validate_existing_work,
         )
         return draft, updates, questions, versions
 
@@ -690,6 +833,8 @@ async def _advance_split(planner, runtime, schema, snapshot, engine, budget, pay
                                    else "held_or_empty")}
     graph_read, task_read = related_reads(
         decision, proposal, snapshot, records, questions=questions, issued=issued,
+        eligible_roles=roles,
+        require_probe_limits=planner.policy.probe_limits is not None,
     )
     lookup_graph, lookup_tasks = pass_context.read_dependencies()
     graph_read.update(lookup_graph)
@@ -699,7 +844,8 @@ async def _advance_split(planner, runtime, schema, snapshot, engine, budget, pay
                 "candidate_inventory": sorted(snapshot.candidates),
                 "task_inventory": sorted(snapshot.tasks),
                 "questions": [question.model_dump(mode="json") for question in questions],
-                "atomization": atomization, **pass_context.auxiliary_reads()}
+                "atomization": atomization, **pass_context.auxiliary_reads(),
+                **_judgment_controls(planner, roles)}
     return await _finalize_hypothesis_pass(
         deps, snapshot, budget, identity=identity, proposal=proposal, judgment=judgment,
         graph_read=graph_read, task_read=task_read, targets=targets, principals=principals,

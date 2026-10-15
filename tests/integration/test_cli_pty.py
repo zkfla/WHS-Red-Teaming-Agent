@@ -35,6 +35,9 @@ async def _fixture():
 
     operator, *_ = await _console()
     deps = operator._deps
+    # RuntimeDeps always carries tool_catalog (None means no catalog). The console
+    # stub predates that field, and the session's tool context reads it directly.
+    deps.tool_catalog = getattr(deps, "tool_catalog", None)
     end = asyncio.Event()
     loop = asyncio.get_running_loop()
     loop.add_signal_handler(signal.SIGUSR1, end.set)

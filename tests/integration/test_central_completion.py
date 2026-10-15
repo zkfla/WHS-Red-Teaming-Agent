@@ -12,13 +12,15 @@ from redteam.app.central_views import inspect_central_run
 from redteam.attack_graph.service import AttackGraphService
 from redteam.capability.development import DevelopmentResponse
 from redteam.core.config import AppConfig, EngagementConfig
+from redteam.core.contracts.events import EventType
 from redteam.core.contracts.graph import Hypothesis
-from redteam.core.enums import AgentPhase, MissionStatus
+from redteam.core.enums import AgentPhase, MissionStatus, TaskStatus
 from redteam.llm.fake import FakeLLMClient
 from redteam.orchestration.central_completion import complete_goal, goal_inputs
 from redteam.orchestration.central_results import settle_central
+from redteam.orchestration.completion import origin_row_hash
 from redteam.orchestration.completion_proposal import CompletionProposal
-from redteam.orchestration.coordination import StateConflict
+from redteam.orchestration.coordination import StateConflict, content_hash
 from redteam.orchestration.local_tools import LocalToolContext
 from redteam.orchestration.state import TerminationReason
 from tests.integration.test_central_development import engagement, gateway
@@ -122,6 +124,76 @@ async def test_goal_uses_original_criteria_without_requiring_finding(tmp_path):
         assert report.criterion_evidence[0]["evidence_ids"] == originals
         assert not report.unresolved_questions[0]["resolved"]
         assert not report.unresolved_questions[0]["required_for_goal"]
+
+
+async def test_goal_rechecks_used_optional_origin_task_row_during_review(tmp_path):
+    """A used optional Task's exact source row stays fenced through goal review."""
+    async with selection(tmp_path) as (session, llm):
+        originals = await finish_inconclusive(session, llm)
+        state = session.deps.central_state
+        source, = await state.list_tasks()
+        # Make the completed producer optional; its original is still selected by
+        # the goal review below and must therefore retain a source-row read.
+        await state.transaction(lambda tx: tx._write_task(
+            tx.get_task(str(source.task_id)).model_copy(update={"required": False}),
+        ))
+        source_before_review = await state.get_task(str(source.task_id))
+        source_hash_before_review = origin_row_hash(source_before_review)
+        mission = await state.get_mission(session.runtime.mission_id)
+        llm._canned_structured = {
+            "accepted": True,
+            "reason": "The optional original supports the goal criterion",
+            "criteria": [{
+                "criterion": criterion,
+                "met": True,
+                "evidence_ids": originals,
+                "claims": [{
+                    "kind": "semantic",
+                    "description": "The preserved response supports the criterion",
+                    "evidence_ids": originals,
+                }],
+            } for criterion in mission.success_criteria],
+        }
+        await state.transaction(lambda tx: tx.set_settlement_gate(True))
+
+        async def terminal_event_count():
+            return await state.transaction(lambda tx: sum(
+                (envelope := json.loads(row[0])).get("event_type") == EventType.TASK_COMPLETED
+                or (
+                    envelope.get("event_type") == "MissionUpdated"
+                    and envelope.get("payload", {}).get("status") == "completed"
+                )
+                for row in tx.db.execute(
+                    "SELECT payload FROM state_outbox WHERE run_id=?", (tx.run_id,),
+                )
+            ), write=False)
+
+        before_count = await terminal_event_count()
+        before_mission = await state.get_mission(session.runtime.mission_id)
+        before = len(llm.requests)
+        llm.request_release.clear()
+        pending = asyncio.create_task(complete_goal(session.deps, session.runtime))
+        try:
+            await asyncio.wait_for(llm.wait_for_requests(before + 1), 5)
+
+            def change_source(tx):
+                current = tx.get_task(str(source.task_id))
+                # Title changes keep the source purpose and receipt valid, so the
+                # specific row hash—not a purpose check—must reject admission.
+                tx._write_task(current.model_copy(update={"title": "Changed during review"}))
+
+            await state.transaction(change_source)
+        finally:
+            llm.request_release.set()
+
+        with pytest.raises(StateConflict, match="goal_origin_task_changed_reassessment_required"):
+            await pending
+        after_mission = await state.get_mission(session.runtime.mission_id)
+        assert after_mission == before_mission
+        assert content_hash(after_mission) == content_hash(before_mission)
+        actual_source_hash = origin_row_hash(await state.get_task(str(source.task_id)))
+        assert actual_source_hash != source_hash_before_review
+        assert await terminal_event_count() == before_count
 
 
 @pytest.mark.parametrize(
@@ -265,7 +337,11 @@ async def test_owned_resume_runs_original_zero_entry_actor(tmp_path):
             discover(TOOL), turn(inspect("same-original-instance")),
             NativeCompletion(text="Further investigation needed", total_tokens=1),
         ]
-        llm._canned_structured = {"questions": [], "reason": "No further work proposed"}
+        llm._canned_structured = {
+            "questions": [], "termination": "held",
+            "resume_conditions": ["A new result or operator instruction arrives"],
+            "reason": "No further work proposed",
+        }
         final = await session.resume()
         assert final.run_id == original.run_id
         execution, = await session.deps.central_state.list_executions()
@@ -331,12 +407,98 @@ async def test_followup_registration_is_not_question_resolution(tmp_path):
         assert (await goal_inputs(session.deps, session.runtime))[3] == []
 
 
+async def test_goal_validates_receipt_for_followup_adopting_original_source(tmp_path):
+    """Task B can independently review Task A's original and carry it to the goal."""
+    from redteam.core.contracts.completion import criterion_id
+    from redteam.orchestration.central_runtime import ready_workers
+    from tests.integration.test_central_development import proposal, register
+
+    async with selection(tmp_path) as (session, llm):
+        original_refs = await finish_inconclusive(session, llm, questions=[{
+            "question_id": "required",
+            "question": "Independently judge whether the original response proves the goal",
+            "required_for_goal": True,
+            "reason": "A second task must assess relevance to the goal",
+        }])
+        state = session.deps.central_state
+        source, = await state.list_tasks()
+        candidate = proposal(
+            source_task_id=str(source.task_id),
+            source_result_id=source.result.result_id,
+            source_question_id="required",
+        )
+        followup_proposal = candidate.model_copy(update={
+            "tasks": [candidate.tasks[0].model_copy(update={
+                "objective": "Judge whether the admin path reuses the observed session",
+            })],
+        })
+        followup_id, = await register(
+            session, "followup-adopts-source-original", followup_proposal,
+        )
+        worker, = await ready_workers(session.deps, session.runtime)
+        task = await state.get_task(followup_id)
+        llm._canned_structured = {
+            "accepted": True,
+            "reason": "The source response independently supports the follow-up purpose",
+            "claims": [{
+                "kind": "semantic",
+                "description": "The preserved source response supports the task purpose",
+                "evidence_ids": original_refs,
+            }],
+            "criterion_results": [{
+                "criterion_id": criterion_id(condition),
+                "met": True,
+                "reason": "The source response supports this fixed condition",
+                "evidence_ids": original_refs,
+            } for condition in task.completion_criteria],
+        }
+        from redteam.orchestration.central_results import settle_central
+        from redteam.orchestration.completion_proposal import CompletionProposal
+        from redteam.orchestration.local_tools import LocalToolContext
+
+        settled = await settle_central(
+            "task",
+            CompletionProposal(
+                outcome="success", reason="Independently reviewed source original",
+                evidence_ids=original_refs,
+            ),
+            LocalToolContext(
+                session.deps, worker.model_copy(update={"phase": AgentPhase.OBSERVE}),
+            ),
+        )
+        assert settled.ok, settled.error
+        await state.transaction(lambda tx: tx.actor_returned(
+            followup_id,
+            owner=worker.work_owner,
+            version=worker.task_ownership_version,
+            instance_id=str(worker.instance_id),
+        ))
+        completed = await state.get_task(followup_id)
+        assert completed.result.outcome == "confirmed"
+        assert completed.result.completion_receipt_id is not None
+        receipt = await session.deps.evidence_store.get(
+            str(completed.result.completion_receipt_id),
+        )
+        assert receipt.metadata["task_id"] == followup_id
+        assert receipt.metadata["source_evidence_ids"] == original_refs
+
+        inputs = await goal_inputs(session.deps, session.runtime)
+        assert inputs[3] == []
+        assert inputs[4][followup_id] == original_refs
+        assert await review(session, llm, original_refs) == []
+        mission = await state.get_mission(session.runtime.mission_id)
+        assert mission.status is MissionStatus.COMPLETED
+
+
 async def test_exhaustion_is_a_fresh_judgment_and_never_goal_success(tmp_path):
     from redteam.orchestration.specialist_planner import SpecialistPlanner
     async with selection(tmp_path) as (session, llm):
         refs = await finish_inconclusive(session, llm)
-        llm._canned_structured = {"questions": [], "termination": "exhausted",
-                                  "reason": "Original response assessed, no useful followup"}
+        llm._canned_structured = {
+            "questions": [], "termination": "exhausted",
+            "resume_conditions": ["A relevant new result changes the available evidence"],
+            "reason": "Original response assessed, no useful followup",
+        }
         await SpecialistPlanner(session.deps).advance(session.runtime)
         mission = await session.deps.central_state.get_mission(session.runtime.mission_id)
         llm._canned_structured = {
@@ -347,6 +509,41 @@ async def test_exhaustion_is_a_fresh_judgment_and_never_goal_success(tmp_path):
         final = await session.settle(session.runtime)
         assert final.termination_reason == TerminationReason.EXHAUSTED
         assert final.mission_status is MissionStatus.ACTIVE
+
+
+async def test_exhaustion_does_not_replace_an_external_task_hold(tmp_path):
+    from redteam.orchestration.specialist_planner import SpecialistPlanner
+    from tests.integration.test_central_development import register
+
+    async with selection(tmp_path) as (session, llm):
+        await finish_inconclusive(session, llm)
+        blocked_id, = await register(session, "external-hold")
+        await session.deps.central_state.transaction(lambda tx: tx._write_task(
+            tx.get_task(str(blocked_id)).model_copy(update={
+                "required": False,
+                "status": TaskStatus.BLOCKED,
+                "blocking_reason": "awaiting_external_prerequisite",
+            }),
+        ))
+        llm._canned_structured = {
+            "questions": [], "termination": "exhausted",
+            "resume_conditions": ["The external prerequisite becomes available"],
+            "reason": "No useful authorized followup is currently available",
+        }
+        await SpecialistPlanner(session.deps).advance(session.runtime)
+        llm._canned_structured = {
+            "accepted": False, "reason": "Goal criterion remains unmet",
+            "criteria": [{"criterion": "Assess the original response", "met": False,
+                          "evidence_ids": [], "claims": []}],
+        }
+
+        final = await session.settle(session.runtime)
+
+        assert final.termination_reason == TerminationReason.INVESTIGATION_HELD
+        assert final.mission_status is MissionStatus.ACTIVE
+        blocked = await session.deps.central_state.get_task(str(blocked_id))
+        assert blocked.status is TaskStatus.BLOCKED
+        assert blocked.blocking_reason == "awaiting_external_prerequisite"
 
 
 async def test_background_reasoning_drains_under_same_driver_ownership(tmp_path):

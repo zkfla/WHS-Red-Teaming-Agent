@@ -57,6 +57,13 @@ def _fake_preparation(monkeypatch, tmp_path):
             policy=policy,
             manifest_path=str(manifest),
             fingerprint=FINGERPRINT,
+            endpoint=SimpleNamespace(
+                binary="docker", context="desktop-linux", host="unix:///docker.sock",
+            ),
+            network_policy=None,
+            network_policy_hash=None,
+            status="local_only",
+            readiness_checked_at=None,
         )
     )
     monkeypatch.setitem(
@@ -101,7 +108,9 @@ async def test_prepared_manifest_reaches_no_argument_program_discovery(monkeypat
     monkeypatch.setattr(runtime.program_source, "_resolve_image_id", AsyncMock(return_value=IMAGE))
     rows = await runtime.program_source.list_image_programs()
     assert [(row.name, row.executable) for row in rows] == [("nmap", "/usr/bin/nmap")]
-    prepare.assert_awaited_once_with(None, progress=None, expected_fingerprint=None)
+    prepare.assert_awaited_once_with(
+        None, progress=None, expected_fingerprint=None,
+    )
 
 
 async def test_manual_mode_never_prepares_or_builds(monkeypatch, tmp_path):

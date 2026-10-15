@@ -101,6 +101,27 @@ function applyEvent(store, item) {
   }
 }
 
+// Shallow allowlist projection of a server input diagnostic: only bounded
+// scalar fields reach the renderer, never a nested diagnostic blob.
+function diagnosticView(value) {
+  if (!value || typeof value !== "object") return null;
+  const text = (item) => (typeof item === "string" ? item : null);
+  const count = (item) => (typeof item === "number" && Number.isInteger(item) && item >= 0 ? item : null);
+  const view = {
+    label: text(value.label),
+    code: text(value.code),
+    stage: text(value.stage),
+    kind: text(value.kind),
+    attempts: count(value.attempts),
+    location: text(value.location),
+    rule: text(value.rule),
+    cause_code: text(value.cause_code),
+    provider_status: count(value.provider_status),
+    error_type: text(value.error_type),
+  };
+  return Object.values(view).some((item) => item !== null) ? view : null;
+}
+
 export function applyItem(store, item) {
   if (item.seq <= store.lastSeq) return false;
   store.lastSeq = item.seq;
@@ -112,7 +133,11 @@ export function applyItem(store, item) {
         type: "note", text: item.data.last_summary,
       });
     }
-  } else if (item.kind === "input") upsert(store, `in:${item.data.input_id}`, { type: "input", ...item.data });
+  } else if (item.kind === "input") {
+    const { diagnostic: _dropped, ...rest } = item.data;
+    upsert(store, `in:${item.data.input_id}`,
+      { type: "input", ...rest, diagnostic: diagnosticView(item.data.diagnostic) });
+  }
   else if (item.kind === "console") logActivity(store, item, item.data.text);
   else if (item.kind === "event") applyEvent(store, item);
   return true;

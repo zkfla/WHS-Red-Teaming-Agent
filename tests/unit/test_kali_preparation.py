@@ -210,7 +210,13 @@ async def test_run_passes_context_and_fingerprints_without_a_second_shell(
             ),
         }
     with environment_context({"REDTEAM_SHELL_AUTO_SETUP": "true"}):
-        _, result = await run.build(AppConfig(engagement=store.load()), max_steps=1, **options)
+        await prepare_web_deployment(store.path)
+        _, result = await run.build(
+            AppConfig(engagement=store.load()),
+            max_steps=1,
+            engagement_path=store.path,
+            **options,
+        )
     assert gate_prepare.await_args.kwargs["expected_fingerprint"] == (
         FINGERPRINT if resuming else None
     )
@@ -227,7 +233,7 @@ async def test_run_passes_context_and_fingerprints_without_a_second_shell(
         "direct_target_route_unavailable", "target_network_id", "Select the target bridge."
     )
     with environment_context({}), pytest.raises(DirectTargetPreparationError):
-        await run.build(AppConfig(engagement=store.load()), max_steps=1)
+        await run.build(AppConfig(engagement=store.load()), max_steps=1, engagement_path=store.path)
     build.assert_not_awaited()
 
 

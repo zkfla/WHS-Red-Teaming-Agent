@@ -13,6 +13,10 @@ from datetime import datetime, timezone
 import pytest
 
 from redteam.app.central_development import build_central_development
+from redteam.app.central_run import bind_run_metadata
+from redteam.attack_graph.service import AttackGraphService
+from redteam.core.contracts.completion import CompletionCriterion, criterion_id
+from redteam.core.contracts.graph import Hypothesis
 from redteam.core.enums import OperatorIntentType, TaskStatus
 from redteam.core.ids import TaskId, new_id
 from redteam.llm.fake import FakeLLMClient
@@ -73,7 +77,10 @@ def strategy_response(*, adjustments=None):
 
 
 def halted_response(*, adjustments=None):
-    payload = {"questions": [], "reason": "plan4c halt", "termination": "exhausted"}
+    payload = {
+        "questions": [], "reason": "plan4c halt", "termination": "exhausted",
+        "resume_conditions": ["A relevant result or goal revision changes the work"],
+    }
     if adjustments is not None:
         payload["task_adjustments"] = adjustments
     return payload
@@ -102,6 +109,7 @@ async def test_guidance_focus_and_reprioritize_reach_model_input():
     async with build_central_development(
         engagement(), llm=llm, tools=gateway(), settings=settings(),
     ) as selection:
+        await bind_run_metadata(selection.deps)
         await register(selection)
         guidance = await apply_plan4c_intent(selection, plan4c_intent(
             selection, OperatorIntentType.GUIDANCE, instruction="prefer quiet reads first"))
@@ -188,11 +196,65 @@ async def test_mid_sequence_exhaustion_is_structured_stop(monkeypatch):
             await SpecialistPlanner(selection.deps).advance(selection.runtime)
         assert failed.value.kind == "budget"
         assert len(llm.requests) == 1
+
+
+async def test_atomization_rejection_preserves_structured_candidate_diagnostic():
+    criteria = [
+        CompletionCriterion(
+            kind="hypothesis_confirmed", description="Review this candidate",
+            hypothesis_id="candidate-a",
+        ),
+        CompletionCriterion(
+            kind="hypothesis_refuted", description="Review this candidate",
+            hypothesis_id="candidate-a",
+        ),
+    ]
+    conflict = {
+        "tasks": [{
+            "task_key": "conflicting-task",
+            "question_id": "q1",
+            "objective": "Investigate the candidate",
+            "title": "Candidate investigation",
+            "role_id": "web-executor",
+            "target_node_ids": [TARGET],
+            "completion_criteria": [item.model_dump(mode="json") for item in criteria],
+        }],
+    }
+    llm = FakeLLMClient(structured_responses=[strategy_response(), *[conflict] * 32])
+    async with build_central_development(
+        engagement(), llm=llm, tools=gateway(), settings=settings(),
+    ) as selection:
+        await register(selection)
+        await AttackGraphService(selection.deps.graph_store).record_hypothesis(Hypothesis(
+            hypothesis_id="candidate-a", description="A test candidate",
+        ))
+        before = await selection.deps.central_state.list_tasks()
+
+        with pytest.raises(DecisionFailure) as failed:
+            await SpecialistPlanner(selection.deps).advance(selection.runtime)
+
+        diagnostic = failed.value.diagnostic.last_cause
+        assert diagnostic is not None
+        assert diagnostic.code == "same_candidate_completion_condition_conflict"
+        assert diagnostic.stage == "task_atomization"
+        assert diagnostic.location == "$.tasks"
+        assert diagnostic.kind == "validation" and diagnostic.retryable
+        assert diagnostic.cause_scope == "model_input"
+        assert diagnostic.owner == "planner"
+        assert diagnostic.repair_condition
+        assert diagnostic.criterion_ids == sorted(criterion_id(item) for item in criteria)
+        assert diagnostic.trace == [{
+            "kind": "same_candidate_completion_condition_conflict",
+            "hypothesis_id": "candidate-a",
+            "criterion_ids": [criterion_id(item) for item in criteria],
+        }]
+        assert await selection.deps.central_state.list_tasks() == before
 async def test_planner_cancel_unblocks_optional_but_required_still_gates():
     llm = FakeLLMClient()
     async with build_central_development(
         engagement(), llm=llm, tools=gateway(), settings=settings(),
     ) as selection:
+        await bind_run_metadata(selection.deps)
         await register(selection, "registration-a")
         await register(selection, "registration-b")
         state = selection.deps.central_state
@@ -223,6 +285,10 @@ async def test_planner_cancel_unblocks_optional_but_required_still_gates():
         _, _, _, errors, _, _, _ = await goal_inputs(selection.deps, selection.runtime)
         assert "required_investigation_unfinished" in errors
 
+        # A new operator guidance intent is a genuine external wake for the next pass.
+        wake = await apply_plan4c_intent(selection, plan4c_intent(
+            selection, OperatorIntentType.GUIDANCE, instruction="narrow remaining work"))
+        assert wake.status is IntentStatus.APPLIED
         remaining = await state.get_mission(selection.runtime.mission_id)
         llm.structured_responses = [halted_response(adjustments=[{
             "task_id": other,

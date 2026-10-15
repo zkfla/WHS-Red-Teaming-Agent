@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
+from redteam.orchestration.diagnostics import DecisionDiagnostic
+
 
 class SessionPhase(str, Enum):
     IDLE = "idle"
@@ -50,6 +52,8 @@ class InputReceipt:
     reason: str = ""
     decision: Any = None
     context_revision: Any = None
+    # Safe cause for a failed input, attached to this receipt only. Never a body or exception text.
+    diagnostic: DecisionDiagnostic | None = None
 
 
 @dataclass

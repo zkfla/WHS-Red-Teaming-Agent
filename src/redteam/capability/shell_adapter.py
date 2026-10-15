@@ -115,17 +115,25 @@ class GatedExecutionDelegate(Protocol):
     async def __call__(self) -> MCPCallResult: ...
 
 
-class ShellExecutionPolicy(Protocol):
-    """Required network-execution seam, shared by direct and retained providers."""
+class NetworkExecutionPolicy(Protocol):
+    """Contextual execution contract shared by direct and gated providers."""
+
+    async def execute(
+        self, invocation: ToolInvocation, parsed: Any, delegate: GatedExecutionDelegate,
+    ) -> MCPCallResult: ...
+
+
+class GatedExecutionPolicy(NetworkExecutionPolicy, Protocol):
+    # Provider-side structural view of the TASK-005 gated policy.
+    # The concrete class lives with 005; it must structurally conform
+    # so this seam binds without importing an unpublished module.
+    # execute() routes through policy enforcement, then the delegate.
     async def execute(
         self,
         invocation: ToolInvocation,
         parsed: Any,
         delegate: GatedExecutionDelegate,
     ) -> MCPCallResult: ...
-
-
-class GatedExecutionPolicy(ShellExecutionPolicy, Protocol):
     # Install-route seam (TASK-005/007): the provider asks the policy
     # for the operator-pinned route of one mirror name, then seeds the
     # install exec env from the forward-proxy variables. Structural so
@@ -223,7 +231,7 @@ class BuiltinShellAdapter(ContextualInvocationAdapter, ExecutionRecoveryProvider
         self._workroom = workroom if workroom is not None else ShellWorkroomManager(policy)
         self._jobs: dict[str, _ShellJob] = {}
         self._lock = asyncio.Lock()
-        self._gated_policy: ShellExecutionPolicy | None = None
+        self._gated_policy: NetworkExecutionPolicy | None = None
         self._gated_descriptors: tuple[ToolDescriptor, ...] = ()
         self._gated_by_name: dict[str, ToolDescriptor] = {}
 
@@ -233,7 +241,7 @@ class BuiltinShellAdapter(ContextualInvocationAdapter, ExecutionRecoveryProvider
 
     def set_gated_policy(
         self,
-        executor: ShellExecutionPolicy,
+        executor: NetworkExecutionPolicy,
         descriptors: list[ToolDescriptor],
     ) -> None:
         # Public configure hook for the TASK-005 gated provider
@@ -255,7 +263,7 @@ class BuiltinShellAdapter(ContextualInvocationAdapter, ExecutionRecoveryProvider
 
     def set_network_policy(
         self,
-        executor: ShellExecutionPolicy,
+        executor: NetworkExecutionPolicy,
         descriptors: list[ToolDescriptor],
     ) -> None:
         """Configure contextual network tools through the existing dispatch seam.
@@ -467,7 +475,7 @@ class BuiltinShellAdapter(ContextualInvocationAdapter, ExecutionRecoveryProvider
         return ref.strip()
 
     @staticmethod
-    def _install_env(policy: ShellExecutionPolicy, mirror: str) -> dict[str, str]:
+    def _install_env(policy: NetworkExecutionPolicy, mirror: str) -> dict[str, str]:
         # Provider-owned installer env from the policy route. The proxy
         # variables come from operator pins (never model args); the
         # supervisor applies them after scrubbing model proxy/index
@@ -1992,7 +2000,7 @@ class BuiltinShellAdapter(ContextualInvocationAdapter, ExecutionRecoveryProvider
         try:
             recover = getattr(policy, "recover_retained", None)
             if not callable(recover):
-                raise ShellWorkroomError("shell_retained_recovery_unavailable")
+                raise ShellWorkroomError("gated_window_recovery_unavailable")
             outcome = await recover(record)
             self._consume_window_settlement(job, outcome)
         except Exception as exc:
@@ -2036,7 +2044,7 @@ class BuiltinShellAdapter(ContextualInvocationAdapter, ExecutionRecoveryProvider
         try:
             close = getattr(policy, "close_retained", None)
             if not callable(close):
-                raise ShellWorkroomError("shell_retained_close_unavailable")
+                raise ShellWorkroomError("gated_window_close_unavailable")
             outcome = await close(job.workroom_key, window_id=window_id)
             self._consume_window_settlement(job, outcome)
         except Exception as exc:

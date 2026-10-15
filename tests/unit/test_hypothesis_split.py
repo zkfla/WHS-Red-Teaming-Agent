@@ -102,7 +102,8 @@ def test_held_plan_skips_atomizer():
 def test_update_only_plan_skips_atomizer():
     snapshot = _snap(_cand())
     draft = HypothesisPlanDraft.model_validate({
-        "updates": [_existing_update()], "reason": "Review one captured candidate",
+        "updates": [_existing_update()], "termination": "replan",
+        "reason": "Review one captured candidate",
     })
     updates, questions, versions = bind_plan(
         draft, snapshot, issued={}, targets={"host:a"}, principals=set(), max_tasks=4,

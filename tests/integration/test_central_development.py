@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from redteam.app.central_development import build_central_development
+from redteam.app.central_run import bind_run_metadata
 from redteam.capability.development import DevelopmentResponse, DevelopmentToolGateway
 from redteam.core.contracts.engagement import Engagement
 from redteam.core.contracts.events import EventType
@@ -171,13 +172,22 @@ async def test_planner_worker_intermediate_followup_and_atomic_originals():
                 "reason": "Assess",
             },
             {"tasks": [t.model_dump(mode="json") for t in proposed.tasks]},
-            *[{"questions": [], "reason": "Held for current worker results"} for _ in range(5)],
+            *[
+                {
+                    "questions": [],
+                    "reason": "Held for current worker results",
+                    "termination": "held",
+                    "resume_conditions": ["New worker result is committed"],
+                }
+                for _ in range(5)
+            ],
         ],
     )
     tools = gateway()
     async with build_central_development(
         engagement(), llm=llm, tools=tools, settings=settings()
     ) as selection:
+        await bind_run_metadata(selection.deps)
         state = selection.deps.central_state
         assert selection.deps.task_graph_store is None
         assert selection.deps.path_store is None
@@ -267,7 +277,9 @@ async def test_planner_worker_intermediate_followup_and_atomic_originals():
         await selection.deps.event_bus.subscribe(EventType.EVIDENCE_CREATED, evidence_committed)
         await selection.deps.event_bus.subscribe(RESULT_UPDATED, intermediate)
         final = await selection.run()
-        assert final.termination_reason == TerminationReason.INVESTIGATION_HELD
+        assert final.termination_reason == TerminationReason.INVESTIGATION_HELD, (
+            final.model_dump(mode="json")
+        )
         assert len(tools.invocations) == 2
         assert tools.invocations[0].arguments != tools.invocations[1].arguments
         assert final.actions_executed == 2 and final.remaining_budget == 4

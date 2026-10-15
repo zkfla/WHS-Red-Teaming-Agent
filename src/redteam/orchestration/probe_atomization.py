@@ -22,14 +22,15 @@ Preservation rules:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from redteam.core.contracts.completion import (
     CompletionCriterion,
+    completion_condition_conflicts,
     completion_conditions,
-    contradictory_candidate_verdict,
     criterion_id,
 )
 from redteam.core.contracts.graph import HypothesisUpdate
@@ -52,9 +53,13 @@ if TYPE_CHECKING:
 class AtomizationProposalError(SpecialistProposalError):
     """Code-owned split-validation label; never contains model text or secrets."""
 
-    def __init__(self, code: str, *, diagnostic: DecisionDiagnostic | None = None):
-        super().__init__(code)
-        self.diagnostic = diagnostic
+    def __init__(
+        self, code: str, *, diagnostic: DecisionDiagnostic | None = None,
+        condition_conflicts: tuple = (),
+    ):
+        super().__init__(code, condition_conflicts=condition_conflicts)
+        if diagnostic is not None:
+            self.diagnostic = diagnostic
 
 
 def _task_rejection(code, *, index, task, field, question, criterion_ids=(),
@@ -163,7 +168,7 @@ class HypothesisPlanDraft(BaseModel):
     reviewed_task_ids: list[str] = Field(default_factory=list)
     reviewed_hypothesis_ids: list[str] = Field(default_factory=list)
     reason: str = Field(min_length=1)
-    termination: Literal["continue", "held", "exhausted", "goal_achieved"] = "continue"
+    termination: Literal["continue", "replan", "held", "exhausted", "goal_achieved"] = "continue"
     resume_conditions: list[str] = Field(default_factory=list)
     context_request: PlannerContextRequest | None = None
 
@@ -239,6 +244,7 @@ def bind_plan(
     targets: set[str],
     principals: set[str],
     max_tasks: int,
+    existing_work_validator: Callable[[list[str], dict[str, int]], set[str]] | None = None,
 ) -> tuple[list[HypothesisUpdate] | None, list[PlannedInvestigationQuestion], dict[str, int]]:
     """Resolve local references for stage-1 updates+questions without mutating originals.
 
@@ -298,30 +304,17 @@ def bind_plan(
                 hypothesis_ref, hypothesis_ref
             ) not in revisions:
                 raise AtomizationProposalError("plan_question_criterion_outside_purpose")
-        contradicted = contradictory_candidate_verdict(question.completion_criteria)
-        if contradicted is not None:
-            # Diagnosed here, before the second (atomizer) model request is ever
-            # made -- plan7d: a contradiction must not reach atomization.
-            code = "plan_question_contradictory_candidate_verdict"
-            location = "$.questions"
-            raise AtomizationProposalError(code, diagnostic=DecisionDiagnostic(
-                code=code, stage="hypothesis_planning", kind="validation", retryable=True,
-                cause_scope="model_input", owner="orchestration.probe_atomization",
-                location=location,
-                summary=safe_feedback(
-                    f"Question {safe_feedback(question.question_id, 80)} requires both "
-                    f"hypothesis_confirmed and hypothesis_refuted for the same candidate "
-                    f"'{safe_feedback(contradicted, 80)}'. A candidate has one status at a "
-                    "time; AND-ing both verdicts for it can never be satisfied. An 'If X "
-                    "then confirmed, else refuted' description does not change this -- "
-                    "every completion_criteria entry is required, not a branch. Split into "
-                    "two tasks only if a different purpose genuinely needs each verdict, or "
-                    "keep only the one verdict this purpose actually proves.",
-                ),
-                repair_condition="Keep at most one of hypothesis_confirmed/hypothesis_refuted "
-                                 f"per candidate ('{contradicted}') on this question.",
-                validation_issues=[{"rule": code, "location": location}],
-            ))
+        resolved_criteria = [condition.model_copy(update={
+            "hypothesis_id": (
+                issued.get(condition.hypothesis_id, condition.hypothesis_id)
+                if condition.hypothesis_id is not None else None),
+        }) for condition in question.completion_criteria]
+        conflicts = completion_condition_conflicts(resolved_criteria)
+        if conflicts:
+            raise AtomizationProposalError(
+                "same_candidate_completion_condition_conflict",
+                condition_conflicts=conflicts,
+            )
         if question.source_task_id:
             source = snapshot.tasks.get(question.source_task_id)
             if source is None or source.result is None or (
@@ -332,18 +325,21 @@ def bind_plan(
             "hypothesis_revisions": revisions,
             "goal_required_hypothesis_ids": [issued.get(ref, ref)
                                              for ref in question.goal_required_hypothesis_ids],
-            "completion_criteria": [condition.model_copy(update={
-                "hypothesis_id": (
-                    issued.get(condition.hypothesis_id, condition.hypothesis_id)
-                    if condition.hypothesis_id is not None else None),
-            }) for condition in question.completion_criteria],
+            "completion_criteria": resolved_criteria,
         }))
     if set(draft.reviewed_task_ids) - snapshot.tasks.keys() or (
         set(draft.reviewed_hypothesis_ids) - snapshot.candidates.keys()
     ):
         raise AtomizationProposalError("reviewed_reference_not_in_snapshot")
+    if draft.termination == "continue" and not questions:
+        if existing_work_validator is None or not existing_work_validator(
+            draft.reviewed_task_ids, versions,
+        ):
+            raise AtomizationProposalError("continue_requires_proposed_or_existing_work")
     if not (updates or questions):
-        if draft.termination == "continue" or not draft.resume_conditions:
+        if draft.termination not in {"continue", "replan", "goal_achieved"} and (
+            not draft.resume_conditions
+        ):
             raise AtomizationProposalError("empty_judgment_needs_termination_and_resume_conditions")
         return None, [], versions
     return updates, questions, versions

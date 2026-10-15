@@ -13,7 +13,13 @@ from copy import deepcopy
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    model_serializer,
+    model_validator,
+)
 
 from redteam.core.contracts.target import TargetRef
 from redteam.core.enums import RiskLevel, ToolHealthStatus
@@ -30,10 +36,20 @@ from redteam.core.tool_binding import LEGACY_ACTION, SELECTED_TOOL, BindingMode
 
 
 class ToolTargetBinding(BaseModel):
+    target_ref_source: Literal["mcp_ref", "logical_host"] = "mcp_ref"
     binds_target_arguments: bool = True
     binds_known_path_from_url: bool = False
     requires_url_target: bool = False
     requires_exact_url_match: bool = False
+
+    @model_serializer(mode="wrap")
+    def serialize_target_ref_source(self, handler):
+        value = handler(self)
+        # Keep historical descriptor fingerprints stable when the new
+        # source selector is absent or explicitly set to its default.
+        if self.target_ref_source == "mcp_ref":
+            value.pop("target_ref_source", None)
+        return value
 
 
 class ToolResourceBinding(BaseModel):

@@ -114,7 +114,7 @@ import tempfile
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 from redteam.capability.shell_manifest import SHELL_SERVER_ID
 from redteam.capability.shell_policy import WORKROOM_KEY_PATTERN, ShellWorkroomPolicy
@@ -1226,6 +1226,28 @@ def _acquire_create_lock(path: str, timeout_seconds: float) -> _CreateLock:
         raise
 
 
+class PreparedEndpointLike(Protocol):
+    """Structural view of the Docker endpoint restored by shell preparation."""
+
+    @property
+    def binary(self) -> str: ...
+
+    @property
+    def context(self) -> str: ...
+
+    @property
+    def host(self) -> str: ...
+
+
+@dataclass(frozen=True)
+class EndpointSnapshot:
+    """Immutable Docker endpoint frozen when preparation is bound to a manager."""
+
+    binary: str
+    context: str
+    host: str
+
+
 class ShellWorkroomManager:
     """Owns warm containers and bounded script execution inside them."""
 
@@ -1243,6 +1265,7 @@ class ShellWorkroomManager:
         self._known: dict[str, str] = {}
         self._ensure_lock = asyncio.Lock()
         self._admission: ExecutionAdmission | None = None
+        self._bound_endpoint: EndpointSnapshot | None = None
 
     def set_execution_admission(self, admission: ExecutionAdmission | None) -> None:
         """Attach the TASK-005 admission hook (default unrestricted)."""
@@ -1292,6 +1315,126 @@ class ShellWorkroomManager:
     def known_workrooms(self) -> tuple[str, ...]:
         return tuple(self._known)
 
+    def bind_prepared_endpoint(self, endpoint: PreparedEndpointLike) -> None:
+        """Freeze the prepared Docker endpoint; identical rebinding is idempotent.
+
+        The policy must already name the same binary and context, so the
+        execution path and the prepared endpoint cannot diverge. A different
+        endpoint after binding is refused rather than replaced.
+        """
+        snapshot = EndpointSnapshot(
+            binary=endpoint.binary, context=endpoint.context, host=endpoint.host
+        )
+        if (
+            snapshot.binary != self._policy.docker_binary
+            or self._policy.docker_context is None
+            or snapshot.context != self._policy.docker_context
+        ):
+            raise ShellWorkroomError("prepared_endpoint_policy_mismatch")
+        if self._bound_endpoint is not None:
+            if self._bound_endpoint != snapshot:
+                raise ShellWorkroomError("prepared_endpoint_rebind_refused")
+            return
+        self._bound_endpoint = snapshot
+
+    @property
+    def bound_endpoint(self) -> EndpointSnapshot | None:
+        return self._bound_endpoint
+
+    async def revalidate_bound_endpoint(self, endpoint: PreparedEndpointLike | None) -> str:
+        """Return endpoint_verified or a stable refusal reason; never raises.
+
+        Host drift is read through the preparation resolver, the same protocol
+        that produced the binding, so no second host-resolution path exists.
+        """
+        bound = self._bound_endpoint
+        if endpoint is None or bound is None:
+            return "endpoint_unbound"
+        if (endpoint.binary, endpoint.context, endpoint.host) != (
+            bound.binary, bound.context, bound.host,
+        ):
+            return "endpoint_mismatch"
+        # Imported here: shell_preparation imports the gated window module,
+        # which imports this module, so a top-level import would cycle.
+        from redteam.capability.shell_preparation import resolve_docker_endpoint
+
+        try:
+            actual = await resolve_docker_endpoint(self._policy)
+        except Exception:
+            return "endpoint_unverified"
+        if (actual.binary, actual.context, actual.host) != (
+            bound.binary, bound.context, bound.host,
+        ):
+            return "endpoint_drift"
+        return "endpoint_verified"
+
+    async def observe_room_for_recovery(self, key: str) -> str:
+        """Read-only room observation: absent, baseline, or unverified.
+
+        Never creates, adopts, starts, or signals a container. Only a complete,
+        successful, exact name query with no match proves absence. A failed,
+        truncated, or unparseable answer is unverified, never absence.
+        """
+        check_workroom_key(key)
+        name = container_name_for(key)
+        code, out, _err, timed_out, cut = await self._run_docker(
+            ("ps", "-a", "--no-trunc", "--filter", "name=^" + name + "$",
+             "--format", "{{.Names}}"),
+            None, 15.0, 1 << 16,
+        )
+        if code != 0 or timed_out or cut:
+            return "unverified"
+        names = [
+            line.strip()
+            for line in out.decode("utf-8", errors="replace").splitlines()
+            if line.strip()
+        ]
+        if not names:
+            return "absent"
+        if names != [name]:
+            return "unverified"
+        code, out, _err, timed_out, cut = await self._run_docker(
+            ("inspect", "--format",
+             "{{json .Config.Labels}}|{{json .NetworkSettings.Networks}}|{{.State.Running}}",
+             name),
+            None, 15.0, 1 << 16,
+        )
+        if code != 0 or timed_out or cut:
+            return "unverified"
+        fields = out.decode("utf-8", errors="replace").strip().split("|")
+        if len(fields) != 3:
+            return "unverified"
+        try:
+            labels = json.loads(fields[0])
+            networks = json.loads(fields[1])
+        except ValueError:
+            return "unverified"
+        managed_key = SHELL_MANAGED_LABEL.split("=", 1)[0]
+        if (
+            not isinstance(labels, dict)
+            or labels.get(managed_key) != "true"
+            or labels.get(SHELL_CONTEXT_LABEL_KEY) != key
+        ):
+            return "unverified"
+        if not isinstance(networks, dict) or set(networks) != {"none"}:
+            return "unverified"
+        if fields[2] == "false":
+            return "baseline"
+        if fields[2] != "true":
+            return "unverified"
+        code, out, _err, timed_out, cut = await self._run_docker(
+            ("exec", name, "sh", "-c",
+             "for d in /proc/[0-9]*/cmdline; do tr '\\0' ' ' < \"$d\"; echo; done"),
+            None, 15.0, 1 << 20,
+        )
+        if code != 0 or timed_out or cut:
+            return "unverified"
+        for line in out.decode("utf-8", errors="replace").splitlines():
+            process = line.strip()
+            if not process or process == "sleep infinity" or "sh -c for d in /proc" in process:
+                continue
+            return "unverified"
+        return "baseline"
     async def _run_docker(
         self,
         argv: tuple[str, ...],

@@ -111,9 +111,16 @@ async def _run(
     component_registry: ComponentRegistry | None = None,
 ) -> int:
     try:
-        config = load_app_config_for_run(args.engagement_path)
-        from redteam.app.cli._shared import runtime_overrides
-        config = runtime_overrides(config, args)
+        from redteam.app.web_policy import select_engagement_startup
+        from redteam.core.environment import environment_context
+
+        startup = await select_engagement_startup(
+            args.engagement_path, require_recorded_preparation=True,
+        )
+        with environment_context(startup.environment):
+            config = load_app_config_for_run(args.engagement_path)
+            from redteam.app.cli._shared import runtime_overrides
+            config = runtime_overrides(config, args)
     except (OSError, ValidationError, ValueError) as exc:
         eprint(f"ERROR: {exc}")
         return EXIT_CONFIG_ERROR
@@ -183,6 +190,7 @@ async def _run_central(args, config, *, mcp_stack, on_finished=None,
             original_stores=original["storage_refs"], original_settings=selected,
             original_component_binding=original.get("component_binding"),
             component_registry=component_registry,
+            engagement_path=getattr(args, "engagement_path", None),
         )
         if session_channel is not None:
             from redteam.app.central_run import central_root_runtime
@@ -295,10 +303,17 @@ def _collection_reason(exc: Exception) -> str:
 async def run_collect_originals(args, *, component_registry=None) -> int:
     async with AsyncExitStack() as stack:
         try:
-            config = load_app_config_for_run(args.engagement_path)
-            from redteam.app.cli._shared import runtime_overrides
+            from redteam.app.web_policy import select_engagement_startup
+            from redteam.core.environment import environment_context
 
-            config = runtime_overrides(config, args)
+            startup = await select_engagement_startup(
+                args.engagement_path, require_recorded_preparation=True,
+            )
+            with environment_context(startup.environment):
+                config = load_app_config_for_run(args.engagement_path)
+                from redteam.app.cli._shared import runtime_overrides
+
+                config = runtime_overrides(config, args)
         except (OSError, ValidationError, ValueError) as exc:
             eprint(f"ERROR: {exc}")
             return EXIT_CONFIG_ERROR
@@ -348,6 +363,7 @@ async def _run_collect_central(args, config, *, mcp_stack, component_registry=No
             original_stores=original["storage_refs"], original_settings=selected,
             original_component_binding=original.get("component_binding"),
             component_registry=component_registry,
+            engagement_path=getattr(args, "engagement_path", None),
         )
         probe_checkpoint = Path(original["storage_refs"]["checkpoints"]).is_file()
         driver_settings = selected

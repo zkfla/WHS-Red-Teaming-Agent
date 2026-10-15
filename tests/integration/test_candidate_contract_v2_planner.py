@@ -160,8 +160,9 @@ async def test_default_v3_rejects_non_v2_candidate_at_nested_contract_field(
         "updates": [{"expected_revision": None, "hypothesis": hypothesis}],
         "questions": [],
         "reason": "Do not admit a candidate without the active contract version",
+        "termination": "replan",
     }
-    llm = CapturingPlannerLLM(plans=[response] * 6)
+    llm = CapturingPlannerLLM(plans=[response] * 7)  # decision_max_attempts (6) + initial
     async with probe_selection(tmp_path, llm=llm) as (session, _, _):
         with pytest.raises(DecisionFailure) as rejected:
             await SpecialistPlanner(session.deps).advance(session.runtime)

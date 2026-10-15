@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from redteam.app.central_development import build_central_development
+from redteam.app.central_run import bind_run_metadata
 from redteam.app.cli import _build_parser
 from redteam.attack_graph.service import AttackGraphService
 from redteam.capability.development import DevelopmentResponse
@@ -86,6 +87,7 @@ async def test_planner_can_judge_new_results_after_four_strategies():
     async with build_central_development(
         engagement, llm=llm, tools=gateway(), settings=settings,
     ) as session:
+        await bind_run_metadata(session.deps)
         await asyncio.wait_for(session.run(settle=False), 10)
         assert len(await session.deps.central_state.list_tasks()) == 5
         usage = await session.deps.central_state.request_ledger().snapshot(

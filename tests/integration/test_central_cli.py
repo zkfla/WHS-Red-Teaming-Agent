@@ -2,6 +2,7 @@
 
 import json
 from contextlib import AsyncExitStack
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -39,7 +40,7 @@ async def test_status_findings_report_read_current_db_without_saved_export(tmp_p
         args = parser.parse_args(["report", "generate", run, "--state-db", path,
                                   "--output-dir", str(tmp_path / "reports")])
         assert await report.run_generate(args) == 0
-        text = (tmp_path / "reports" / run / "report.md").read_text()
+        text = (tmp_path / "reports" / run / "report.md").read_text(encoding="utf-8")
         assert "Criterion evidence" in text and refs[0] in text
         assert not (tmp_path / "data" / "reports").exists()
 
@@ -143,7 +144,11 @@ async def test_cli_resume_reuses_original_approval_action_and_budget(tmp_path, m
     config = AppConfig(engagement=EngagementConfig.model_validate(
         raw.model_dump(exclude={"engagement_id", "created_at"}),
     ), orchestration=OrchestrationConfig(runtime_backend="central", central_state_path=path))
-    llm._canned_structured = {"questions": [], "reason": "No further proposal"}
+    llm._canned_structured = {
+        "questions": [], "termination": "exhausted",
+        "resume_conditions": ["A relevant new result changes the available evidence"],
+        "reason": "Original response assessed, no useful followup",
+    }
     real_build = run_command.build_application
     captured = []
     async def with_explicit_test_doubles(config, **kwargs):
@@ -249,7 +254,8 @@ async def test_default_application_assembles_candidate_planner_and_common_worker
     )
 
     assert deps.specialist_policy.probe_limits is not None
-    assert deps.settings.specialist_profile_path.endswith("config/agents/native-probes.yaml")
+    assert Path(deps.settings.specialist_profile_path).as_posix().endswith(
+        "config/agents/native-probes.yaml")
     assert [str(item.agent_id) for item in deps.agents.definitions() if item.schedulable] == [
         "probe-worker"
     ]

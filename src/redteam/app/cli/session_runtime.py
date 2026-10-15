@@ -87,13 +87,20 @@ async def run_session(
                 build_options["component_profile"] = component_profile
             if component_registry is not None:
                 build_options["component_registry"] = component_registry
+            # The startup selection records exactly what the build wrote to the
+            # engagement file (requested artifacts). That is the only baseline
+            # for the drift check below; any other byte change is an operator edit.
+            startups = []
             engagement, deps = built or await run_command.build(
-                current, max_steps=None, mcp_stack=stack, **build_options
+                current, max_steps=None, mcp_stack=stack,
+                engagement_path=session.engagement_path, startup_sink=startups,
+                **build_options
             )
+            expected_engagement = startups[0].engagement if startups else current.engagement
             # Do not dispatch using a configuration changed during bootstrap.
             if (
                 session.engagement_path.exists()
-                and load_engagement_config(session.engagement_path) != current.engagement
+                and load_engagement_config(session.engagement_path) != expected_engagement
             ):
                 return RunResult(
                     exit_code=2,
