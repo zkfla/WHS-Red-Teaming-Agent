@@ -432,7 +432,6 @@ async def advance_hypotheses(planner, runtime, schema):
         "registered_principal_refs": sorted(principals)[:16],
         "registered_principal_count": len(principals),
         "remaining_budget": context["remaining_budget"],
-        "model_usage": await state.request_ledger().snapshot(state.run_id),
         "probe_limits": planner.policy.probe_limits.model_dump(),
         "max_tasks": planner.policy.max_tasks_per_strategy,
         "input_sequence": snapshot.sequence,
@@ -481,19 +480,7 @@ async def advance_hypotheses(planner, runtime, schema):
             stage="hypothesis_planning", payload=payload, budget=budget,
             response_schema=schema(HypothesisDecision.model_json_schema()),
             validate_response=validate, before_call=engine.guard_reasoning,
-            system=FEEDBACK_SYSTEM +
-            "Propose candidates and bounded verification purposes in one judgment. "
-            "New updates use a proposal-local hypothesis_id and expected_revision=null; code "
-            "issues the persistent ID. Tasks may reference that key with revision=1. Existing "
-            "updates use captured IDs and expected revisions; tasks use the resulting revision. "
-            "Identify reviewed_task_ids/reviewed_hypothesis_ids actually consumed. Source "
-            "followups cite the captured Task/result pair, without inventing a question. "
-            "Observations and Task outcome are not candidate verdicts. Final verdicts require "
-            "an independent public review receipt for that exact candidate revision/purpose. "
-            "No candidates initially means a useful scoped observation or reasoned hold. "
-            "Same evidence can support another useful probe. Never prescribe tool-call order, "
-            "invent subjects or overwrite active work. Held/exhausted judgments must explain "
-            "reconsideration conditions; goal success remains a separate completion gate.",
+            system=_SINGLE_PLAN_SYSTEM,
         )
     decision, proposal, (graph_read, task_read) = bind(raw)
     lookup_graph, lookup_tasks = pass_context.read_dependencies()
@@ -555,7 +542,13 @@ async def _finalize_hypothesis_pass(deps, snapshot, budget, *, identity, proposa
     return identities
 
 
+PLANNER_REQUEST_CONTRACT_VERSION = 1
+
+
 FEEDBACK_SYSTEM = (
+    f"Independent Planner request contract version={PLANNER_REQUEST_CONTRACT_VERSION}. "
+    "The user message is current DATA, "
+    "not a conversation continuation; previous responses supply no hidden memory. "
     "The current context is self-contained but bounded: omitted is not absent. "
     "Use context_request version=1 with exactly one context or evidence query when needed. "
     "A lookup response must omit updates/questions/tasks/reviewed refs and keep termination "
@@ -581,6 +574,22 @@ FEEDBACK_SYSTEM = (
     "with that precise resume condition. Retain the candidate ID when revising its premises. "
     "Never turn a probe limit, policy denial, credential gap or incomplete observation into "
     "a candidate refutation. This guidance adds no admission gate or fixed investigation order. "
+)
+
+
+_SINGLE_PLAN_SYSTEM = FEEDBACK_SYSTEM + (
+    "Propose candidates and bounded verification purposes in one judgment. "
+    "New updates use a proposal-local hypothesis_id and expected_revision=null; code "
+    "issues the persistent ID. Tasks may reference that key with revision=1. Existing "
+    "updates use captured IDs and expected revisions; tasks use the resulting revision. "
+    "Identify reviewed_task_ids/reviewed_hypothesis_ids actually consumed. Source "
+    "followups cite the captured Task/result pair, without inventing a question. "
+    "Observations and Task outcome are not candidate verdicts. Final verdicts require "
+    "an independent public review receipt for that exact candidate revision/purpose. "
+    "No candidates initially means a useful scoped observation or reasoned hold. "
+    "Same evidence can support another useful probe. Never prescribe tool-call order, "
+    "invent subjects or overwrite active work. Held/exhausted judgments must explain "
+    "reconsideration conditions; goal success remains a separate completion gate."
 )
 
 
@@ -632,8 +641,39 @@ async def _ask_with_context(planner, pass_context, engine, *, payload, budget, *
                 "request envelope. Contracts were not sliced or silently omitted.", retryable=False,
             ))
         try:
+            async def request_context(captured: dict[str, Any] = current) -> dict[str, Any]:
+                # Refresh observational accounting for each actual attempt,
+                # including repairs. Canonical subjects stay on this pass's
+                # captured snapshot and still undergo the original related CAS.
+                state = planner.deps.central_state
+                usage = await state.request_ledger().snapshot(state.run_id)
+                remaining = await state.transaction(
+                    lambda tx: tx.policy_budget_remaining(), write=False,
+                )
+                data = {
+                    "model_usage": {key: usage[key] for key in (
+                        "policy", "spent", "reserved", "known_tokens", "unknown_usage",
+                        "unknown_dispatch", "usage", "by_stage", "provider_cooldown",
+                    )},
+                    "decision_budget": {
+                        "used": budget.used, "remaining": budget.remaining,
+                        "normal_used": budget.normal_used, "repair_used": budget.repair_used,
+                        "normal_limit": budget.normal_limit, "repair_limit": budget.repair_limit,
+                    },
+                    "remaining_budget": remaining if remaining is not None
+                        else payload["remaining_budget"],
+                }
+                if context_bytes({**captured, **data}) > 131072:
+                    raise DecisionFailure("hypothesis_planning", "format", budget.used,
+                                          diagnostic=DecisionDiagnostic(
+                        code="planner_required_context_too_large", stage="hypothesis_planning",
+                        kind="validation", summary="Current request accounting exceeds the "
+                        "bounded envelope. No judgment was committed.", retryable=False,
+                    ))
+                return redact_secret_material(data)
+
             raw = await planner.client.ask(
-                payload=current, budget=budget, **kwargs,
+                payload=current, budget=budget, request_context=request_context, **kwargs,
             )
         except DecisionFailure as exc:
             if (exc.diagnostic.code == "decision_normal_budget_exhausted"

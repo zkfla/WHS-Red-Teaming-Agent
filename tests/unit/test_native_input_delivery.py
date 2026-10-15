@@ -18,11 +18,7 @@ from redteam.orchestration.native_local_tools import (
     goal_settle_descriptor,
     task_settle_descriptor,
 )
-from redteam.orchestration.nodes.react import (
-    _compact_context_messages,
-    _message_history,
-    _result_messages,
-)
+from redteam.orchestration.nodes.react import _result_messages
 from redteam.orchestration.tool_discovery import (
     NativeInputLimit,
     bootstrap_local_ids,
@@ -94,10 +90,10 @@ async def test_both_originals_survive_local_round_and_restoration_without_checkp
     original_history = copy.deepcopy(history)
     saver = build_checkpointer(enabled=True)
     restored = saver.serde.loads_typed(saver.serde.dumps_typed({"native_messages": history}))
-    restored = _compact_context_messages(_message_history(restored["native_messages"]))
+    restored = restored["native_messages"]
     bindings = build_native_bindings(catalog_tool_ids=["registered.tool"],
                                      local_tool_ids=["tool.get_detail"])
-    # The same successful detail proof remains usable after normal round compaction/restore.
+    # The same successful detail proof remains usable after checkpoint restore.
     restored[-2]["tool_calls"][0]["function"]["name"] = next(
         name for name, identity in bindings.items() if identity == "tool.get_detail"
     )

@@ -15,6 +15,7 @@ from redteam.attack_graph.stores.central import CentralAttackGraphStore
 from redteam.attack_graph.stores.namespaced import EngagementScopedAttackGraphStore
 from redteam.core.contracts.events import EventEnvelope, EventType
 from redteam.core.contracts.execution import ExecutionState, TaskExecution
+from redteam.core.contracts.tool import EXECUTION_STARTED_METADATA_KEY
 from redteam.core.convert import execution_input_digest
 from redteam.core.enums import (
     AgentPhase,
@@ -32,7 +33,7 @@ from redteam.orchestration.execution_journal import append_execution_receipt, pr
 from redteam.orchestration.operator_intents.models import IntentStatus
 from redteam.orchestration.operator_intents.service import is_task_suppressed
 from redteam.orchestration.resource_conflicts import execution_resource_keys
-from redteam.orchestration.state import TerminationReason
+from redteam.orchestration.state import RuntimeState, TerminationReason
 from redteam.orchestration.work.models import work_owner_for
 
 
@@ -427,19 +428,14 @@ async def ready_workers(deps, base, *, max_instances=None):
     except CoordinationError:
         return []
     return [
-        base.model_copy(
-            deep=True,
-            update={
-                "instance_id": instance,
-                "active_task_id": task.task_id,
-                "task_ownership_version": task.ownership_version,
-                "current_agent": task.assigned_agent,
-                "phase": AgentPhase.OBSERVE,
-                "termination_reason": None,
-                "pending_action_id": None,
-                "pending_approval_id": None,
-                "probe_hypotheses": snapshots,
-            },
+        RuntimeState(
+            run_id=base.run_id, engagement_id=base.engagement_id, mission_id=base.mission_id,
+            current_goal=base.current_goal, started_at=base.started_at,
+            component_binding=base.component_binding, llm_request_policy=base.llm_request_policy,
+            remaining_budget=base.remaining_budget,
+            instance_id=instance, active_task_id=task.task_id,
+            task_ownership_version=task.ownership_version, current_agent=task.assigned_agent,
+            probe_hypotheses=snapshots,
         )
         for instance, task, snapshots in claimed
     ]
@@ -695,13 +691,20 @@ async def run_call(call, state, deps):
             in {ExecutionState.SUCCEEDED, ExecutionState.FAILED, ExecutionState.CANCELLED}
             and not previous.wait_reason
         ):
+            original = await preserved_result(
+                deps.evidence_store, run_id=runtime.run_id,
+                action_id=previous.action_id, instance_id=runtime.instance_id, work_id=None,
+            ) if previous.state is ExecutionState.FAILED else None
             call.evidence_ids = (
                 [str(previous.result_evidence_id)] if previous.result_evidence_id else []
             )
             call.completed = True
             call.feedback = {
                 "ok": previous.state is ExecutionState.SUCCEEDED,
-                "executed": previous.state is not ExecutionState.CANCELLED,
+                "executed": previous.state is not ExecutionState.CANCELLED and (
+                    original is None
+                    or original[0].metadata.get(EXECUTION_STARTED_METADATA_KEY) is not False
+                ),
                 "restored": True,
             }
         elif previous.state is ExecutionState.PENDING:
@@ -769,7 +772,7 @@ async def _finish_call(deps, state, call, local, item):
     call.evidence_ids = [str(local["result_evidence_id"])]
     call.feedback = {
         "ok": result.success and not unknown,
-        "executed": True,
+        "executed": result.metadata.get(EXECUTION_STARTED_METADATA_KEY) is not False,
         "evidence_ids": call.evidence_ids,
         "unknown": unknown,
     }

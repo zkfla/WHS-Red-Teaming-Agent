@@ -11,6 +11,34 @@ from redteam.capability.servers.config import ServerPolicy
 from redteam.capability.servers.network import ToolInputError, request, resolve_target
 
 
+@pytest.mark.parametrize("failure,code,phase", [
+    (httpx.ConnectTimeout("secret connection information"),
+     "target_http_connect_timeout", "connect"),
+    (httpx.ConnectError("secret connection information"), "target_http_connect_failed", "connect"),
+    (httpx.ReadTimeout("secret connection information"),
+     "target_http_response_timeout", "request_or_response"),
+])
+async def test_network_failure_preserves_safe_stage_and_no_retry(
+    policy, monkeypatch, failure, code, phase,
+):
+    from redteam.capability.servers.network import TargetRequestError
+
+    mock_dns(monkeypatch, ["192.0.2.10"])
+    calls = []
+
+    def fail(req):
+        calls.append(req)
+        raise failure
+
+    with pytest.raises(TargetRequestError) as captured:
+        await request(policy, "bank", "/account", transport=httpx.MockTransport(fail))
+    diagnostic = captured.value.diagnostic
+    assert diagnostic["code"] == code and diagnostic["phase"] == phase
+    assert diagnostic["response_received"] is (False if phase == "connect" else None)
+    assert diagnostic["repair_condition"]
+    assert "secret" not in str(captured.value) and len(calls) == 1
+
+
 @pytest.fixture
 def policy() -> ServerPolicy:
     return ServerPolicy.model_validate(

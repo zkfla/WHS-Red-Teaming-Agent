@@ -9,7 +9,12 @@ from mcp.server import MCPServer
 
 from redteam.capability.servers.config import ServerPolicy
 from redteam.capability.servers.inspection import security_observations
-from redteam.capability.servers.network import ToolInputError, request, session_header
+from redteam.capability.servers.network import (
+    ToolInputError,
+    request,
+    session_header,
+    target_network_tool,
+)
 
 
 def create_server(policy: ServerPolicy) -> MCPServer:
@@ -35,6 +40,7 @@ def create_server(policy: ServerPolicy) -> MCPServer:
         }
 
     @server.tool()
+    @target_network_tool
     async def http_request(
         target_ref: str,
         path: str,
@@ -77,6 +83,7 @@ def create_server(policy: ServerPolicy) -> MCPServer:
         )}
 
     @server.tool()
+    @target_network_tool
     async def http_compare_sessions(
         target_ref: str,
         path: str,
@@ -121,6 +128,7 @@ def create_server(policy: ServerPolicy) -> MCPServer:
         }
 
     @server.tool()
+    @target_network_tool
     async def http_security_posture(
         target_ref: str, path: str, session_ref: str | None = None,
     ) -> dict[str, Any]:
@@ -141,6 +149,7 @@ def create_server(policy: ServerPolicy) -> MCPServer:
         }
 
     @server.tool()
+    @target_network_tool
     async def http_compare_anonymous(
         target_ref: str, path: str, session_ref: str,
     ) -> dict[str, Any]:

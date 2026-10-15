@@ -184,9 +184,10 @@ async def test_chat_drops_previous_response_id(monkeypatch):
     stub = _chat_namespace(monkeypatch, _chat_message("done", calls=None))
     await LiteLLMClient("unit-model").complete_native(
         [{"role": "user", "content": "hi"}], [SPEC],
-        previous_response_id="resp_private",
+        previous_response_id="resp_private", conversation="conversation_other_task",
     )
     assert "previous_response_id" not in stub.kwargs
+    assert "conversation" not in stub.kwargs
 
 
 def test_chat_tool_param_shape():
@@ -282,7 +283,8 @@ async def test_subscription_nonstream_roundtrip(monkeypatch):
     harness = _SubscriptionHarness(monkeypatch, response)
     result = await LiteLLMClient("chatgpt/unit-model").complete_native(
         [{"role": "user", "content": "hi"}], [SPEC], system="sys",
-        **{"stream": False, "previous_response_id": "resp_private"},
+        **{"stream": False, "previous_response_id": "resp_private",
+           "conversation": "conversation_other_task"},
     )
     assert result.protocol_error is None
     assert result.text == "working"
@@ -292,6 +294,7 @@ async def test_subscription_nonstream_roundtrip(monkeypatch):
     assert harness.captured["instructions"] == "sys"
     assert harness.captured["tools"][0]["name"] == "lookup"
     assert "previous_response_id" not in harness.captured
+    assert "conversation" not in harness.captured
 
 
 async def test_subscription_stream_accumulates_calls_and_ignores_reasoning():

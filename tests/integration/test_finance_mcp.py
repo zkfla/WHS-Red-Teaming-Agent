@@ -144,6 +144,25 @@ async def test_real_stdio_proxy_role_discovers_neutral_tools(
     assert result.is_error is True
 
 
+@pytest.mark.parametrize("role,tool", [(web_http, "http_request"), (recon, "http_probe")])
+async def test_target_failure_has_structured_diagnosis_over_mcp(policy, monkeypatch, role, tool):
+    from redteam.capability.servers.network import TargetRequestError
+
+    async def fail(*args, **kwargs):
+        raise TargetRequestError("target_http_connect_failed", "connect",
+                                 "Use the prepared container-network route.")
+
+    monkeypatch.setattr(role, "request", fail)
+    async with Client(role.create_server(policy)) as client:
+        result = await client.call_tool(tool, {"target_ref": "bank", "path": "/account"})
+    assert result.is_error
+    diagnostic = result.structured_content["diagnostic"]
+    assert diagnostic["code"] == "target_http_connect_failed"
+    assert diagnostic["cause_scope"] == "target_prerequisite"
+    assert diagnostic["response_received"] is False
+    assert "container-network route" in diagnostic["repair_condition"]
+
+
 async def test_two_principal_comparison_is_observation_not_finding(
     policy: ServerPolicy,
     monkeypatch: pytest.MonkeyPatch,

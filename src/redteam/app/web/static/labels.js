@@ -38,6 +38,7 @@ export const WORKER = {
   waiting_approval: "승인 대기",
   waiting_job: "작업 완료 대기",
   waiting_resource: "자원 대기",
+  waiting_review: "결과 확인·재개 대기",
   outcome_unknown: "결과 불명 — 확인 필요",
   returned: "슬롯 반납",
   reserved: "시작 준비",
@@ -46,7 +47,7 @@ export const WORKER = {
 
 export const WORKER_GLYPH = {
   model: "◐", tool: "▶", waiting_approval: "!", waiting_job: "…", waiting_resource: "…",
-  outcome_unknown: "?", returned: "◌", reserved: "○", between: "·",
+  waiting_review: "!", outcome_unknown: "?", returned: "◌", reserved: "○", between: "·",
 };
 
 export const GRAPH_UNAVAILABLE = {

@@ -580,6 +580,11 @@ class StructuredDecisionClient:
     return an extra dict merged into the payload without overwriting
     explicit keys. When absent (default) no extra lookup is attempted;
     a payload key named evidence_context is passed through as-is.
+
+    request_context is a caller-owned sync/async telemetry supplier, sampled
+    before each structured attempt, including repairs. Its public fields replace
+    those fields in a request-local copy only; canonical captured state is never
+    mutated. It must not perform model/target calls or supply conversation history.
     """
 
     def __init__(
@@ -626,6 +631,7 @@ class StructuredDecisionClient:
         budget: DecisionBudget | None = None,
         before_call: Callable[..., Any] | None = None,
         validate_response: Callable[[dict[str, Any]], None] | None = None,
+        request_context: Callable[[], Any] | None = None,
     ) -> dict[str, Any]:
         if budget is None:
             budget = DecisionBudget(
@@ -639,11 +645,15 @@ class StructuredDecisionClient:
         for key, value in extra.items():
             working.setdefault(key, value)
         json.dumps(working)
+        # Output contracts precede changing user DATA in the provider's logical
+        # input. Freeze their ordering once, including optional reads/repairs.
+        response_schema = json.loads(json.dumps(response_schema, sort_keys=True, allow_nan=False))
         from redteam.orchestration.prompts import instruction_scope
 
         with instruction_scope(stage):
             return await self._ask_with_tenacity(
-                stage, working, response_schema, system, budget, before_call, validate_response
+                stage, working, response_schema, system, budget, before_call, validate_response,
+                request_context,
             )
 
     async def _resolve_extra_context(self, stage: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -817,8 +827,19 @@ class StructuredDecisionClient:
         budget: DecisionBudget,
         attempt_timeout: float | None,
         guard: Callable[..., Any] | None = None,
+        request_context: Callable[[], Any] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        messages = [{"role": "user", "content": self._prompt_for(working, feedback, kind)}]
+        current = dict(working)
+        if request_context is not None:
+            extra = request_context()
+            if inspect.isawaitable(extra):
+                extra = await extra
+            if not isinstance(extra, dict):
+                raise ValueError("request_context must return a dict")
+            current.update(extra)
+        # A single current-data message, never the preceding response/assistant
+        # transcript. Repair feedback is a bounded public diagnostic suffix.
+        messages = [{"role": "user", "content": self._prompt_for(current, feedback, kind)}]
         use_metered = callable(getattr(self._llm, "complete_structured_with_usage", None))
         attempt_start = time.perf_counter()
         try:
@@ -975,6 +996,7 @@ class StructuredDecisionClient:
         budget: DecisionBudget,
         before_call: Callable[..., Any] | None = None,
         validate_response: Callable[[dict[str, Any]], None] | None = None,
+        request_context: Callable[[], Any] | None = None,
     ) -> dict[str, Any]:
         is_repair = False
         is_transport = False
@@ -1059,6 +1081,7 @@ class StructuredDecisionClient:
                             budget=budget,
                             attempt_timeout=attempt_timeout,
                             guard=before_call,
+                            request_context=request_context,
                         )
                         if validate_response is not None:
                             try:

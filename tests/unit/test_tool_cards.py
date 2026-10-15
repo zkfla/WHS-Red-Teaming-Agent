@@ -91,6 +91,32 @@ def _catalog() -> MCPToolCatalog:
     return MCPToolCatalog(_registry())
 
 
+def test_read_only_inputs_are_hidden_in_detail_without_changing_execution_schema():
+    from redteam.core.contracts.tool import model_input_schema
+
+    schema = {
+        "type": "object",
+        "properties": {"trusted_identity": {"type": "string", "readOnly": True},
+                       "query": {"type": "string"}, "limit": {"type": "integer"}},
+        "required": ["trusted_identity", "query"], "additionalProperties": False,
+    }
+    registry = MCPToolRegistry()
+    descriptor = _tool("web.lookup", "lookup", capability="web").model_copy(
+        update={"input_schema": schema},
+    )
+    registry.register(descriptor)
+    catalog = MCPToolCatalog(registry)
+    detail = catalog.get_detail(descriptor.tool_id)
+    assert detail is not None
+    assert detail.input_schema == model_input_schema(schema)
+    assert detail.required_arguments == ["query"]
+    assert detail.optional_arguments == ["limit"]
+    assert "trusted_identity" not in detail.input_schema["properties"]
+    detail.input_schema["properties"]["query"]["type"] = "number"
+    original = catalog.get(descriptor.tool_id).input_schema
+    assert original == schema and original["properties"]["query"]["type"] == "string"
+
+
 def test_default_cards_include_unknown_health_but_hide_unhealthy() -> None:
     catalog = _catalog()
     cards = catalog.list_cards()

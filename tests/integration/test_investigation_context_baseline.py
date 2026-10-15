@@ -5,19 +5,22 @@ preserved below; 8b now dispatches bounded views through the real consumer.
 """
 
 import json
-from dataclasses import asdict
+from dataclasses import asdict, replace
+from hashlib import sha256
 
 import pytest
 
 from redteam.core.enums import TaskStatus
-from redteam.core.ports.llm import NativeCompletion
+from redteam.core.ports.llm import LLMUsage, NativeCompletion
 from redteam.orchestration.investigation_context import (
     InvestigationContextReader,
     capture_investigation_context,
     context_bytes,
 )
 from redteam.orchestration.specialist_planner import SpecialistPlanner
-from tests.integration.test_probe_workers import drive, selection
+from tests.fakes.worker_input import worker_input
+from tests.integration.test_central_development import TOOL, discover, gateway, inspect, turn
+from tests.integration.test_probe_workers import drive, register, selection
 from tests.integration.test_v3_atomization import (
     SplitDouble,
     _new_candidate_atom,
@@ -37,6 +40,7 @@ class MeasuredDouble(SplitDouble):
                     "kind": "task", "mode": "read",
                     "refs": [{"kind": "task", "identity": "history-0"}]}}}]
         self.envelopes = []
+        self._previous_envelopes = {}
         self.native_responses = [NativeCompletion(text="Synthetic probe has no more actions.")]
 
     async def complete_structured(self, *, messages, response_schema, system=None, **kwargs):
@@ -54,13 +58,95 @@ class MeasuredDouble(SplitDouble):
 
     def measure(self, stage, messages, system, **schemas):
         envelope = {"messages": messages, "system": system, **schemas}
-        current = json.loads(messages[-1]["content"].split("\n\nPrevious attempt failed")[0])
+        previous = self._previous_envelopes.get(stage)
+        comparison = _compare_requests(envelope, previous)
+        # Only the in-memory double keeps request text. Artifacts remain scalar.
+        self._previous_envelopes[stage] = json.loads(json.dumps(envelope))
+        current = worker_input(messages) if stage == "worker" else json.loads(
+            messages[-1]["content"].split("\n\nPrevious attempt failed")[0],
+        )
         self.envelopes.append({
             "stage": stage, "total_bytes": context_bytes(envelope),
             "parts": {key: context_bytes(value) for key, value in envelope.items()},
             "fields": {key: context_bytes(value) for key, value in current.items()},
             "task_count": len(current.get("investigation_tasks", [])),
+            **comparison,
         })
+
+
+def _compare_requests(envelope, previous):
+    def encode(value):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode()
+
+    def ordered(value):
+        return {"system": value.get("system"), "tools": value.get("tools"),
+                "response_schema": value.get("response_schema"), "messages": value["messages"]}
+
+    current_bytes = encode(ordered(envelope))
+    old_bytes = encode(ordered(previous)) if previous else b""
+    prefix = next((index for index, (left, right) in enumerate(
+        zip(old_bytes, current_bytes, strict=False))
+                   if left != right), min(len(old_bytes), len(current_bytes)))
+    old_messages = previous["messages"] if previous else []
+    common_messages = next((index for index, (left, right) in enumerate(
+        zip(old_messages, envelope["messages"], strict=False)) if left != right),
+        min(len(old_messages), len(envelope["messages"])))
+    windows = []
+    for message in envelope["messages"]:
+        if message.get("role") == "tool":
+            body = json.loads(message["content"])
+            windows.extend(body.get("original_results", []))
+    return {
+        "message_count": len(envelope["messages"]), "previous_message_count": len(old_messages),
+        "common_message_prefix": common_messages,
+        "first_changed_previous_message": (
+            common_messages if common_messages < len(old_messages) else None),
+        "common_prefix_bytes": prefix, "previous_bytes": len(old_bytes),
+        "system_hash": sha256(encode(envelope.get("system"))).hexdigest(),
+        "tools_hash": sha256(encode(envelope.get("tools"))).hexdigest(),
+        "schema_hash": sha256(encode(envelope.get("response_schema"))).hexdigest(),
+        "original_window_limits": [window["limit"] for window in windows],
+        "original_window_text_chars": [len(window.get("text", "")) for window in windows],
+    }
+
+
+async def test_multi_turn_worker_final_input_baseline(tmp_path):
+    """Compare 10c append-only inputs against the recorded 10a mutation baseline."""
+    llm = MeasuredDouble()
+    inner = gateway()
+    for response in inner.responses:
+        response.output = {"status": 200, "text": "synthetic-long-output " * 500}
+    from tests.integration.test_central_completion import OriginalProtocolDouble
+
+    async with selection(tmp_path, llm=llm, tools=OriginalProtocolDouble(inner)) as (session, _, _):
+        identity = await register(session, "multi-turn-baseline", actions=4, requests=8)
+        llm.native_responses_by_task[identity] = [
+            discover(TOOL), replace(turn(inspect("first", account="a")),
+                                    usage=LLMUsage(8, 2, 10, 4)),
+            turn(inspect("second", account="b")), turn(inspect("third", account="c")),
+            NativeCompletion(text="Return the bounded observations for planner assessment."),
+        ]
+        result, = await drive(session)
+        assert result.kind == "completed", result.error
+        assert len(inner.invocations) == 3
+        usage = await session.deps.central_state.request_ledger().snapshot(
+            str(session.runtime.run_id),
+        )
+        assert usage["spent"] == len(llm.envelopes) == 5
+        assert usage["by_task"][identity]["spent"] == 5
+        assert usage["by_task"][identity]["usage"]["cache_read_tokens"] == {
+            "known": 4, "unknown": 4,
+        }
+        assert all(item["parts"]["system"] > 0 and item["parts"]["tools"] > 0
+                   for item in llm.envelopes)
+        assert all(item["first_changed_previous_message"] is None for item in llm.envelopes)
+        assert all(all(limit == 4000 for limit in item["original_window_limits"])
+                   for item in llm.envelopes)
+    scalar = {"requests": llm.envelopes, "model_calls": usage["spent"],
+              "unknown_usage": usage["unknown_usage"],
+              "cumulative_bytes": sum(item["total_bytes"] for item in llm.envelopes)}
+    (tmp_path / "worker-session-baseline.json").write_text(json.dumps(scalar, indent=2))
+    print(json.dumps({"multi_turn_baseline": scalar}, sort_keys=True))
 
 
 @pytest.mark.parametrize("lookups", [False, True])

@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import ipaddress
 import json
 import os
 import socket
+import ssl
 from dataclasses import dataclass, field
+from functools import wraps
 from html import escape
 from html.parser import HTMLParser
 from typing import Any
@@ -17,6 +20,7 @@ from urllib.parse import urlsplit
 import anyio
 import httpx
 from mcp.server.mcpserver.exceptions import ToolError
+from mcp.types import CallToolResult, TextContent
 
 from redteam.capability.servers.config import ServerPolicy, TargetProfile
 from redteam.capability.servers.session_state import cookie_header
@@ -86,6 +90,70 @@ class ToolInputError(ToolError, ValueError):
     already-safe-to-share rejection like "target address outside configured
     networks", never a secret or a raw target response.
     """
+
+
+class TargetRequestError(ToolInputError):
+    """Safe target-transport diagnosis; never the raw exception or request."""
+
+    def __init__(self, code: str, phase: str, repair: str):
+        self.diagnostic = {
+            "code": code, "cause_scope": "target_prerequisite",
+            "owner": "capability.servers.network",
+            "phase": phase, "repair_condition": repair,
+            "message": "target HTTP request failed",
+            "response_received": False if phase in {"connect", "tls"} else None,
+        }
+        super().__init__(f"target HTTP request failed ({code}): {repair}")
+
+
+def target_network_tool(function):
+    """Preserve typed tool schemas and return safe transport failures as DATA."""
+    @wraps(function)
+    async def wrapped(*args, **kwargs):
+        try:
+            return await function(*args, **kwargs)
+        except TargetRequestError as exc:
+            return CallToolResult(
+                is_error=True,
+                content=[TextContent(type="text", text=str(exc))],
+                structured_content={"diagnostic": exc.diagnostic},
+            )
+    return wrapped
+
+
+def _target_request_error(exc: BaseException) -> TargetRequestError:
+    if isinstance(exc, httpx.ConnectTimeout):
+        code, phase = "target_http_connect_timeout", "connect"
+    elif isinstance(exc, httpx.ConnectError):
+        code, phase = "target_http_connect_failed", "connect"
+    elif isinstance(exc, (httpx.TimeoutException, TimeoutError)):
+        code, phase = "target_http_response_timeout", "request_or_response"
+    else:
+        code, phase = "target_http_transport_failed", "request_or_response"
+    cause: BaseException | None = exc
+    for _ in range(8):
+        if isinstance(cause, ssl.SSLError):
+            code, phase = "target_http_tls_failed", "tls"
+            break
+        if isinstance(cause, OSError):
+            if cause.errno == errno.ECONNREFUSED:
+                code, phase = "target_http_connection_refused", "connect"
+                break
+            if cause.errno in {errno.ENETUNREACH, errno.EHOSTUNREACH}:
+                code, phase = "target_http_route_unreachable", "connect"
+                break
+        cause = cause.__cause__ if cause is not None else None
+    repair = (
+        "Check target reachability from this MCP server process. A Docker-internal address "
+        "may require the prepared container-network execution route. Another tool in the "
+        "same host process does not repair that route."
+        if phase == "connect" else
+        "Check the target TLS certificate and configured hostname; retain certificate verification."
+        if phase == "tls" else
+        "Check the target response and the registered execution route before another request. "
+        "A missing response does not establish whether the request had effects."
+    )
+    return TargetRequestError(code, phase, repair)
 
 
 @dataclass(frozen=True)
@@ -329,4 +397,4 @@ async def request(
                         has_session_receipt=True,
                     )
     except (httpx.HTTPError, OSError, asyncio.TimeoutError, TimeoutError) as exc:
-        raise ToolInputError("target HTTP request failed") from exc
+        raise _target_request_error(exc) from exc

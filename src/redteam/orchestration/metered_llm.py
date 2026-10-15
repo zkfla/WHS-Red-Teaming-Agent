@@ -129,11 +129,17 @@ class RunMeteredLLM:
             raise
         await self.ledger.settle(
             scope.run_id, request, total_tokens=getattr(response, "total_tokens", None),
+            usage=getattr(response, "usage", None),
         )
         await self.ledger.record_provider_outcome(scope.run_id)
         return response
 
     async def complete(self, *, messages, system=None, **kwargs) -> str:
+        if callable(getattr(self.client, "complete_with_usage", None)):
+            response = await self._call(
+                "complete_with_usage", messages=messages, system=system, **kwargs,
+            )
+            return str(response.value)
         return await self._call("complete", messages=messages, system=system, **kwargs)
 
     async def complete_native(self, messages, tools, system=None, **kwargs):

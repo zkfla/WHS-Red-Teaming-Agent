@@ -1,6 +1,7 @@
 """Direct Kali target routing has no gate daemon or packet-accounting path."""
 
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -11,6 +12,7 @@ from redteam.capability.direct_target import (
     DirectTargetExecutionPolicy,
     DirectTargetNetworkExtension,
     DirectTargetProviderConfig,
+    _descriptor,
 )
 from redteam.capability.shell_policy import ShellWorkroomPolicy
 from redteam.capability.shell_preparation import DockerEndpoint
@@ -24,6 +26,7 @@ from redteam.core.contracts.tool import (
     EXECUTION_UNCERTAIN_METADATA_KEY,
     ExecutionContext,
     ToolInvocation,
+    model_input_schema,
 )
 from redteam.core.ids import (
     ActionId,
@@ -242,6 +245,39 @@ async def test_changed_docker_endpoint_is_refused_before_workroom_creation(monke
     )
     assert not result.success and result.error.code == "direct_target_docker_endpoint_changed"
     assert manager._known == {} and manager.calls == []
+
+
+async def test_native_selector_uses_declared_host_binding_despite_mcp_alias():
+    from redteam.core.contracts.target import HostTarget
+    from redteam.orchestration.engine import DecisionRuleError, validate_argument_target
+    from redteam.orchestration.knowledge_validation import InternalAssessment, InternalTarget
+    from redteam.orchestration.native_binding import resolve_native_target
+
+    descriptor = _descriptor(FakeManager().policy, DirectTargetConfig(
+        targets={IP: (IP,)}, target_ports={IP: (5000,)},
+    ))
+    target = HostTarget(host=IP + ":5000")
+    deps = SimpleNamespace(
+        graph_store=object(),
+        engagement=SimpleNamespace(metadata={"target_refs": {IP + ":5000": "opaque-mcp-id"}}),
+        operation_bindings=None,
+    )
+    material = InternalAssessment(targets={
+        "host:registered": InternalTarget(node_id="host:registered", execution_target=target),
+    })
+    arguments = {"target_ref": IP, "port": 5000, "language": "bash", "script": "true"}
+    assert await resolve_native_target(deps, descriptor, arguments, material) == target
+    assert "workroom_key" not in model_input_schema(descriptor.input_schema)["properties"]
+    for invalid, code in [
+        ({**arguments, "target_ref": "10.0.0.10"}, "target_ref_source_mismatch"),
+        ({**arguments, "port": 5001}, "ambiguous_tool_target"),
+    ]:
+        with pytest.raises(DecisionRuleError) as rejected:
+            await resolve_native_target(deps, descriptor, invalid, material)
+        assert rejected.value.diagnostic.code == code
+    # An opaque MCP selector retains its original exact reference check.
+    with pytest.raises(DecisionRuleError):
+        validate_argument_target(target, arguments, {"opaque-mcp-id"})
 
 
 class _NoLock:

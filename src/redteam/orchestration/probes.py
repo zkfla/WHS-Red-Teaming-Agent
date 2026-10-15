@@ -16,8 +16,9 @@ Execute only this bounded probe purpose using the selected role's registered too
 Completion diagnostics describe their cause_scope, owner and repair_condition.
 Correct model_input when possible. Preserve originals and diagnostic references in
 an unresolved return for runtime_contract or unknown support that you cannot repair;
-target calls and repeated reads do not fix runtime contracts. Current execution waits
-come from execution_history, not historical diagnostic messages.
+target calls and repeated reads do not fix runtime contracts. Current waits and
+changes come from new tool replies and worker_updates. Initial execution_history
+and earlier diagnostic messages are historical views, not current permission.
 Choose methods yourself; there is no mandatory tool sequence or domain handoff.
 Related candidates are immutable admitted snapshots, not permission or verified findings.
 Return observations and limitations early with task.settle (inconclusive/blocked)
@@ -176,7 +177,8 @@ async def yield_probe(deps, state, reason):
     originals = await deps.central_state.list_executions(task_id=str(task.task_id))
     records = await original_records(deps, task)
     refs = [str(record.evidence_id) for record in records]
-    pending = any(unsafe(item) for item in originals) or task.status is TaskStatus.BLOCKED
+    pending = (any(unsafe(item) for item in originals) or task.status is TaskStatus.BLOCKED
+               or any(not call.completed for call in state.get("native_calls", [])))
     waiting = any(item.wait_reason for item in originals)
     summary = "Probe returned preserved observations: " + reason
     proposal = CompletionProposal(

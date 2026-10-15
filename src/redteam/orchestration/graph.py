@@ -1,4 +1,4 @@
-"""Native MODEL -> TOOLS -> SETTLE with central state and original checkpoints."""
+"""PREPARE -> MODEL -> TOOLS -> SETTLE with original durable displays/calls."""
 
 from __future__ import annotations
 
@@ -9,10 +9,10 @@ from langgraph.graph import END, START, StateGraph
 
 from redteam.core.enums import AgentPhase
 from redteam.orchestration.context import RuntimeDeps
-from redteam.orchestration.nodes.react import model_node, settle_node, tools_node
+from redteam.orchestration.nodes.react import model_node, prepare_node, settle_node, tools_node
 from redteam.orchestration.state import GraphState
 
-NODE_NAMES = ("model", "tools", "settle")
+NODE_NAMES = ("prepare", "model", "tools", "settle")
 
 
 def _after_model(state: GraphState):
@@ -24,7 +24,7 @@ def _central_entry(state: GraphState):
         return "tools"
     if state["runtime"].phase == AgentPhase.POLICY and state.get("action_proposal") is not None:
         raise ValueError("central_checkpoint_requires_native_execution_continuation")
-    return "model"
+    return "prepare"
 
 
 def _after_settle(state: GraphState):
@@ -36,13 +36,15 @@ def build_graph(deps: RuntimeDeps, *, checkpointer: Any | None = None) -> Any:
         raise ValueError("runtime_requires_central_state")
     graph = StateGraph(GraphState)
 
+    graph.add_node("prepare", functools.partial(prepare_node, deps=deps))
     graph.add_node("model", functools.partial(model_node, deps=deps))
     graph.add_node("tools", functools.partial(tools_node, deps=deps))
     graph.add_node("settle", functools.partial(settle_node, deps=deps))
 
+    graph.add_conditional_edges("prepare", _after_model, {"tools": "model", "settle": "settle"})
     graph.add_conditional_edges("model", _after_model, {"tools": "tools", "settle": "settle"})
     graph.add_edge("tools", "settle")
-    graph.add_conditional_edges("settle", _after_settle, {"model": "model", "end": END})
+    graph.add_conditional_edges("settle", _after_settle, {"model": "prepare", "end": END})
 
-    graph.add_conditional_edges(START, _central_entry, {"model": "model", "tools": "tools"})
+    graph.add_conditional_edges(START, _central_entry, {"prepare": "prepare", "tools": "tools"})
     return graph.compile(checkpointer=checkpointer)
