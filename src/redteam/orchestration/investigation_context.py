@@ -15,7 +15,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic_core import PydanticCustomError
 
 from redteam.attack_graph.predicates import facts_of
 from redteam.core.contracts.execution import TaskExecution
@@ -25,6 +26,7 @@ from redteam.core.enums import GraphNodeType, TaskStatus
 from redteam.orchestration.central_completion import unsafe
 from redteam.orchestration.coordination import content_hash
 from redteam.orchestration.coverage import project_coverage_gaps
+from redteam.orchestration.diagnostics import DecisionDiagnostic, diagnostic_for_exception
 
 if TYPE_CHECKING:
     from redteam.orchestration.central_state import CentralStateStore, CentralTransaction
@@ -55,10 +57,67 @@ def context_bytes(value: Any) -> int:
     return len(_json(value).encode("utf-8"))
 
 
+def context_rule_diagnostic(
+    exc: BaseException, *, stage: str, schema: dict[str, Any] | None = None,
+) -> DecisionDiagnostic | None:
+    """Owned diagnostic for a ContextQuery/ContextRef rule; None for every other failure.
+
+    Locations come from diagnostic_for_exception with the caller's own input schema, so the
+    caller's field names render and unknown keys do not. Messages, inputs and identities are
+    never read or copied; the summary is the fixed template for the matched rule code.
+    """
+    if not isinstance(exc, ValidationError):
+        return None
+    errors = exc.errors(include_input=False, include_url=False, include_context=False)
+    matched = [index for index, error in enumerate(errors[:10])
+               if error.get("type") in CONTEXT_RULE_GUIDANCE]
+    if not matched:
+        return None
+    base = diagnostic_for_exception(exc, stage=stage, schema=schema)
+    issues = [{"rule": str(errors[index]["type"]),
+               "location": base.validation_issues[index]["location"]} for index in matched]
+    code = issues[0]["rule"]
+    return DecisionDiagnostic(
+        code=code, stage=base.stage, kind="format", location=issues[0]["location"],
+        summary=CONTEXT_RULE_GUIDANCE[code], retryable=True, cause_scope="model_input",
+        owner="orchestration.investigation_context",
+        repair_condition="The query satisfies its documented mode, reference and section "
+                         "conditions.",
+        validation_issues=issues, error_type=base.error_type,
+        exception_chain=base.exception_chain,
+    )
+
+
 class ContextReadError(ValueError):
     def __init__(self, code: str):
         self.code = code
         super().__init__(code)
+
+
+# Owned rule code -> fixed corrective summary. These templates are the only text published
+# for a query rule; the caller's input, messages and identities are never copied.
+CONTEXT_RULE_GUIDANCE: dict[str, str] = {
+    "context_identity_invalid": "Use a nonblank identity of at most 512 characters without "
+                                "NUL or unit-separator characters.",
+    "context_selector_invalid": "Use nonblank target, principal and revision selectors of at "
+                                "most 512 characters without NUL or unit-separator characters.",
+    "context_revision_invalid": "Use non-negative whole-number hypothesis revisions.",
+    "context_status_invalid": "Use only the statuses that this query kind supports.",
+    "context_relation_root_required": "Related mode needs at least one ref as its root.",
+    "context_refs_require_related_or_read": "Refs need related or read mode; list mode takes "
+                                            "filters only.",
+    "context_read_needs_one_matching_reference": "Read mode needs exactly one ref whose kind "
+                                                 "matches kind.",
+    "context_section_requires_read": "Only read mode may select a section other than record.",
+    "context_task_section_required": "The completion_criteria and result sections need kind "
+                                     "task.",
+    "context_graph_section_required": "The properties section needs kind node or edge.",
+}
+
+
+def _rule(code: str) -> PydanticCustomError:
+    """Typed Pydantic rule; the template is static and never formatted with input."""
+    return PydanticCustomError(code, CONTEXT_RULE_GUIDANCE[code])
 
 
 class ContextRef(BaseModel):
@@ -71,7 +130,7 @@ class ContextRef(BaseModel):
     @classmethod
     def local_identity(cls, value: str) -> str:
         if not value.strip() or "\x1f" in value or "\x00" in value:
-            raise ValueError("context_identity_invalid")
+            raise _rule("context_identity_invalid")
         return value
 
 
@@ -106,26 +165,26 @@ class ContextQuery(BaseModel):
         identities = [*self.target_node_ids, *self.principal_refs, *self.hypothesis_revisions]
         if any(not value.strip() or len(value) > 512 or "\x1f" in value
                or "\x00" in value for value in identities):
-            raise ValueError("context_selector_invalid")
+            raise _rule("context_selector_invalid")
         if any(type(version) is not int or version < 0
                for version in self.hypothesis_revisions.values()):
-            raise ValueError("context_revision_invalid")
+            raise _rule("context_revision_invalid")
         states = {"task": _TASK_STATES, "candidate": _CANDIDATE_STATES,
                   "execution": _EXECUTION_STATES}.get(self.kind, set())
         if set(self.statuses) - states:
-            raise ValueError("context_status_invalid")
+            raise _rule("context_status_invalid")
         if self.mode == "related" and not self.refs:
-            raise ValueError("context_relation_root_required")
+            raise _rule("context_relation_root_required")
         if self.mode == "list" and self.refs:
-            raise ValueError("context_refs_require_related_or_read")
+            raise _rule("context_refs_require_related_or_read")
         if self.mode == "read" and (len(self.refs) != 1 or self.refs[0].kind != self.kind):
-            raise ValueError("context_read_needs_one_matching_reference")
+            raise _rule("context_read_needs_one_matching_reference")
         if self.mode != "read" and self.section != "record":
-            raise ValueError("context_section_requires_read")
+            raise _rule("context_section_requires_read")
         if self.section in {"completion_criteria", "result"} and self.kind != "task":
-            raise ValueError("context_task_section_required")
+            raise _rule("context_task_section_required")
         if self.section == "properties" and self.kind not in {"node", "edge"}:
-            raise ValueError("context_graph_section_required")
+            raise _rule("context_graph_section_required")
         return self
 
 

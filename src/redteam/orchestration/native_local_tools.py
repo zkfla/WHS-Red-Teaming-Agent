@@ -45,6 +45,7 @@ from redteam.orchestration.investigation_context import (
     ContextReadError,
     InvestigationContextReader,
     capture_investigation_context,
+    context_rule_diagnostic,
 )
 from redteam.orchestration.local_tools import (
     RUNTIME_TOOL_CONTRIBUTION_VERSION,
@@ -226,7 +227,9 @@ async def context_query_handler(
     try:
         query = ContextQuery.model_validate(tool_input or {})
     except Exception as exc:
-        diagnostic = diagnostic_for_exception(exc, stage="native_local_tool")
+        diagnostic = context_rule_diagnostic(
+            exc, stage="native_local_tool", schema=ContextQuery.model_json_schema(),
+        ) or diagnostic_for_exception(exc, stage="native_local_tool")
         diagnostic = diagnostic.model_copy(update={
             "cause_scope": "model_input", "owner": "orchestration.investigation_context",
             "repair_condition": "Correct the context query using the registered schema.",

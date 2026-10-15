@@ -35,7 +35,7 @@ from redteam.orchestration.diagnostics import (
     exception_chain_for,
 )
 from redteam.orchestration.engine import InvestigationEngine
-from redteam.orchestration.investigation_context import context_bytes
+from redteam.orchestration.investigation_context import context_bytes, context_rule_diagnostic
 from redteam.orchestration.knowledge_validation import known_principals, known_target_ids
 from redteam.orchestration.metered_llm import llm_request_scope
 from redteam.orchestration.planner_context import (
@@ -213,6 +213,9 @@ def _proposal_validation_diagnostic(
     lookup_diagnostic = planner_lookup_diagnostic(exc, stage=stage)
     if lookup_diagnostic is not None:
         return lookup_diagnostic
+    context_diagnostic = context_rule_diagnostic(exc, stage=stage, schema=schema)
+    if context_diagnostic is not None:
+        return context_diagnostic
     detail = getattr(exc, "diagnostic", None)
     if isinstance(detail, DecisionDiagnostic):
         return detail.model_copy(update={
