@@ -237,6 +237,7 @@ async def test_atomization_coded_semantic_error_preserves_proposal_code(tmp_path
         "completion_criterion_ids": [criterion_id(CompletionCriterion(
             kind="observation", description="Inspect the preserved response",
         ))],
+        "hypothesis_revisions": {},
     }]}
     llm = PlannerResponseLLM(plan=_valid_plan(), atom=atom)
     async with probe_selection(tmp_path, llm=llm) as (session, _, _):

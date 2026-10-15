@@ -48,7 +48,6 @@ def atomize(payload):
         "objective",
         "target_node_ids",
         "principal_refs",
-        "hypothesis_revisions",
         "evidence_ids",
         "source_task_id",
         "source_result_id",
@@ -63,6 +62,7 @@ def atomize(payload):
                 "probe_limits": {"max_actions": 2, "max_model_requests": 8},
                 "completion_criterion_ids": [item["criterion_id"]
                                              for item in q["completion_criteria"]],
+                "hypothesis_revisions": q["hypothesis_revisions"],
                 **{key: q[key] for key in keys if key in q},
             }
             for q in payload["questions"]

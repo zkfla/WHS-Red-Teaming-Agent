@@ -84,6 +84,7 @@ def atom(payload):
         "objective": "Inspect a new premise", "role_id": "probe-worker",
         "target_node_ids": [TARGET],
         "completion_criterion_ids": [_condition_id("Inspect first")],
+        "hypothesis_revisions": {},
         "source_task_id": "z-source", "source_result_id": "old-result"}]}
 
 

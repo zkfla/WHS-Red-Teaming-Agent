@@ -97,11 +97,13 @@ def _plan_two_questions():
 def _atom_two_tasks():
     return {"tasks": [
         {"task_key": "t1", "question_id": "q1", "objective": "Probe first",
+         "hypothesis_revisions": {},
          "title": "First probe", "role_id": "probe-worker",
          "target_node_ids": [TARGET],
          "completion_criterion_ids": [_condition_id("Inspect first")],
          "probe_limits": {"max_actions": 1, "max_model_requests": 4}},
         {"task_key": "t2", "question_id": "q2", "objective": "Probe second",
+         "hypothesis_revisions": {},
          "title": "Second probe", "role_id": "probe-worker",
          "target_node_ids": [TARGET],
          "completion_criterion_ids": [_condition_id("Inspect second")],

@@ -2,6 +2,8 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 from redteam.core.contracts.completion import CompletionCriterion, criterion_id
 from redteam.orchestration.probe_atomization import _task_rejection
 from redteam.orchestration.specialist_planner import SpecialistPlanner
@@ -44,19 +46,22 @@ def _task(revisions):
                 "completion_criterion_ids": [
                     criterion_id(CompletionCriterion(kind="observation", description="Inspect new"))
                 ],
-                "hypothesis_revisions": revisions,
+                **({} if revisions is None else {"hypothesis_revisions": revisions}),
                 "probe_limits": {"max_actions": 1, "max_model_requests": 4},
             }
         ]
     }
 
 
-async def test_omitted_revision_map_is_named_as_missing_then_copied_map_commits(tmp_path):
+@pytest.mark.parametrize("invalid_map", [None, {}])
+async def test_omitted_revision_map_is_named_as_missing_then_copied_map_commits(
+    tmp_path, invalid_map,
+):
     seen_keys = []
 
     def omitted(payload):
         seen_keys.append(set(payload["issued_candidate_ids"].values()))
-        return _task({})
+        return _task(invalid_map)
 
     def copied(payload):
         (question,) = payload["questions"]
@@ -69,9 +74,12 @@ async def test_omitted_revision_map_is_named_as_missing_then_copied_map_commits(
     assert len(ids) == 1 and spent == 3
     assert len(llm.atom_inputs) == 2
     feedback = llm.atom_feedback[1]
-    assert "atomized_revision_not_preserved" in feedback
-    assert "missing_candidate_revisions" in feedback
-    assert "expected 1 candidate revisions, submitted 0" in feedback
+    if invalid_map is None:
+        assert "schema_required at $.tasks[0].hypothesis_revisions" in feedback
+    else:
+        assert "missing_candidate_revisions" in feedback
+        assert "expected 1 candidate revisions, submitted 0" in feedback
+
     issued = {value for keys in seen_keys for value in keys}
     assert not any(key in feedback for key in issued)
 
@@ -82,12 +90,16 @@ def test_long_labels_do_not_truncate_revision_repair_instruction():
         "expected 3 candidate revisions, submitted 2."
     )
     rejection = _task_rejection(
-        "atomized_revision_not_preserved", index=99,
+        "atomized_revision_not_preserved",
+        index=99,
         task=SimpleNamespace(task_key="t" * 200),
         question=SimpleNamespace(question_id="q" * 200),
         field="hypothesis_revisions",
-        differing_fields=["missing_candidate_revisions", "extra_candidate_revisions",
-                          "candidate_revision_values"],
+        differing_fields=[
+            "missing_candidate_revisions",
+            "extra_candidate_revisions",
+            "candidate_revision_values",
+        ],
         repair=repair,
     )
     assert repair in rejection.diagnostic.feedback()

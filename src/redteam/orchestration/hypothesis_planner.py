@@ -684,6 +684,16 @@ def _split_plan_response_schema(schema: dict[str, Any]) -> dict[str, Any]:
     return schema
 
 
+def _atomizer_response_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Model-facing stage-2 schema: every task states its revision map ({} when none)."""
+    schema = deepcopy(schema)
+    selection = schema.get("$defs", {}).get("AtomizedProbeSelection")
+    if selection is not None:
+        required = list(selection.get("required", []))
+        selection["required"] = list(dict.fromkeys([*required, "hypothesis_revisions"]))
+    return schema
+
+
 async def _ask_with_context(planner, pass_context, engine, *, payload, budget, **kwargs):
     """Optional reads share the client's normal/repair budget, ledger and guard."""
     current = payload
@@ -822,7 +832,9 @@ async def _advance_split(planner, runtime, schema, snapshot, engine, budget, pay
         with llm_request_scope(str(runtime.run_id), "hypothesis_planning"):
             tasks_raw = await planner.client.ask(
                 stage="task_atomization", payload=atom_payload, budget=budget,
-                response_schema=schema(TaskAtomizationDraft.model_json_schema()),
+                response_schema=_atomizer_response_schema(
+                    schema(TaskAtomizationDraft.model_json_schema())
+                ),
                 validate_response=validate_tasks, before_call=engine.guard_reasoning,
                 system=_SPLIT_ATOMIZE_SYSTEM,
             )
