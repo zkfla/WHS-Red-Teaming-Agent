@@ -109,8 +109,7 @@ async def test_prepared_manifest_reaches_no_argument_program_discovery(monkeypat
     rows = await runtime.program_source.list_image_programs()
     assert [(row.name, row.executable) for row in rows] == [("nmap", "/usr/bin/nmap")]
     prepare.assert_awaited_once_with(
-        None, program_manifest_path=None, network_policy_path=None,
-        progress=None, expected_fingerprint=None,
+        None, progress=None, expected_fingerprint=None,
     )
 
 

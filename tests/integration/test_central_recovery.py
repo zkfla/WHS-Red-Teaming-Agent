@@ -363,7 +363,8 @@ async def test_stop_does_not_wait_for_blocked_planner_response():
         assert usage["unknown_dispatch"] == 1 and usage["reserved"] == 0
 
 
-async def test_selected_network_ledger_keeps_pool_window_sequence_on_reopen(tmp_path, monkeypatch):
+async def test_selected_network_ledger_keeps_pool_window_sequence_on_reopen(tmp_path):
+    from redteam.app.bootstrap import build_central_storage
     from redteam.capability.gated_activation import GatedProviderConfig, configure_gated
     from redteam.capability.gated_network_policy import GatedNetworkPolicy
     from redteam.capability.shell_runtime import build_shell_runtime
@@ -372,57 +373,51 @@ async def test_selected_network_ledger_keeps_pool_window_sequence_on_reopen(tmp_
         NetworkGrant,
         NetworkPurpose,
     )
+    from tests.fakes import FakeEvidenceStore
     from tests.unit.test_network_ledger import budget, caps
     from tests.unit.test_shell_runtime_008 import _policy_file
 
-    captured = []
-
-    def capture(shell, scope, ledger, evidence, **kwargs):
-        captured.append(ledger)
-        return configure_gated(shell, scope, ledger, evidence, **kwargs)
-
-    monkeypatch.setattr("redteam.capability.gated_activation.configure_gated", capture)
+    # Direct target is the default selection and owns no ledger. This ledger
+    # belongs to the dormant gated provider, so it is selected explicitly.
     provider = GatedProviderConfig(network_policy=GatedNetworkPolicy(
         budget=budget(), default_target_caps=caps(),
         default_install_caps=caps(purpose=NetworkPurpose.INSTALL),
     ))
-    config = AppConfig(engagement=EngagementConfig.model_validate(
-        engagement().model_dump(exclude={"engagement_id", "created_at"}),
-    ))
-    root = tmp_path / "central"
-    policy_file = _policy_file(tmp_path)
+    engagement_model = engagement()
+    run_id = "ledger-run"
+    state_path = tmp_path / "central" / "state.sqlite3"
+    shell = build_shell_runtime(_policy_file(tmp_path))
+    assert shell is not None
 
-    async def assemble(resume=False, run_id=None, engagement_id=None):
-        shell = build_shell_runtime(policy_file)
-        return open_central_run(
-            config, directory=root, settings=limits()[1], resume=resume,
-            run_id=run_id, engagement_id=engagement_id, llm=FakeLLMClient(),
-            builtin_adapters=[shell.adapter], builtin_concurrency=shell.concurrency,
-            builtin_output_limits=shell.output_limits, shell_programs=shell.program_source,
-            gated_shell=(shell, provider),
+    async def open_ledger():
+        _, ledger = await build_central_storage(
+            engagement_model, run_id=run_id, path=state_path, network_budget=budget(),
         )
+        assert ledger is not None
+        return ledger
 
-    async with await assemble() as selection:
-        run_id, engagement_id = selection.runtime.run_id, selection.runtime.engagement_id
-        original = captured[-1]
-        window = await original.request_window(run_id=str(run_id), instance_id="original-holder",
-                                               epoch=1, caps=caps())
-        assert isinstance(window, NetworkGrant)
-        assert (await original.admit_delivery(window_id=window.window_id,
-            daemon_session_id="original-daemon", seq=1, flow_key="original-flow")).charged_delivery
-        args = dict(window_id=window.window_id, meter=None, verified_closed=False)
-        settled = await original.settle_window(**args)
-        assert settled.released_bytes == settled.released_deliveries == 0
-    with sqlite3.connect(root / "state.sqlite3") as db:
+    original = await open_ledger()
+    assembly = configure_gated(
+        shell, engagement_model.scope, original, FakeEvidenceStore(), provider_config=provider,
+    )
+    assert assembly.descriptors
+    window = await original.request_window(run_id=run_id, instance_id="original-holder",
+                                           epoch=1, caps=caps())
+    assert isinstance(window, NetworkGrant)
+    assert (await original.admit_delivery(window_id=window.window_id,
+        daemon_session_id="original-daemon", seq=1, flow_key="original-flow")).charged_delivery
+    args = dict(window_id=window.window_id, meter=None, verified_closed=False)
+    settled = await original.settle_window(**args)
+    assert settled.released_bytes == settled.released_deliveries == 0
+    with sqlite3.connect(state_path) as db:
         before = {table: db.execute(f"SELECT * FROM {table}").fetchall()
                   for table in ("network_pools", "network_windows", "network_seq_log")}
-    async with await assemble(True, run_id, engagement_id):
-        reopened = captured[-1]
-        assert await reopened.settle_window(**args) == settled
-        refused = await reopened.request_window(run_id=str(run_id), instance_id="original-holder",
-                                                epoch=2, caps=caps())
-        assert isinstance(refused, GrantRefused) and refused.code == "quarantined"
-    with sqlite3.connect(root / "state.sqlite3") as db:
+    reopened = await open_ledger()
+    assert await reopened.settle_window(**args) == settled
+    refused = await reopened.request_window(run_id=run_id, instance_id="original-holder",
+                                            epoch=2, caps=caps())
+    assert isinstance(refused, GrantRefused) and refused.code == "quarantined"
+    with sqlite3.connect(state_path) as db:
         after = {table: db.execute(f"SELECT * FROM {table}").fetchall() for table in before}
     assert before == after
     assert not list(tmp_path.rglob("network_grants.sqlite3"))
