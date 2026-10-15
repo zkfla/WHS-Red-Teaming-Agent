@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from redteam.core.contracts.graph import Hypothesis
 from redteam.orchestration.probe_atomization import (
     AtomizationProposalError,
     HypothesisPlanDraft,
@@ -14,6 +15,17 @@ from tests.unit.test_plan_linkage_rejection import _question
 from tests.unit.test_split_planner_repair_guidance import _advance_with
 
 IDENTIFIER_MARKER = "RELATION-MARKER-5b7d"
+
+
+def _candidate():
+    return Hypothesis(
+        contract_version=2,
+        hypothesis_id=IDENTIFIER_MARKER,
+        description="Assess the preserved response",
+        reason="Assess the preserved response",
+        revision=2,
+        target_node_ids=["host:a"],
+    )
 
 
 def _criterion(**extra):
@@ -36,7 +48,7 @@ def _bind(questions, *, principals=(), candidates=None):
 
 
 def test_revision_mismatch_names_hypothesis_revisions_without_identifiers():
-    candidates = {IDENTIFIER_MARKER: SimpleNamespace(revision=2)}
+    candidates = {IDENTIFIER_MARKER: _candidate()}
     with pytest.raises(AtomizationProposalError) as failed:
         _bind([_question(hypothesis_revisions={IDENTIFIER_MARKER: 1})], candidates=candidates)
     diagnostic = failed.value.diagnostic
@@ -46,7 +58,7 @@ def test_revision_mismatch_names_hypothesis_revisions_without_identifiers():
 
 
 def test_matching_candidate_revision_binds():
-    candidates = {IDENTIFIER_MARKER: SimpleNamespace(revision=2)}
+    candidates = {IDENTIFIER_MARKER: _candidate()}
     _, questions, _ = _bind(
         [_question(hypothesis_revisions={IDENTIFIER_MARKER: 2})],
         candidates=candidates,
