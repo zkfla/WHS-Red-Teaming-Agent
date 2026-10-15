@@ -117,12 +117,13 @@ async def test_criterion_purpose_repair_then_valid_plan_commits(tmp_path):
     assert IDENTIFIER_MARKER not in feedback
 
 
-async def test_revision_mismatch_repair_then_valid_plan_commits(tmp_path):
+async def test_old_revision_map_on_wire_repair_then_valid_plan_commits(tmp_path):
     malformed = _plan_two_questions()
+    # The planner wire has no revision map; the old key must be rejected as unsupported.
     malformed["questions"][0]["hypothesis_revisions"] = {IDENTIFIER_MARKER: 1}
     ids, spent, llm = await _advance_with(tmp_path, [malformed, _plan_two_questions()])
     assert len(ids) == 2 and spent == 3
     assert len(llm.atom_inputs) == 1
     feedback = llm.plan_feedback[1]
-    assert "$.questions[0].hypothesis_revisions" in feedback
+    assert "schema_additionalProperties at $.questions[0]" in feedback
     assert IDENTIFIER_MARKER not in feedback

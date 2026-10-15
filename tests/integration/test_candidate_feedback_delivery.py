@@ -19,7 +19,7 @@ from tests.integration.test_probe_workers import drive, selection
 from tests.integration.test_v3_atomization import SplitDouble
 
 
-def question(key, *, revisions=None, source=None, evidence=()):
+def question(key, *, candidate_refs=(), source=None, evidence=()):
     return {
         "question_id": key,
         "objective": "Narrow the anonymous response exposure premise",
@@ -32,7 +32,7 @@ def question(key, *, revisions=None, source=None, evidence=()):
                 "principal_refs": ["anonymous"],
             }
         ],
-        "hypothesis_revisions": revisions or {},
+        "candidate_refs": list(candidate_refs),
         "evidence_ids": list(evidence),
         **(
             {"source_task_id": source["task_id"], "source_result_id": source["result"]["result_id"]}
@@ -49,8 +49,6 @@ def atomize(payload):
         "target_node_ids",
         "principal_refs",
         "evidence_ids",
-        "source_task_id",
-        "source_result_id",
     )
     return {
         "tasks": [
@@ -62,7 +60,6 @@ def atomize(payload):
                 "probe_limits": {"max_actions": 2, "max_model_requests": 8},
                 "completion_criterion_ids": [item["criterion_id"]
                                              for item in q["completion_criteria"]],
-                "hypothesis_revisions": q["hypothesis_revisions"],
                 **{key: q[key] for key in keys if key in q},
             }
             for q in payload["questions"]
@@ -215,7 +212,7 @@ async def test_anonymous_observation_candidate_probe_same_candidate_feedback_and
                 }
             ],
             "questions": [
-                question("check", revisions={"premise": 1}, source=source, evidence=evidence)
+                question("check", candidate_refs=["premise"], source=source, evidence=evidence)
             ],
             "reason": "Test the stated uncertainty",
             "termination": "continue",

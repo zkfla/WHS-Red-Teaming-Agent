@@ -88,9 +88,11 @@ def _plan_two_questions():
     return {"updates": [], "questions": [
         {"question_id": "q1", "objective": "Inspect the first response",
          "target_node_ids": [TARGET],
+         "candidate_refs": [],
          "completion_criteria": [{"kind": "observation", "description": "Inspect first"}]},
         {"question_id": "q2", "objective": "Inspect the second response",
          "target_node_ids": [TARGET],
+         "candidate_refs": [],
          "completion_criteria": [{"kind": "observation", "description": "Inspect second"}]}],
         "reason": "Two useful scoped observations", "termination": "continue"}
 
@@ -186,7 +188,7 @@ async def test_split_loop_updated_candidate_forwarded_to_atomizer(tmp_path):
                 "completion_criteria": [{"kind": "observation",
                                         "description": "Inspect refined",
                                         "hypothesis_id": pid}],
-                "hypothesis_revisions": {pid: 2}}],
+                "candidate_refs": [pid]}],
             "reason": "Refine and re-probe", "termination": "continue"})
         async def atom_updated(payload):
             (question,) = [item for item in payload["questions"]
@@ -308,7 +310,7 @@ async def test_split_loop_related_change_between_stages_discards_all(tmp_path):
                 "target_node_ids": [TARGET],
                 "completion_criteria": [{"kind": "observation",
                                         "description": "Inspect seed"}],
-                "hypothesis_revisions": {pid: 1}}],
+                "candidate_refs": [pid]}],
             "reason": "Probe the seeded premise", "termination": "continue"})
         async def atom_with_related_drift(payload):
             current = await service.get_hypothesis(pid)
@@ -504,7 +506,7 @@ def _new_candidate_plan():
         "questions": [{"question_id": "q1", "objective": "Probe the new premise",
          "target_node_ids": [TARGET],
          "completion_criteria": [{"kind": "observation", "description": "Inspect new"}],
-         "hypothesis_revisions": {"local": 1}}],
+         "candidate_refs": ["local"]}],
         "reason": "Probe the new premise", "termination": "continue"}
 
 def _new_candidate_atom(payload):

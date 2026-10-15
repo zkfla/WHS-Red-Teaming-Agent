@@ -32,7 +32,7 @@ def test_probe_profile_uses_one_common_executor_and_split_atomizer():
     assert len(executors) == 1
     assert loaded.run_policy().probe_limits == ProbeLimits(max_actions=4, max_model_requests=16)
 
-    assert loaded.profile.version == "16"
+    assert loaded.profile.version == "17"
     atomizer_id = loaded.profile.stages.get("task_atomization")
     assert atomizer_id == "probe-atomizer"
     assert atomizer_id != loaded.profile.stages["hypothesis_planning"]

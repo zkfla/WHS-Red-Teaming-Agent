@@ -65,6 +65,7 @@ def _valid_plan():
         "questions": [{
             "question_id": "q1",
             "objective": "Inspect the captured response",
+            "candidate_refs": [],
             "target_node_ids": [TARGET],
             "completion_criteria": [{
                 "kind": "observation",
@@ -86,6 +87,7 @@ async def test_split_plan_validation_keeps_declared_and_nested_locations(tmp_pat
         "questions": [{
             "question_id": "q1",
             "objective": objective_marker,
+            "candidate_refs": [],
             "target_node_ids": nested_value_marker,
             "completion_criteria": [{
                 "kind": "observation",
@@ -120,6 +122,7 @@ async def test_split_outer_schema_gate_keeps_declared_field_location(tmp_path):
         "questions": [{
             "question_id": "q1",
             "objective": marker,
+            "candidate_refs": [],
             "target_node_ids": [TARGET],
             "completion_criteria": [{
                 "kind": "observation",
@@ -237,7 +240,6 @@ async def test_atomization_coded_semantic_error_preserves_proposal_code(tmp_path
         "completion_criterion_ids": [criterion_id(CompletionCriterion(
             kind="observation", description="Inspect the preserved response",
         ))],
-        "hypothesis_revisions": {},
     }]}
     llm = PlannerResponseLLM(plan=_valid_plan(), atom=atom)
     async with probe_selection(tmp_path, llm=llm) as (session, _, _):

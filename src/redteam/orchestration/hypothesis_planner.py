@@ -46,10 +46,10 @@ from redteam.orchestration.planner_context import (
     project_planner_knowledge,
 )
 from redteam.orchestration.probe_atomization import (
-    HypothesisPlanDraft,
+    HypothesisPlanSelection,
     TaskAtomizationDraft,
     bind_candidate_updates,
-    bind_plan,
+    bind_plan_selection,
     build_atomizer_input,
     needs_atomization,
     resolve_atomized_tasks,
@@ -619,13 +619,16 @@ FEEDBACK_SYSTEM = (
 _SPLIT_PLAN_SYSTEM = FEEDBACK_SYSTEM + (
     "Propose candidate updates and investigation questions in one judgment, never worker tasks. "
     "New updates use a proposal-local hypothesis_id and expected_revision=null; code issues the "
-    "persistent ID. Questions may reference that key with revision=1. Existing updates use "
-    "captured IDs and expected revisions; questions use the resulting revision. Questions carry "
-    "only the investigation purpose -- objective, subjects, completion criteria, related "
-    "candidate revisions, evidence and source refs, and the required meaning -- never a worker "
+    "persistent ID. Questions name related candidates in candidate_refs (captured IDs or this "
+    "proposal's local keys) and never write revision numbers; code copies the resulting "
+    "revision. Existing updates use captured IDs and expected revisions. Questions carry "
+    "only the investigation purpose -- objective, subjects, completion criteria, candidate_refs "
+    "for related candidates (code copies their revisions), evidence and source refs, and the "
+    "required meaning -- never a worker "
     "role or tool-call order. Question IDs are local to this plan. Identify "
-    "reviewed_task_ids/reviewed_hypothesis_ids actually consumed. Source followups cite the "
-    "captured Task/result pair, without inventing a question. Observations and Task outcome are "
+    "reviewed_task_ids/reviewed_hypothesis_ids actually consumed. A followup gives the captured "
+    "source_task_id and omits source_result_id; code copies that Task's result, and an explicit "
+    "null is not derived. Observations and Task outcome are "
     "not candidate verdicts. Final verdicts require an independent public review receipt for "
     "that exact candidate revision/purpose. No candidates initially means a useful scoped "
     "observation or reasoned hold. Same evidence can support another useful probe. Never "
@@ -660,6 +663,11 @@ _SPLIT_ATOMIZE_SYSTEM = (
 
 
 _SPLIT_PLAN_REQUIRED = ("questions", "termination")
+_CANDIDATE_REFS_DESCRIPTION = (
+    "Captured candidate IDs or this proposal's local hypothesis_id keys this question concerns. "
+    "Include every candidate a completion criterion names. Code copies each candidate's resulting "
+    "revision; never write revision numbers."
+)
 _SPLIT_PLAN_DESCRIPTIONS = {
     "questions": (
         "Required in every reply. Use [] when no new observation is needed. Completed Tasks, "
@@ -684,12 +692,22 @@ def _split_plan_response_schema(schema: dict[str, Any]) -> dict[str, Any]:
     schema["required"] = list(dict.fromkeys([*required, *_SPLIT_PLAN_REQUIRED]))
     for name, text in _SPLIT_PLAN_DESCRIPTIONS.items():
         schema["properties"][name]["description"] = text
-    criterion = schema.get("$defs", {}).get("CompletionCriterion")
+    defs = schema.get("$defs", {})
+    criterion = defs.get("CompletionCriterion")
     if criterion is not None:
         criterion_required = ("kind", "description")
         criterion["required"] = list(dict.fromkeys([
             *criterion.get("required", []), *criterion_required,
         ]))
+    question = defs.get("PlannedQuestionSelection")
+    if question is not None:
+        question["required"] = list(dict.fromkeys([
+            *question.get("required", []), "candidate_refs",
+        ]))
+        question["properties"]["candidate_refs"]["description"] = _CANDIDATE_REFS_DESCRIPTION
+        # Wire copy only: an omitted source_result_id is derived from the captured Task, so
+        # the model must not see a null default to echo back.
+        question["properties"]["source_result_id"].pop("default", None)
     return schema
 
 
@@ -750,16 +768,15 @@ async def _advance_split(planner, runtime, schema, snapshot, engine, budget, pay
         )
 
     def bind_stage_one(raw):
-        draft = HypothesisPlanDraft.model_validate(raw)
-        if lookup_only(draft):
-            return draft, None, [], {}
-        pass_context.validate_reviewed(draft)
-        updates, questions, versions = bind_plan(
-            draft, snapshot, issued=issued, targets=targets, principals=principals,
+        selection = HypothesisPlanSelection.model_validate(raw)
+        if lookup_only(selection):
+            return selection, None, [], {}
+        pass_context.validate_reviewed(selection)
+        return bind_plan_selection(
+            selection, snapshot, issued=issued, targets=targets, principals=principals,
             max_tasks=planner.policy.max_tasks_per_strategy,
             existing_work_validator=validate_existing_work,
         )
-        return draft, updates, questions, versions
 
     def validate_plan(raw):
         try:
@@ -775,14 +792,14 @@ async def _advance_split(planner, runtime, schema, snapshot, engine, budget, pay
                     "purpose only, never worker tasks. Empty judgments need a termination reason "
                     "and resume_conditions.",
                 ),
-                schema=HypothesisPlanDraft.model_json_schema(),
+                schema=HypothesisPlanSelection.model_json_schema(),
             )) from exc
 
     with llm_request_scope(str(runtime.run_id), "hypothesis_planning"):
         plan_raw = await _ask_with_context(planner, pass_context, engine,
             stage="hypothesis_planning", payload=payload, budget=budget,
             response_schema=_split_plan_response_schema(
-                schema(HypothesisPlanDraft.model_json_schema())
+                schema(HypothesisPlanSelection.model_json_schema())
             ),
             validate_response=validate_plan, before_call=engine.guard_reasoning,
             system=_SPLIT_PLAN_SYSTEM,

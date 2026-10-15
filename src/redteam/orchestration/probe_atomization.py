@@ -23,6 +23,7 @@ Preservation rules:
 from __future__ import annotations
 
 from collections.abc import Callable
+from copy import deepcopy
 from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -112,8 +113,8 @@ _PRINCIPAL_SUMMARY = (
 )
 _PURPOSE_SUMMARY = (
     "Each completion criterion hypothesis_id must be a candidate listed in its question's "
-    "hypothesis_revisions. Use the intended candidate already listed there. If the question "
-    "needs that relation, include the captured candidate with its correct proposed revision. "
+    "{field}. Use the intended candidate already listed there. If the question "
+    "needs that relation, list the captured or proposed candidate there. "
     "Do not invent refs or remove required purpose; correct the location named in the diagnostic."
 )
 
@@ -238,6 +239,54 @@ class HypothesisPlanDraft(BaseModel):
     context_request: PlannerContextRequest | None = None
 
 
+class PlannedQuestionSelection(BaseModel):
+    """Model-facing stage-1 question: candidate_refs replaces numeric revision maps.
+
+    Canonical PlannedInvestigationQuestion stays the stored contract. Code resolves
+    candidate_refs to the revisions this pass yields and derives source_result_id only
+    when the field is omitted and the captured Task holds its one result.
+    """
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+    question_id: str = Field(min_length=1)
+    objective: str = Field(min_length=1)
+    target_node_ids: list[str] = Field(min_length=1)
+    principal_refs: list[str] = Field(default_factory=list)
+    completion_criteria: list[CompletionCriterion] = Field(min_length=1)
+    candidate_refs: list[str]
+    required: bool = False
+    required_reason: str | None = None
+    goal_required_hypothesis_ids: list[str] = Field(default_factory=list)
+    evidence_ids: list[str] = Field(default_factory=list)
+    source_task_id: str | None = None
+    source_result_id: str | None = None
+    source_question_id: str | None = None
+
+    @model_validator(mode="after")
+    def _purpose(self):
+        if not self.question_id.strip() or not self.objective.strip() or any(
+            not ref.strip() for ref in self.target_node_ids
+        ):
+            raise ValueError("planned question purpose and references must be nonblank")
+        if self.required and not (self.required_reason or "").strip():
+            raise ValueError("goal-required question needs an explicit reason")
+        return self
+
+
+class HypothesisPlanSelection(BaseModel):
+    """Model-facing stage-1 judgment: canonical draft fields, wire questions."""
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+    updates: list[HypothesisUpdate] = Field(default_factory=list)
+    questions: list[PlannedQuestionSelection] = Field(default_factory=list)
+    reviewed_task_ids: list[str] = Field(default_factory=list)
+    reviewed_hypothesis_ids: list[str] = Field(default_factory=list)
+    reason: str = Field(min_length=1)
+    termination: Literal["continue", "replan", "held", "exhausted", "goal_achieved"] = "continue"
+    resume_conditions: list[str] = Field(default_factory=list)
+    context_request: PlannerContextRequest | None = None
+
+
 class AtomizedProbeTask(ProbeTaskProposal):
     """Internal hydrated probe, never the atomizer's model-output schema."""
 
@@ -328,24 +377,16 @@ def resolve_atomized_tasks(
     return tasks
 
 
-def bind_plan(
-    draft: HypothesisPlanDraft,
+def _bind_updates(
+    draft: HypothesisPlanDraft | HypothesisPlanSelection,
     snapshot: PlanningSnapshot,
     *,
     issued: dict[str, str],
     targets: set[str],
     principals: set[str],
     max_tasks: int,
-    existing_work_validator: Callable[[list[str], dict[str, int]], set[str]] | None = None,
-) -> tuple[list[HypothesisUpdate] | None, list[PlannedInvestigationQuestion], dict[str, int]]:
-    """Resolve local references for stage-1 updates+questions without mutating originals.
-
-    Returns (updates_or_None, questions, versions). None updates marks an
-    empty/held judgment that must skip the atomizer (no second request).
-    versions maps persistent hypothesis IDs to the revision this pass proposes,
-    including newly issued candidates at revision 1 -- the FR009 input for
-    stage 2 alongside the issued-ID map itself.
-    """
+) -> tuple[list[HypothesisUpdate], dict[str, int]]:
+    """Single candidate-update authority for stage 1: bound updates and proposed versions."""
     names = [update.hypothesis.hypothesis_id for update in draft.updates]
     if not draft.reason.strip() or any(
         not value.strip() for value in draft.resume_conditions
@@ -367,8 +408,53 @@ def bind_plan(
     versions = {identity: candidate.revision for identity, candidate in snapshot.candidates.items()}
     versions.update({update.hypothesis.hypothesis_id: (update.expected_revision or 0) + 1
                      for update in updates})
+    return updates, versions
+
+
+def bind_plan(
+    draft: HypothesisPlanDraft,
+    snapshot: PlanningSnapshot,
+    *,
+    issued: dict[str, str],
+    targets: set[str],
+    principals: set[str],
+    max_tasks: int,
+    existing_work_validator: Callable[[list[str], dict[str, int]], set[str]] | None = None,
+) -> tuple[list[HypothesisUpdate] | None, list[PlannedInvestigationQuestion], dict[str, int]]:
+    """Resolve local references for stage-1 updates+questions without mutating originals.
+
+    Returns (updates_or_None, questions, versions). None updates marks an
+    empty/held judgment that must skip the atomizer (no second request).
+    versions maps persistent hypothesis IDs to the revision this pass proposes,
+    including newly issued candidates at revision 1 -- the FR009 input for
+    stage 2 alongside the issued-ID map itself.
+    """
+    updates, versions = _bind_updates(
+        draft, snapshot, issued=issued, targets=targets, principals=principals,
+        max_tasks=max_tasks,
+    )
+    questions = _bind_plan_questions(
+        draft.questions, snapshot, issued=issued, targets=targets, principals=principals,
+        versions=versions,
+    )
+    return _finish_plan_judgment(
+        draft, updates, questions, versions, snapshot, existing_work_validator,
+    )
+
+
+def _bind_plan_questions(
+    raw_questions: list[PlannedInvestigationQuestion],
+    snapshot: PlanningSnapshot,
+    *,
+    issued: dict[str, str],
+    targets: set[str],
+    principals: set[str],
+    versions: dict[str, int],
+    relation_field: str = "hypothesis_revisions",
+) -> list[PlannedInvestigationQuestion]:
+    """Shared per-question route: revisions, subjects, required, criteria and source gates."""
     questions: list[PlannedInvestigationQuestion] = []
-    for question_index, question in enumerate(draft.questions):
+    for question_index, question in enumerate(raw_questions):
         revisions = {issued.get(identity, identity): revision
                      for identity, revision in question.hypothesis_revisions.items()}
         if any(versions.get(identity) != revision for identity, revision in revisions.items()):
@@ -426,7 +512,7 @@ def bind_plan(
                     "plan_question_criterion_outside_purpose",
                     location=(f"$.questions[{question_index}]"
                               f".completion_criteria[{condition_index}].hypothesis_id"),
-                    summary=_PURPOSE_SUMMARY,
+                    summary=_PURPOSE_SUMMARY.format(field=relation_field),
                 )
         resolved_criteria = [condition.model_copy(update={
             "hypothesis_id": (
@@ -451,6 +537,18 @@ def bind_plan(
                                              for ref in question.goal_required_hypothesis_ids],
             "completion_criteria": resolved_criteria,
         }))
+    return questions
+
+
+def _finish_plan_judgment(
+    draft: HypothesisPlanDraft,
+    updates: list[HypothesisUpdate],
+    questions: list[PlannedInvestigationQuestion],
+    versions: dict[str, int],
+    snapshot: PlanningSnapshot,
+    existing_work_validator: Callable[[list[str], dict[str, int]], set[str]] | None,
+) -> tuple[list[HypothesisUpdate] | None, list[PlannedInvestigationQuestion], dict[str, int]]:
+    """Shared judgment tail: reviewed references, continue admission, empty-judgment rule."""
     if set(draft.reviewed_task_ids) - snapshot.tasks.keys() or (
         set(draft.reviewed_hypothesis_ids) - snapshot.candidates.keys()
     ):
@@ -467,6 +565,84 @@ def bind_plan(
             raise AtomizationProposalError("empty_judgment_needs_termination_and_resume_conditions")
         return None, [], versions
     return updates, questions, versions
+
+
+_UNKNOWN_CANDIDATE_REF_SUMMARY = (
+    "Each candidate_refs entry must name a candidate from the snapshot or this proposal. "
+    "Use a captured ID or this proposal's local key at the location named in the diagnostic. "
+    "Do not write revision numbers; code copies the revision this pass yields."
+)
+_DUPLICATE_CANDIDATE_REF_SUMMARY = (
+    "Each candidate_refs entry must name a distinct candidate within its question. Remove the "
+    "repeated entry at the location named in the diagnostic and keep one copy."
+)
+
+
+def _hydrate_question(index: int, question: PlannedQuestionSelection, snapshot: PlanningSnapshot,
+                      *, issued: dict[str, str], versions: dict[str, int],
+                      ) -> PlannedInvestigationQuestion:
+    """Canonical question from the wire form; revisions come from candidate_refs only."""
+    revisions: dict[str, int] = {}
+    for ref_index, ref in enumerate(question.candidate_refs):
+        identity = issued.get(ref, ref)
+        location = f"$.questions[{index}].candidate_refs[{ref_index}]"
+        if identity not in versions:
+            raise _plan_rejection("plan_question_candidate_ref_unknown", location=location,
+                                  summary=_UNKNOWN_CANDIDATE_REF_SUMMARY)
+        if identity in revisions:
+            raise _plan_rejection("plan_question_duplicate_candidate_ref", location=location,
+                                  summary=_DUPLICATE_CANDIDATE_REF_SUMMARY)
+        revisions[identity] = versions[identity]
+    source_result_id = question.source_result_id
+    if "source_result_id" not in question.model_fields_set and question.source_task_id:
+        source = snapshot.tasks.get(question.source_task_id)
+        if source is not None and source.result is not None:
+            source_result_id = source.result.result_id
+    values = {name: deepcopy(getattr(question, name))
+              for name in PlannedInvestigationQuestion.model_fields
+              if name != "hypothesis_revisions"}
+    values.update(hypothesis_revisions=revisions, source_result_id=source_result_id)
+    return PlannedInvestigationQuestion.model_validate(values)
+
+
+def bind_plan_selection(
+    selection: HypothesisPlanSelection,
+    snapshot: PlanningSnapshot,
+    *,
+    issued: dict[str, str],
+    targets: set[str],
+    principals: set[str],
+    max_tasks: int,
+    existing_work_validator: Callable[[list[str], dict[str, int]], set[str]] | None = None,
+) -> tuple[HypothesisPlanDraft, list[HypothesisUpdate] | None,
+           list[PlannedInvestigationQuestion], dict[str, int]]:
+    """Wire-to-canonical stage-1 binding: (canonical draft, updates_or_None, questions, versions).
+
+    One bind_candidate_updates pass (inside _bind_updates) issues IDs and yields versions.
+    candidate_refs resolve against those versions, then the shared private question and
+    judgment routes validate the hydrated draft with the same gates as the canonical path.
+    """
+    updates, versions = _bind_updates(
+        selection, snapshot, issued=issued, targets=targets, principals=principals,
+        max_tasks=max_tasks,
+    )
+    draft = HypothesisPlanDraft(
+        updates=selection.updates,
+        questions=[_hydrate_question(index, question, snapshot, issued=issued, versions=versions)
+                   for index, question in enumerate(selection.questions)],
+        reviewed_task_ids=selection.reviewed_task_ids,
+        reviewed_hypothesis_ids=selection.reviewed_hypothesis_ids,
+        reason=selection.reason, termination=selection.termination,
+        resume_conditions=selection.resume_conditions, context_request=selection.context_request,
+    )
+    questions = _bind_plan_questions(
+        draft.questions, snapshot, issued=issued, targets=targets, principals=principals,
+        versions=versions, relation_field="candidate_refs",
+    )
+    finished_updates, questions, versions = _finish_plan_judgment(
+        draft, updates, questions, versions, snapshot, existing_work_validator,
+    )
+    return draft, finished_updates, questions, versions
 
 
 def needs_atomization(

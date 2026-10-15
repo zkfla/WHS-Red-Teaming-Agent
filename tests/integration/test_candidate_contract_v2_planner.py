@@ -61,14 +61,14 @@ def _plan_with_candidate():
                 "kind": "observation",
                 "description": "Inspect the candidate response",
             }],
-            "hypothesis_revisions": {"local-candidate": 1},
+            "candidate_refs": ["local-candidate"],
         }],
         "reason": "One scoped observation can resolve the candidate uncertainty",
+        "termination": "continue",
     }
 
 
 def _atomize_new_candidate(payload):
-    candidate_id = payload["issued_candidate_ids"]["local-candidate"]
     return {"tasks": [{
         "task_key": "candidate-probe",
         "question_id": "question-local",
@@ -78,7 +78,6 @@ def _atomize_new_candidate(payload):
         "target_node_ids": [TARGET],
         "completion_criterion_ids": [item["criterion_id"]
                                      for item in payload["questions"][0]["completion_criteria"]],
-        "hypothesis_revisions": {candidate_id: 1},
         "probe_limits": {"max_actions": 1, "max_model_requests": 4},
     }]}
 

@@ -113,3 +113,9 @@ fixed with new target calls or unchanged-record reads. Preserve the diagnostic
 and use independent valid observations if useful authorized work remains. If
 all next work depends on an unavailable condition, return held with the precise
 resume condition. Do not assign a worker to repair inaccessible runtime code.
+
+Name each question's related candidates in candidate_refs, using a captured
+hypothesis ID or this proposal's local key. Include every candidate a completion
+criterion names. Never write revision numbers; code copies the revision this pass
+yields. For a followup of a captured Task, give source_task_id and omit
+source_result_id; code copies that Task's result. An explicit null is not derived.
