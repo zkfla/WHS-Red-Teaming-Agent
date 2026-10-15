@@ -101,8 +101,9 @@ _REPAIR_GUIDANCE: dict[str, tuple[str, str]] = {
         "$.termination",
         "Continue is valid only with proposed tasks/questions or referenced existing work "
         "that is still claimable/running, ready, unsuppressed and current in candidate "
-        "purpose. Updates alone are not progress. Otherwise use replan, held with an external "
-        "prerequisite, or exhausted. Goal_achieved only proposes the separate completion gate.",
+        "purpose; candidate updates alone are not progress. Use continue only with that path; "
+        "otherwise use replan, held for a prerequisite, or exhausted. "
+        "goal_achieved only proposes the separate completion gate.",
     ),
     "new_work_requires_continue_judgment": (
         "$.termination",
