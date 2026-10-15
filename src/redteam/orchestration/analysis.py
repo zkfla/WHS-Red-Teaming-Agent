@@ -509,15 +509,9 @@ def _has_raw_account_artifact(
     arguments: dict[str, Any] | None = None,
 ) -> bool:
     """True only on exact structural identity equality; never bare or substring."""
+    if not isinstance(raw, dict) or raw.get("success") is not True:
+        return False
     args = arguments if isinstance(arguments, dict) else {}
-    expected_principals: set[str] = set()
-    cleaned_claim = _clean_identity(claimed)
-    if cleaned_claim is not None:
-        expected_principals.add(cleaned_claim)
-    for key in ("principal_ref", "principal", "first_principal_ref", "second_principal_ref"):
-        cleaned = _clean_identity(args.get(key))
-        if cleaned is not None:
-            expected_principals.add(cleaned)
     expected_sessions: set[str] = set()
     for key in ("session_ref", "first_session_ref", "second_session_ref"):
         cleaned = _clean_identity(args.get(key))
@@ -526,6 +520,7 @@ def _has_raw_account_artifact(
     # Shared with completion: only each unit's own actual-use pair proves
     # its account. Echoes and configured inventory never prove use.
     raw_sessions = collect_actual_sessions(metadata, raw)
+    raw_account_pairs = actual_account_pairs(raw)
     # Cross-layer actual disagreement is unprovable; fail closed outright.
     if actual_receipt_conflict(metadata, raw) is not None:
         return False
@@ -533,24 +528,57 @@ def _has_raw_account_artifact(
     comparison_dict: dict[str, Any] | None = comparison if isinstance(comparison, dict) else None
     raw_principals = collect_actual_accounts(metadata, raw, expected_sessions)
     if comparison_dict is not None:
-        first_principal = _clean_identity(comparison_dict.get("first_principal_ref"))
-        second_principal = _clean_identity(comparison_dict.get("second_principal_ref"))
-        if first_principal is not None or second_principal is not None:
-            if not expected_principals:
+        # Derived comparison principals must agree with their own original
+        # request unit. Comparing them with the claim's allowed-name set
+        # incorrectly rejects a valid unrelated leg, while comparing against
+        # all raw principals would let one leg borrow the other's identity.
+        output = raw.get("output") if isinstance(raw, dict) else None
+        for side in ("first", "second"):
+            observed_principal = _clean_identity(
+                comparison_dict.get(f"{side}_principal_ref")
+            )
+            observed_session = _clean_identity(
+                comparison_dict.get(f"{side}_actual_session_ref")
+            )
+            observed_request = _clean_identity(comparison_dict.get(f"{side}_session_ref"))
+            requested_session = _clean_identity(args.get(f"{side}_session_ref"))
+            if (
+                requested_session is not None
+                and observed_request is not None
+                and observed_request != requested_session
+            ):
                 return False
-            for observed in (first_principal, second_principal):
-                if observed is not None and observed not in expected_principals:
-                    return False
-            if first_principal is None or second_principal is None:
+            if observed_principal is None:
+                continue
+            if requested_session is None or not isinstance(output, dict):
                 return False
-        # Request echo pairs never establish session use.
-        session_pair = ("first_actual_session_ref", "second_actual_session_ref")
-        first_session = _clean_identity(comparison_dict.get(session_pair[0]))
-        second_session = _clean_identity(comparison_dict.get(session_pair[1]))
-        if (first_session is not None or second_session is not None) and expected_sessions:
-            for observed in (first_session, second_session):
-                if observed is not None and observed not in expected_sessions:
-                    return False
+            original_pairs: set[tuple[str, str]] = set()
+            original_session: str | None = None
+            original_principal = _clean_identity(output.get(f"{side}_principal_ref"))
+            direct_session = _clean_identity(output.get(f"{side}_actual_session_ref"))
+            if original_principal is not None and direct_session is not None:
+                original_session = direct_session
+                original_pairs.add((direct_session, original_principal))
+            nested = output.get(side)
+            if isinstance(nested, dict):
+                original_principal = _clean_identity(nested.get("principal_ref"))
+                nested_session = _clean_identity(nested.get("actual_session_ref"))
+                if original_principal is not None and nested_session is not None:
+                    original_session = nested_session
+                    original_pairs.add((nested_session, original_principal))
+            if len({principal for _, principal in original_pairs}) > 1:
+                return False
+            if (
+                original_session is None
+                or original_session != requested_session
+                or (observed_session is not None and observed_session != original_session)
+            ):
+                return False
+            if (
+                (original_session, observed_principal) not in original_pairs
+                or (original_session, observed_principal) not in raw_account_pairs
+            ):
+                return False
     return claimed in raw_principals or claimed in (raw_sessions & expected_sessions)
 
 
