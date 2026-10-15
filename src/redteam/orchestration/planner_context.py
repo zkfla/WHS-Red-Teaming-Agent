@@ -4,11 +4,17 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic_core import PydanticCustomError
 
 from redteam.attack_graph.hypotheses import hypothesis_purpose
 from redteam.core.contracts.mission import redact_secret_material
 from redteam.orchestration.coordination import content_hash
+from redteam.orchestration.diagnostics import (
+    DecisionDiagnostic,
+    error_type_for,
+    exception_chain_for,
+)
 from redteam.orchestration.evidence_access import (
     EvidenceReader,
     project_original_records,
@@ -48,8 +54,14 @@ class PlannerEvidenceQuery(BaseModel):
 
     @model_validator(mode="after")
     def read_identity(self):
-        if (self.mode == "read") != (self.evidence_id is not None):
-            raise ValueError("evidence_read_needs_identity_list_uses_filters")
+        # Typed codes are Pydantic-owned rule names with fixed templates; never input text.
+        if self.mode == "read" and self.evidence_id is None:
+            raise PydanticCustomError(
+                "planner_evidence_read_needs_evidence_id", "Read mode needs evidence_id.")
+        if self.mode == "list" and self.evidence_id is not None:
+            raise PydanticCustomError(
+                "planner_evidence_list_rejects_evidence_id",
+                "List mode takes filters, not evidence_id.")
         return self
 
 
@@ -62,8 +74,71 @@ class PlannerContextRequest(BaseModel):
     @model_validator(mode="after")
     def one_query(self):
         if (self.context is None) == (self.evidence is None):
-            raise ValueError("planner_lookup_needs_exactly_one_query")
+            raise PydanticCustomError(
+                "planner_lookup_needs_exactly_one_query",
+                "Send exactly one context or evidence query in context_request.")
         return self
+
+
+class PlannerReviewedReferenceError(ContextReadError):
+    """Code-owned diagnostic; the shared validator keeps its exact code and location."""
+
+    def __init__(self, field: str):
+        code = "planner_reviewed_reference_not_presented"
+        location = f"$.{field}"
+        self.diagnostic = DecisionDiagnostic(
+            code=code, stage="hypothesis_planning", kind="validation", location=location,
+            summary="A reviewed task or candidate must be presented in this pass. Read or "
+                    "list its original with context_request first, then cite only refs "
+                    "that appear in that result, or remove the unseen ID.",
+            retryable=True, cause_scope="model_input", owner="planner_context",
+            repair_condition="The cited task or candidate appears in the captured context "
+                             "or a lookup result of this pass.",
+            validation_issues=[{"rule": code, "location": location}],
+        )
+        super().__init__(code)
+
+
+# Owned rule code -> (fixed contract location, static correction). Pydantic supplies only the
+# code; messages, inputs and contexts are never read or copied.
+LOOKUP_RULE_GUIDANCE: dict[str, tuple[str, str]] = {
+    "planner_lookup_needs_exactly_one_query": (
+        "$.context_request",
+        "Send exactly one query: context for graph/task/candidate reads or evidence for "
+        "captured records.",
+    ),
+    "planner_evidence_read_needs_evidence_id": (
+        "$.context_request.evidence",
+        "Read mode needs one evidence_id copied from a list result.",
+    ),
+    "planner_evidence_list_rejects_evidence_id": (
+        "$.context_request.evidence",
+        "List mode uses filters and count; remove evidence_id or switch to read mode.",
+    ),
+}
+
+
+def planner_lookup_diagnostic(exc: BaseException, *, stage: str = "hypothesis_planning"
+                              ) -> DecisionDiagnostic | None:
+    """Owned diagnostic for a Pydantic lookup rule, or None for every other failure."""
+    if not isinstance(exc, ValidationError):
+        return None
+    errors = exc.errors(include_input=False, include_url=False, include_context=False)
+    matched = [error for error in errors if error.get("type") in LOOKUP_RULE_GUIDANCE]
+    if not matched:
+        return None
+    code = str(matched[0]["type"])
+    location, summary = LOOKUP_RULE_GUIDANCE[code]
+    return DecisionDiagnostic(
+        code=code, stage=stage, kind="format", location=location, summary=summary,
+        retryable=True, cause_scope="model_input", owner="planner_context",
+        repair_condition="The context_request names exactly the documented lookup query.",
+        validation_issues=[
+            {"rule": str(error["type"]), "location": LOOKUP_RULE_GUIDANCE[str(error["type"])][0]}
+            for error in matched[:10]
+        ],
+        error_type=error_type_for(exc), exception_chain=exception_chain_for(exc),
+    )
 
 
 def lookup_only(decision) -> bool:
@@ -278,9 +353,10 @@ class PlannerPassContext:
         return result
 
     def validate_reviewed(self, decision):
-        if (set(decision.reviewed_task_ids) - self.seen["task"]
-                or set(decision.reviewed_hypothesis_ids) - self.seen["candidate"]):
-            raise ContextReadError("planner_reviewed_reference_not_presented")
+        if set(decision.reviewed_task_ids) - self.seen["task"]:
+            raise PlannerReviewedReferenceError("reviewed_task_ids")
+        if set(decision.reviewed_hypothesis_ids) - self.seen["candidate"]:
+            raise PlannerReviewedReferenceError("reviewed_hypothesis_ids")
 
     async def lookup(self, request: PlannerContextRequest):
         key = content_hash(request.model_dump(mode="json"))

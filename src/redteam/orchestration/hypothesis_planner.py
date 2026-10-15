@@ -42,6 +42,7 @@ from redteam.orchestration.planner_context import (
     PlannerContextRequest,
     PlannerPassContext,
     lookup_only,
+    planner_lookup_diagnostic,
     project_planner_knowledge,
 )
 from redteam.orchestration.probe_atomization import (
@@ -209,6 +210,9 @@ def _proposal_validation_diagnostic(
     and keep the existing human-readable repair `summary` instead of the generic one.
     """
     base = diagnostic_for_exception(exc, stage=stage, schema=schema)
+    lookup_diagnostic = planner_lookup_diagnostic(exc, stage=stage)
+    if lookup_diagnostic is not None:
+        return lookup_diagnostic
     detail = getattr(exc, "diagnostic", None)
     if isinstance(detail, DecisionDiagnostic):
         return detail.model_copy(update={
