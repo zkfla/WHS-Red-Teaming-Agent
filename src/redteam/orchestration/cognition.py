@@ -1064,8 +1064,17 @@ class StructuredDecisionClient:
                             try:
                                 validate_response(result)
                             except DecisionValidationError as rejected:
+                                rejected_context = decision_context(
+                                    working, result, response_schema=response_schema,
+                                    validated=False,
+                                )
+                                if "normalization" in metrics:
+                                    rejected_context["normalization"] = metrics["normalization"]
                                 raise _RetryableDecisionError(
                                     rejected.diagnostic.model_copy(update={"stage": stage}),
+                                    rejected_context,
+                                    elapsed_ms=metrics["elapsed_ms"],
+                                    response_shape=metrics["response_shape"],
                                 ) from rejected
                         budget.record(
                             stage, "response_validated",

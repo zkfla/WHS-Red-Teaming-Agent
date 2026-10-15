@@ -442,6 +442,38 @@ def parse_error_for(exc: json.JSONDecodeError) -> ParseErrorContext:
     })
 
 
+_JUDGMENT_LIST_FIELDS = (
+    "updates", "questions", "tasks", "reviewed_task_ids", "reviewed_hypothesis_ids",
+    "resume_conditions",
+)
+
+
+def _project_declared_judgment(
+    view: dict[str, Any], proposal: dict, response_schema: dict | None,
+) -> None:
+    """Shapes of judgment fields the schema declares; termination only as an enum member."""
+    declared = (response_schema or {}).get("properties", {})
+    if not isinstance(declared, dict):
+        return
+    for key in _JUDGMENT_LIST_FIELDS:
+        if key in proposal and key in declared:
+            view[f"{key}_shape"] = _value_shape(proposal[key])
+    if "context_request" in proposal and "context_request" in declared:
+        view["context_request_shape"] = _value_shape(proposal["context_request"])
+    if "termination" in proposal and isinstance(declared.get("termination"), dict):
+        allowed = declared["termination"].get("enum")
+        value = proposal["termination"]
+        if (
+            isinstance(value, str)
+            and isinstance(allowed, list)
+            and all(isinstance(item, str) for item in allowed)
+            and value in allowed
+        ):
+            view["termination"] = value
+        else:
+            view["termination_shape"] = _value_shape(value)
+
+
 def decision_context(
     payload: dict, proposal: Any = None, *, response_schema: dict | None = None,
     validated: bool = True,
@@ -481,6 +513,14 @@ def decision_context(
                 context["proposal"]["evidence_request_shape"] = evidence_request_shape(
                     proposal["evidence_request"]
                 )
+            _project_declared_judgment(context["proposal"], proposal, response_schema)
+        for key in ("known_target_ids", "registered_principal_refs"):
+            if isinstance(payload.get(key), list):
+                context[f"{key}_shape"] = _value_shape(payload[key])
+        for key in ("known_target_count", "registered_principal_count"):
+            count = payload.get(key)
+            if isinstance(count, int) and not isinstance(count, bool):
+                context[f"{key}_shape"] = _value_shape(count, control_number=True)
         return redact_secret_material(context)
     if proposal is not None and not isinstance(proposal, dict):
         context["proposal_shape"] = _value_shape(proposal)
