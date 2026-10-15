@@ -1231,6 +1231,7 @@ class GraphRecordingHandler:
                 else str(finding_verdict)
             ),
             "outcome": getattr(assessment, "outcome", None),
+            "hypothesis_outcome": getattr(assessment, "hypothesis_outcome", None),
             "reason": str(getattr(assessment, "reason", "") or "")[:300],
         }
         try:
@@ -1450,14 +1451,16 @@ def graph_recording_descriptor() -> LocalToolDescriptor:
             "when a verifier and review budget are available. During a probe the candidate "
             "must be admitted in the Task hypothesis_revisions. The receipt is bound to the "
             "candidate revision and purpose, without another target call; UNKNOWN remains "
-            "unresolved. Task completion receipts are not candidate reviews. "
+            "unresolved. The review outcome judges the claim; hypothesis_outcome separately "
+            "judges the cited candidate and may remain unknown despite claim success. "
+            "Task completion receipts are not candidate reviews. "
             "Shell streams and exit codes are program "
             "assertions/execution metadata; use evidence-linked hypotheses or unresolved "
             "observations, never measured remote facts."
         ),
         input_schema=GraphRecordingInput.model_json_schema(),
         contribution_id=GRAPH_RECORD_CONTRIBUTION_ID,
-        version="5",
+        version="6",
     )
 
 
@@ -1485,6 +1488,6 @@ def graph_recording_contribution() -> Contribution:
 
     return runtime_tool_contribution(
         contribution_id=GRAPH_RECORD_CONTRIBUTION_ID,
-        version="5",
+        version="6",
         factory=factory,
     )
