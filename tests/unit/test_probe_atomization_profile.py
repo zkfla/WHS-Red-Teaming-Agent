@@ -10,22 +10,22 @@ from tests.integration.test_central_development import PROFILE
 PROBES = PROFILE.with_name("native-probes.yaml")
 LEGACY = PROFILE.with_name("native-probes-legacy.yaml")
 
-# Golden constants for the version-15 single-stage v3 compatibility profile,
-# intentionally versioned for historical result elision and explicit reread guidance.
+# Golden constants for the version-16 single-stage v3 compatibility profile,
+# intentionally versioned for bounded planner batch lookups and retained read windows.
 # This does not assert compatibility with older prompt/profile versions;
 # integration tests separately require matching selection fingerprints on resume.
 # Runtime fingerprints hash raw prompt bytes, so both LF and CRLF prompt variants
 # are pinned while the YAML checksum is newline-canonicalized.
-LEGACY_YAML_LF_SHA256 = "b76530b1c587cd4879100c5b9d105b0e53c6620e2d690c861c7b4dd5ddfb74a2"
-LEGACY_FINGERPRINT_CRLF = "6f65a37fafcc8c8621bdc1d083c1f21a7fa844a71b0297af74755126512531db"
-LEGACY_FINGERPRINT_LF = "6e936407566befd679fdd29aba93fca4cc60d5fcfdbf33a883b450d54b72b21d"
+LEGACY_YAML_LF_SHA256 = "b2494e2d69a754c6cd3b35a529d8fc4d96cc9bff3048cdbe7a76bf62d63b0247"
+LEGACY_FINGERPRINT_CRLF = "604bfcaa4981f4097dad54451dda7c9f5cef4da1f002ab1058410cf71c5492c1"
+LEGACY_FINGERPRINT_LF = "6bc51d0b42281ebe2a016fa1ffe6d6c01ad422b8aac6943b9677d9ef8b8e5834"
 
 
 def test_legacy_golden_fingerprint_and_bytes():
     canonical = LEGACY.read_bytes().replace(b"\r\n", b"\n")
     assert hashlib.sha256(canonical).hexdigest() == LEGACY_YAML_LF_SHA256
     loaded = load_specialist_profile(LEGACY)
-    assert loaded.profile.version == "15"
+    assert loaded.profile.version == "16"
     assert loaded.fingerprint in {LEGACY_FINGERPRINT_CRLF, LEGACY_FINGERPRINT_LF}
     assert loaded.run_policy().probe_atomization is False
     assert loaded.run_policy().fingerprint == loaded.fingerprint

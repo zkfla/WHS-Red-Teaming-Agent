@@ -150,11 +150,27 @@ candidate revision changes mid-turn. No target, MCP or live model call occurs.
 This verifies delivery and reference reuse through the worker loop; a live
 model's decision to request useful context remains a separate measurement.
 
+## Native worker result delivery
+
+Native worker delivery keeps bounded 1,000-character execution-original windows.
+Explicit evidence reads preserve their requested offset/query and deliver at most
+4,000 characters. Recent two user turns retain their local result bodies; older
+bulky local results can become status/diagnostic envelopes with an exact `reread`
+pointer after the existing EvidenceReader verifies run, engagement and supported
+view ownership. Missing or unsupported pointers keep their original body. Original
+execution previews, assistant/tool call pairing, provider continuations and stored
+checkpoint messages stay intact. Elision is a display projection and does not
+grant proof, complete work or change budgets. Re-reading may require another
+model turn, so reduced synthetic bytes alone do not establish lower live latency.
+
 ## Planner structured lookup (plan8b)
 
 Both the split strategy profile and the single-stage compatibility profile accept
-optional `context_request` version 1. It contains exactly one `context` query (the
-contract above) or `evidence` query. A reply with a request cannot also contain
+optional `context_request` version 1 or 2. Version 1 contains exactly one `context`
+query (the contract above) or `evidence` query. Version 2 contains only `queries`,
+an array of one to four items, each containing exactly one context or evidence
+query. Items execute against the same captured snapshot, with a reasoning guard
+before each backend read; item errors do not erase other results. A reply with a request cannot also contain
 updates, questions/tasks, reviewed IDs, resume conditions or terminal intent.
 Normal final replies omit the request or set it to null. `reason` remains required.
 
@@ -186,8 +202,17 @@ invalid mixed replies consume the existing repair budget. Duplicate reads can
 reuse the pass-local result cache, but every model request remains charged.
 Budget exhaustion reports `planner_lookup_budget_exhausted`, without consuming
 the planning cursor, issuing candidate IDs or committing partial Tasks. No extra
-read is mandatory. The next payload retains the self-contained base plus only
-the latest lookup response, not an accumulating transcript.
+read is mandatory. The next payload retains the self-contained base plus up to
+eight recent lookup windows within 65,536 UTF-8 JSON bytes and the existing
+131,072-byte serialized payload ceiling. This ceiling does not include the trusted
+system prompt or response schema. Version 1 keeps its latest result under
+`context_lookup_result`, with earlier retained windows under
+`context_lookup_history`; mixed or version-2 requests use `context_lookup_results`.
+Batch result items align with request items. Evicted windows remain readable by
+querying again; reviewed IDs must still be present in the base or retained windows.
+An oversized result set is replaced by `context_batch_budget_exceeded` guidance
+to narrow the reads, and its unseen references, cache and read indexes are rolled
+back. Any follow-up model request uses the existing finite normal budget.
 
 `evidence` accepts `mode=list/read`, captured `task_id`, `hypothesis_id` or
 `record_kind` filters, `offset`, `count<=20`, `limit<=12000`, optional literal

@@ -67,7 +67,31 @@ class PlannerEvidenceQuery(BaseModel):
 
 class PlannerContextRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
-    version: Literal[1] = 1
+    version: Literal[1, 2] = 1
+    context: ContextQuery | None = None
+    evidence: PlannerEvidenceQuery | None = None
+    queries: list[PlannerContextBatchItem] | None = Field(default=None, min_length=1,
+                                                              max_length=4)
+
+    @model_validator(mode="after")
+    def one_query(self):
+        if self.version == 1 and ((self.context is None) == (self.evidence is None)
+                                  or self.queries is not None):
+            raise PydanticCustomError(
+                "planner_lookup_needs_exactly_one_query",
+                "Send exactly one context or evidence query in context_request.")
+        if self.version == 2 and (self.context is not None or self.evidence is not None
+                                  or self.queries is None):
+            raise PydanticCustomError(
+                "planner_lookup_needs_exactly_one_query",
+                "Version 2 uses a queries array, not top-level context or evidence.")
+        return self
+
+
+class PlannerContextBatchItem(BaseModel):
+    """One independently bounded read in a version-2 lookup batch."""
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
     context: ContextQuery | None = None
     evidence: PlannerEvidenceQuery | None = None
 
@@ -76,8 +100,11 @@ class PlannerContextRequest(BaseModel):
         if (self.context is None) == (self.evidence is None):
             raise PydanticCustomError(
                 "planner_lookup_needs_exactly_one_query",
-                "Send exactly one context or evidence query in context_request.")
+                "Each batch item needs exactly one context or evidence query.")
         return self
+
+
+PlannerLookupRequest = PlannerContextRequest
 
 
 class PlannerReviewedReferenceError(ContextReadError):
@@ -104,8 +131,8 @@ class PlannerReviewedReferenceError(ContextReadError):
 LOOKUP_RULE_GUIDANCE: dict[str, tuple[str, str]] = {
     "planner_lookup_needs_exactly_one_query": (
         "$.context_request",
-        "Send exactly one query: context for graph/task/candidate reads or evidence for "
-        "captured records.",
+        "Use version 1 with exactly one context or evidence query, or version 2 with only a "
+        "queries array containing one to four items. Each item has exactly one query.",
     ),
     "planner_evidence_read_needs_evidence_id": (
         "$.context_request.evidence",
@@ -203,8 +230,8 @@ class _PublicReceiptRead:
 class PlannerPassContext:
     """Bounded prompt views and consumed read identities, never a second state store.
 
-    Source data is captured once. Lookup results replace the previous window;
-    only identity/hash read sets accumulate internally for the existing CAS.
+    Source data is captured once. Bounded recent lookup windows are retained for the next
+    judgment; only identity/hash read sets accumulate internally for the existing CAS.
     """
 
     def __init__(self, snapshot, records, context, *, run_id, engagement_id, evidence_store,
@@ -229,6 +256,10 @@ class PlannerPassContext:
         self.used_evidence: set[str] = set()
         self.cache: dict[str, dict] = {}
         self.last_request: dict | None = None
+        self.recent_windows: list[dict] = []
+        self._recent_seen: list[set[tuple[str, str]]] = []
+        self._lookup_visible: set[tuple[str, str]] = set()
+        self.pending_batch_request: dict | None = None
         recent = sorted(self.records.values(), key=lambda record: record.created_at, reverse=True)
         feedback = tuple(dict.fromkeys(record.metadata.get("mission_task_id")
                                        for record in recent[:10]
@@ -236,6 +267,7 @@ class PlannerPassContext:
                                        in snapshot.tasks))[:4]
         self.view = self.reader.overview(feedback_task_ids=feedback)
         self._consume(self.view)
+        self._baseline_seen = {kind: set(values) for kind, values in self.seen.items()}
 
     def _consume(self, result):
         if result.get("status") != "ok":
@@ -312,7 +344,9 @@ class PlannerPassContext:
         fields["context_lookup"] = {
             "version": 1, "snapshot_id": self.reader.snapshot_id,
             "note": "Optional context_request replaces a decision; same normal budget. "
-                    "Only the latest lookup window is retained. Summaries are not full reads. "
+                    "Version 2 can read up to four independent queries in one request. Recent "
+                    "lookup windows are retained within the request envelope; summaries are "
+                    "not full reads. "
                     "List/related finds omitted IDs, read fetches exact sections. "
                     "No match is scoped, not proof of no duplicates. Evidence supports "
                     "task_id/hypothesis_id/record_kind filters and bounded windows.",
@@ -358,27 +392,135 @@ class PlannerPassContext:
         if set(decision.reviewed_hypothesis_ids) - self.seen["candidate"]:
             raise PlannerReviewedReferenceError("reviewed_hypothesis_ids")
 
-    async def lookup(self, request: PlannerContextRequest):
-        key = content_hash(request.model_dump(mode="json"))
+    async def lookup(self, request: PlannerLookupRequest, *, before_each=None):
+        if request.version == 2:
+            items = request.queries
+            assert items is not None
+            results = []
+            visible: set[tuple[str, str]] = set()
+            for item in items:
+                # Each item runs against the same immutable snapshot. Errors are item-local.
+                if before_each is not None:
+                    await before_each()
+                result, item_visible = await self._lookup_item(item)
+                visible.update(item_visible)
+                results.append({"query": item.model_dump(mode="json"), "result": result})
+            return {"version": 2, "status": "ok", "results": results}, visible
+        if before_each is not None:
+            await before_each()
+        result, visible = await self._lookup_item(request)
+        return result, visible
+
+    async def _lookup_item(self, request: PlannerContextBatchItem | PlannerContextRequest):
+        query: ContextQuery | PlannerEvidenceQuery | PlannerContextRequest | PlannerContextBatchItem
+        if isinstance(request, PlannerContextBatchItem):
+            query = (request.context if request.context is not None else
+                     request.evidence if request.evidence is not None else request)
+            key = content_hash(request.model_dump(mode="json"))
+        else:
+            query = (request.context if request.context is not None else
+                     request.evidence if request.evidence is not None else request)
+            key = content_hash(request.model_dump(mode="json"))
         if key in self.cache:
-            return self.cache[key]
-        if request.context is not None:
-            result = self.reader.query(request.context)
-            self._consume(result)
+            return self.cache[key], self._visible_for(query, self.cache[key])
+        if isinstance(query, ContextQuery):
+            result = self.reader.query(query)
             if result.get("status") == "ok":
                 for ref in result.get("relation_read_refs", []):
                     self.consumed[ref["kind"]].add(ref["identity"])
                 for card in result.get("records", []):
                     self.consumed[card["kind"]].add(card["identity"])
-                for ref in request.context.refs:
+                for ref in query.refs:
                     self.consumed[ref.kind].add(ref.identity)
-                self.consumed["node"].update(request.context.target_node_ids)
-                self.consumed["candidate"].update(request.context.hypothesis_revisions)
+                self.consumed["node"].update(query.target_node_ids)
+                self.consumed["candidate"].update(query.hypothesis_revisions)
         else:
-            result = await self._evidence_lookup(request.evidence)
+            result = await self._evidence_lookup(query)
         result = redact_secret_material(result)
         self.cache[key] = result
-        return result
+        return result, self._visible_for(query, result)
+
+    @staticmethod
+    def _visible_for(query, result):
+        visible = set()
+        if isinstance(query, ContextQuery) and result.get("status") == "ok":
+            visible.update((card["kind"], card["identity"])
+                           for card in result.get("records", []))
+            visible.update((ref["kind"], ref["identity"])
+                           for ref in result.get("relation_read_refs", []))
+        elif isinstance(query, PlannerEvidenceQuery) and query.mode == "read" \
+                and result.get("status") == "ok":
+            visible.add(("evidence", query.evidence_id))
+        return visible
+
+    def retain_lookup_window(self, payload, request, result, visible):
+        """Keep recent windows only while the complete next request fits its hard cap."""
+        public = {"request": request, "result": result,
+                  "retention": "Recent bounded lookup windows are retained; omitted windows "
+                               "remain readable by querying again."}
+        entry = {"request": request, "result": result, "public": public, "_visible": visible}
+        windows = [*self.recent_windows, entry]
+        # Bounded recent-window policy; also evict until serialized request can fit.
+        windows = windows[-8:]
+        while windows:
+            all_v1_candidate = all(item["request"].get("version") == 1 for item in windows)
+            if all_v1_candidate:
+                shaped = {"context_lookup_result": windows[-1]["public"],
+                          "context_lookup_history": [item["public"] for item in windows[:-1]]}
+            else:
+                shaped = {"context_lookup_results": [
+                    {"request": item["request"], "result": item["result"]} for item in windows]}
+            if context_bytes(shaped) <= 65536:
+                break
+            windows.pop(0)
+        if not windows:
+            return False
+        # Preserve the exact v1 shape for existing readers when only v1 lookups are retained.
+        all_v1 = all(item["request"].get("version") == 1 for item in windows)
+        if all_v1:
+            candidate = {"context_lookup_result": windows[-1]["public"],
+                         "context_lookup_history": [item["public"] for item in windows[:-1]]}
+        else:
+            candidate = {"context_lookup_results": [
+                {"request": item["request"], "result": item["result"]} for item in windows]}
+        if context_bytes({**payload, **candidate}) > 131072:
+            return False
+        self.recent_windows = windows
+        self._retained_all_v1 = all_v1
+        # Visibility for reviewed IDs follows retained windows exactly. Preserve the captured
+        # base view and replace prior lookup visibility when its windows are evicted.
+        self._recent_seen = [item["_visible"] for item in windows]
+        next_lookup_visible = set().union(*self._recent_seen) if self._recent_seen else set()
+        for kind in self.seen:
+            self.seen[kind].difference_update(identity for old_kind, identity
+                                              in self._lookup_visible if old_kind == kind)
+            self.seen[kind].update(self._baseline_seen[kind])
+        for seen in self._recent_seen:
+            for kind, identity in seen:
+                if kind in self.seen:
+                    self.seen[kind].add(identity)
+        self._lookup_visible = next_lookup_visible
+        self.used_evidence.update(identity for kind, identity in next_lookup_visible
+                                  if kind == "evidence")
+        return True
+
+    def _retained_lookup_payload(self, payload, request):
+        windows = self.recent_windows
+        if not windows:
+            return {}
+        if not getattr(self, "_retained_all_v1", False):
+            return {"context_lookup_results": [
+                {"request": item["request"], "result": item["result"]} for item in windows]}
+        return {"context_lookup_result": windows[-1]["public"],
+                "context_lookup_history": [item["public"] for item in windows[:-1]]}
+
+    def batch_budget_result(self, request):
+        """Explicitly tell the model to narrow reads without retaining unseen refs."""
+        return {"version": request.version, "status": "error",
+                "code": "context_batch_budget_exceeded",
+                "summary": "Lookup results exceed the remaining 65536-byte lookup window "
+                           "budget. No references from these results were admitted for review; "
+                           "narrow the queries or read fewer records."}
 
     async def _evidence_lookup(self, query):
         base = {"snapshot_id": self.reader.snapshot_id, "version": 1}
@@ -419,8 +561,6 @@ class PlannerPassContext:
             engagement_id=self.reader.snapshot.engagement_id, offset=query.offset,
             limit=query.limit, query=query.query,
         )
-        if result.get("status") == "ok":
-            self.used_evidence.add(query.evidence_id)
         from redteam.orchestration.evidence_validity import current_validity, is_binding
 
         validity = await current_validity(

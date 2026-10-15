@@ -70,3 +70,10 @@ fixed with new target calls or unchanged-record reads. Preserve the diagnostic
 and use independent valid observations if useful authorized work remains. If
 all next work depends on an unavailable condition, return held with the precise
 resume condition. Do not assign a worker to repair inaccessible runtime code.
+
+When independent captured reads are known together, use context_request version 2
+with one to four queries instead of requesting each in a separate model turn.
+Each query contains either context or evidence. Results use the same snapshot and
+align with their queries; inspect per-item errors. Recent windows are retained
+within the payload limit. Query again for omitted windows, and narrow reads if
+the result reports a context window budget error.

@@ -82,10 +82,9 @@ def atom(payload):
     assert "model_usage" not in payload and "review_receipts" not in payload
     return {"tasks": [{"task_key": "followup", "question_id": "q1", "title": "New premise",
         "objective": "Inspect a new premise", "role_id": "probe-worker",
-        "target_node_ids": [TARGET],
-        "completion_criterion_ids": [_condition_id("Inspect first")],
-        "hypothesis_revisions": {},
-        "source_task_id": "z-source", "source_result_id": "old-result"}]}
+        "target_node_ids": [TARGET], "principal_refs": [], "evidence_ids": [],
+        "probe_limits": {"max_actions": 1, "max_model_requests": 4},
+        "completion_criterion_ids": [_condition_id("Inspect first")]}]}
 
 
 async def test_search_read_followup_one_pass_and_no_lookup_commit(tmp_path):

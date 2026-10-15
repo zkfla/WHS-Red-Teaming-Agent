@@ -127,3 +127,10 @@ hypothesis ID or this proposal's local key. Include every candidate a completion
 criterion names. Never write revision numbers; code copies the revision this pass
 yields. For a followup of a captured Task, give source_task_id and omit
 source_result_id; code copies that Task's result. An explicit null is not derived.
+
+When independent captured reads are known together, use context_request version 2
+with one to four queries instead of requesting each in a separate model turn.
+Each query contains either context or evidence. Results use the same snapshot and
+align with their queries; inspect per-item errors. Recent windows are retained
+within the payload limit. Query again for omitted windows, and narrow reads if
+the result reports a context window budget error.

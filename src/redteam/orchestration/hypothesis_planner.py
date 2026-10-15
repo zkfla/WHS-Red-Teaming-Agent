@@ -703,7 +703,11 @@ async def _finalize_hypothesis_pass(deps, snapshot, budget, *, identity, proposa
 
 FEEDBACK_SYSTEM = (
     "The current context is self-contained but bounded: omitted is not absent. "
-    "Use context_request version=1 with exactly one context or evidence query when needed. "
+    "Use context_request version=1 with one context or evidence query for compatibility, or "
+    "version=2 with one to four independent queries in a queries array when those reads are "
+    "known together. Batch items run against the same captured snapshot and return aligned "
+    "item results; an item error does not erase other results. Recent lookup windows remain "
+    "available within the bounded request envelope; query again if a window was evicted. "
     "A lookup response proposes no updates/questions/tasks/reviewed refs (declared required "
     "collection fields are []) and keeps termination continue; it commits nothing and consumes "
     "the same normal decision budget. Read exact "
@@ -856,12 +860,35 @@ async def _ask_with_context(planner, pass_context, engine, *, payload, budget, *
             return raw
         parsed = PlannerContextRequest.model_validate(request)
         await engine.guard_reasoning()
-        result = await pass_context.lookup(parsed)
+        consumed_before = {kind: set(values) for kind, values in pass_context.consumed.items()}
+        evidence_before = set(pass_context.used_evidence)
+        cache_before = dict(pass_context.cache)
+        result, visible = await pass_context.lookup(parsed, before_each=engine.guard_reasoning)
         pass_context.last_request = parsed.model_dump(mode="json")
-        current = {**payload, "context_lookup_result": {
-            "request": pass_context.last_request, "result": result,
-            "retention": "Only this latest lookup window is sent; earlier IDs remain readable.",
-        }}
+        if not pass_context.retain_lookup_window(
+                _planner_base_payload(current),
+                pass_context.last_request, result, visible):
+            pass_context.consumed = consumed_before
+            pass_context.used_evidence = evidence_before
+            pass_context.cache = cache_before
+            result = pass_context.batch_budget_result(parsed)
+            visible = set()
+            if not pass_context.retain_lookup_window(
+                    payload, pass_context.last_request, result, visible):
+                raise DecisionFailure("hypothesis_planning", "format", budget.used,
+                                      diagnostic=DecisionDiagnostic(
+                    code="context_batch_budget_exceeded", stage="hypothesis_planning",
+                    kind="validation", summary="Even the bounded lookup diagnostic cannot fit "
+                    "the remaining request envelope. No lookup references were admitted.",
+                    retryable=False, cause_scope="runtime_contract", owner="planner_context"))
+        current = {**payload, **pass_context._retained_lookup_payload(current, parsed)}
+
+
+def _planner_base_payload(current):
+    """Strip only lookup-owned fields before recomputing retained-window capacity."""
+    return {key: value for key, value in current.items()
+            if key not in {"context_lookup_result", "context_lookup_history",
+                           "context_lookup_results"}}
 
 
 async def _advance_split(planner, runtime, schema, snapshot, engine, budget, payload,
