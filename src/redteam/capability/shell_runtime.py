@@ -134,6 +134,7 @@ async def prepare_shell_runtime(
         None, policy=prepared.policy, program_manifest_path=prepared.manifest_path,
     )
     assert runtime is not None
+    runtime.adapter.program_source.bind_prepared_endpoint(prepared.endpoint)
     return replace(
         runtime,
         environment_fingerprint=prepared.fingerprint,

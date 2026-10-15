@@ -60,7 +60,12 @@ from redteam.core.contracts.network import (
     WindowCaps,
     WindowSettlement,
 )
-from redteam.core.ports.network_grants import NetworkGrantLedger
+from redteam.core.ports.gated_recovery import (
+    GatedInstanceRecoveryReport,
+    GatedWindowRecoveryOutcome,
+    PreparedDockerEndpoint,
+)
+from redteam.core.ports.network_grants import NetworkGrantLedger, OutstandingNetworkWindow
 
 TABLE_NAME = "gated"
 GATED_QUEUE_NUM = 7
@@ -76,6 +81,12 @@ GATE_SOURCE_ID = "whs-gated-window-v1"
 # Constraint 4: external IPv6 is unsupported/fail-closed. This reason string
 # is surfaced wherever an IPv6 allow is requested.
 IPV6_EXTERNAL_UNSUPPORTED = "external-ipv6-unsupported-fail-closed"
+
+# Total budget for one interrupted-opening abort (sidecar, network, settlement).
+# A timed-out abort keeps the same identity held for retry; it never reports closure.
+_ABORT_BUDGET_SECONDS = 120.0
+# One ledger settlement call inside an abort or a recovery settlement.
+_SETTLE_STEP_SECONDS = 30.0
 
 
 class GatedNetworkError(ValueError):
@@ -236,6 +247,8 @@ class GatedWindowExtension(ExecutionAdmission):
         self._open: dict[str, OpenWindow] = {}
         self._opening: set[str] = set()
         self._companions: dict[str, dict[str, object]] = {}
+        self._held_aborts: dict[str, tuple[str, str, bool, NetworkGrant | None]] = {}
+        self._abort_tasks: set[asyncio.Task[None]] = set()
 
     def _held(self, key: str) -> bool:
         return key in self._open or key in self._opening
@@ -352,15 +365,10 @@ class GatedWindowExtension(ExecutionAdmission):
             await self._add_live_elements(tag, allowed, caps.duration_seconds)
             created = await self._transition_network(room, network_name, internal)
             await self._verify_open_posture_or_raise(tag, allowed=allowed)
-        except Exception:
-            await self._remove_sidecar(tag)
-            if created:
-                await self._remove_owned_network(network_name)
-            self._opening.discard(key)
-            if grant is not None:
-                await self.ledger.settle_window(
-                    window_id=grant.window_id, meter=None, verified_closed=False
-                )
+        except BaseException:
+            # Caller cancellation and failures share one total-budget abort. The
+            # original exception always propagates unchanged.
+            await self._bounded_abort(key, tag, network_name, created, grant)
             raise
         window = OpenWindow(
             key=key, room=room, grant=grant, daemon_session_id=session,
@@ -375,6 +383,109 @@ class GatedWindowExtension(ExecutionAdmission):
         self._open[key] = window
         self._opening.discard(key)
         return grant
+
+    async def _abort_opening(
+        self,
+        key: str,
+        tag: str,
+        network_name: str,
+        created: bool,
+        grant: NetworkGrant | None,
+    ) -> None:
+        """Bounded UNKNOWN abort of an interrupted opening, one step at a time.
+
+        Every step is attempted: sidecar removal, owned-network removal, and
+        full-charge UNKNOWN settlement. A failed step never replaces the original
+        error and never frees the instance: the handle stays held with the same
+        grant identity until a retry completes every step.
+        """
+        clean = True
+        try:
+            await self._remove_sidecar(tag)
+        except Exception:
+            clean = False
+        if created:
+            try:
+                await self._remove_owned_network(network_name)
+            except Exception:
+                clean = False
+        if grant is not None:
+            try:
+                await asyncio.wait_for(
+                    self.ledger.settle_window(
+                        window_id=grant.window_id, meter=None, verified_closed=False
+                    ),
+                    timeout=_SETTLE_STEP_SECONDS,
+                )
+            except Exception:
+                clean = False
+        if clean:
+            self._opening.discard(key)
+            self._held_aborts.pop(key, None)
+        else:
+            self._held_aborts[key] = (tag, network_name, created, grant)
+
+    async def retry_abort(self, key: str) -> bool:
+        """Repeat a held interrupted-opening abort with the same identity.
+
+        Returns True when the instance handle was released. Settlement replays
+        return the stored receipt, so a repeated attempt never recharges.
+        """
+        held = self._held_aborts.get(key)
+        if held is None:
+            return False
+        await self._bounded_abort(key, *held)
+        return key not in self._opening
+
+    async def _bounded_abort(
+        self,
+        key: str,
+        tag: str,
+        network_name: str,
+        created: bool,
+        grant: NetworkGrant | None,
+    ) -> None:
+        """Run one abort under a total budget without ever reporting false closure.
+
+        asyncio.wait does not cancel the abort task, so repeated caller
+        cancellation only spends the remaining budget. On timeout or an abnormal
+        end, the same identity stays held for retry and the abort task keeps
+        running; its outcome is consumed by a callback, never silently dropped.
+        """
+        loop = asyncio.get_running_loop()
+        abort = asyncio.ensure_future(
+            self._abort_opening(key, tag, network_name, created, grant)
+        )
+        self._abort_tasks.add(abort)
+        abort.add_done_callback(self._abort_finished)
+        deadline = loop.time() + _ABORT_BUDGET_SECONDS
+        while not abort.done():
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                self._hold_identity(key, tag, network_name, created, grant)
+                return
+            try:
+                await asyncio.wait({abort}, timeout=remaining)
+            except asyncio.CancelledError:
+                continue
+        if abort.cancelled() or abort.exception() is not None:
+            self._hold_identity(key, tag, network_name, created, grant)
+
+    def _hold_identity(
+        self,
+        key: str,
+        tag: str,
+        network_name: str,
+        created: bool,
+        grant: NetworkGrant | None,
+    ) -> None:
+        self._opening.add(key)
+        self._held_aborts[key] = (tag, network_name, created, grant)
+
+    def _abort_finished(self, task: asyncio.Task[None]) -> None:
+        self._abort_tasks.discard(task)
+        if not task.cancelled():
+            task.exception()
 
     async def _create_sidecar(self, tag: str, room: str) -> None:
         if self.policy is None:
@@ -892,6 +1003,159 @@ class GatedWindowExtension(ExecutionAdmission):
     @staticmethod
     def settlement_summary(settlement: WindowSettlement) -> dict[str, object]:
         return json.loads(settlement.model_dump_json())
+
+
+class GatedWindowRecovery:
+    """Trusted recovery of one Run instance's original gated windows.
+
+    Observation is read-only: this class never creates, adopts, starts, or
+    signals a sidecar, network, or room. Every outstanding OPEN window settles
+    UNKNOWN with its full reservation charged. Quarantine release needs
+    verified physical closure under a revalidated Docker endpoint; any doubt
+    keeps the window quarantined. The report is never actor-readiness authority.
+    """
+
+    def __init__(self, extension: GatedWindowExtension) -> None:
+        self._ext = extension
+
+    async def reconcile_instance(
+        self,
+        *,
+        run_id: str,
+        instance_id: str,
+        endpoint: PreparedDockerEndpoint | None,
+    ) -> GatedInstanceRecoveryReport:
+        rows = await self._ext.ledger.outstanding_windows(
+            run_id=run_id, instance_id=instance_id
+        )
+        if not rows:
+            return GatedInstanceRecoveryReport(windows=())
+        endpoint_state = await self._ext.manager.revalidate_bound_endpoint(endpoint)
+        outcomes = [
+            await self._reconcile_window(
+                row, run_id=run_id, instance_id=instance_id, endpoint_state=endpoint_state
+            )
+            for row in rows
+        ]
+        return GatedInstanceRecoveryReport(windows=tuple(outcomes))
+
+    async def _reconcile_window(
+        self,
+        row: OutstandingNetworkWindow,
+        *,
+        run_id: str,
+        instance_id: str,
+        endpoint_state: str,
+    ) -> GatedWindowRecoveryOutcome:
+        grant = row.grant
+        window_id = grant.window_id
+        key = workroom_key_for(run_id, instance_id)
+        if self._ext._held(key):
+            return GatedWindowRecoveryOutcome(
+                window_id=window_id, closure_verified=False, settlement=row.settlement,
+                quarantine_released=False, reason_code="held_in_process",
+            )
+        settlement = row.settlement
+        if settlement is None:
+            try:
+                settlement = await asyncio.wait_for(
+                    self._ext.ledger.settle_window(
+                        window_id=window_id, meter=None, verified_closed=False
+                    ),
+                    timeout=_SETTLE_STEP_SECONDS,
+                )
+            except Exception:
+                return GatedWindowRecoveryOutcome(
+                    window_id=window_id, closure_verified=False, settlement=None,
+                    quarantine_released=False, reason_code="settlement_failed",
+                )
+        if endpoint_state != "endpoint_verified":
+            return GatedWindowRecoveryOutcome(
+                window_id=window_id, closure_verified=False, settlement=settlement,
+                quarantine_released=False, reason_code=endpoint_state,
+            )
+        tag = opaque_window_tag(run_id, instance_id, grant.epoch)
+        network_name = tag.replace(OPAQUE_PREFIX, "gwn-", 1)
+        verified, reason = await self._verify_closed(
+            tag=tag, network_name=network_name, room_key=key
+        )
+        if not verified:
+            return GatedWindowRecoveryOutcome(
+                window_id=window_id, closure_verified=False, settlement=settlement,
+                quarantine_released=False, reason_code=reason,
+            )
+        try:
+            released = await self._ext.ledger.release_quarantine(
+                window_id=window_id, verified_closed=True
+            )
+        except Exception:
+            return GatedWindowRecoveryOutcome(
+                window_id=window_id, closure_verified=True, settlement=settlement,
+                quarantine_released=False, reason_code="release_failed",
+            )
+        return GatedWindowRecoveryOutcome(
+            window_id=window_id, closure_verified=True, settlement=settlement,
+            quarantine_released=bool(released),
+            reason_code=None if released else "release_refused",
+        )
+
+    async def _inventory(self, argv: tuple[str, ...], field: str) -> frozenset[str] | None:
+        """Exact names from a complete JSON-per-line inventory; None when unproven."""
+        code, out, _err, timed_out, cut = await self._ext.run_docker(
+            argv, None, 30.0, 1 << 20
+        )
+        if code != 0 or timed_out or cut:
+            return None
+        names: set[str] = set()
+        for line in out.decode("utf-8", errors="replace").splitlines():
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except ValueError:
+                return None
+            value = record.get(field) if isinstance(record, dict) else None
+            if not isinstance(value, str):
+                return None
+            names.add(value)
+        return frozenset(names)
+
+    async def _verify_closed(
+        self, *, tag: str, network_name: str, room_key: str
+    ) -> tuple[bool, str]:
+        """Closure needs complete inventories: no sidecar, no owned network, idle room."""
+        labelled = await self._inventory(
+            ("ps", "-a", "--no-trunc", "--filter", "label=" + GATED_LABEL,
+             "--format", "{{json .}}"),
+            "Names",
+        )
+        exact = await self._inventory(
+            ("ps", "-a", "--no-trunc", "--filter", "name=^" + tag + "$",
+             "--format", "{{json .}}"),
+            "Names",
+        )
+        if labelled is None or exact is None:
+            return False, "sidecar_inventory_unverified"
+        if tag in labelled or tag in exact:
+            return False, "sidecar_present"
+        net_labelled = await self._inventory(
+            ("network", "ls", "--no-trunc", "--filter", "label=" + GATED_LABEL,
+             "--format", "{{json .}}"),
+            "Name",
+        )
+        net_exact = await self._inventory(
+            ("network", "ls", "--no-trunc", "--filter", "name=^" + network_name + "$",
+             "--format", "{{json .}}"),
+            "Name",
+        )
+        if net_labelled is None or net_exact is None:
+            return False, "network_inventory_unverified"
+        if network_name in net_labelled or network_name in net_exact:
+            return False, "network_present"
+        room = await self._ext.manager.observe_room_for_recovery(room_key)
+        if room not in ("absent", "baseline"):
+            return False, "room_unverified"
+        return True, "closure_verified"
 
 
 def _short(data: bytes, limit: int = 200) -> str:
