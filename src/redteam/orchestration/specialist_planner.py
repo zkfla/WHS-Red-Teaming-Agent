@@ -8,7 +8,8 @@ import asyncio
 from copy import deepcopy
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic_core import PydanticCustomError
 
 from redteam.attack_graph.service import AttackGraphService
 from redteam.core.contracts.completion import ALLOWED_CRITERION_KINDS
@@ -49,25 +50,59 @@ class StrategyDraft(BaseModel):
     @model_validator(mode="after")
     def _judgment_shape(self) -> "StrategyDraft":
         if not self.reason.strip():
-            raise ValueError("planner_reason_blank")
+            raise PydanticCustomError("planner_reason_blank", "planner_reason_blank")
         if len(set(self.reviewed_task_ids)) != len(self.reviewed_task_ids):
-            raise ValueError("planner_reviewed_task_ids_duplicate")
+            raise PydanticCustomError(
+                "planner_reviewed_task_ids_duplicate", "planner_reviewed_task_ids_duplicate",
+            )
         if any(not item.strip() for item in self.reviewed_task_ids):
-            raise ValueError("planner_reviewed_task_id_blank")
+            raise PydanticCustomError(
+                "planner_reviewed_task_id_blank", "planner_reviewed_task_id_blank",
+            )
         if self.termination != "continue" and (self.questions or self.reviewed_task_ids):
-            raise ValueError("planner_terminal_judgment_has_work")
+            raise PydanticCustomError(
+                "planner_terminal_judgment_has_work", "planner_terminal_judgment_has_work",
+            )
         if self.termination in {"held", "exhausted"} and not any(
             item.strip() for item in self.resume_conditions
         ):
-            raise ValueError("planner_resume_condition_required")
+            raise PydanticCustomError(
+                "planner_resume_condition_required", "planner_resume_condition_required",
+            )
         if any(not item.strip() for item in self.resume_conditions):
-            raise ValueError("planner_resume_condition_blank")
+            raise PydanticCustomError(
+                "planner_resume_condition_blank", "planner_resume_condition_blank",
+            )
         return self
 
 
 class AtomizationDraft(BaseModel):
     model_config = ConfigDict(extra="forbid")
     tasks: list[AtomicTaskProposal] = Field(min_length=1)
+
+
+#: StrategyDraft's own rule codes (raised as PydanticCustomError types) and the field each names.
+_STRATEGY_RULE_LOCATIONS: dict[str, str] = {
+    "planner_reason_blank": "$.reason",
+    "planner_reviewed_task_ids_duplicate": "$.reviewed_task_ids",
+    "planner_reviewed_task_id_blank": "$.reviewed_task_ids",
+    "planner_terminal_judgment_has_work": "$.termination",
+    "planner_resume_condition_required": "$.resume_conditions",
+    "planner_resume_condition_blank": "$.resume_conditions",
+}
+
+
+def _strategy_rule_error(caught: ValueError) -> SpecialistProposalError:
+    """Keep the StrategyDraft rule code instead of the generic invalid-proposal code.
+
+    Only the validator's own code, carried as the error type, is read. Messages, input
+    and context are never read, because they can contain the model's text.
+    """
+    if isinstance(caught, ValidationError):
+        for error in caught.errors(include_input=False, include_url=False, include_context=False):
+            if error.get("type") in _STRATEGY_RULE_LOCATIONS:
+                return SpecialistProposalError(str(error["type"]))
+    return SpecialistProposalError("specialist_invalid_proposal")
 
 
 def _schema_with_completion_criterion_hint(schema: dict[str, Any]) -> dict[str, Any]:
@@ -299,7 +334,7 @@ class SpecialistPlanner:
                 )
             except (ValueError, SpecialistProposalError) as caught:
                 exc = (caught if isinstance(caught, SpecialistProposalError)
-                       else SpecialistProposalError("specialist_invalid_proposal"))
+                       else _strategy_rule_error(caught))
                 if exc.code.startswith("planner_adjustment_"):
                     raise DecisionValidationError(DecisionDiagnostic(
                         code=exc.code, stage="attack_path_proposal", kind="validation",
@@ -413,7 +448,10 @@ class SpecialistPlanner:
 
     @staticmethod
     def _rejection(error, stage):
-        location = "$.questions" if stage == "attack_path_proposal" else "$.tasks"
+        rule_location = _STRATEGY_RULE_LOCATIONS.get(error.code)
+        location = rule_location or (
+            "$.questions" if stage == "attack_path_proposal" else "$.tasks"
+        )
         diagnostic = getattr(error, "diagnostic", None)
         if isinstance(diagnostic, DecisionDiagnostic):
             return DecisionValidationError(diagnostic.model_copy(update={
@@ -428,6 +466,9 @@ class SpecialistPlanner:
             code=error.code, stage=stage, kind="validation", retryable=True,
             summary=summary,
             location=location,
+            validation_issues=(
+                [{"rule": error.code, "location": location}] if rule_location else []
+            ),
         ))
 
 
@@ -440,6 +481,14 @@ _REJECTION_SUMMARIES: dict[str, str] = {
     "specialist_invalid_proposal": "Return a judgment that matches the supplied schema and "
         "preserves the stated work and progress conditions.",
     "planner_reviewed_task_unknown": "reviewed_task_ids must name Tasks in this Run.",
+    "planner_reason_blank": "reason must contain non-blank text.",
+    "planner_reviewed_task_ids_duplicate": "reviewed_task_ids must list each Task once.",
+    "planner_reviewed_task_id_blank": "reviewed_task_ids entries must be non-blank Task ids.",
+    "planner_terminal_judgment_has_work": "A termination other than continue must have no "
+        "questions and no reviewed_task_ids; move that work under continue or remove it.",
+    "planner_resume_condition_required": "held and exhausted need at least one non-blank "
+        "resume_conditions entry naming the external prerequisite or the end of useful work.",
+    "planner_resume_condition_blank": "every resume_conditions entry must be non-blank.",
     "planner_continue_requires_progress": "Continue requires proposed questions or a reviewed "
         "claimable/running Task; use replan for one bounded follow-up judgment, held for an "
         "external prerequisite, or exhausted when no useful work remains.",
