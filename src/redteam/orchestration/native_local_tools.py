@@ -246,8 +246,8 @@ async def context_query_handler(
         )
     try:
         snapshot = await capture_investigation_context(
-            state, hops=_CONTEXT_QUERY_HOPS, max_nodes=_CONTEXT_QUERY_MAX_NODES,
-            max_edges=_CONTEXT_QUERY_MAX_EDGES,
+            state, worker_task_id=task_id, hops=_CONTEXT_QUERY_HOPS,
+            max_nodes=_CONTEXT_QUERY_MAX_NODES, max_edges=_CONTEXT_QUERY_MAX_EDGES,
         )
         reader = InvestigationContextReader(snapshot, worker_task_id=task_id)
         result = reader.query(query)

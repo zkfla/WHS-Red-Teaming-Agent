@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 from collections import Counter, deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Literal
@@ -38,6 +39,10 @@ _NOTE = (
     "Search related records then read details; original bodies use EvidenceReader. "
     "Matches identify relationships, not semantic duplicates."
 )
+
+
+_WORKER_ANCESTRY_LIMIT = 64  # Forward source/dependency Tasks one worker may read.
+_WORKER_ROOT_LIMIT = 16  # Graph roots per worker capture, within context_neighborhood's cap.
 
 
 def _json(value: Any) -> str:
@@ -195,26 +200,73 @@ class InvestigationSnapshot:
 
 async def capture_investigation_context(
     state: CentralStateStore, *, graph_roots: tuple[str, ...] = (), hops: int = 1,
-    max_nodes: int = 32, max_edges: int = 64,
+    max_nodes: int = 32, max_edges: int = 64, worker_task_id: str | None = None,
 ) -> InvestigationSnapshot:
-    """One borrowed read transaction; no writes, models, full graph, or evidence bodies."""
+    """One borrowed read transaction; no writes, models, full graph, or evidence bodies.
+
+    With worker_task_id, roots are that Task's own targets and forward ancestry, read in this
+    same transaction. Pass the same id to InvestigationContextReader(worker_task_id=...).
+    """
+    if worker_task_id is not None and graph_roots:
+        raise ValueError("context_worker_roots_are_derived")
     def capture(tx: CentralTransaction) -> InvestigationSnapshot:
         mission_id, binding = tx.binding()
         mission = tx.get_mission(mission_id)
         if mission is None:
             raise ContextReadError("context_mission_missing")
+        tasks = tx.list_tasks()
+        roots, roots_truncated = graph_roots, False
+        if worker_task_id is not None:
+            roots, roots_truncated = _worker_graph_roots(tasks, worker_task_id)
         nodes, edges, truncated = tx.graph.context_neighborhood(
-            graph_roots, hops=hops, max_nodes=max_nodes, max_edges=max_edges,
+            roots, hops=hops, max_nodes=max_nodes, max_edges=max_edges,
         )
         candidates = [Hypothesis.model_validate(facts_of(node.properties))
                       for node in tx.graph.query(node_type=GraphNodeType.HYPOTHESIS)]
         return InvestigationSnapshot.create(
             run_id=tx.run_id, engagement_id=tx.engagement_id, mission=mission,
-            binding_hash=binding, tasks=tx.list_tasks(), candidates=candidates,
+            binding_hash=binding, tasks=tasks, candidates=candidates,
             executions=tx.list_executions(), nodes=nodes, edges=edges,
-            graph_roots=graph_roots, graph_truncated=truncated,
+            graph_roots=roots, graph_truncated=truncated or roots_truncated,
         )
     return await state.transaction(capture, write=False)
+
+
+def _worker_ancestry(
+    task_id: str, refs_of: Callable[[str], list[str] | None],
+) -> tuple[list[str], bool]:
+    """Forward source/dependency Tasks from task_id, bounded. refs_of returns None if missing."""
+    order: list[str] = []
+    seen: set[str] = set()
+    queue = deque([task_id])
+    while queue and len(order) < _WORKER_ANCESTRY_LIMIT:
+        current = queue.popleft()
+        if current in seen:
+            continue
+        refs = refs_of(current)
+        if refs is None:
+            continue
+        seen.add(current)
+        order.append(current)
+        queue.extend(refs)
+    return order, bool(queue)
+
+
+def _worker_graph_roots(tasks: list[MissionTask], task_id: str) -> tuple[tuple[str, ...], bool]:
+    """A worker's related graph targets across its own ancestry, capped for one neighborhood."""
+    by_id = {str(task.task_id): task for task in tasks}
+
+    def refs_of(current: str) -> list[str] | None:
+        task = by_id.get(current)
+        if task is None:
+            return None
+        return [str(ref) for ref in [task.source_task_id, *task.dependency_task_ids] if ref]
+
+    ids, ancestry_truncated = _worker_ancestry(task_id, refs_of)
+    roots = sorted({str(node) for current in ids
+                    for node in by_id[current].related_attack_graph_node_ids})
+    truncated = ancestry_truncated or len(roots) > _WORKER_ROOT_LIMIT
+    return tuple(roots[:_WORKER_ROOT_LIMIT]), truncated
 
 
 def _preview(value: Any, path: str, cut: list[str], *, depth: int = 0) -> Any:
@@ -289,20 +341,14 @@ class InvestigationContextReader:
         if ("task", identity) not in self._records:
             raise ContextReadError("context_worker_task_missing")
         # Forward source/dependency ancestry only, never reverse sibling tasks.
-        allowed: set[tuple[str, str]] = set()
-        queue = deque([identity])
-        while queue and len(allowed) < 64:
-            task_id = queue.popleft()
-            key = ("task", task_id)
-            if key in allowed:
-                continue
-            item = self._records.get(key)
+        def refs(task_id: str) -> list[str]:
+            item = self._records.get(("task", task_id))
             if item is None:
                 raise ContextReadError("context_worker_source_missing")
-            allowed.add(key)
-            queue.extend(ref for ref in [item.get("source_task_id"),
-                                         *item.get("dependency_task_ids", [])] if ref)
-        self.worker_scope_truncated = bool(queue)
+            return [ref for ref in [item.get("source_task_id"),
+                                    *item.get("dependency_task_ids", [])] if ref]
+        ids, self.worker_scope_truncated = _worker_ancestry(identity, refs)
+        allowed: set[tuple[str, str]] = {("task", task_id) for task_id in ids}
         for key in list(allowed):
             item = self._records[key]
             allowed.update(("candidate", ref) for ref in item.get("related_hypothesis_ids", []))
