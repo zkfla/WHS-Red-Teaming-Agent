@@ -675,6 +675,12 @@ def _split_plan_response_schema(schema: dict[str, Any]) -> dict[str, Any]:
     schema["required"] = list(dict.fromkeys([*required, *_SPLIT_PLAN_REQUIRED]))
     for name, text in _SPLIT_PLAN_DESCRIPTIONS.items():
         schema["properties"][name]["description"] = text
+    criterion = schema.get("$defs", {}).get("CompletionCriterion")
+    if criterion is not None:
+        criterion_required = ("kind", "description")
+        criterion["required"] = list(dict.fromkeys([
+            *criterion.get("required", []), *criterion_required,
+        ]))
     return schema
 
 

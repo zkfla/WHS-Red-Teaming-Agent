@@ -2,6 +2,7 @@
 
 import jsonschema
 
+from redteam.core.contracts.completion import CompletionCriterion
 from redteam.orchestration.hypothesis_planner import _split_plan_response_schema
 from redteam.orchestration.planner_context import lookup_only
 from redteam.orchestration.probe_atomization import HypothesisPlanDraft
@@ -67,12 +68,52 @@ async def test_omitted_questions_fail_schema_then_valid_plan_commits(tmp_path):
 async def test_omitted_termination_fails_schema_then_valid_plan_commits(tmp_path):
     ids, spent, llm = await _advance_with(
         tmp_path,
-        [{key: value for key, value in _plan_two_questions().items() if key != "termination"},
-         _plan_two_questions()],
+        [
+            {key: value for key, value in _plan_two_questions().items() if key != "termination"},
+            _plan_two_questions(),
+        ],
     )
     assert len(ids) == 2 and spent == 3
     assert len(llm.atom_inputs) == 1
     assert "schema_required at $.termination" in llm.plan_feedback[1]
+
+
+def test_criterion_kind_and_description_are_required_only_in_model_facing_schema():
+    criterion = STAGE_ONE_SCHEMA["$defs"]["CompletionCriterion"]
+    assert {"kind", "description"} <= set(criterion["required"])
+    shared = HypothesisPlanDraft.model_json_schema()["$defs"]["CompletionCriterion"]
+    assert "kind" not in shared.get("required", [])
+    assert CompletionCriterion().kind == "unknown"
+    jsonschema.validate(instance={"kind": "observation", "description": ""}, schema=criterion)
+
+
+def _criterion_without(field):
+    plan = _plan_two_questions()
+    plan["questions"][0]["completion_criteria"][0].pop(field)
+    return plan
+
+
+async def test_omitted_criterion_kind_is_schema_rejected_then_repaired_and_atomized(tmp_path):
+    ids, spent, llm = await _advance_with(
+        tmp_path,
+        [_criterion_without("kind"), _plan_two_questions()],
+    )
+    assert len(ids) == 2 and spent == 3
+    assert len(llm.atom_inputs) == 1
+    assert "schema_required at $.questions[0].completion_criteria[0].kind" in llm.plan_feedback[1]
+
+
+async def test_omitted_criterion_description_is_schema_rejected_then_repaired(tmp_path):
+    ids, spent, llm = await _advance_with(
+        tmp_path,
+        [_criterion_without("description"), _plan_two_questions()],
+    )
+    assert len(ids) == 2 and spent == 3
+    assert len(llm.atom_inputs) == 1
+    assert (
+        "schema_required at $.questions[0].completion_criteria[0].description"
+        in llm.plan_feedback[1]
+    )
 
 
 async def test_explicit_held_with_empty_questions_is_accepted_without_atomizer(tmp_path):
