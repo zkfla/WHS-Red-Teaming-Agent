@@ -536,6 +536,17 @@ def _request_timeout_diagnostic(stage: str, *, attempts: int = 0) -> DecisionDia
     )
 
 
+def _prompt_json(value: Any) -> str:
+    """Compact UTF-8 JSON body, the encoding that investigation_context.context_bytes measures.
+
+    allow_nan=False makes a non-finite number fail here, before any request is charged.
+    """
+    try:
+        return json.dumps(value, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    except ValueError as exc:
+        raise ValueError(f"decision payload is not finite JSON: {exc}") from exc
+
+
 class StructuredDecisionClient:
     """Ask the model for a JSON decision validated against a schema.
 
@@ -638,7 +649,7 @@ class StructuredDecisionClient:
         extra = await self._resolve_extra_context(stage, payload)
         for key, value in extra.items():
             working.setdefault(key, value)
-        json.dumps(working)
+        _prompt_json(working)
         from redteam.orchestration.prompts import instruction_scope
 
         with instruction_scope(stage):
@@ -797,7 +808,7 @@ class StructuredDecisionClient:
         )
 
     def _prompt_for(self, working: dict[str, Any], feedback: str, kind: str) -> str:
-        body = json.dumps(working)
+        body = _prompt_json(working)
         if not feedback:
             return body
         return (
