@@ -163,6 +163,15 @@ checkpoint messages stay intact. Elision is a display projection and does not
 grant proof, complete work or change budgets. Re-reading may require another
 model turn, so reduced synthetic bytes alone do not establish lower live latency.
 
+`graph.record` review summaries expose claim `outcome` and independent candidate
+`hypothesis_outcome` separately. A supported claim can leave the candidate unknown;
+the public receipt and final admission gates retain that distinction. The
+`authentication.assess` comparison also exposes an optional fixed `mismatch_reason`
+when its baseline/request prerequisites fail. The existing inconclusive outcome
+and source refs remain intact; successful local-tool delivery is not a successful
+comparison. A valid baseline has no mismatch reason, including when the current
+response itself is uninterpretable.
+
 ## Planner structured lookup (plan8b)
 
 Both the split strategy profile and the single-stage compatibility profile accept

@@ -144,10 +144,14 @@ def authentication_assess_descriptor() -> LocalToolDescriptor:
             "Compare a preserved anonymous HTTP baseline and selected session response. "
             "Provide both original evidence IDs and session_ref; expected_access is optional. "
             "Returns an authentication observation and source refs, never a confirmed finding. "
+            "An inconclusive baseline comparison includes a fixed mismatch_reason naming "
+            "the first failed source or request condition; correct the cited inputs before "
+            "repeating the comparison. A successful tool call alone is not a resolved comparison. "
             "Submit any security claim through the supplied recording tool."
         ),
         input_schema=AuthenticationAssessmentInput.model_json_schema(),
         contribution_id="authentication-assessment",
+        version="2",
     )
 
 
@@ -155,4 +159,6 @@ def authentication_assessment_contribution() -> Contribution:
     def factory(wiring: Any) -> tuple[LocalToolDescriptor, Any]:
         return authentication_assess_descriptor(), authentication_assess_handler
 
-    return runtime_tool_contribution(contribution_id="authentication-assessment", factory=factory)
+    return runtime_tool_contribution(
+        contribution_id="authentication-assessment", version="2", factory=factory,
+    )

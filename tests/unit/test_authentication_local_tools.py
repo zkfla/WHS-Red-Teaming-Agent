@@ -388,6 +388,14 @@ async def test_baseline_mismatch_stays_inconclusive(mismatch: str) -> None:
     )
     assert result.ok is True
     assert result.payload["outcome"] == "baseline_evidence_unavailable_or_mismatched"
+    expected_reason = {
+        "path": "baseline_path_mismatch",
+        "target": "baseline_target_ref_mismatch",
+        "session": "request_session_mismatch",
+    }[mismatch]
+    assert result.payload["mismatch_reason"] == expected_reason
+    checked, = world.bus.history(event_type=AUTHENTICATION_CHECKED)
+    assert checked.payload["mismatch_reason"] == expected_reason
     assert result.payload["evidence_ids"] == [session_id]
     assert result.refs == (session_id,)
     assert await world.service.list_findings() == []

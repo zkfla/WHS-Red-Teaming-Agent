@@ -184,12 +184,32 @@ def comparison_outcome(status: int | None, expected_access: str) -> str:
     return "inconclusive_response"
 
 
+#: Fixed codes naming the first baseline or request condition that failed.
+#: They never carry provided values, prompts, or credential material.
+BaselineMismatchReason = Literal[
+    "baseline_missing",
+    "baseline_scope_mismatch",
+    "baseline_source_mismatch",
+    "baseline_not_successful",
+    "request_method_mismatch",
+    "request_session_mismatch",
+    "target_mismatch",
+    "baseline_observation_missing",
+    "baseline_status_mismatch",
+    "baseline_session_mismatch",
+    "baseline_method_mismatch",
+    "baseline_path_mismatch",
+    "baseline_target_ref_mismatch",
+]
+
+
 class AuthenticationAssessment(BaseModel):
     outcome: str
     hypothesis_status: str
     evidence_ids: list[str]
     anonymous_status: int | None = None
     session_status: int | None = None
+    mismatch_reason: BaselineMismatchReason | None = None
 
 
 def _same_executed_target(baseline: EvidenceRecord, evidence: EvidenceRecord) -> bool:
@@ -215,6 +235,43 @@ def _same_executed_target(baseline: EvidenceRecord, evidence: EvidenceRecord) ->
         return False
 
 
+def _baseline_mismatch_reason(
+    check: AuthenticationCheck,
+    proposal: ActionProposal,
+    evidence: EvidenceRecord,
+    baseline: EvidenceRecord | None,
+    previous: Any,
+) -> BaselineMismatchReason | None:
+    """Return the first failed baseline or request condition, or None when valid."""
+    if baseline is None:
+        return "baseline_missing"
+    if baseline.run_id != evidence.run_id or baseline.engagement_id != evidence.engagement_id:
+        return "baseline_scope_mismatch"
+    if baseline.source_id != "web.http_request":
+        return "baseline_source_mismatch"
+    if baseline.metadata.get("success") is not True:
+        return "baseline_not_successful"
+    if proposal.arguments.get("method", "GET") != "GET":
+        return "request_method_mismatch"
+    if proposal.arguments.get("session_ref") != check.session_ref:
+        return "request_session_mismatch"
+    if not _same_executed_target(baseline, evidence):
+        return "target_mismatch"
+    if not isinstance(previous, dict):
+        return "baseline_observation_missing"
+    if previous.get("status_code") != 401:
+        return "baseline_status_mismatch"
+    if previous.get("session_ref") is not None:
+        return "baseline_session_mismatch"
+    if previous.get("method") != "GET":
+        return "baseline_method_mismatch"
+    if previous.get("path") != proposal.arguments.get("path"):
+        return "baseline_path_mismatch"
+    if previous.get("target_ref") != proposal.arguments.get("target_ref"):
+        return "baseline_target_ref_mismatch"
+    return None
+
+
 def _assess_observations(
     check: AuthenticationCheck,
     proposal: ActionProposal,
@@ -223,28 +280,14 @@ def _assess_observations(
     current: dict[str, Any] | None,
 ) -> AuthenticationAssessment:
     previous = baseline.metadata.get("http_observation") if baseline else None
-    valid = bool(
-        baseline is not None
-        and baseline.run_id == evidence.run_id
-        and baseline.engagement_id == evidence.engagement_id
-        and baseline.source_id == "web.http_request"
-        and baseline.metadata.get("success") is True
-        and proposal.arguments.get("method", "GET") == "GET"
-        and proposal.arguments.get("session_ref") == check.session_ref
-        and _same_executed_target(baseline, evidence)
-        and isinstance(previous, dict)
-        and previous.get("status_code") == 401
-        and previous.get("session_ref") is None
-        and previous.get("method") == "GET"
-        and previous.get("path") == proposal.arguments.get("path")
-        and previous.get("target_ref") == proposal.arguments.get("target_ref")
-    )
+    reason = _baseline_mismatch_reason(check, proposal, evidence, baseline, previous)
     refs = [str(evidence.evidence_id)]
-    if not valid:
+    if reason is not None:
         return AuthenticationAssessment(
             outcome="baseline_evidence_unavailable_or_mismatched",
             hypothesis_status="inconclusive",
             evidence_ids=refs,
+            mismatch_reason=reason,
         )
     refs.insert(0, str(check.baseline_evidence_id))
     status = current["status_code"] if current else None
