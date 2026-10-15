@@ -101,7 +101,11 @@ async def planner_passes(state):
 
 @pytest.mark.parametrize("profile", [LEGACY, SPLIT])
 async def test_one_replan_queues_one_wake_and_projects_the_absolute_count(tmp_path, profile):
-    llm = PlannerDouble([{"reason": "Request one bounded planning pass", "termination": "replan"}])
+    decision = {"reason": "Request one bounded planning pass", "termination": "replan"}
+    if profile == SPLIT:
+        # Split planning requires an explicit empty question list for a no-work replan.
+        decision["questions"] = []
+    llm = PlannerDouble([decision])
     async with budgeted(tmp_path, llm=llm, profile=profile) as (session, llm, tools):
         state = session.deps.central_state
         assert await SpecialistPlanner(session.deps).advance(session.runtime) == []

@@ -113,13 +113,17 @@ async def test_candidate_probe_partial_followup_and_reviewed_verdict(tmp_path, v
         service = AttackGraphService(session.deps.graph_store)
         current, = await service.list_hypotheses()
         assert current.hypothesis_id != "local" and current.revision == 1
-        llm.native_responses_by_task[first_id] = [discover(TOOL), turn(inspect("first"))]
+        llm.native_responses_by_task[first_id] = [
+            discover(TOOL), turn(inspect("first")),
+        ]
         await drive(session)
         second_id, = await planner.advance(session.runtime)
         second = await session.deps.central_state.get_task(second_id)
         assert second.source_task_id == first_id and second.source_question_id is None
         assert second.hypothesis_revisions == {current.hypothesis_id: 2}
-        llm.native_responses_by_task[second_id] = [discover(TOOL), turn(inspect("second"))]
+        llm.native_responses_by_task[second_id] = [
+            discover(TOOL), turn(inspect("second")),
+        ]
         await drive(session)
         current = await service.get_hypothesis(current.hypothesis_id)
         sources = await session.deps.evidence_store.list_for_run(session.runtime.run_id)
@@ -153,7 +157,22 @@ async def test_candidate_probe_partial_followup_and_reviewed_verdict(tmp_path, v
         mission = await session.deps.central_state.get_mission(session.runtime.mission_id)
         assert mission.status is MissionStatus.ACTIVE
         assert len(llm.planner_inputs) == 3
-        assert len(llm.requests) == 7  # Three planner judgments plus two native requests per probe.
+        native_requests = [request for request in llm.requests
+                           if request["kind"] == "complete_native"]
+        planner_requests = [request for request in llm.requests
+                            if request["kind"] == "complete_structured"]
+        assert len(planner_requests) == 3
+        assert len(native_requests) == 6  # Each worker gets one local turn after the physical cap.
+        assert len(tools.inner.invocations) == 2  # No physical request after either probe cap.
+        for task_id in (first_id, second_id):
+            task_requests = []
+            for request in native_requests:
+                user_messages = [message for message in request["messages"]
+                                 if message.get("role") == "user"]
+                payload = json.loads(user_messages[-1]["content"])
+                if payload.get("active_task", {}).get("task_id") == task_id:
+                    task_requests.append(request)
+            assert len(task_requests) == 3
 
 
 async def test_initial_observation_and_same_event_redelivery_are_distinct(tmp_path):
@@ -254,10 +273,16 @@ async def test_explicit_profile_runs_candidate_feedback_loop_without_atomizer(tm
         from redteam.core.contracts.events import EventType
 
         await session.deps.event_bus.subscribe(EventType.TASK_CREATED, script)
-        final = await asyncio.wait_for(session.run(settle=False), 5)
+        # Include the bounded post-action local turn and persisted outbox completion.
+        final = await asyncio.wait_for(session.run(settle=False), 15)
         assert final.actions_executed == 1 and len(llm.planner_inputs) == 2
         assert len(tools.inner.invocations) == 1
-        assert len(llm.requests) == 4  # Two judgments and two native requests; no atomizer.
+        native_requests = [request for request in llm.requests
+                           if request["kind"] == "complete_native"]
+        planner_requests = [request for request in llm.requests
+                            if request["kind"] == "complete_structured"]
+        assert len(planner_requests) == 2  # No atomizer request in the legacy profile.
+        assert len(native_requests) == 3  # Discovery, one original and a post-cap local turn.
         mission = await session.deps.central_state.get_mission(session.runtime.mission_id)
         assert mission.status is MissionStatus.ACTIVE
 
@@ -325,7 +350,9 @@ async def test_candidate_loop_never_refutes_pending_or_unknown_execution(tmp_pat
             ]
 
         await session.deps.event_bus.subscribe(EventType.TASK_CREATED, script)
-        await asyncio.wait_for(session.run(settle=False), 5)
+        # This exercises persisted pending execution and outbox processing. The unknown
+        # case takes over five seconds on the Windows runner; retain a bounded hang guard.
+        await asyncio.wait_for(session.run(settle=False), 15)
         task, = await session.deps.central_state.list_tasks()
         saved, = await AttackGraphService(session.deps.graph_store).list_hypotheses()
         assert task.status is TaskStatus.BLOCKED and task.result.outcome == "blocked"

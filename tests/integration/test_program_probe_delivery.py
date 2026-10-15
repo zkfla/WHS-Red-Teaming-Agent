@@ -130,6 +130,7 @@ class SchemaSensitiveProgramProbe(FakeLLMClient):
         if "updates" in response_schema["properties"]:
             self.planner_inputs.append(json.loads(messages[-1]["content"]))
             self._canned_structured = {
+                "updates": [], "questions": [],
                 "reason": "Need a reachable target before further testing", "termination": "held",
                 "resume_conditions": ["Target responds on the selected route"],
             }
@@ -224,7 +225,14 @@ async def test_program_original_reaches_worker_and_planner_with_one_original_exe
         planner = llm.planner_inputs[-1]
         view, = planner["original_observations"]["records"]
         assert view["execution"] == worker["execution"]
-        assert view["program_output"] == worker["program_output"]
+        preview = view["program_output"]
+        original_output = worker["program_output"]
+        assert original_output["stdout"].startswith("program-observation")
+        assert preview["stdout"].startswith("program-observation")
+        assert preview["stdout"].startswith(original_output["stdout"])
+        assert preview["stderr"] == original_output["stderr"]
+        assert len(preview["stdout"]) + len(preview["stderr"]) <= 2000
+        assert preview["stdout_truncated"] or preview["stderr_truncated"]
         assert view["provenance"]["invocation_id"] == str(raw.invocation_id)
         assert planner["program_execution_environment"]["routes"][1]["status"] == "target_ready"
         assert planner["tool_cards_truncated"]

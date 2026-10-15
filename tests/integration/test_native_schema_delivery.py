@@ -64,6 +64,7 @@ class SchemaSensitiveProbe(FakeLLMClient):
     async def complete_structured(self, *, messages, response_schema, system=None, **kwargs):
         if "updates" in response_schema["properties"]:
             self._canned_structured = {
+                "updates": [], "questions": [],
                 "reason": "Observation returned; await authorized follow-up",
                 "termination": "held", "resume_conditions": ["Additional premise arrives"],
             }

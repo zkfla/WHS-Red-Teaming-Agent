@@ -171,8 +171,3 @@ async def test_native_worker_corrects_refused_candidate_reference_then_reaches_r
         saved = await service.get_hypothesis(current.hypothesis_id)
         assert saved.status == "confirmed" and saved.revision == 2
         assert await service.list_findings() == []
-
-
-
-
-

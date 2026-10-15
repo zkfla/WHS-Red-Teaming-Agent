@@ -184,4 +184,3 @@ async def test_corrected_candidate_after_feedback_reaches_existing_review(tmp_pa
         receipt = await _receipt(session, second)
         assert receipt.metadata["record_kind"] == "review_receipt"
         assert meaning.review_calls == 1
-
