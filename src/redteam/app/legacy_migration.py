@@ -31,7 +31,12 @@ async def migrated_run_guard(state, *, approval_store=None, audit_store=None, **
 
 
 def original_planning_inputs(deps):
-    """Remove only the versioned central adapter additions for source validation."""
+    """Historical source identity: remove central additions, map legacy schema back.
+
+    Only the legacy investigation planner (schema 4, no probe limits) maps to the
+    schema 2 identity the offline import accepts. Other schemas keep their value and
+    fail the exact hash comparison.
+    """
     from redteam.orchestration.component_binding import RuntimeComponentBinding
     from redteam.orchestration.specialist_planner import specialist_planning_inputs
 
@@ -42,6 +47,8 @@ def original_planning_inputs(deps):
     inputs["components"] = binding.model_copy(update={
         "extension_versions": versions,
     }).model_dump(mode="json")
+    if inputs["schema_version"] == 4 and deps.specialist_policy.probe_limits is None:
+        inputs["schema_version"] = 2
     return inputs
 
 
