@@ -897,8 +897,10 @@ the candidate planner loop through the existing central assembly.
 Tests may also register v2 probes directly through the existing central admission.
 Schema-2 profiles retain their original serialized policy and prompt fingerprints.
 
-The profile's `probe_limits` defaults to four original action submissions and
-eight model request reservations per Task. A proposal may tighten either limit,
+The selected profile provides each Task's `probe_limits`: the default split
+profile currently allows four original action submissions and sixteen model
+request reservations, while the legacy profile uses four and eight. An omitted
+override inherits those limits. A proposal may tighten either limit,
 but cannot exceed the selected profile. Limits are immutable Task input, included
 in its completion purpose hash, while the entire profile participates in the
 existing persisted selection fingerprint. No new queue, ledger or database is
@@ -922,9 +924,13 @@ cannot register another candidate or review an unassigned candidate.
 The worker prompt and native contract allow early inconclusive/blocked return,
 intermediate result publication and an existing independently reviewed short
 completion. Task outcome never automatically settles a candidate or Finding.
-At the admission boundary, code publishes original ToolResult references,
-execution observations and a system-authored limitation without another model
-request. Execution journal/resolution IDs remain in the original execution rows;
+At the physical action cap, new physical admission stops. Local result reads,
+independent review and settlement can continue within the remaining Task and Run
+model budget when no original execution or blocked Task is still held. No model
+or action budget is reset or enlarged. Exhausting model
+budget or encountering a terminal/wait condition publishes original ToolResult
+references, execution observations and a system-authored limitation without
+another model request. Execution journal/resolution IDs remain in the original execution rows;
 they are not substituted for review-facing ToolResult evidence. Safe partial
 work can finish inconclusively. Approval/job/resource/UNKNOWN work remains
 blocked with original ownership and reservations; only the actor slot returns.

@@ -15,7 +15,6 @@ from redteam.core.config import AppConfig, EngagementConfig
 from redteam.core.contracts.completion import CompletionCriterion, criterion_id
 from redteam.core.contracts.execution import ExecutionState
 from redteam.core.enums import ApprovalStatus, TaskStatus, ToolHealthStatus
-from redteam.core.ports.llm import NativeCompletion
 from redteam.llm.fake import FakeLLMClient
 from redteam.orchestration.agents.tool_access import eligible_role_tool_ids
 from redteam.orchestration.central_runtime import ACTOR_RETURNED, ready_workers
@@ -138,7 +137,11 @@ async def test_common_pool_stops_extra_calls_and_isolates_worker_context(tmp_pat
             llm.native_responses_by_task[identity] = [
                 discover(TOOL), turn(inspect("first", account=str(index)),
                                     inspect("excess", account=str(index))),
-                NativeCompletion(text="Must not need another request", total_tokens=1),
+                turn(call("return-observation", "task.settle", {
+                    "outcome": "inconclusive",
+                    "reason": "Return the retained observation without another physical call",
+                    "evidence_ids": [],
+                })),
             ]
         results = await drive(session)
         assert len(results) == 2 and all(item.kind == "completed" for item in results)
@@ -150,12 +153,11 @@ async def test_common_pool_stops_extra_calls_and_isolates_worker_context(tmp_pat
         for identity in ids:
             task = await session.deps.central_state.get_task(identity)
             assert task.status is TaskStatus.COMPLETED and task.result.outcome == "inconclusive"
-            assert "probe_action_limit_exhausted" in task.result.limitations
             usage = await session.deps.central_state.transaction(
                 lambda tx, identity=identity: tx.probe_usage(identity), write=False,
             )
-            assert usage["actions"] == 1 and usage["model_requests"] == 2
-        assert len(llm.requests) == 4
+            assert usage["actions"] == 1 and usage["model_requests"] == 3
+        assert len(llm.requests) == 6
         payloads = [json.loads(item["messages"][-1]["content"]) for item in llm.requests]
         assert all(len(payload["investigation_tasks"]) == 1 for payload in payloads)
         assert {payload["active_task"]["assigned_agent"] for payload in payloads} == {
@@ -269,7 +271,11 @@ async def test_boundaries_preserve_pending_originals_and_resume_exact_calls(tmp_
         after = await session.deps.central_state.transaction(
             lambda tx: tx.probe_usage(identity), write=False,
         )
-        assert before == after and len(llm.requests) == 2
+        # A recovered successful original permits one local completion turn; UNKNOWN
+        # still waits without a request. Neither branch resets or resubmits an action.
+        local_turns = 1 if mode == "approval" else 0
+        assert after == {**before, "model_requests": before["model_requests"] + local_turns}
+        assert len(llm.requests) == 2 + local_turns
 
 
 class ReviewedObservationModel(FakeLLMClient):
@@ -340,7 +346,8 @@ async def test_probe_job_collection_does_not_resubmit_or_reset_limits(tmp_path):
         usage = await session.deps.central_state.transaction(
             lambda tx: tx.probe_usage(identity), write=False,
         )
-        assert usage["actions"] == 1 and usage["model_requests"] == 2
+        # Collection is the original action; the third request consumes its result locally.
+        assert usage["actions"] == 1 and usage["model_requests"] == 3
         assert (await session.deps.central_state.get_task(identity)).status is TaskStatus.COMPLETED
 
 
@@ -410,11 +417,11 @@ async def test_probe_resource_wait_automatically_resumes_original_at_boundary(tm
         assert all(result.kind == "completed" for result in results)
         assert {item.invocation_id for item in final} == {item.invocation_id for item in originals}
         assert all(item.state is ExecutionState.SUCCEEDED for item in final)
-        assert len(tools.inner.invocations) == 2 and len(llm.requests) == 4
+        assert len(tools.inner.invocations) == 2 and len(llm.requests) == 6
         for identity in ids:
             usage = await session.deps.central_state.transaction(
                 lambda tx, identity=identity: tx.probe_usage(identity), write=False,
             )
-            assert usage["actions"] == 1 and usage["model_requests"] == 2
+            assert usage["actions"] == 1 and usage["model_requests"] == 3
             task = await session.deps.central_state.get_task(identity)
             assert task.status is TaskStatus.COMPLETED

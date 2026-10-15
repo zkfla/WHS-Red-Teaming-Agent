@@ -1,8 +1,10 @@
 """Bounded worker input and code-only yield over existing Task/execution rows."""
 
+from typing import Literal
+
 from redteam.core.contracts.graph import Hypothesis
 from redteam.core.contracts.mission import InvestigationResult
-from redteam.core.enums import TaskStatus
+from redteam.core.enums import MissionStatus, TaskStatus
 from redteam.orchestration.central_completion import unsafe
 from redteam.orchestration.central_results import commit_result, result_for
 from redteam.orchestration.central_runtime import runtime_token
@@ -27,11 +29,19 @@ Confirmed/refuted probe results require the existing settlement review. A review
 probe result is not automatically the candidate's verdict or Mission completion.
 When the purpose is already sufficiently tested, the existing review helpers may
 verify it within the remaining shared limits. Never bypass review because a limit ended.
+When probe.physical_cap.budget_available is false, make no new target requests: a further
+physical call is denied without running. budget_available is only the physical action count
+against its limit; it is not authorization, approval, scope, or readiness. Local tools still
+read preserved originals, record grounded observations and settle within the remaining model
+request budget, so a reviewed observation can finish the purpose without another target
+request. When the model request budget is exhausted, code stops and returns preserved
+originals without another model request, retaining pending approvals/jobs/UNKNOWN and their
+original execution identifiers.
 Reusing evidence for another useful, authorized probe is allowed; unknown physical
 calls must not be repeated. Report unexpected directions to the planner instead
-of starting another investigation. Code stops new admission at the probe boundary
-and returns preserved originals without another model request, retaining pending
-approvals/jobs/UNKNOWN and their original execution identifiers.
+of starting another investigation.
+Local continuation past the physical cap happens only when no original is pending,
+waiting, UNKNOWN, held by a job or resource, and the task is not blocked.
 """
 
 
@@ -42,18 +52,49 @@ async def probe_task(deps, runtime):
     return task if task is not None and task.probe_limits is not None else None
 
 
-async def boundary_reason(deps, runtime, *, actions_only=False):
+BoundaryMode = Literal["all", "actions", "model"]
+
+
+async def boundary_reason(deps, runtime, *, mode: BoundaryMode = "all"):
+    """Return the first exhausted probe limit, or None.
+
+    Modes: "all" checks both caps; "actions" checks only the physical cap (the per-dispatch
+    guard before a physical call); "model" is the local-turn check for model and settlement
+    turns. Under "model" the physical cap stops only while an original is still in flight
+    (pending/running/UNKNOWN, a wait, a resource hold, a job, or a BLOCKED task). Otherwise
+    the local turn continues within the remaining model budget. Central admission still
+    rejects any physical call beyond the cap.
+    """
+    if mode not in ("all", "actions", "model"):
+        raise ValueError("unknown probe boundary mode: " + str(mode))
     task = await probe_task(deps, runtime)
     if task is None or task.status is TaskStatus.COMPLETED:
         return None
+    if mode == "model":
+        # A local turn is new admission too: an operator pause or cancel keeps it closed.
+        mission = await deps.central_state.get_mission(task.mission_id)
+        if mission is not None and mission.status in {
+            MissionStatus.PAUSED, MissionStatus.CANCELLED,
+        }:
+            return "operator_stopped"
     used = await deps.central_state.transaction(
         lambda tx: tx.probe_usage(str(task.task_id)), write=False,
     )
-    if used["actions"] >= task.probe_limits.max_actions:
+    if used["actions"] >= task.probe_limits.max_actions and (
+        mode != "model" or await _physical_wait(deps, task)
+    ):
         return "probe_action_limit_exhausted"
-    if not actions_only and used["model_requests"] >= task.probe_limits.max_model_requests:
+    if mode != "actions" and used["model_requests"] >= task.probe_limits.max_model_requests:
         return "probe_model_request_limit_exhausted"
     return None
+
+
+async def _physical_wait(deps, task) -> bool:
+    """Existing execution rows decide whether an original still holds the task open."""
+    if task.status is TaskStatus.BLOCKED:
+        return True
+    executions = await deps.central_state.list_executions(task_id=str(task.task_id))
+    return any(unsafe(item) for item in executions)
 
 
 async def original_records(deps, task):
@@ -148,12 +189,21 @@ async def context_for_probe(deps, runtime, context):
     filtered["evidence_omitted_count"] = max(
         filtered["evidence_count"] - len(filtered.get("evidence", [])), 0,
     )
+    usage = await deps.central_state.transaction(
+        lambda tx: tx.probe_usage(str(task.task_id)), write=False,
+    )
+    limit = task.probe_limits.max_actions
     filtered["probe"] = {
         "candidates": runtime.probe_hypotheses,
         "original_evidence_ids": [str(record.evidence_id) for record in originals],
-        "usage": await deps.central_state.transaction(
-            lambda tx: tx.probe_usage(str(task.task_id)), write=False,
-        ),
+        "usage": usage,
+        # Computed from the same ledger counts; it is not a second stored flag.
+        "physical_cap": {
+            "limit": limit,
+            "used": usage["actions"],
+            "remaining": max(limit - usage["actions"], 0),
+            "budget_available": usage["actions"] < limit,
+        },
         "purpose": task.objective,
         "return_conditions": [item.model_dump(mode="json") for item in task.completion_criteria],
         "result_schema": InvestigationResult.model_json_schema(),
@@ -167,11 +217,13 @@ async def yield_probe(deps, state, reason):
     task = await probe_task(deps, runtime)
     if task is None or task.status is TaskStatus.COMPLETED:
         return state
-    from redteam.core.enums import MissionStatus
-
     mission = await deps.central_state.get_mission(task.mission_id)
     if mission.status in {MissionStatus.PAUSED, MissionStatus.CANCELLED}:
-        return state  # Operator stop never causes new mutation/admission.
+        # Operator stop never causes new mutation/admission; the run ends on the stop reason.
+        stop = (TerminationReason.OPERATOR_PAUSED if mission.status is MissionStatus.PAUSED
+                else TerminationReason.OPERATOR_STOPPED)
+        runtime.termination_reason = runtime.termination_reason or stop
+        return state
     token = await runtime_token(deps, runtime)
     originals = await deps.central_state.list_executions(task_id=str(task.task_id))
     records = await original_records(deps, task)

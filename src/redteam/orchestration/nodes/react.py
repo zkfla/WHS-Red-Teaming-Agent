@@ -405,7 +405,7 @@ async def model_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     )
 
     probe = await probe_task(deps, runtime)
-    boundary = await boundary_reason(deps, runtime)
+    boundary = await boundary_reason(deps, runtime, mode="model")
     if boundary:
         return await yield_probe(deps, state, boundary)
     reason = runtime.termination_reason or _hard_stop(runtime, deps)
@@ -748,7 +748,7 @@ async def tools_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             previous = (await deps.central_state.get_execution(
                 str(call.dispatch.invocation.invocation_id)
             ) if call.dispatch.invocation is not None else None)
-            boundary = await boundary_reason(deps, state["runtime"], actions_only=True)
+            boundary = await boundary_reason(deps, state["runtime"], mode="actions")
             if previous is None and boundary:
                 call.feedback = {"ok": False, "executed": False, "reason_code": boundary}
                 call.completed = True
@@ -773,7 +773,7 @@ async def settle_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     runtime = state["runtime"]
     from redteam.orchestration.probes import boundary_reason, yield_probe
 
-    boundary = await boundary_reason(deps, runtime)
+    boundary = await boundary_reason(deps, runtime, mode="model")
     if boundary or runtime.termination_reason:
         state = await yield_probe(deps, state, boundary or runtime.termination_reason)
     outcome = state.get("native_outcome")

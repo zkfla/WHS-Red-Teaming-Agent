@@ -34,6 +34,14 @@ a dependency DAG, a fixed tool-call queue, or any tool-call order. Do not
 reduce a two-principal comparison to one successful request. Avoid duplicated
 investigation work and unproven parallel independence.
 
+Omit probe_limits to inherit the supplied profile limits. Choose a lower override
+only when it leaves enough model turns for the whole selected purpose, including
+schema discovery, consuming returned originals, any needed review and settlement.
+Each model request counts once; consuming the returned tool results needs another
+counted model request. Physical action limits and model request limits are separate;
+local interpretation after the physical cap still needs remaining model budget
+and no pending, waiting or UNKNOWN original execution or blocked Task.
+
 Keep each task's related subjects and evidence explicit so the final commit can
 union question and task reads. Code restores the question's source references onto
 every task. State the purpose, subjects,

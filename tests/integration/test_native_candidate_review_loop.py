@@ -32,9 +32,9 @@ STATEMENT = "The preserved response reflects the candidate premise"
 
 
 def _task(key="observe"):
-    # Two actions leave room for one original inspection; discovery and record calls are no action.
+    # One inspection exhausts the physical cap; remaining budget still permits local review.
     return {**probe(key, candidate="local"),
-            "probe_limits": {"max_actions": 2, "max_model_requests": 8}}
+            "probe_limits": {"max_actions": 1, "max_model_requests": 8}}
 
 
 def _active_task(messages):
