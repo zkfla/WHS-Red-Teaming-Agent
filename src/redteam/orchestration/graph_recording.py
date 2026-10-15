@@ -371,6 +371,57 @@ def _address_candidate_ids(value: str, *, base_url: str | None) -> set[str]:
     return ids
 
 
+_PROBE_HYPOTHESES_SUMMARY = (
+    "Probe calls cannot register candidate proposals; no items recorded"
+)
+_PROBE_HYPOTHESES_REPAIR = (
+    "Omit restated candidates and cite only admitted Task hypothesis_revisions in findings; "
+    "return genuinely new candidates through existing Task feedback for Planner."
+)
+_PROBE_FINDING_SUMMARY = "Finding cites no admitted candidate; no items recorded"
+_PROBE_FINDING_REPAIR = (
+    "Cite only an admitted candidate whose intent matches the claim, or return the claim "
+    "as feedback when none is assigned. Resubmit the complete recording after correction."
+)
+
+
+def _probe_candidate_refusal(
+    recording: GraphRecordingInput, *, admitted: Any
+) -> DecisionDiagnostic | None:
+    """Whole-call refusal for candidate use during a probe. Writes nothing.
+
+    Proposals are never recorded. Each finding must cite one admitted candidate,
+    compared after the same strip used when the finding is written. Diagnostics
+    carry only fixed text and JSON pointers, never the cited value.
+    """
+    if recording.hypotheses:
+        return DecisionDiagnostic(
+            code="probe_candidate_change_requires_planner", stage="native_local_tool",
+            kind="validation", retryable=False, cause_scope="model_input",
+            owner="graphrecording", location="$.hypotheses",
+            summary=_PROBE_HYPOTHESES_SUMMARY, repair_condition=_PROBE_HYPOTHESES_REPAIR,
+        )
+    issues: list[dict[str, str]] = []
+    for index, item in enumerate(recording.findings):
+        assigned = (item.hypothesis_id or "").strip()
+        if assigned and assigned in admitted:
+            continue
+        rule = (
+            "required_admitted_candidate_id" if not assigned
+            else "admitted_candidate_id_in_hypothesis_revisions"
+        )
+        issues.append({"rule": rule, "location": f"$.findings[{index}].hypothesis_id"})
+    if not issues:
+        return None
+    return DecisionDiagnostic(
+        code="probe_finding_candidate_reference", stage="native_local_tool",
+        kind="validation", retryable=True, cause_scope="model_input",
+        owner="graphrecording", location=issues[0]["location"],
+        summary=_PROBE_FINDING_SUMMARY, repair_condition=_PROBE_FINDING_REPAIR,
+        validation_issues=issues[:10],
+    )
+
+
 class GraphRecordingHandler:
     """Ground and write one recording call. No independent budget.
 
@@ -869,19 +920,13 @@ class GraphRecordingHandler:
         active_task_id = getattr(runtime, "active_task_id", None)
         task = (await state.get_task(str(active_task_id))
                 if state is not None and active_task_id else None)
-        if task is not None and task.probe_limits is not None and (
-            recording.hypotheses or any(
-                item.hypothesis_id not in task.hypothesis_revisions for item in recording.findings
-            )
-        ):
-            diagnostic = DecisionDiagnostic(
-                code="probe_candidate_change_requires_planner", stage="native_local_tool",
-                kind="validation", retryable=False,
-                summary="Return new candidate proposals as feedback. Only admitted candidates "
-                        "may use claim review during this probe.",
-            )
-            return LocalToolResult(ok=False, error=diagnostic.feedback(),
-                                   payload={"diagnostic": diagnostic.model_dump(mode="json")})
+        if task is not None and task.probe_limits is not None:
+            probe_refusal = _probe_candidate_refusal(recording, admitted=task.hypothesis_revisions)
+            if probe_refusal is not None:
+                return LocalToolResult(
+                    ok=False, error=probe_refusal.feedback(),
+                    payload={"diagnostic": probe_refusal.model_dump(mode="json")},
+                )
         service = self._graph
         if service is None:
             graph_store = getattr(getattr(context, "deps", None), "graph_store", None)
@@ -1402,7 +1447,8 @@ def graph_recording_descriptor() -> LocalToolDescriptor:
             "explicit finding or execution verification; findings run "
             "posthoc review plus promotion here. A finding with a hypothesis_id and "
             "grounded retained evidence_refs can request an independent review receipt "
-            "when a verifier and review budget are available. The receipt is bound to the "
+            "when a verifier and review budget are available. During a probe the candidate "
+            "must be admitted in the Task hypothesis_revisions. The receipt is bound to the "
             "candidate revision and purpose, without another target call; UNKNOWN remains "
             "unresolved. Task completion receipts are not candidate reviews. "
             "Shell streams and exit codes are program "
@@ -1411,7 +1457,7 @@ def graph_recording_descriptor() -> LocalToolDescriptor:
         ),
         input_schema=GraphRecordingInput.model_json_schema(),
         contribution_id=GRAPH_RECORD_CONTRIBUTION_ID,
-        version="4",
+        version="5",
     )
 
 
@@ -1439,6 +1485,6 @@ def graph_recording_contribution() -> Contribution:
 
     return runtime_tool_contribution(
         contribution_id=GRAPH_RECORD_CONTRIBUTION_ID,
-        version="4",
+        version="5",
         factory=factory,
     )

@@ -245,7 +245,9 @@ async def test_out_of_purpose_probe_is_refused_before_review_or_writes(tmp_path,
             }]}
         result = await handler(tool_input, LocalToolContext(session.deps, worker))
         assert not result.ok
-        assert result.payload["diagnostic"]["code"] == "probe_candidate_change_requires_planner"
+        expected = ("probe_candidate_change_requires_planner" if shape == "new_proposal"
+                    else "probe_finding_candidate_reference")
+        assert result.payload["diagnostic"]["code"] == expected
         assert meaning.review_calls == 0
         assert await _receipts(session) == []
         assert await service.list_findings() == []
