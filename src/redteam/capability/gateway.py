@@ -229,7 +229,10 @@ class MCPToolGateway:
             raise ValueError("execution_reference_operation_mismatch")
         bound = self._bind_invocation(invocation, descriptor, adapter)
         if isinstance(bound, ToolResult):
-            raise ValueError("execution_reference_context_invalid")
+            # No provider entry is possible for this rejected input. Leave it
+            # handle-less so ordinary invoke returns the structured error to
+            # the worker, rather than aborting submission before that reply.
+            return None
         reference = adapter.prepare_reference(bound)
         if reference is not None:
             expected = {

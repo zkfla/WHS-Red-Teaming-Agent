@@ -65,6 +65,7 @@ def _run_input_schema(policy: ShellWorkroomPolicy | None) -> dict:
         "properties": {
             "workroom_key": {
                 "type": "string",
+                "readOnly": True,
                 "minLength": 1,
                 "maxLength": 128,
                 "pattern": WORKROOM_KEY_PATTERN,
@@ -111,6 +112,7 @@ def _job_input_schema() -> dict:
         "properties": {
             "workroom_key": {
                 "type": "string",
+                "readOnly": True,
                 "minLength": 1,
                 "maxLength": 128,
                 "pattern": WORKROOM_KEY_PATTERN,
@@ -330,6 +332,8 @@ def _check_key_pattern(descriptor) -> None:
         raise ValueError("shell descriptor is missing the workroom_key property") from None
     if not isinstance(prop, dict) or prop.get("pattern") != WORKROOM_KEY_PATTERN:
         raise ValueError("shell descriptor carries an unexpected workroom_key pattern")
+    if prop.get("readOnly") is not True:
+        raise ValueError("shell descriptor must keep workroom_key server-bound")
     required = descriptor.input_schema.get("required", [])
     if "workroom_key" in required:
         raise ValueError("shell descriptor must not require workroom_key")

@@ -21,7 +21,7 @@ from redteam.core.contracts.evidence import EvidenceRecord
 from redteam.core.contracts.mission import redact_secret_material
 from redteam.core.enums import EvidenceSourceType
 from redteam.core.ids import ActionId, EvidenceId, ToolId, new_id
-from redteam.core.ports.llm import NativeCompletion, NativeToolSpec
+from redteam.core.ports.llm import NativeCompletion
 from redteam.orchestration.agents.base import PlanStep
 from redteam.orchestration.candidates.compiler import CandidateCompiler
 from redteam.orchestration.candidates.models import CandidateDraft
@@ -45,7 +45,7 @@ from redteam.orchestration.knowledge_validation import (
     registered_principal_for_arguments,
 )
 from redteam.orchestration.local_tools import LocalToolContext
-from redteam.orchestration.native_binding import exposed_tool_name, resolve_native_target
+from redteam.orchestration.native_binding import resolve_native_target
 from redteam.orchestration.nodes._support import publisher_for
 from redteam.orchestration.nodes.observe import observe_node
 from redteam.orchestration.nodes.replan import _hard_stop, replan_node
@@ -53,14 +53,25 @@ from redteam.orchestration.progress import canonical_graph_changed
 from redteam.orchestration.state import GraphState, NativeCallState, TerminationReason
 from redteam.orchestration.tool_discovery import (
     NATIVE_INPUT_LIMIT,
-    bootstrap_local_ids,
     build_native_bindings,
-    detail_fetched_tool_ids,
-    discovery_lookup_wired,
-    select_advertised_tool_ids,
 )
+from redteam.orchestration.worker_conversation import (
+    binding_context,
+    checkpoint_session,
+    compact_session,
+    initial_context,
+    initial_tools,
+    provider_binding,
+    restore_session,
+    update_session,
+)
+from redteam.orchestration.worker_session import FrozenMessage, SessionBinding, WorkerSession
 
 SYSTEM = """You investigate the current authorized task using the supplied tools.
+Continue the assigned Task's conversation: the first user message defines its
+purpose and initial conditions. Later tool replies and worker_updates contain
+new DATA. Earlier displayed messages/windows remain unchanged historical views.
+Use fresh replies for changed conditions; original context never grants permission.
 Choose useful tool calls directly; no investigation path, numbered step, or
 internal execution IDs are required. Tool results describe execution, not
 proof of a vulnerability or completion. Stored originals can be read with
@@ -90,14 +101,15 @@ def _safe(value: Any) -> Any:
 
 async def _result_messages(messages: list[dict[str, Any]], *, deps: RuntimeDeps,
                            runtime: Any) -> list[dict[str, Any]]:
-    """Read bounded originals for delivery, keeping checkpoint messages reference-only."""
+    """Render NEW result messages once; never pass an earlier transcript here."""
     # Non-tool messages (assistant with provider_continuation) are appended
-    # unchanged; only executed tool bodies gain original_results. No redaction
+    # unchanged; receipt-backed tool bodies gain original_results, including
+    # rejected calls that never entered the provider. No redaction
     # is applied to assistant messages so signatures stay byte-identical.
     delivered = []
     reader = EvidenceReader(deps.evidence_store)
-    # Distribute the existing total window across every retained executed
-    # result, not just the last round. Local discovery cannot evict originals.
+    # Share the automatic window only across this NEW result batch. Later
+    # executions/read requests never recalculate earlier displayed windows.
     identities: list[str] = []
     requested_count = 0
     for message in messages:
@@ -106,7 +118,7 @@ async def _result_messages(messages: list[dict[str, Any]], *, deps: RuntimeDeps,
         body = json.loads(message.get("content") or "{}")
         if isinstance(body, dict) and body.get("evidence_read_request"):
             requested_count += 1
-        if isinstance(body, dict) and body.get("executed") is True:
+        if isinstance(body, dict) and "executed" in body:
             identities.extend(str(ref) for ref in body.get("evidence_ids", []))
     identities = list(dict.fromkeys(identities))
     per_original = min(4000, DEFAULT_CONTEXT_CHARS // max(1, len(identities) + requested_count))
@@ -123,6 +135,9 @@ async def _result_messages(messages: list[dict[str, Any]], *, deps: RuntimeDeps,
             continue
         body = json.loads(message.get("content") or "{}")
         if isinstance(body, dict) and body.get("evidence_read_request"):
+            if isinstance(body.get("payload"), dict) and "text" in body["payload"]:
+                delivered.append(message)  # Preserve the actual read, not a second read.
+                continue
             request = EvidenceReadRequest.model_validate(body["evidence_read_request"])
             request = request.model_copy(update={"limit": min(request.limit, per_original)})
             window = await reader.read(
@@ -135,7 +150,7 @@ async def _result_messages(messages: list[dict[str, Any]], *, deps: RuntimeDeps,
                 {**body, "payload": _safe(window)}, ensure_ascii=False,
             )})
             continue
-        if not isinstance(body, dict) or body.get("executed") is not True:
+        if not isinstance(body, dict) or "executed" not in body:
             delivered.append(message)
             continue
         windows = []
@@ -151,54 +166,6 @@ async def _result_messages(messages: list[dict[str, Any]], *, deps: RuntimeDeps,
             ensure_ascii=False,
         )})
     return delivered
-
-
-def _message_history(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Trim complete conversation rounds, anchored on user turns.
-    # Slicing only; assistant provider_continuation blocks ride along untouched.
-
-    Every stored round is: user context, then assistant, then tool
-    results (the user context message is persisted now). Slicing at a
-    user boundary keeps each assistant tool_calls message paired with
-    its tool results and keeps the provider-facing sequence user-first;
-    slicing at an assistant boundary could start the request with an
-    assistant turn, which some providers reject as an invalid sequence.
-    """
-    user_starts = [index for index, message in enumerate(messages) if message.get("role") == "user"]
-    if not user_starts:
-        return messages
-    keep_from = user_starts[-12] if len(user_starts) > 12 else user_starts[0]
-    return messages[keep_from:]
-
-
-_CONTEXT_OMITTED = (
-    "Earlier context snapshot omitted; the newest user message carries the "
-    "current run state, and earlier tool results remain in this conversation."
-)
-
-
-def _compact_context_messages(
-    messages: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Keep one full state snapshot per request.
-    # Assistant and tool messages (including provider_continuation) pass through
-    # by reference; only user snapshots are replaced. No redaction here.
-
-    Every user message is a complete engine context snapshot, and each new
-    snapshot already contains the cumulative state; older copies are
-    therefore near-duplicates that made the request grow to hundreds of
-    kilobytes. They are replaced by a short placeholder while the newest
-    snapshot (appended by the caller right after this) stays whole. The
-    assistant/tool action history is untouched, so call pairing and the
-    provider-required user-first order are preserved.
-    """
-    compacted: list[dict[str, Any]] = []
-    for message in messages:
-        if message.get("role") == "user" and message.get("content") != _CONTEXT_OMITTED:
-            compacted.append({**message, "content": _CONTEXT_OMITTED})
-        else:
-            compacted.append(message)
-    return compacted
 
 
 def _native_purpose_text(runtime: Any, task: dict[str, Any]) -> str:
@@ -394,12 +361,12 @@ def _echo_provider_continuation(response: Any) -> list[dict[str, Any]] | None:
     return copy.deepcopy(list(validated))
 
 
-async def model_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
+async def prepare_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
+    """Commit the selected first display/generation BEFORE provider dispatch."""
     runtime = state["runtime"]
     from redteam.orchestration.probes import (
         PROBE_SYSTEM,
         boundary_reason,
-        context_for_probe,
         probe_task,
         yield_probe,
     )
@@ -421,107 +388,100 @@ async def model_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     if runtime.termination_reason:
         return state
     engine = InvestigationEngine(deps)
-    budget = engine.begin_native_turn(runtime)
-    before_usage = (
-        runtime.model_requests_used,
-        runtime.model_tokens_used,
-        runtime.model_usage_unknown,
-    )
+    engine.begin_native_turn(runtime)
     try:
-        context = await engine.context(runtime, state.get("observation"))
-        context = await context_for_probe(deps, runtime, context)
-        # Strategy artifacts may be consulted voluntarily. They are not the
-        # execution contract and are not repeated as mandatory model fields.
-        context.pop("evidence_read_contract", None)
-        context.pop("execution_options", None)
-        # The local tool schemas already travel through the native tools
-        # parameter; the duplicate context copy is not sent again.
-        context.pop("local_tools", None)
-        context.pop("tools", None)
-        # Bindings cover every role-eligible catalog name plus every local
-        # helper, so validation and execution still resolve a direct call to
-        # an already-registered name. Only the advertised provider set is
-        # sized: declared local helpers always, the complete eligible catalog
-        # when it fits, otherwise explicitly fetched schemas via discovery.
-        local_descriptors = list(deps.local_tools.descriptors())
-        local_ids = [str(item.tool_id) for item in local_descriptors]
-        eligible_ids: list[str] = []
-        for role_tools in context.get("tools_by_role", {}).values():
-            for identity in role_tools:
-                if str(identity) not in eligible_ids:
-                    eligible_ids.append(str(identity))
-        bindings = build_native_bindings(catalog_tool_ids=eligible_ids, local_tool_ids=local_ids)
-        history = _compact_context_messages(list(state.get("native_messages", [])))
-        fetched_ids = detail_fetched_tool_ids(history, bindings=bindings)
-        wired = discovery_lookup_wired(local_ids)
-        if wired:
-            always = set(bootstrap_local_ids(local_descriptors))
-            local_pool = set(local_ids)
-            always.update(str(item.tool_id) for item in local_descriptors if item.initial_exposure)
-            wanted_locals = always | {name for name in fetched_ids if name in local_pool}
-            exposed_locals = [
-                item for item in local_descriptors if str(item.tool_id) in wanted_locals
-            ]
-            advertised_ids = select_advertised_tool_ids(
-                eligible_ids=eligible_ids, fetched_ids=fetched_ids, local_tool_ids=local_ids
-            )
-        else:
-            # No lookup path exists for the model in this run, so advertise
-            # every local helper and eligible tool instead of stranding it
-            # without schemas. Registration, role eligibility, and Control
-            # gating are unchanged.
-            exposed_locals = local_descriptors
-            advertised_ids = list(eligible_ids)
-        tools: list[NativeToolSpec] = []
-        for descriptor in exposed_locals:
-            tools.append(
-                NativeToolSpec(
-                    name=exposed_tool_name(descriptor.tool_id),
-                    description=descriptor.description,
-                    input_schema=descriptor.input_schema,
-                )
-            )
-        catalog_specs = []
-        catalog = deps.tool_catalog
-        for identity in eligible_ids:
-            advertised = catalog.get(ToolId(identity)) if catalog else None
-            if advertised is not None:
-                catalog_specs.append(NativeToolSpec(
-                    name=exposed_tool_name(identity),
-                    description=str(advertised.description or identity),
-                    input_schema=advertised.input_schema or {"type": "object"},
-                ))
-        user_message = {
-            "role": "user",
-            "content": json.dumps(_safe(context), ensure_ascii=False),
-        }
-        # The user context is persisted with the assistant turn: the stored
-        # history keeps complete user -> assistant -> tool rounds, so the
-        # next request never starts with an assistant turn (providers
-        # reject that) and the model keeps the context its call answered.
-        # Older snapshots are compacted to placeholders: only the newest
-        # snapshot stays whole, which keeps the request bounded while every
-        # action and its result remain in the conversation.
-        messages = [*await _result_messages(history, deps=deps, runtime=runtime), user_message]
         system = SYSTEM + PROBE_SYSTEM if probe else SYSTEM
         role_id = str(runtime.current_agent) if runtime.current_agent is not None else None
         composed_system = (deps.agent_prompts.compose("native_action", system, role_id=role_id)
                            if deps.agent_prompts else system)
-        # Measure complete schemas/descriptions plus mandatory locals, history,
-        # observation windows, current context and the composed trusted prompt.
-        # Never select an arbitrary subset of unfetched catalog tools.
-        if NATIVE_INPUT_LIMIT.fits(messages=messages, tools=[*tools, *catalog_specs],
-                                   system=composed_system):
-            tools.extend(catalog_specs)
+        if state.get("worker_session") is None:
+            if state.get("native_messages"):
+                raise DecisionRuleError("Legacy history requires explicit session migration.",
+                                        code="worker_session_legacy_checkpoint")
+            context = await initial_context(deps, runtime, engine, state.get("observation"))
+            first_message = {"role": "user", "content": json.dumps(
+                context, ensure_ascii=False,
+            )}
+            if not NATIVE_INPUT_LIMIT.fits(messages=[first_message], tools=[],
+                                           system=composed_system):
+                raise DecisionRuleError("Initial task context exceeds the native input bound.",
+                                        code="native_input_limit_exceeded", location="input")
+            first = FrozenMessage.capture(first_message,
+                                          max_content_chars=NATIVE_INPUT_LIMIT.max_bytes)
+            tools = initial_tools(deps, context, messages=[first.message()], system=composed_system,
+                                  input_limit=NATIVE_INPUT_LIMIT)
+            task = await deps.central_state.get_task(str(runtime.active_task_id))
+            if task is None:
+                raise DecisionRuleError("The assigned Task is missing.", code="probe_task_missing")
+            session = WorkerSession(
+                binding=SessionBinding.capture(runtime, task, system=composed_system, tools=tools,
+                                               provider_binding=provider_binding(deps)),
+                system=system, tools_json=json.dumps([asdict(tool) for tool in tools]),
+                initial_tool_count=len(tools),
+            ).append(first)
         else:
-            wanted_names = {exposed_tool_name(identity) for identity in advertised_ids}
-            tools.extend(spec for spec in catalog_specs if spec.name in wanted_names)
+            context = await binding_context(deps, runtime)
+            task = await deps.central_state.get_task(str(runtime.active_task_id))
+            if task is None:
+                raise DecisionRuleError("The assigned Task is missing.", code="probe_task_missing")
+            session = restore_session(state, deps=deps, runtime=runtime, task=task,
+                                      system=system, composed_system=composed_system,
+                                      allow_purpose_change=not state.get("native_calls"))
+            if session.binding.purpose_hash != completion_contract_hash(task):
+                session = await compact_session(
+                    session, deps=deps, runtime=runtime, engine=engine,
+                    observation=state.get("observation"), task=task,
+                    composed_system=composed_system, input_limit=NATIVE_INPUT_LIMIT,
+                    reason="purpose_changed", pending_calls=state.get("native_calls", []),
+                )
+        session = await update_session(session, deps=deps, runtime=runtime, context=context)
+        checkpoint_session(state, session)
+        messages, tools = session.conversation(), session.tools()
         if not NATIVE_INPUT_LIMIT.fits(messages=messages, tools=tools, system=composed_system):
-            raise DecisionRuleError(
-                "The native request exceeds the bounded input envelope; reduce the context "
-                "or selected contract size before resuming. No model request was dispatched.",
-                code="native_input_limit_exceeded", location="input",
+            session = await compact_session(
+                session, deps=deps, runtime=runtime, engine=engine,
+                observation=state.get("observation"), task=task,
+                composed_system=composed_system, input_limit=NATIVE_INPUT_LIMIT,
+                reason="input_limit", pending_calls=state.get("native_calls", []),
             )
+            checkpoint_session(state, session)
+    except (DecisionFailure, ReasoningHalted, ValueError, TypeError) as exc:
+        _native_failure(state, exc)
+    return {**state, "runtime": runtime}
+
+
+async def model_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
+    # Standalone callers retain the existing entry API. The actual graph always
+    # checkpoints prepare_node first, including on subsequent generation changes.
+    if state.get("worker_session") is None and not state["runtime"].termination_reason:
+        state = await prepare_node(state, deps=deps)
+    runtime = state["runtime"]
+    if runtime.termination_reason:
+        return state
+    engine = InvestigationEngine(deps)
+    budget = engine.begin_native_turn(runtime)
+    before_usage = (runtime.model_requests_used, runtime.model_tokens_used,
+                    runtime.model_usage_unknown)
+    try:
+        from redteam.orchestration.probes import PROBE_SYSTEM, probe_task
+
+        system = SYSTEM + PROBE_SYSTEM if await probe_task(deps, runtime) else SYSTEM
+        role_id = str(runtime.current_agent) if runtime.current_agent is not None else None
+        composed_system = (deps.agent_prompts.compose("native_action", system, role_id=role_id)
+                           if deps.agent_prompts else system)
+        context = await binding_context(deps, runtime)
+        task = await deps.central_state.get_task(str(runtime.active_task_id))
+        session = restore_session(state, deps=deps, runtime=runtime, task=task,
+                                  system=system, composed_system=composed_system)
+        messages, tools = session.conversation(), session.tools()
+        if not NATIVE_INPUT_LIMIT.fits(messages=messages, tools=tools, system=composed_system):
+            raise DecisionRuleError("The prepared envelope exceeds the current input bound.",
+                                    code="native_input_limit_exceeded", location="input")
+        bindings = build_native_bindings(
+            catalog_tool_ids=[identity for ids in context["tools_by_role"].values()
+                              for identity in ids],
+            local_tool_ids=[str(item.tool_id) for item in deps.local_tools.descriptors()],
+        )
         response = await engine.client.ask_native(
             messages=messages,
             tools=tools,
@@ -600,32 +560,13 @@ async def model_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             if call.completed or call.dispatch is not None:
                 call.arguments = None
         state["native_calls"] = calls
-        checkpoint_context = dict(context)
-        if isinstance(context.get("requested_evidence"), list):
-            checkpoint_context["requested_evidence"] = [
-                {**{key: value for key, value in view.items()
-                    if key not in {"text", "program_output"}},
-                 "text_omitted": True, "program_output_omitted": "program_output" in view}
-                for view in context["requested_evidence"]
-            ]
-        checkpoint_message = {**user_message, "content": json.dumps(
-            _safe(checkpoint_context), ensure_ascii=False,
-        )}
-        state["native_messages"] = [*history, checkpoint_message, assistant]
+        checkpoint_session(state, session.append(FrozenMessage.capture(
+            assistant, max_content_chars=NATIVE_INPUT_LIMIT.max_bytes,
+        )))
         state["native_final_text"] = None if calls else (public_text or None)
         state["native_outcome"] = None
     except (DecisionFailure, ReasoningHalted, ValueError, TypeError) as exc:
-        diagnostic = diagnostic_for_exception(exc, stage="native_action")
-        runtime.planning_diagnostic = diagnostic
-        runtime.planning_diagnostic_history = [*runtime.planning_diagnostic_history, diagnostic][
-            -10:
-        ]
-        runtime.termination_reason = (
-            runtime.termination_reason or diagnostic.termination_reason
-            or TerminationReason.PLANNING_ERROR
-        )
-        runtime.planning_error = None if diagnostic.termination_reason else type(exc).__name__
-        state["native_calls"] = []
+        _native_failure(state, exc)
     finally:
         runtime.model_requests_used = before_usage[0] + budget.used
         runtime.model_tokens_used = before_usage[1] + budget.tokens_used
@@ -633,8 +574,39 @@ async def model_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     return {**state, "runtime": runtime}
 
 
-async def _local_call(call: NativeCallState, state: GraphState, *, deps: RuntimeDeps) -> None:
+def _native_failure(state, exc):
     runtime = state["runtime"]
+    diagnostic = diagnostic_for_exception(exc, stage="native_action")
+    runtime.planning_diagnostic = diagnostic
+    runtime.planning_diagnostic_history = [*runtime.planning_diagnostic_history, diagnostic][-10:]
+    runtime.termination_reason = (runtime.termination_reason or diagnostic.termination_reason
+                                  or TerminationReason.PLANNING_ERROR)
+    runtime.planning_error = None if diagnostic.termination_reason else type(exc).__name__
+    state["native_calls"] = []
+
+
+async def _local_call(call: NativeCallState, state: GraphState, *, deps: RuntimeDeps) -> None:
+    from redteam.orchestration.native_local_recovery import (
+        call_binding,
+        prior_result,
+        record_submission,
+    )
+
+    runtime = state["runtime"]
+    binding = call_binding(state, call)
+    try:
+        previous = await prior_result(deps, runtime, call, binding)
+    except DecisionRuleError as exc:
+        runtime.planning_diagnostic = exc.diagnostic
+        runtime.termination_reason = TerminationReason.INVESTIGATION_HELD
+        return
+    if previous is not None:
+        call.feedback, call.evidence_ids = previous.metadata["result"], [str(previous.evidence_id)]
+        call.arguments, call.completed = None, True
+        state["native_outcome"] = (call.feedback.get("runtime_outcome")
+                                   or state.get("native_outcome"))
+        return
+    await record_submission(deps, runtime, call, binding)
     engine = InvestigationEngine(deps)
     budget = engine.begin_native_turn(runtime)
     before_usage = (
@@ -656,13 +628,6 @@ async def _local_call(call: NativeCallState, state: GraphState, *, deps: Runtime
             ),
         )
         call.feedback = _safe(asdict(result))
-        if result.evidence_read_request is not None:
-            # A source request plus metadata is enough to restore the window.
-            # _result_messages delivers it transiently on the next model request.
-            call.feedback["payload"].pop("text", None)
-            if call.feedback["payload"].pop("program_output", None) is not None:
-                call.feedback["payload"]["program_output_omitted"] = True
-            call.feedback["payload"]["text_omitted"] = True
         if result.last_event_id is not None:
             state["last_event_id"] = result.last_event_id
         if result.ok:
@@ -699,6 +664,9 @@ async def _local_call(call: NativeCallState, state: GraphState, *, deps: Runtime
             "result": call.feedback,
         }
     )
+    # Preserve opaque call IDs and their binding; neither contains public text.
+    payload["model_tool_call_id"] = call.call_id
+    payload["call_binding"] = binding
     identity = EvidenceId(new_id("evidence"))
     await deps.evidence_store.append(
         EvidenceRecord(
@@ -725,6 +693,7 @@ async def tools_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
 
     calls = [call.model_copy(deep=True) for call in state.get("native_calls", [])]
     state = {**state, "native_calls": calls}
+    await restore_completed_calls(state, deps=deps)
     for call in calls:
         if call.completed or state["runtime"].termination_reason:
             continue
@@ -757,14 +726,77 @@ async def tools_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     for call in calls:
         if call.completed:
             call.arguments, call.dispatch = None, None
-    if all(call.completed for call in calls):
-        state["native_messages"] = _message_history([
-            *state.get("native_messages", []),
+    return await append_completed_results(state, deps=deps)
+
+
+async def restore_completed_calls(state, *, deps):
+    """Read verified canonical outcomes after a checkpoint lag; never submit."""
+    from redteam.orchestration.central_completion import unsafe
+    from redteam.orchestration.native_local_recovery import call_binding, prior_result
+
+    runtime = state["runtime"]
+    for call in state.get("native_calls", []):
+        if call.completed:
+            continue
+        if call.dispatch is None:
+            try:
+                prior = await prior_result(deps, runtime, call, call_binding(state, call))
+            except DecisionRuleError:
+                continue  # Preserve unresolved local submission; _local_call will hold.
+            if prior is not None:
+                call.feedback = prior.metadata["result"]
+                call.evidence_ids = [str(prior.evidence_id)]
+                call.completed, call.arguments = True, None
+                state["native_outcome"] = (call.feedback.get("runtime_outcome")
+                                           or state.get("native_outcome"))
+        elif call.dispatch.invocation is not None:
+            prior = await deps.central_state.get_execution(
+                str(call.dispatch.invocation.invocation_id),
+            )
+            if prior is not None and not unsafe(prior):
+                from redteam.core.contracts.execution import ExecutionState
+                from redteam.orchestration.central_state import (
+                    check_evidence,
+                    check_execution_receipt,
+                )
+
+                if prior.result_evidence_id:
+                    checked, = await check_evidence(deps.evidence_store,
+                        run_id=str(runtime.run_id), engagement_id=str(runtime.engagement_id),
+                        evidence_ids=[str(prior.result_evidence_id)])
+                    check_execution_receipt(prior, checked.record, result=True)
+                call.feedback = {"ok": prior.state is ExecutionState.SUCCEEDED,
+                                 "executed": prior.state is not ExecutionState.CANCELLED,
+                                 "restored": True}
+                call.evidence_ids = ([str(prior.result_evidence_id)]
+                                     if prior.result_evidence_id else [])
+                call.completed, call.arguments, call.dispatch = True, None, None
+    return state
+
+
+async def append_completed_results(state, *, deps):
+    calls = state.get("native_calls", [])
+    if calls and all(call.completed for call in calls):
+        new_results = [
             *({"role": "tool", "tool_call_id": call.call_id,
                "content": json.dumps({**call.feedback, "evidence_ids": call.evidence_ids})}
               for call in calls),
-        ])
+        ]
+        if state.get("worker_session") is not None:
+            session = WorkerSession.model_validate_json(json.dumps(state["worker_session"]))
+            session = session.model_copy(update={"status": "open", "wait_reason": None})
+            delivered = await _result_messages(new_results, deps=deps, runtime=state["runtime"])
+            checkpoint_session(state, session.append(*(FrozenMessage.capture(
+                message, max_content_chars=NATIVE_INPUT_LIMIT.max_bytes,
+            ) for message in delivered)))
+        else:
+            state["native_messages"] = [*state.get("native_messages", []), *new_results]
         state["native_calls"] = []
+    elif state.get("worker_session") is not None:
+        session = WorkerSession.model_validate_json(json.dumps(state["worker_session"]))
+        checkpoint_session(state, session.model_copy(update={
+            "status": "waiting", "wait_reason": state["runtime"].termination_reason or "execution",
+        }))
     return state
 
 
@@ -787,4 +819,20 @@ async def settle_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             "investigation_finished": TerminationReason.MISSION_BLOCKED,
             "investigation_held": TerminationReason.INVESTIGATION_HELD,
         }[outcome]
+    if state.get("worker_session") is not None:
+        from redteam.core.enums import TaskStatus
+
+        session = WorkerSession.model_validate_json(json.dumps(state["worker_session"]))
+        task = await deps.central_state.get_task(session.binding.task_id)
+        executions = await deps.central_state.list_executions(task_id=session.binding.task_id)
+        from redteam.orchestration.central_completion import unsafe
+
+        unresolved = bool(state.get("native_calls")) or any(unsafe(item) for item in executions)
+        if (task is not None and task.status in {TaskStatus.COMPLETED, TaskStatus.CANCELLED}
+                and not unresolved):
+            session = session.model_copy(update={"status": "closed", "wait_reason": None})
+        elif runtime.termination_reason:
+            session = session.model_copy(update={"status": "waiting",
+                                                  "wait_reason": runtime.termination_reason})
+        checkpoint_session(state, session)
     return await replan_node(state, deps=deps)

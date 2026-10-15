@@ -5,6 +5,15 @@ import { badge } from "./ui.js";
 
 const rows = (pairs) => h("dl", { class: "gdl" }, pairs.flatMap(([k, v]) => [h("dt", { text: k }), h("dd", { text: v === null || v === undefined || v === "" ? UNKNOWN : String(v) })]));
 
+function tokenUsage(usage) {
+  const names = [["input_tokens", "입력"], ["output_tokens", "출력"],
+    ["cache_read_tokens", "캐시 읽기"], ["cache_write_tokens", "캐시 쓰기"]];
+  return names.map(([key, label]) => {
+    const count = usage?.usage?.[key];
+    return [label, count ? `확인 ${count.known} 토큰 · 미보고 ${count.unknown}건` : UNKNOWN];
+  });
+}
+
 function timeline(view, taskId) {
   const events = view.events.filter((e) => !taskId || e.data.mission_task_id === taskId || e.data.task_id === taskId).slice(0, 12).reverse();
   if (!events.length) return h("p", { class: "note", text: "표시할 기록이 없습니다." });
@@ -26,6 +35,7 @@ function planner(view) {
     ["직전 판단 사유", p.last_judgment && p.last_judgment.reason],
     ["등록한 Task(누적)", p.tasks_registered],
     ["모델 요청", `${p.usage.requests}건 · 진행 ${p.usage.in_flight} · 확인된 토큰 ${p.usage.known_tokens} · 사용량 미확인 ${p.usage.unknown_usage}건`],
+    ...tokenUsage(p.usage),
     ["단계별 요청", Object.entries(view.usage.by_stage || {}).map(([stage, usage]) => `${stage}: ${usage.spent}건`).join(" · ") || UNKNOWN],
     ["운영자 안내", p.guidance_in_input === true ? "플래너 입력에 포함" :
       p.guidance_in_input === false ? "플래너 판단 입력에 포함되지 않음" : UNKNOWN],
@@ -45,6 +55,8 @@ function task(view, id) {
     ["막힌 사유", t.blocking_reason || "없음"],
     ["대기", t.wait ? `${WAIT[t.wait.reason] || t.wait.reason}${t.wait.approval_ref ? ` · 승인 ${t.wait.approval_ref}` : ""}` : "없음"],
     ["증거 수", t.evidence], ["결과", t.has_result ? "저장됨" : "아직 없음"],
+    ["결과 판정", t.result_outcome],
+    ...tokenUsage(t.usage),
   ]), h("h4", { text: "기록" }), timeline(view, id)];
 }
 
@@ -74,6 +86,8 @@ function worker(view, id) {
     ["대기", w.wait ? `${WAIT[w.wait.reason] || w.wait.reason}${w.wait.approval_ref ? ` · 승인 ${w.wait.approval_ref}` : ""}` : "없음"],
     ["슬롯", w.slot_released ? "반납됨(요청은 보존)" : "사용 중 또는 해당 없음"],
     ["저장된 증거", w.evidence_refs.join(", ") || "없음"],
+    ...tokenUsage(w.usage),
+    ["실제 요금", "미측정"],
   ]), h("h4", { text: "이 Task의 기록" }), timeline(view, w.task_id)];
 }
 

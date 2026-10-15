@@ -157,6 +157,10 @@ def _render_markdown(report: TerminalReportProjection) -> str:
             lines += [f"- {stage}: requests={counts['spent']}; "
                       f"reserved={counts['reserved']}; known tokens={counts['known_tokens']}; "
                       f"unknown usage={counts['unknown_usage']}"]
+        for name, counts in usage.get("usage", {}).items():
+            lines += [f"- {name}: reported sum={counts['known']}; "
+                      f"unreported requests={counts['unknown']}"]
+        lines += ["- Cache read/write are input subsets. Actual provider cost is unmeasured."]
     if report.mission is not None:
         contracted = [t for t in report.mission.tasks if t.completion_contract_version == 2]
         if contracted:

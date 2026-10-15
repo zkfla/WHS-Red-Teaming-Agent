@@ -187,10 +187,10 @@ incompatible execution resume and historical originals remain readable.
 
 ## Native worker observation delivery
 
-`nodes.react._result_messages` rehydrates windows for every retained executed
-tool result, including results before a local discovery/read round. Unique
-originals and explicit reader requests share the existing 8000-character
-automatic-delivery allowance, at most 4000 characters per window. Repeated
+`nodes.react._result_messages` renders only the NEW completed tool-result batch.
+Automatic original windows in that batch use the existing 8000-character
+allowance, at most 4000 characters per window. A later batch does not recalculate
+an earlier display. Repeated
 references are not repeated independent proof. Windows retain scope/provenance,
 source IDs, offsets, actual shown limits, truncation and untrusted DATA semantics;
 execution success/UNKNOWN flags and the separate evidence-validity context remain
@@ -198,16 +198,17 @@ available. Missing or truncated content is unknown, never inferred success.
 
 The model can request further offsets/queries through the existing EvidenceReader.
 Successful reads carry a source `evidence_read_request` in LocalToolResult.
-Native checkpoint feedback, its runtime-result record and requested_evidence
-context retain the request/metadata and `text_omitted`, not window text or program
-streams (`program_output_omitted`). Provider
-delivery rehydrates that text from the single original store. The original
-read request is retained even if the delivery allowance shortens its shown
-window; the returned limit/truncation describe the delivered content. Reference
-rehydration makes no target call or additional model request.
+The first actual masked response, including bounded text/program streams and
+request ID/offset/limit/query, is frozen in `worker_session` in the existing
+instance checkpoint. Native local result receipts preserve that same bounded
+reader response. Replay uses the frozen display, not a new read of the original.
+Further reads append new call/result pairs. Whole originals remain exclusively
+authoritative in EvidenceStore, and a displayed excerpt is never a review receipt.
 
-The existing complete-round history trimming and assistant/tool-call pairing
-remain unchanged. Older windows outside retained rounds remain available through
-the probe's original references and explicit reader. No body checkpoint/cache or
-second summary store is introduced. Discovery cannot grant permission, settle a
-Task, or turn a partial observation into a Finding.
+Normal turns preserve all earlier call/result pairs and opaque continuations;
+there is no fixed-round trimming. At an actual input bound a safe, explicit
+generation can replace reader bodies with original references and omission
+markers; the exact earlier displays stay archived in the same checkpoint.
+Unsafe pending/opaque boundaries hold. No second DB or semantic summary store
+is introduced. Discovery cannot grant permission, settle a Task, or turn a
+partial observation into a Finding. See [Worker conversation](worker-conversation.md).

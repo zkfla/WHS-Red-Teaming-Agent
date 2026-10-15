@@ -14,8 +14,8 @@ from pydantic import BaseModel, Field, PrivateAttr, model_validator
 from redteam.core.config import OrchestrationConfig
 from redteam.core.contracts.llm_policy import LLMRequestPolicy
 
-#: The native graph has three nodes per model turn.
-NODES_PER_TURN = 3
+#: Prepare/checkpoint, model, tools, and settle each consume one graph step.
+NODES_PER_TURN = 4
 
 #: Head-room for the non-looping edges around the loop itself.
 RECURSION_SLACK = 10

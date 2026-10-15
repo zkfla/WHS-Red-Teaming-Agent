@@ -273,6 +273,115 @@ async def test_chat_exact_url_auth_and_body(_sdk):
     assert "/" not in body["model"]
     assert body["messages"][0] == {"role": "system", "content": "sys-hint"}
     _assert_clean_body(entry)
+
+@pytest.mark.parametrize("model,path", [
+    ("openai/gpt-wire-usage", "chat"),
+    ("openai/responses/gpt-wire-usage", "responses"),
+    ("anthropic/claude-wire-usage", "messages"),
+])
+async def test_request_local_cache_usage_survives_actual_sdk_transformation(_sdk, model, path):
+    from redteam.core.ports.llm import LLMUsage
+
+    def response(body):
+        if path == "messages":
+            payload = _messages_payload(body)
+            payload["usage"] = {"input_tokens": 5, "output_tokens": 2,
+                                "cache_read_input_tokens": 7, "cache_creation_input_tokens": 3}
+        elif path == "responses":
+            payload = _responses_payload(body)
+            payload["usage"] = {"input_tokens": 15, "output_tokens": 2, "total_tokens": 17,
+                                "input_tokens_details": {
+                                    "cached_tokens": 7, "cache_write_tokens": 3}}
+        else:
+            payload = _chat_payload(body)
+            payload["usage"] = {"prompt_tokens": 15, "completion_tokens": 2, "total_tokens": 17,
+                                "prompt_tokens_details": {
+                                    "cached_tokens": 7, "cache_write_tokens": 3}}
+        return payload
+
+    RESPONDERS[path] = response
+    client = _build(model)
+    with llm_request_scope("run-usage", "owner-usage"):
+        result = await client.complete_with_usage(messages=[{"role": "user", "content": "hi"}])
+    assert result.usage == LLMUsage(15, 2, 17, 7, 3)
+    assert len(CAPTURED) == 1
+    _assert_clean_body(_last())
+
+
+@pytest.mark.parametrize("split", [False, True])
+@pytest.mark.parametrize("model,path", [
+    ("openai/gpt-wire-planner", "chat"),
+    ("openai/responses/gpt-wire-planner", "responses"),
+    ("anthropic/claude-wire-planner", "messages"),
+])
+async def test_independent_planner_prefix_survives_sdk_wire_and_shared_meter(
+    _sdk, tmp_path, split, model, path,
+):
+    from redteam.app.agent_profile import load_specialist_profile
+    from redteam.core.contracts.llm_policy import LLMRequestPolicy
+    from redteam.orchestration.cognition import StructuredDecisionClient
+    from redteam.orchestration.hypothesis_planner import (
+        _SINGLE_PLAN_SYSTEM,
+        _SPLIT_PLAN_SYSTEM,
+        HypothesisDecision,
+    )
+    from redteam.orchestration.llm_requests import RunRequestLedger
+    from redteam.orchestration.metered_llm import RunMeteredLLM
+    from redteam.orchestration.probe_atomization import HypothesisPlanDraft
+    from tests.integration.test_hypothesis_planner import held
+    from tests.integration.test_probe_workers import PROFILE
+    from tests.unit.test_orchestration_coordination import RUN, world
+
+    def response(body):
+        text = json.dumps(held("Synthetic public judgment only"))
+        if path == "messages":
+            payload = _messages_payload(body, text=text)
+        elif path == "responses":
+            payload = _responses_payload(body, text=text, total=5)
+        else:
+            payload = _chat_payload(body, content=text)
+        return payload
+
+    RESPONDERS[path] = response
+    profile = load_specialist_profile(PROFILE if split else PROFILE.with_name(
+        "native-probes-legacy.yaml"))
+    w = await world(tmp_path, "sqlite")
+    ledger = RunRequestLedger(w.coordinator)
+    await ledger.bind(RUN, LLMRequestPolicy(mode="bounded", max_requests=2))
+    client = StructuredDecisionClient(RunMeteredLLM(_build(model), ledger, prompts=profile.prompts))
+    schema = (HypothesisPlanDraft if split else HypothesisDecision).model_json_schema()
+    for index in range(2):
+        with llm_request_scope(RUN, "planner"):
+            assert await client.ask(
+                stage="hypothesis_planning", payload={"input_sequence": index,
+                    "worker_result": "failed" if index else "inconclusive"},
+                response_schema=schema, system=_SPLIT_PLAN_SYSTEM if split else _SINGLE_PLAN_SYSTEM,
+            ) == held("Synthetic public judgment only")
+    assert len(CAPTURED) == 2
+    first, second = [entry["body"] for entry in CAPTURED]
+    assert first["model"] == second["model"]
+    assert all("previous_response_id" not in body and "conversation" not in body
+               and not body.get("tools") for body in (first, second))
+    if path == "responses":
+        assert first["instructions"] == second["instructions"]
+        assert first["text"] == second["text"]
+        data = [body["input"] for body in (first, second)]
+    elif path == "chat":
+        assert first["messages"][0] == second["messages"][0]
+        assert first["messages"][0]["role"] == "system"
+        assert first["response_format"] == second["response_format"]
+        data = [body["messages"][1:] for body in (first, second)]
+    else:
+        assert first["system"] == second["system"]
+        assert first["output_config"] == second["output_config"]
+        data = [body["messages"] for body in (first, second)]
+    assert data[0] != data[1]
+    assert all(len(messages) == 1 and messages[0]["role"] == "user" for messages in data)
+    assert all("Synthetic public judgment only" not in json.dumps(messages) for messages in data)
+    usage = await ledger.snapshot(RUN)
+    assert usage["spent"] == usage["by_stage"]["hypothesis_planning"]["spent"] == 2
+    assert usage["known_tokens"] == 10 and usage["unknown_usage"] == 0
+
 async def test_responses_exact_url_auth_and_body(_sdk):
     client = _build("openai/responses/gpt-wire-resp")
     assert client.protocol == "responses"
@@ -542,6 +651,56 @@ async def test_responses_native_tool_call_round_trip(_sdk):
                and item.get("call_id") == "call_9"
                and "B" in item.get("output", "") for item in sent)
     _assert_clean_body(_last())
+
+@pytest.mark.parametrize("model,path", [
+    ("openai/gpt-worker-prefix", "chat"),
+    ("openai/responses/gpt-worker-prefix", "responses"),
+    ("anthropic/claude-worker-prefix", "messages"),
+])
+async def test_worker_frozen_prefix_survives_actual_sdk_wire(_sdk, model, path):
+    from redteam.orchestration.worker_session import FrozenMessage
+
+    def native_response(body):
+        if path == "chat":
+            return _chat_payload(body, content=None, tool_calls=[{
+                "id": "call_original", "type": "function", "function": {
+                    "name": "lookup", "arguments": '{"q":"fixture"}'},
+            }])
+        if path == "responses":
+            return _responses_payload(body, output=[{
+                "type": "function_call", "id": "fc_original", "call_id": "call_original",
+                "name": "lookup", "arguments": '{"q":"fixture"}', "status": "completed",
+            }])
+        return {**_messages_payload(body), "stop_reason": "tool_use", "content": [{
+            "type": "tool_use", "id": "call_original", "name": "lookup",
+            "input": {"q": "fixture"},
+        }]}
+
+    RESPONDERS[path] = native_response
+    client = _build(model)
+    messages = [FrozenMessage.capture({"role": "user", "content": "One synthetic Task"},
+                                     max_content_chars=1000).message()]
+    with llm_request_scope("run-prefix", "worker-a"):
+        response = await client.complete_native(messages, [SPEC], system="Stable Worker")
+        call, = response.tool_calls
+        messages.extend([FrozenMessage.capture(message, max_content_chars=2000).message()
+                         for message in [{"role": "assistant", "content": None,
+                             "tool_calls": [{"id": call.call_id, "type": "function",
+                                 "function": {"name": call.name,
+                                              "arguments": json.dumps(call.arguments)}}]},
+                             {"role": "tool", "tool_call_id": call.call_id,
+                              "content": json.dumps({"text": "frozen original", "offset": 4,
+                                                     "limit": 20, "truncated": True})}]])
+        await client.complete_native(messages, [SPEC], system="Stable Worker")
+    first, second = [item["body"] for item in CAPTURED]
+    field = "input" if path == "responses" else "messages"
+    assert second[field][:len(first[field])] == first[field]
+    assert second["tools"] == first["tools"]
+    assert second.get("system") == first.get("system")
+    assert second.get("instructions") == first.get("instructions")
+    assert "frozen original" in json.dumps(second[field])
+    assert "previous_response_id" not in second and "conversation" not in second
+
 
 async def test_messages_native_tool_call_round_trip(_sdk):
     use_item = {"type": "tool_use", "id": "toolu_1", "name": "lookup",

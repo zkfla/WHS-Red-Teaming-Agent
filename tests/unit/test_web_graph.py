@@ -56,10 +56,11 @@ async def test_planner_state_follows_the_stored_model_request_and_judgment(tmp_p
     assert view["planner"]["last_judgment"] == {
         "termination": "held", "reason": "no useful question left",
     }
-    assert view["planner"]["usage"] == {
+    assert {key: value for key, value in view["planner"]["usage"].items() if key != "usage"} == {
         "requests": 1, "in_flight": 0, "known_tokens": 42, "unknown_usage": 0,
         "unknown_outcome": 0,
     }
+    assert view["planner"]["usage"]["usage"]["cache_read_tokens"] == {"known": 0, "unknown": 1}
 
 
 async def test_split_planner_live_stage_and_usage_are_read_from_original_requests(tmp_path):

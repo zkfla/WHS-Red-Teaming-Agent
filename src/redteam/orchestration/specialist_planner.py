@@ -71,7 +71,10 @@ def _schema_with_completion_criterion_hint(schema: dict[str, Any]) -> dict[str, 
 
 def specialist_planning_inputs(deps) -> dict:
     """Assembler-owned input identity, also checked before reservation recovery."""
+    from redteam.orchestration.worker_conversation import WORKER_CONVERSATION_VERSION
+
     inputs = {
+        "worker_conversation_version": WORKER_CONVERSATION_VERSION,
         # Schema 3 is the candidate-planner/common-worker meaning.  Keeping the
         # old value for historical profiles prevents a stored schema-2 Run from
         # being silently reinterpreted when bindings are compared on resume.
@@ -86,6 +89,12 @@ def specialist_planning_inputs(deps) -> dict:
         "specialists": deps.specialist_policy.model_dump(mode="json")
         if deps.specialist_policy else None,
     }
+    if deps.specialist_policy.probe_limits is not None:
+        from redteam.orchestration.hypothesis_planner import PLANNER_REQUEST_CONTRACT_VERSION
+
+        # Bind code-owned request semantics as well as profile/prompt bytes,
+        # including custom profiles whose role prompt did not change in 10b.
+        inputs["planner_request_contract_version"] = PLANNER_REQUEST_CONTRACT_VERSION
     # Preserve legacy input identity when this optional mechanism is absent.
     fixture_runner = getattr(deps, "code_fixture_runner", None)
     if fixture_runner is not None:

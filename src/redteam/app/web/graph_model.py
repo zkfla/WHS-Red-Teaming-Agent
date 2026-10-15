@@ -13,7 +13,7 @@ from redteam.app.cli.display import safe_text
 from redteam.core.contracts.execution import ExecutionState, TaskExecution
 from redteam.core.contracts.graph import Hypothesis
 from redteam.core.contracts.mission import MissionPlan, MissionTask
-from redteam.orchestration.llm_requests import request_stage_usage
+from redteam.orchestration.llm_requests import request_stage_usage, request_usage
 
 PLANNER_OWNER = "specialist_planning"
 PLANNER_OWNERS = frozenset({PLANNER_OWNER, "hypothesis_planning", "task_atomization"})
@@ -59,6 +59,7 @@ def _usage(requests: list[dict[str, Any]]) -> dict[str, Any]:
         "known_tokens": sum(r.get("total_tokens") or 0 for r in spent),
         "unknown_usage": sum(r.get("total_tokens") is None for r in spent),
         "unknown_outcome": sum(r.get("state") == "unknown" for r in spent),
+        "usage": request_usage(requests)["usage"],
     }
 
 
@@ -127,6 +128,7 @@ def _worker(activation: dict[str, Any], raw: GraphRaw) -> dict[str, Any]:
     unknown = [e for e in mine if e.state == ExecutionState.UNKNOWN]
     waiting = next((e for e in open_runs if e.wait_reason), None)
     stage = activation["launch_stage"]
+    task = next((item for item in raw.tasks if str(item.task_id) == task_id), None)
     if waiting is not None:
         phase = f"waiting_{waiting.wait_reason}"
     elif open_runs:
@@ -135,13 +137,21 @@ def _worker(activation: dict[str, Any], raw: GraphRaw) -> dict[str, Any]:
         phase = "model"
     elif unknown:
         phase = "outcome_unknown"
+    elif stage == "returned" and task is not None and (
+        task.status.value == "blocked" or task.status.value == "running"
+        and task.result is not None and task.result.outcome == "blocked"
+    ):
+        phase = "waiting_review"
     elif stage == "returned":
         phase = "returned"
     elif stage == "reserved":
         phase = "reserved"
     else:
         phase = "between"  # settle/hand-off: neither a model request nor a tool is open
-    requests = [r for r in raw.llm_requests if r.get("owner") == owner]
+    # Recovery may transfer the owner epoch without creating another Task/Worker.
+    # Preserve those original charges through the recorded Task attribution.
+    requests = [r for r in raw.llm_requests
+                if r.get("owner") == owner or r.get("task_id") == task_id]
     refs = [str(e.result_evidence_id) for e in mine if e.result_evidence_id]
     return {
         "instance_id": instance,
@@ -149,6 +159,7 @@ def _worker(activation: dict[str, Any], raw: GraphRaw) -> dict[str, Any]:
         "launch_stage": stage,
         "phase": phase,
         "model_requests": len(requests),
+        "usage": _usage(requests),
         "tool_calls": len(mine),
         "tool_states": {s.value: sum(e.state == s for e in mine)
                         for s in ExecutionState if any(e.state == s for e in mine)},
@@ -179,9 +190,11 @@ def _task(task: MissionTask, workers: list[dict[str, Any]], raw: GraphRaw) -> di
         "required": task.required,
         "evidence": len(task.evidence_ids),
         "has_result": task.result is not None,
+        "result_outcome": task.result.outcome if task.result else None,
         "candidate_ids": list(task.related_hypothesis_ids),
         "source_task_id": str(task.source_task_id) if task.source_task_id else None,
         "source_result_id": task.source_result_id,
+        "usage": _usage([r for r in raw.llm_requests if r.get("task_id") == str(task.task_id)]),
     }
 
 

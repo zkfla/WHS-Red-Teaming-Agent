@@ -60,8 +60,12 @@ async def test_reference_is_bound_pure_and_routes_reads_without_invocation():
 async def test_wrong_context_and_forged_provider_identity_fail_before_entry():
     provider = RecoverableProvider()
     gateway = await build_mcp_tool_gateway([], builtin_adapters=[provider])
-    with pytest.raises(ValueError, match="execution_reference_context_invalid"):
-        gateway.prepare_reference(invocation({"run_id": "foreign"}))
+    rejected = invocation({"run_id": "foreign"})
+    assert gateway.prepare_reference(rejected) is None
+    result = await gateway.invoke(rejected)
+    assert not result.success and result.error is not None
+    assert result.error.code.endswith("_context_mismatch")
+    assert result.metadata["execution_started"] is False
     assert provider.prepared == [] and provider.calls == []
     prepare = provider.prepare_reference
     provider.prepare_reference = lambda call: prepare(call).model_copy(

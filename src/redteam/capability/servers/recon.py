@@ -12,7 +12,12 @@ from mcp.server import MCPServer
 
 from redteam.capability.servers.config import ServerPolicy
 from redteam.capability.servers.inspection import html_observations
-from redteam.capability.servers.network import ToolInputError, request, resolve_target
+from redteam.capability.servers.network import (
+    ToolInputError,
+    request,
+    resolve_target,
+    target_network_tool,
+)
 
 
 def object_document(body: bytes) -> dict[str, Any]:
@@ -37,6 +42,7 @@ def create_server(policy: ServerPolicy) -> MCPServer:
         return {"target_ref": target_ref, "addresses": list(target.addresses)}
 
     @server.tool()
+    @target_network_tool
     async def http_probe(target_ref: str, path: str = "/") -> dict[str, Any]:
         """Single GET for reachability and security-header presence, without redirects."""
         async with execution_lock:
@@ -87,6 +93,7 @@ def create_server(policy: ServerPolicy) -> MCPServer:
                     pass
 
     @server.tool()
+    @target_network_tool
     async def openapi_inventory(target_ref: str, path: str) -> dict[str, Any]:
         """Fetch one approved OpenAPI JSON path. List operations; never follow $ref or servers.
 
@@ -133,6 +140,7 @@ def create_server(policy: ServerPolicy) -> MCPServer:
         }
 
     @server.tool()
+    @target_network_tool
     async def oidc_inventory(target_ref: str, path: str) -> dict[str, Any]:
         """Inspect an approved OIDC discovery document without visiting advertised endpoints."""
         async with execution_lock:
@@ -172,6 +180,7 @@ def create_server(policy: ServerPolicy) -> MCPServer:
         }
 
     @server.tool()
+    @target_network_tool
     async def html_inventory(target_ref: str, path: str) -> dict[str, Any]:
         """One approved GET: list static same-origin link/form/script paths, never follow them.
 

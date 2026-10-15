@@ -115,17 +115,17 @@ class GatedExecutionDelegate(Protocol):
     async def __call__(self) -> MCPCallResult: ...
 
 
-class GatedExecutionPolicy(Protocol):
-    # Provider-side structural view of the TASK-005 gated policy.
-    # The concrete class lives with 005; it must structurally conform
-    # so this seam binds without importing an unpublished module.
-    # execute() routes through policy enforcement, then the delegate.
+class ShellExecutionPolicy(Protocol):
+    """Required network-execution seam, shared by direct and retained providers."""
     async def execute(
         self,
         invocation: ToolInvocation,
         parsed: Any,
         delegate: GatedExecutionDelegate,
     ) -> MCPCallResult: ...
+
+
+class GatedExecutionPolicy(ShellExecutionPolicy, Protocol):
     # Install-route seam (TASK-005/007): the provider asks the policy
     # for the operator-pinned route of one mirror name, then seeds the
     # install exec env from the forward-proxy variables. Structural so
@@ -223,7 +223,7 @@ class BuiltinShellAdapter(ContextualInvocationAdapter, ExecutionRecoveryProvider
         self._workroom = workroom if workroom is not None else ShellWorkroomManager(policy)
         self._jobs: dict[str, _ShellJob] = {}
         self._lock = asyncio.Lock()
-        self._gated_policy: GatedExecutionPolicy | None = None
+        self._gated_policy: ShellExecutionPolicy | None = None
         self._gated_descriptors: tuple[ToolDescriptor, ...] = ()
         self._gated_by_name: dict[str, ToolDescriptor] = {}
 
@@ -233,7 +233,7 @@ class BuiltinShellAdapter(ContextualInvocationAdapter, ExecutionRecoveryProvider
 
     def set_gated_policy(
         self,
-        executor: GatedExecutionPolicy,
+        executor: ShellExecutionPolicy,
         descriptors: list[ToolDescriptor],
     ) -> None:
         # Public configure hook for the TASK-005 gated provider
@@ -255,7 +255,7 @@ class BuiltinShellAdapter(ContextualInvocationAdapter, ExecutionRecoveryProvider
 
     def set_network_policy(
         self,
-        executor: GatedExecutionPolicy,
+        executor: ShellExecutionPolicy,
         descriptors: list[ToolDescriptor],
     ) -> None:
         """Configure contextual network tools through the existing dispatch seam.
@@ -467,14 +467,18 @@ class BuiltinShellAdapter(ContextualInvocationAdapter, ExecutionRecoveryProvider
         return ref.strip()
 
     @staticmethod
-    def _install_env(policy: GatedExecutionPolicy, mirror: str) -> dict[str, str]:
+    def _install_env(policy: ShellExecutionPolicy, mirror: str) -> dict[str, str]:
         # Provider-owned installer env from the policy route. The proxy
         # variables come from operator pins (never model args); the
         # supervisor applies them after scrubbing model proxy/index
         # variables so a model override can never win. Fail closed.
         try:
-            route = policy.install_route_for(mirror)
-            env = policy.install_forward_env(route)
+            route_for = getattr(policy, "install_route_for", None)
+            forward_env = getattr(policy, "install_forward_env", None)
+            if not callable(route_for) or not callable(forward_env):
+                raise ShellWorkroomError("shell_install_route_unavailable")
+            route = route_for(mirror)
+            env = forward_env(route)
         except Exception as exc:
             raise ShellWorkroomError("shell_install_route_unavailable") from exc
         if not isinstance(env, dict) or not env:
@@ -1986,7 +1990,10 @@ class BuiltinShellAdapter(ContextualInvocationAdapter, ExecutionRecoveryProvider
             )
             return
         try:
-            outcome = await policy.recover_retained(record)
+            recover = getattr(policy, "recover_retained", None)
+            if not callable(recover):
+                raise ShellWorkroomError("shell_retained_recovery_unavailable")
+            outcome = await recover(record)
             self._consume_window_settlement(job, outcome)
         except Exception as exc:
             self._note_window_settlement_failure(
@@ -2027,7 +2034,10 @@ class BuiltinShellAdapter(ContextualInvocationAdapter, ExecutionRecoveryProvider
             )
             return
         try:
-            outcome = await policy.close_retained(job.workroom_key, window_id=window_id)
+            close = getattr(policy, "close_retained", None)
+            if not callable(close):
+                raise ShellWorkroomError("shell_retained_close_unavailable")
+            outcome = await close(job.workroom_key, window_id=window_id)
             self._consume_window_settlement(job, outcome)
         except Exception as exc:
             self._note_window_settlement_failure(

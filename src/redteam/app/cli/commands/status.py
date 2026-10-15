@@ -83,6 +83,17 @@ async def run(args: argparse.Namespace) -> int:
     if report.previous_termination_reason:
         print(f"Previous termination reason: {report.previous_termination_reason}")
     print(f"\nActions executed: {report.actions_executed}")
+    if report.mission is not None:
+        for task in report.mission.tasks:
+            print(f"  Task {task.task_id}: {task.status}")
+    accounting = report.llm_request_accounting
+    if accounting is not None:
+        print(f"Model requests: {accounting['spent']}; "
+              f"unreported usage: {accounting['unknown_usage']}")
+        for name, counts in accounting.get("usage", {}).items():
+            print(f"  {name}: reported sum={counts['known']}; "
+                  f"unreported requests={counts['unknown']}")
+        print("Actual provider cost: unmeasured")
     if report.work_status_counts:
         print("Work items by status:")
         for status, count in report.work_status_counts.items():

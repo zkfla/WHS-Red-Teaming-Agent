@@ -1400,7 +1400,11 @@ def validate_argument_target(
                 if value
             }
         )
-        if arguments.get("target_ref") is not None and str(arguments["target_ref"]) not in allowed:
+        if (
+            (argument_bindings or {}).get("target_ref", "target_ref") == "target_ref"
+            and arguments.get("target_ref") is not None
+            and str(arguments["target_ref"]) not in allowed
+        ):
             raise ValueError("tool target reference differs from proposal target binding")
         bindings = (
             asset_bindings

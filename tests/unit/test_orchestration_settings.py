@@ -34,8 +34,7 @@ def test_overrides_win_over_config_and_none_is_ignored() -> None:
 
 
 def test_recursion_limit_covers_the_whole_loop() -> None:
-    # LangGraph's default of 25 super-steps is under four turns of a
-    # seven-node loop, so a real run would abort for no domain reason.
+    # Each native turn checkpoints prepare, model, tools and settle separately.
     settings = OrchestrationSettings(max_steps=10)
     assert settings.effective_recursion_limit == 10 * NODES_PER_TURN + RECURSION_SLACK
     assert OrchestrationSettings(max_steps=10, recursion_limit=42).effective_recursion_limit == 42

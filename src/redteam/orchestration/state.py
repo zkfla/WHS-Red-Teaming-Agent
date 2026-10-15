@@ -218,6 +218,9 @@ class GraphState(TypedDict, total=False):
     # Native model-tool roundtrip. No complete provider responses/reasoning.
     native_calls: list[NativeCallState]
     native_messages: list[dict[str, Any]]
+    # Frozen Task conversation, including first-delivered windows; native_messages
+    # remains empty for these sessions so the checkpoint has one transcript owner.
+    worker_session: dict[str, Any] | None
     native_final_text: str | None
     native_outcome: str | None
 
@@ -240,6 +243,7 @@ def initial_graph_state(
         "last_event_id": last_event_id,
         "native_calls": [],
         "native_messages": [],
+        "worker_session": None,
         "native_final_text": None,
         "native_outcome": None,
     }

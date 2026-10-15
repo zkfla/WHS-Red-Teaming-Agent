@@ -206,7 +206,7 @@ async def test_default_application_assembles_only_central_domain_store(tmp_path,
     from redteam.orchestration.graph import build_graph
 
     assert set(build_graph(deps).get_graph().nodes) == {
-        "__start__", "model", "tools", "settle", "__end__",
+        "__start__", "prepare", "model", "tools", "settle", "__end__",
     }
     await run_engagement(scope, deps=deps)
     assert not list(tmp_path.rglob("task_graph.sqlite3"))

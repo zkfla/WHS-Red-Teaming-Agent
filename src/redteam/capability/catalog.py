@@ -23,7 +23,7 @@ from redteam.core.action_semantics import (
     validate_capability_name,
     validate_operation_name,
 )
-from redteam.core.contracts.tool import ToolDescriptor
+from redteam.core.contracts.tool import ToolDescriptor, model_input_schema
 from redteam.core.enums import RiskLevel, ToolHealthStatus
 from redteam.core.ids import ToolId
 from redteam.core.ports.tool_catalog import ToolCard, ToolCardKind, ToolDetail
@@ -339,7 +339,7 @@ class MCPToolCatalog:
             namespace = parsed[0]
             if not include_unhealthy and descriptor.health_status == ToolHealthStatus.UNHEALTHY:
                 continue
-            required, optional = _argument_names(descriptor.input_schema)
+            required, optional = _argument_names(model_input_schema(descriptor.input_schema))
             for bound_operation in sorted(self._operations_for(descriptor)):
                 if operation is not None and bound_operation != operation:
                     continue
