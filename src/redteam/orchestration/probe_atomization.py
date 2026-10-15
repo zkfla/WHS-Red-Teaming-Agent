@@ -69,11 +69,11 @@ def _task_rejection(code, *, index, task, field, question, criterion_ids=(),
     location = f"$.tasks[{index}].{field}"
     references = list(criterion_ids)[:8]
     summary = safe_feedback(
+        f"{repair} "
         f"Task {safe_feedback(task.task_key, 80)} for question "
         f"{safe_feedback(question.question_id, 80)}: {field} does not match the question. "
         f"Condition IDs: {', '.join(references[:1]) or 'none'}. "
-        f"Differing fields: {', '.join(differing_fields) or field}. "
-        f"{repair}",
+        f"Differing fields: {', '.join(differing_fields) or field}.",
     )
     return AtomizationProposalError(code, diagnostic=DecisionDiagnostic(
         code=code, stage="task_atomization", kind="validation", retryable=True,
@@ -237,6 +237,11 @@ class AtomizedProbeSelection(ProbeTaskPurpose):
 
     question_id: str = Field(min_length=1)
     completion_criterion_ids: list[str] = Field(min_length=1)
+    hypothesis_revisions: dict[str, int] = Field(
+        default_factory=dict,
+        description="Copy the question's hypothesis_revisions exactly: the same candidate "
+                    "keys with the same revision numbers, nothing added or omitted.",
+    )
 
 
 class TaskAtomizationDraft(BaseModel):
@@ -491,7 +496,22 @@ def validate_atomized_tasks(
             resolved = {issued.get(key, key): revision
                         for key, revision in child.hypothesis_revisions.items()}
             if resolved != expected_revisions:
-                raise reject("atomized_revision_not_preserved", "hypothesis_revisions")
+                missing = set(expected_revisions) - set(resolved)
+                extra = set(resolved) - set(expected_revisions)
+                changed = {key for key in set(resolved) & set(expected_revisions)
+                           if resolved[key] != expected_revisions[key]}
+                fields = [label for label, items in (
+                    ("missing_candidate_revisions", missing),
+                    ("extra_candidate_revisions", extra),
+                    ("candidate_revision_values", changed),
+                ) if items]
+                raise reject(
+                    "atomized_revision_not_preserved", "hypothesis_revisions",
+                    fields=fields,
+                    repair=("Copy this question's hypothesis_revisions exactly onto each task "
+                            f"of the question: expected {len(expected_revisions)} candidate "
+                            f"revisions, submitted {len(resolved)}."),
+                )
             if child.required != question.required or {
                 issued.get(ref, ref) for ref in child.goal_required_hypothesis_ids
             } != expected_required:
