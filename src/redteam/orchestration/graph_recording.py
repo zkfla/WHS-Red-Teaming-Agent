@@ -1400,13 +1400,18 @@ def graph_recording_descriptor() -> LocalToolDescriptor:
             + ") and written to existing graph nodes or edges only; "
             "hypotheses stay open inference here and resolve through an "
             "explicit finding or execution verification; findings run "
-            "posthoc review plus promotion here. Shell streams and exit codes are program "
+            "posthoc review plus promotion here. A finding with a hypothesis_id and "
+            "grounded retained evidence_refs can request an independent review receipt "
+            "when a verifier and review budget are available. The receipt is bound to the "
+            "candidate revision and purpose, without another target call; UNKNOWN remains "
+            "unresolved. Task completion receipts are not candidate reviews. "
+            "Shell streams and exit codes are program "
             "assertions/execution metadata; use evidence-linked hypotheses or unresolved "
             "observations, never measured remote facts."
         ),
         input_schema=GraphRecordingInput.model_json_schema(),
         contribution_id=GRAPH_RECORD_CONTRIBUTION_ID,
-        version="3",
+        version="4",
     )
 
 
@@ -1434,6 +1439,6 @@ def graph_recording_contribution() -> Contribution:
 
     return runtime_tool_contribution(
         contribution_id=GRAPH_RECORD_CONTRIBUTION_ID,
-        version="3",
+        version="4",
         factory=factory,
     )

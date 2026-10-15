@@ -5,7 +5,7 @@
 # old Runs/tests lives in native-probes-legacy.yaml (compat only, not a feature).
 schema_version: '3'
 profile_id: native-probes
-version: '17'
+version: '18'
 common: {path: prompts/common.md, version: '2', contract_version: '1'}
 probe_limits: {max_actions: 4, max_model_requests: 16}
 max_instances: 2
@@ -32,7 +32,7 @@ roles:
       capabilities: []
       tool_selection: {}
       context_profile: {profile_id: hypothesis_planning}
-    prompt: {path: prompts/hypothesis-strategy.md, version: '9'}
+    prompt: {path: prompts/hypothesis-strategy.md, version: '10'}
   - definition:
       agent_id: probe-atomizer
       role: atomization
@@ -51,7 +51,7 @@ roles:
       capabilities: [web, api, recon, mobile, analysis]
       tool_selection: {capability_tags: [web, api, recon, mobile, analysis]}
       context_profile: {profile_id: probe_execution}
-    prompt: {path: prompts/worker.md, version: '8'}
+    prompt: {path: prompts/worker.md, version: '9'}
   - definition:
       agent_id: research-evidence
       role: research_evidence

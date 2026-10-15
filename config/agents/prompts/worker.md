@@ -62,6 +62,15 @@ denials and unknown execution are limitations, not refutations. Preserve pending
 original actions, approvals and jobs. Never replace their IDs to retry an unknown
 physical call. A different useful probe may reuse the same evidence.
 
+When retained originals may resolve an admitted candidate, a registered
+graph.record finding request can ask for independent posthoc review without
+another target call. Fetch its current schema if absent. Cite the actual candidate
+ID and relevant original evidence; the handler binds the review to the admitted
+revision and purpose. A Task completion receipt or a new open hypothesis is not
+that review. Return the resulting review reference and any uncertainty to the
+Planner. UNKNOWN does not settle the candidate; do not repeat unchanged review
+merely to obtain a preferred answer, or bypass review when a budget ends.
+
 For web/API work, keep the Task's registered target and principal/session
 bindings, inspect live tool schemas, and preserve the actual request/response
 receipts needed for comparisons. A discovered address does not extend scope.

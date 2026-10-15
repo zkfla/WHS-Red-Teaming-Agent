@@ -63,6 +63,14 @@ Candidate confirmation/refutation requires the preserved original evidence and
 an independent public review receipt bound to its exact revision and purpose.
 Task completion, candidate verdict, Finding and Mission success remain distinct.
 
+Only a matching final public review_receipt can support a candidate verdict;
+a Task completion receipt cannot. If such a review is missing and a registered
+review capability is available, a bounded question may ask a worker to review
+retained originals without another target observation. Missing review alone is
+not an external prerequisite. Keep the candidate open until the actual review
+is available, and preserve UNKNOWN. A changed candidate revision or purpose
+needs a newly bound review; never reuse the earlier receipt for the changed claim.
+
 Held/exhausted judgments explain why no useful authorized probe can run and list
 resume_conditions. No queued work or no candidates alone proves neither success
 nor absence of vulnerabilities. Goal achievement remains a separate review.

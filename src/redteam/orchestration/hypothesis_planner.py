@@ -1,5 +1,6 @@
 """One candidate/probe judgment over captured originals and existing central admission."""
 
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -9,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from redteam.attack_graph.predicates import facts_of
 from redteam.attack_graph.service import AttackGraphService
 from redteam.core.contracts.events import EventType
+from redteam.core.contracts.evidence import EvidenceRecord
 from redteam.core.contracts.graph import GraphNode, Hypothesis, HypothesisUpdate
 from redteam.core.contracts.mission import MissionPlan, MissionTask, redact_secret_material
 from redteam.core.enums import GraphNodeType
@@ -21,6 +23,7 @@ from redteam.orchestration.central_runtime import (
     runtime_token,
     task_is_claimable,
 )
+from redteam.orchestration.central_state import receipt_failure
 from redteam.orchestration.cognition import DecisionFailure, DecisionValidationError
 from redteam.orchestration.coordination import (
     CandidateAdmissionConflict,
@@ -95,6 +98,32 @@ class HypothesisProposalError(ValueError):
         if diagnostic is not None:
             self.diagnostic = diagnostic
         super().__init__(code)
+
+
+def validate_candidate_review_selections(
+    updates: Sequence[HypothesisUpdate], records: Mapping[str, EvidenceRecord],
+) -> None:
+    """Repair invalid receipt selection before admission; final proof stays authoritative."""
+    for index, update in enumerate(updates):
+        if update.hypothesis.status not in {"confirmed", "rejected"}:
+            continue
+        failure = receipt_failure(
+            update, update.hypothesis, records.get(update.review_evidence_id or ""),
+        )
+        if failure is None:
+            continue
+        code = "candidate_review_receipt_invalid"
+        raise HypothesisProposalError(code, diagnostic=DecisionDiagnostic(
+            code=code, stage="hypothesis_planning", kind="validation",
+            location=f"$.updates[{index}].review_evidence_id", retryable=True,
+            cause_scope="model_input", owner="orchestration.hypothesis_planner",
+            summary="Select a final public independent review receipt matching the candidate, "
+                    "revision, purpose and outcome. A Task completion receipt is not a "
+                    "candidate verdict review.",
+            repair_condition="Use a matching captured review_receipt, or keep the candidate "
+                             "open and request independent review of retained originals.",
+            trace=[{"receipt_failure": failure}],
+        ))
 
 
 # Code-owned repair guidance keyed by proposal error code: (contract field, guidance).
@@ -571,6 +600,9 @@ async def advance_hypotheses(planner, runtime, schema):
             roles=roles, max_tasks=planner.policy.max_tasks_per_strategy,
             limits=planner.policy.probe_limits,
         )
+        validate_candidate_review_selections(
+            proposal.updates if proposal is not None else [], pass_context.records,
+        )
         return decision, proposal, related_reads(
             decision, proposal, snapshot, records, eligible_roles=roles,
             require_probe_limits=planner.policy.probe_limits is not None,
@@ -853,11 +885,13 @@ async def _advance_split(planner, runtime, schema, snapshot, engine, budget, pay
         if lookup_only(selection):
             return selection, None, [], {}
         pass_context.validate_reviewed(selection)
-        return bind_plan_selection(
+        bound = bind_plan_selection(
             selection, snapshot, issued=issued, targets=targets, principals=principals,
             max_tasks=planner.policy.max_tasks_per_strategy,
             existing_work_validator=validate_existing_work,
         )
+        validate_candidate_review_selections(bound[1] or [], pass_context.records)
+        return bound
 
     def validate_plan(raw):
         try:

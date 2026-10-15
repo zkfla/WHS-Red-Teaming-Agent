@@ -9,9 +9,16 @@ from redteam.attack_graph.service import AttackGraphService
 from redteam.core.enums import Verdict
 from redteam.orchestration.analysis import VerificationAssessment, append_posthoc_claim_receipt
 from redteam.orchestration.cognition import DecisionFailure
+from redteam.orchestration.coordination import CandidateAdmissionConflict
 from redteam.orchestration.specialist_planner import SpecialistPlanner
 from tests.integration.test_central_development import TARGET, TOOL, discover, inspect, turn
-from tests.integration.test_hypothesis_planner import PlannerDouble, candidate, probe, selection
+from tests.integration.test_hypothesis_planner import (
+    PlannerDouble,
+    candidate,
+    probe,
+    register_candidate_update,
+    selection,
+)
 from tests.integration.test_probe_workers import drive
 
 FIRST = {"updates": [candidate()], "tasks": [probe(candidate="local")],
@@ -93,21 +100,44 @@ async def test_unsafe_missing_review_reference_does_not_reach_durable_diagnostic
         current, = await service.list_hypotheses()
         source = await _source(session, first_id)
         llm.decisions.append(_verdict(leaked, [str(source.evidence_id)]))
-        with pytest.raises(DecisionFailure) as failed:
-            await SpecialistPlanner(session.deps).advance(session.runtime)
-        diagnostic = failed.value.diagnostic
+        # Repair feedback names the code and location only; the unknown reference is not echoed.
+        assert await SpecialistPlanner(session.deps).advance(session.runtime) == []
+        prompt = llm.requests[-1]["messages"][-1]["content"]
+        feedback = prompt.partition("Previous attempt failed")[2]
+        assert "candidate_review_receipt_invalid" in feedback
+        assert "$.updates[0].review_evidence_id" in feedback
+        assert "hunter2" not in feedback and "ev missing" not in feedback
+        assert (await service.get_hypothesis(current.hypothesis_id)).status == "open"
+        assert await service.list_findings() == []
+        # Final admission keeps the unknown reference out of its durable diagnostic.
+        update = candidate(current=current.model_dump(mode="json"), status="confirmed",
+                           evidence=[str(source.evidence_id)], review=leaked)
+        with pytest.raises(CandidateAdmissionConflict) as gate:
+            await register_candidate_update(session, update)
+        diagnostic = gate.value.diagnostic
         assert diagnostic.code == "original_evidence_missing"
         assert diagnostic.evidence_ids == []
         assert "hunter2" not in diagnostic.model_dump_json()
-        assert (await service.get_hypothesis(current.hypothesis_id)).status == "open"
+        assert (await service.get_hypothesis(current.hypothesis_id)).revision == 1
 
 
 async def test_well_formed_missing_review_reference_is_kept_as_identifier(tmp_path):
     llm = PlannerDouble([FIRST])
     async with selection(tmp_path, llm=llm) as (session, llm, tools):
         first_id = await _observe(session, llm)
+        service = AttackGraphService(session.deps.graph_store)
+        current, = await service.list_hypotheses()
         source = await _source(session, first_id)
         llm.decisions.append(_verdict("ev_missing_review", [str(source.evidence_id)]))
-        with pytest.raises(DecisionFailure) as failed:
-            await SpecialistPlanner(session.deps).advance(session.runtime)
-        assert failed.value.diagnostic.evidence_ids == ["ev_missing_review"]
+        # The well-formed but unknown identifier is rejected in repair and never echoed back.
+        assert await SpecialistPlanner(session.deps).advance(session.runtime) == []
+        feedback = llm.requests[-1]["messages"][-1]["content"]
+        assert "candidate_review_receipt_invalid" in feedback
+        assert "ev_missing_review" not in feedback
+        assert (await service.get_hypothesis(current.hypothesis_id)).status == "open"
+        # The final admission keeps the identifier in its diagnostic for the canonical record.
+        update = candidate(current=current.model_dump(mode="json"), status="confirmed",
+                           evidence=[str(source.evidence_id)], review="ev_missing_review")
+        with pytest.raises(CandidateAdmissionConflict) as gate:
+            await register_candidate_update(session, update)
+        assert gate.value.diagnostic.evidence_ids == ["ev_missing_review"]

@@ -12,9 +12,10 @@ from redteam.llm.fake import FakeLLMClient
 from redteam.orchestration.analysis import VerificationAssessment, append_posthoc_claim_receipt
 from redteam.orchestration.central_results import commit_result, result_for
 from redteam.orchestration.central_runtime import ready_workers, runtime_token
-from redteam.orchestration.cognition import DecisionFailure
+from redteam.orchestration.coordination import CandidateAdmissionConflict, content_hash
 from redteam.orchestration.hypothesis_planner import PLANNING_INVALIDATED
 from redteam.orchestration.specialist_planner import SpecialistPlanner
+from redteam.orchestration.specialist_tasks import HypothesisProbeProposal, register_probe_tasks
 from tests.integration.test_central_development import TARGET, TOOL, discover, inspect, turn
 from tests.integration.test_probe_workers import PROFILE, drive, register
 from tests.integration.test_probe_workers import selection as probe_selection
@@ -347,6 +348,7 @@ async def test_invalid_followup_is_repaired_within_one_shared_planner_budget(tmp
 
 
 async def test_partial_gap_cannot_supply_a_candidate_verdict_receipt(tmp_path):
+    """A partial gap is repaired before admission; the final gate still refuses it directly."""
     llm = PlannerDouble([{"updates": [candidate()], "tasks": [probe(candidate="local")],
                          "reason": "Observe before making any verdict"}])
     async with selection(tmp_path, llm=llm) as (session, llm, tools):
@@ -357,15 +359,41 @@ async def test_partial_gap_cannot_supply_a_candidate_verdict_receipt(tmp_path):
         task = await session.deps.central_state.get_task(identity)
         service = AttackGraphService(session.deps.graph_store)
         current, = await service.list_hypotheses()
-        llm.decisions.append({"updates": [candidate(
-            current=current.model_dump(mode="json"), status="rejected",
-            evidence=task.result.evidence_ids, review=task.result.evidence_ids[-1],
-        )], "termination": "replan",
+        partial = task.result.evidence_ids[-1]
+        verdict = candidate(current=current.model_dump(mode="json"), status="rejected",
+                            evidence=task.result.evidence_ids, review=partial)
+        llm.decisions.append({"updates": [verdict], "termination": "replan",
             "reason": "Attempt to use an unresolved limitation as proof"})
-        with pytest.raises(DecisionFailure) as rejected:
-            await planner.advance(session.runtime)
-        assert rejected.value.diagnostic.code == (
-            "completion_evidence_reference_has_no_path_linkage_18"
-        )
+        # The planner repairs the receipt selection; the repair fallback holds without a verdict.
+        assert await planner.advance(session.runtime) == []
+        prompt = llm.requests[-1]["messages"][-1]["content"]
+        feedback = prompt.partition("Previous attempt failed")[2]
+        assert "candidate_review_receipt_invalid" in feedback
+        assert "$.updates[0].review_evidence_id" in feedback
+        assert partial not in feedback
         saved = await service.get_hypothesis(current.hypothesis_id)
         assert saved.status == "open" and saved.revision == 1
+        assert await service.list_findings() == []
+        # The final admission still refuses the same reference when it is submitted directly.
+        with pytest.raises(CandidateAdmissionConflict) as gate:
+            await register_candidate_update(session, verdict)
+        assert gate.value.diagnostic.code == "completion_evidence_reference_has_no_path_linkage_18"
+        assert (await service.get_hypothesis(current.hypothesis_id)).revision == 1
+
+
+async def register_candidate_update(session, update):
+    """Final canonical admission for one candidate update, with no planner repair in between."""
+    deps, state = session.deps, session.deps.central_state
+    service = AttackGraphService(deps.graph_store)
+    mission = await state.get_mission(session.runtime.mission_id)
+    binding = await state.transaction(lambda tx: tx.binding()[1], write=False)
+    read = {TARGET: content_hash(await service.get_node(TARGET))}
+    if update.get("expected_revision") is not None:
+        ref = "hypothesis:" + update["hypothesis"]["hypothesis_id"]
+        read[ref] = content_hash(await service.get_node(ref))
+    return await register_probe_tasks(
+        deps, proposal_id="final-gate-" + update["hypothesis"]["hypothesis_id"],
+        proposal=HypothesisProbeProposal.model_validate({"updates": [update]}),
+        expected_revision=mission.revision, expected_binding_hash=binding,
+        graph_read=read, known_targets={TARGET}, known_principals=set(), max_tasks=1,
+    )
