@@ -14,7 +14,11 @@ from redteam.capability.direct_target import (
 )
 from redteam.capability.shell_policy import ShellWorkroomPolicy
 from redteam.capability.shell_preparation import DockerEndpoint
-from redteam.capability.shell_workroom import workroom_key_for
+from redteam.capability.shell_workroom import (
+    ShellWorkroomManager,
+    container_name_for,
+    workroom_key_for,
+)
 from redteam.core.contracts.target import EndpointTarget
 from redteam.core.contracts.tool import (
     EXECUTION_UNCERTAIN_METADATA_KEY,
@@ -238,3 +242,112 @@ async def test_changed_docker_endpoint_is_refused_before_workroom_creation(monke
     )
     assert not result.success and result.error.code == "direct_target_docker_endpoint_changed"
     assert manager._known == {} and manager.calls == []
+
+
+class _NoLock:
+    def release(self) -> None:
+        return None
+
+
+class DockerBoundary:
+    """Fake Docker CLI boundary. The real ShellWorkroomManager runs on top of it."""
+
+    def __init__(self, *, rm_fails: bool = False, detach_fails: bool = False) -> None:
+        self.live: set[str] = set()
+        self.calls: list[tuple[str, ...]] = []
+        self.rm_fails = rm_fails
+        self.detach_fails = detach_fails
+
+    async def run(self, argv, stdin, timeout, limit=None):
+        argv = tuple(argv)
+        self.calls.append(argv)
+        if argv[0] == "start":
+            self.live.add(argv[1])
+        if argv[0] == "inspect":
+            if argv[-1] in self.live:
+                return 0, b"true", b"", False, False
+            return 1, b"", b"No such object", False, False
+        if argv[0] == "rm":
+            if self.rm_fails:
+                return 1, b"", b"cannot remove a running container", False, False
+            self.live.discard(argv[-1])
+        if argv[:3] == ("network", "disconnect", "-f") and self.detach_fails:
+            return 1, b"", b"detach failed", False, False
+        return 0, b"", b"", False, False
+
+
+def real_manager(docker: DockerBoundary, monkeypatch) -> ShellWorkroomManager:
+    manager = ShellWorkroomManager(ShellWorkroomPolicy(image="test", allow_unpinned_image=True))
+    monkeypatch.setattr(manager, "_run_docker", docker.run)
+    monkeypatch.setattr(manager, "_enforce_workroom_cap", AsyncMock(return_value=None))
+    monkeypatch.setattr(manager, "_setup_container", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        "redteam.capability.shell_workroom._create_lock_path", lambda: "unused"
+    )
+    monkeypatch.setattr(
+        "redteam.capability.shell_workroom._acquire_create_lock", lambda *_args: _NoLock()
+    )
+    return manager
+
+
+def patch_route_and_endpoint(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "redteam.capability.direct_target._route_identity",
+        AsyncMock(return_value=ROUTE),
+    )
+    monkeypatch.setattr(
+        "redteam.capability.direct_target.resolve_docker_endpoint",
+        AsyncMock(return_value=DockerEndpoint(**ENDPOINT)),
+    )
+
+
+async def test_cache_lost_while_attached_still_detaches_the_attached_room(monkeypatch):
+    key = workroom_key_for("run_001", "inst_001")
+    docker = DockerBoundary(rm_fails=True)
+    manager = real_manager(docker, monkeypatch)
+    patch_route_and_endpoint(monkeypatch)
+    extension = DirectTargetNetworkExtension(manager, provider())
+
+    async def script_with_teardown():
+        # Run teardown while the script is attached. The real remove_workroom pops
+        # the cache entry before its rm -f, and the rm fails, so the container lives.
+        assert await manager.remove_workroom(key) is False
+        assert key not in manager._known
+        return ok_result()
+
+    result = await DirectTargetExecutionPolicy(extension, allow).execute(
+        invocation(), {"language": "bash", "script": "true"}, script_with_teardown
+    )
+
+    assert result.success
+    assert result.metadata["direct_target_network"] == "attached_for_execution"
+    assert ("network", "disconnect", "-f", "vuln-bank", container_name_for(key)) in docker.calls
+    assert extension.expected_networks(key) == frozenset({"none"})
+
+
+async def test_cache_lost_and_detach_failure_refuses_closure(monkeypatch):
+    key = workroom_key_for("run_001", "inst_001")
+    docker = DockerBoundary(rm_fails=True, detach_fails=True)
+    manager = real_manager(docker, monkeypatch)
+    patch_route_and_endpoint(monkeypatch)
+    extension = DirectTargetNetworkExtension(manager, provider())
+    policy = DirectTargetExecutionPolicy(extension, allow)
+
+    async def script_with_teardown():
+        assert await manager.remove_workroom(key) is False
+        return ok_result()
+
+    result = await policy.execute(
+        invocation(), {"language": "bash", "script": "true"}, script_with_teardown
+    )
+
+    assert not result.success
+    assert result.error.code == "direct_target_disconnect_failed"
+    assert result.metadata[EXECUTION_UNCERTAIN_METADATA_KEY] is True
+    assert extension.expected_networks(key) == frozenset({"vuln-bank"})
+
+    second = await policy.execute(
+        invocation(), {"language": "bash", "script": "true"},
+        AsyncMock(side_effect=AssertionError("must not execute")),
+    )
+    assert not second.success and second.error.code == "direct_target_busy"

@@ -325,6 +325,7 @@ async def prepare_target_network(
 
 @dataclass
 class _Attached:
+    room: str
     network_name: str
     holder_invocation_id: str
     created: bool
@@ -408,7 +409,7 @@ class DirectTargetNetworkExtension(ExecutionAdmission):
             )
             if code or timed_out:
                 raise DirectTargetError("direct_target_connect_failed")
-            self._open[key] = _Attached(network_name, holder_invocation_id, created)
+            self._open[key] = _Attached(room, network_name, holder_invocation_id, created)
         except BaseException:
             if room and network_name:
                 await self._disconnect(room, network_name)
@@ -422,8 +423,10 @@ class DirectTargetNetworkExtension(ExecutionAdmission):
         attached = self._open.get(key)
         if attached is None:
             return
-        room = self.manager._known.get(key)
-        if room and not await self._disconnect(room, attached.network_name):
+        # Detach the room recorded at open. The manager cache may already be
+        # gone (remove_workroom pops it before a failed rm), so it never decides
+        # that nothing needs detaching.
+        if not await self._disconnect(attached.room, attached.network_name):
             raise DirectTargetError("direct_target_disconnect_failed")
         if attached.created:
             code, _, _, timed_out, _ = await self.manager._run_docker(
