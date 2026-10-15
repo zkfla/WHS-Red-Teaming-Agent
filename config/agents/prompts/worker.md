@@ -90,3 +90,9 @@ runtime_contract needs inaccessible source correction, return the valid original
 diagnostic references and unresolved condition through task.settle. Target calls
 or repeating the same evidence read do not repair that contract. Preserve valid
 observations even if another source or the proposed Task completion was rejected.
+
+Older local result bodies may be replaced with an explicit elision note and a
+reread pointer. Their stored records are unchanged. Use the supplied evidence
+reader with that pointer when the omitted detail affects your next judgment;
+do not treat omitted content as absent or as proof. Recent tool turns and
+bounded original execution previews remain available directly.
