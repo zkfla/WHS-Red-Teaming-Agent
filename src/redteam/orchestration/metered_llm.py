@@ -12,7 +12,11 @@ from typing import Any
 from redteam.core.ports.agent_prompts import AgentPrompts
 from redteam.core.ports.llm import LLMProviderFailure, StructuredCompletion
 from redteam.core.request_scope import RequestScope, current_request_scope, llm_request_scope
-from redteam.orchestration.llm_requests import RequestAdmissionError, RunRequestLedger
+from redteam.orchestration.llm_requests import (
+    RequestAdmissionError,
+    RunRequestLedger,
+    outcome_for_exception,
+)
 
 __all__ = ["RequestScope", "current_request_scope", "llm_request_scope", "RunMeteredLLM",
            "configure_request_metering", "llm_request_guard", "current_request_guard"]
@@ -120,8 +124,11 @@ class RunMeteredLLM:
         except BaseException as exc:
             # If settlement itself fails, the durable dispatched reservation
             # remains charged. Do not mask the original exception/cancellation.
+            outcome = outcome_for_exception(exc)
             try:
-                await self.ledger.settle(scope.run_id, request, unknown=True)
+                await self.ledger.settle(
+                    scope.run_id, request, unknown=True, outcome=outcome,
+                )
             except BaseException:
                 pass
             if isinstance(exc, LLMProviderFailure):

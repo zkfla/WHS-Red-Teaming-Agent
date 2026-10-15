@@ -153,6 +153,11 @@ def _render_markdown(report: TerminalReportProjection) -> str:
             f"- Known tokens: {usage['known_tokens']}; unknown usage: {usage['unknown_usage']}",
             "- This ledger, not per-instance decision counters, owns request admission.", "",
         ]
+        if "unknown_dispatch" in usage:
+            lines.append(f"- Dispatched requests with unknown outcome: {usage['unknown_dispatch']}")
+        if usage.get("unknown_outcomes"):
+            lines.append("- Recorded unknown-outcome categories: "
+                         + json.dumps(usage["unknown_outcomes"], sort_keys=True))
         for stage, counts in usage.get("by_stage", {}).items():
             lines += [f"- {stage}: requests={counts['spent']}; "
                       f"reserved={counts['reserved']}; known tokens={counts['known_tokens']}; "

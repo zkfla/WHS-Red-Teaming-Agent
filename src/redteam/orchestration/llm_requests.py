@@ -7,6 +7,8 @@ dispatched request. A recovered unknown remains charged.
 
 from __future__ import annotations
 
+import asyncio
+import math
 import time
 from collections.abc import Awaitable, Callable, Coroutine, MutableMapping
 from typing import Any, Protocol
@@ -18,6 +20,66 @@ from redteam.orchestration.cognition import ReasoningHalted
 from redteam.orchestration.coordination import CoordinationError, Coordinator
 
 _REQUEST_STATES = ("reserved", "dispatched", "settled", "unknown", "released")
+_FACADE_OUTCOMES = ("cancelled", "timeout", "exception")
+_PROVIDER_OUTCOME_KEYS = frozenset({
+    "category", "source", "kind", "http_status", "provider_code", "retryable", "retry_after",
+})
+# Optional Unix UTC seconds from the ledger clock (float). Rows written before these
+# fields existed have none; readers must not infer them.
+_TIME_FIELDS = ("dispatched_at", "settled_at")
+
+
+def outcome_for_exception(exc: BaseException) -> dict[str, Any]:
+    """Safe settlement category for an unknown row: no type name, message or body."""
+    if isinstance(exc, LLMProviderFailure):
+        return {"category": "provider_failure", "source": "facade", "kind": exc.kind,
+                "http_status": exc.http_status, "provider_code": exc.provider_code,
+                "retryable": exc.retryable, "retry_after": exc.retry_after}
+    if isinstance(exc, asyncio.CancelledError):
+        return {"category": "cancelled", "source": "facade"}
+    # Python 3.10 keeps asyncio.TimeoutError distinct from the builtin TimeoutError.
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return {"category": "timeout", "source": "facade"}
+    return {"category": "exception", "source": "facade"}
+
+
+def _valid_outcome(outcome: Any, state: Any) -> bool:
+    """Accept only the sanitized shapes written above; anything else is malformed."""
+    if state != "unknown" or not isinstance(outcome, dict):
+        return False
+    category, source = outcome.get("category"), outcome.get("source")
+    if category == "outcome_lost":
+        return source == "recovery" and set(outcome) == {"category", "source"}
+    if source != "facade":
+        return False
+    if category in _FACADE_OUTCOMES:
+        return set(outcome) == {"category", "source"}
+    if category != "provider_failure" or set(outcome) != _PROVIDER_OUTCOME_KEYS:
+        return False
+    if type(outcome["retryable"]) is not bool:
+        return False
+    try:
+        failure = LLMProviderFailure(
+            kind=outcome["kind"], http_status=outcome["http_status"],
+            provider_code=outcome["provider_code"], retryable=outcome["retryable"],
+            retry_after=outcome["retry_after"],
+        )
+    except Exception:
+        return False
+    return (failure.kind == outcome["kind"]
+            and failure.http_status == outcome["http_status"]
+            and failure.provider_code == outcome["provider_code"]
+            and failure.retry_after == outcome["retry_after"])
+
+
+def _unknown_outcome_counts(rows) -> dict[str, int]:
+    """Unknown rows by stored category; rows written before this field stay unrecorded."""
+    counts: dict[str, int] = {}
+    for row in rows:
+        if row["state"] == "unknown":
+            category = (row.get("outcome") or {}).get("category", "unrecorded")
+            counts[category] = counts.get(category, 0) + 1
+    return dict(sorted(counts.items()))
 
 
 def request_stage_usage(rows) -> dict[str, dict[str, int]]:
@@ -174,6 +236,12 @@ class RunRequestLedger:
         if (tokens is not None and (type(tokens) is not int or tokens < 0
                                     or row["state"] not in {"settled", "unknown"})):
             raise RequestAdmissionError("llm_request_record_invalid")
+        if "outcome" in row and not _valid_outcome(row["outcome"], row["state"]):
+            raise RequestAdmissionError("llm_request_record_invalid")
+        if any(key in row and (type(row[key]) not in (int, float)
+                               or not math.isfinite(row[key]) or row[key] < 0)
+               for key in _TIME_FIELDS):
+            raise RequestAdmissionError("llm_request_record_invalid")
         return row
 
     @classmethod
@@ -287,6 +355,7 @@ class RunRequestLedger:
             if self._cooldown(tx, run_id, policy) > 0:
                 raise RequestAdmissionError("llm_provider_cooldown_active")
             row["state"] = "dispatched"
+            row["dispatched_at"] = self.clock()
         await self._change(run_id, change)
 
     @classmethod
@@ -301,17 +370,20 @@ class RunRequestLedger:
 
     async def settle(
         self, run_id: str, request_id: str, *, unknown: bool = False,
-        total_tokens: int | None = None,
+        total_tokens: int | None = None, outcome: dict[str, Any] | None = None,
     ) -> None:
         async def change(tx: RequestSession) -> None:
             row = self._get(tx, run_id, request_id)
             state = "unknown" if unknown else "settled"
             tokens = total_tokens if type(total_tokens) is int and total_tokens >= 0 else None
+            if outcome is not None and (not unknown or not _valid_outcome(outcome, state)):
+                raise RequestAdmissionError("llm_request_outcome_invalid")
             if row["state"] == state and row["total_tokens"] == tokens:
                 return
             if row["state"] != "dispatched":
                 raise RequestAdmissionError("llm_request_settlement_conflict")
-            row.update(state=state, total_tokens=tokens)
+            row.update(state=state, total_tokens=tokens, settled_at=self.clock(),
+                       **({"outcome": dict(outcome)} if outcome is not None else {}))
         await self._change(run_id, change)
 
     async def release_undispatched(self, run_id: str, request_id: str) -> None:
@@ -335,6 +407,7 @@ class RunRequestLedger:
                 "unknown_dispatch": sum(r["state"] == "unknown" for r in spent),
                 "provider_cooldown": tx.records.get(("llm_provider_cooldown", run_id)),
                 "by_stage": request_stage_usage(rows),
+                "unknown_outcomes": _unknown_outcome_counts(rows),
             }
         return await self._change(run_id, read)
 
@@ -353,7 +426,8 @@ class RunRequestLedger:
                 if current["state"] == "reserved":
                     current["state"] = "released"
                 elif current["state"] == "dispatched":
-                    current.update(state="unknown", total_tokens=None)
+                    current.update(state="unknown", total_tokens=None,
+                                   outcome={"category": "outcome_lost", "source": "recovery"})
         await self._change(run_id, change)
 
     async def recover_run(self, run_id: str) -> None:
