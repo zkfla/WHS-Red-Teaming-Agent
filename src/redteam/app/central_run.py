@@ -396,6 +396,7 @@ class CentralRun:
         import json
 
         from redteam.orchestration.central_completion import complete_goal, goal_snapshot, unsafe
+        from redteam.orchestration.central_results import OriginTaskChangedConflict
         from redteam.orchestration.coordination import CoordinationError, StateConflict
         from redteam.orchestration.reasoning_time import reasoning_time_failure
 
@@ -423,6 +424,8 @@ class CentralRun:
                     if not errors:
                         reason = TerminationReason.GOAL_ACHIEVED
                     else:
+                        planner_events = tuple(SpecialistPlanner(self.deps).wake_events())
+
                         def judgment(tx):
                             row = tx.db.execute(
                                 "SELECT payload FROM state_requests WHERE run_id=? "
@@ -434,24 +437,81 @@ class CentralRun:
                                 proposal is None or "candidate_inputs" not in proposal
                                 or proposal["candidate_inputs"] == tx.hypothesis_candidate_inputs()
                             )
-                            return (proposal, goal_snapshot(tx, include_assessment=False),
-                                    fresh_candidates)
-                        proposal, (_, tasks, stamp), fresh_candidates = await state.transaction(
-                            judgment, write=False,
-                        )
+                            progress = tx.planner_progress_status()
+                            cursor = tx.hypothesis_planner_cursor()
+                            latest = tx.latest_event_sequence(planner_events)
+                            return (
+                                proposal,
+                                goal_snapshot(tx, include_assessment=False),
+                                fresh_candidates,
+                                progress,
+                                cursor,
+                                latest,
+                                tx.active_activation_count(),
+                            )
+                        (
+                            proposal,
+                            (_, tasks, stamp),
+                            fresh_candidates,
+                            progress,
+                            cursor,
+                            latest,
+                            active_actors,
+                        ) = await state.transaction(judgment, write=False)
                         history = await state.list_executions()
                         if (proposal and proposal["termination"] == "exhausted"
                                 and proposal["inputs"] == stamp
                                 and fresh_candidates
                                 and not any(unsafe(item) for item in history)
-                                and not any(task.status.value in {"ready", "pending", "running"}
+                                and not any(task.status.value in {
+                                    "ready", "pending", "running", "blocked",
+                                }
                                             for task in tasks)):
                             reason = TerminationReason.EXHAUSTED
+                        elif (
+                            progress is not None
+                            and progress.kind == "replan_exhausted"
+                            and proposal is not None
+                            and proposal.get("termination") == "replan"
+                            and proposal.get("inputs") == stamp
+                            and fresh_candidates
+                            and cursor is not None
+                            and cursor == latest
+                            and active_actors == 0
+                            and not any(unsafe(item) for item in history)
+                            and not any(
+                                task.status.value in {"ready", "pending", "running", "blocked"}
+                                for task in tasks
+                            )
+                        ):
+                            reason = TerminationReason.NO_ACTIONABLE_PLAN
+                            diagnostic = progress.diagnostic
+                            final = final.model_copy(update={
+                                "planning_diagnostic": diagnostic,
+                                "planning_diagnostic_history": [
+                                    *final.planning_diagnostic_history,
+                                    *([diagnostic] if diagnostic is not None
+                                      and (not final.planning_diagnostic_history
+                                           or final.planning_diagnostic_history[-1] != diagnostic)
+                                      else []),
+                                ],
+                            })
                         else:
                             reason = TerminationReason.INVESTIGATION_HELD
                 except (DecisionFailure, ReasoningHalted) as exc:
                     reason = exc.diagnostic.termination_reason or TerminationReason.PLANNING_ERROR
                     final = final.model_copy(update={"planning_diagnostic": exc.diagnostic})
+                except OriginTaskChangedConflict as exc:
+                    reason = TerminationReason.INVESTIGATION_HELD
+                    final = final.model_copy(update={
+                        "planning_diagnostic": exc.diagnostic,
+                        "planning_diagnostic_history": [
+                            *final.planning_diagnostic_history,
+                            *([exc.diagnostic] if not final.planning_diagnostic_history
+                              or final.planning_diagnostic_history[-1] != exc.diagnostic
+                              else []),
+                        ],
+                    })
                 except (CoordinationError, StateConflict):
                     reason = TerminationReason.INVESTIGATION_HELD
                 finally:
