@@ -267,7 +267,7 @@ def purpose_compare_message(metadata: Any, task: Any, evidence_id: str) -> str |
     current_hash = (completion_contract_hash(task)
                     if metadata.get("central_execution_version") == 1
                     else purpose_hash(_record_text(getattr(task, "objective", ""))))
-    if expected_hash == current_hash:
+    if expected_hash == current_hash or _cites_declared_source(task, metadata):
         return None
     return "evidence '" + str(evidence_id) + "' purpose changed since the evidence"
 
@@ -387,6 +387,25 @@ async def recheck_origin_proofs(
             )
             return origin_refusal(failure, proof.evidence_id)
     return None
+def _cites_declared_source(task: Any, meta: dict[str, Any]) -> bool:
+    """A follow-up task may cite its own already-verified source task's evidence.
+
+    ``task.source_task_id``/``source_result_id`` is validated once, at Task
+    registration (hypothesis_planner.bind_decision / probe_atomization.bind_plan):
+    the cited result must already exist on the named source task's stored
+    ``MissionTask.result``. Citing that same source task's evidence again here
+    -- to review or carry forward its observation -- reads the original, it does
+    not change its recorded purpose. This never widens to "any task": only the
+    exact task_id this Task declared (and had verified) as its source, matched
+    against the evidence's own recorded originating task, is accepted. A task
+    with no declared source_task_id gets no exception; the purpose hash must
+    still match exactly.
+    """
+    source_task_id = _record_text(getattr(task, "source_task_id", "") or "").strip()
+    if not source_task_id:
+        return False
+    origin_task_id = _record_text(meta.get("mission_task_id", "") or "").strip()
+    return bool(origin_task_id) and origin_task_id == source_task_id
 
 
 async def verify_single_origin(

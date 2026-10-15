@@ -67,19 +67,28 @@ async def role_readiness(deps) -> list[dict]:
             "reason_code": "catalog_ready" if healthy else (
                 "no_healthy_eligible_tool" if visible else "no_eligible_tool_or_target"),
             "healthy_tool_ids": healthy, "visible_tool_ids": sorted(visible),
+            "eligible_tool_ids": sorted(eligible),
             "target_execution_verified": False, "execution_permission_granted": False,
         })
     return rows
 
 
 async def _readiness_handler(tool_input, context):
-    return LocalToolResult(ok=True, payload={"roles": await role_readiness(context.deps),
-                                            "target_execution_verified": False})
+    from redteam.orchestration.tool_discovery import program_execution_environment
+
+    rows = await role_readiness(context.deps)
+    return LocalToolResult(ok=True, payload={
+        "roles": rows, "target_execution_verified": False,
+        "program_execution_environment": program_execution_environment(
+            getattr(context.deps, "shell_programs", None),
+            {identity for row in rows for identity in row["eligible_tool_ids"]},
+        ),
+    })
 
 
 def register_role_readiness(registry) -> None:
     registry.register(LocalToolDescriptor(
-        tool_id="agent.readiness", contribution_id="specialists:role-readiness", version="1",
+        tool_id="agent.readiness", contribution_id="specialists:role-readiness", version="2",
         description="Read current role catalog/health eligibility. No device probing, target "
                     "execution, permission or readiness fabrication.",
         input_schema={"type": "object", "properties": {}, "additionalProperties": False},

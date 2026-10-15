@@ -770,6 +770,7 @@ async def bind_run_metadata(deps, *, before_bind=None):
     if binding is not None and (
         binding.llm_connection_fingerprint is not None
         or binding.execution_environment_fingerprint is not None
+        or binding.network_environment_fingerprint is not None
     ):
         # New optional provider identity remains readable before transports are
         # rebuilt. Absent identities keep historical central metadata unchanged.

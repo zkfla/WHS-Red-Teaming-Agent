@@ -64,13 +64,16 @@ _TARGET_RUN_DESCRIPTION = (
     "The script runs inside one exclusive per-instance transmit window "
     "that reaches only operator-pinned IPs for the selected registry "
     "target. Enforcement uses pinned IP literals; the registry name is "
-    "only a selector."
+    "only a selector. Host/VM loopback is not the workroom loopback. "
+    "Scripts have no NET_ADMIN or CAP_NET_RAW; raw-packet modes are "
+    "unsupported. Use available unprivileged connection/application modes."
 )
 _TARGET_JOB_START_DESCRIPTION = (
     "Stateful shell workroom, gated target route (shell_target_job_start). "
     "Starts one tagged background execution inside the exclusive window; "
     "poll it with shell_job_status. Same destination bounds as "
-    "shell_target_run."
+    "shell_target_run. Scripts have no NET_ADMIN or CAP_NET_RAW; "
+    "raw-packet modes are unsupported."
 )
 _INSTALL_RUN_DESCRIPTION = (
     "Stateful shell workroom, gated install route (shell_install_run). "

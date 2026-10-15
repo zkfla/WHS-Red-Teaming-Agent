@@ -603,8 +603,9 @@ async def model_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         checkpoint_context = dict(context)
         if isinstance(context.get("requested_evidence"), list):
             checkpoint_context["requested_evidence"] = [
-                {**{key: value for key, value in view.items() if key != "text"},
-                 "text_omitted": True}
+                {**{key: value for key, value in view.items()
+                    if key not in {"text", "program_output"}},
+                 "text_omitted": True, "program_output_omitted": "program_output" in view}
                 for view in context["requested_evidence"]
             ]
         checkpoint_message = {**user_message, "content": json.dumps(
@@ -659,6 +660,8 @@ async def _local_call(call: NativeCallState, state: GraphState, *, deps: Runtime
             # A source request plus metadata is enough to restore the window.
             # _result_messages delivers it transiently on the next model request.
             call.feedback["payload"].pop("text", None)
+            if call.feedback["payload"].pop("program_output", None) is not None:
+                call.feedback["payload"]["program_output_omitted"] = True
             call.feedback["payload"]["text_omitted"] = True
         if result.last_event_id is not None:
             state["last_event_id"] = result.last_event_id

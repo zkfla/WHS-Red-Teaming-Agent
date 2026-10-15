@@ -22,8 +22,7 @@ Preservation rules:
 
 from __future__ import annotations
 
-import copy
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -31,14 +30,18 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from redteam.core.contracts.completion import (
     CompletionCriterion,
     completion_condition_conflicts,
+    completion_conditions,
     criterion_id,
 )
 from redteam.core.contracts.graph import HypothesisUpdate
 from redteam.core.contracts.specialists import ProbeLimits
 from redteam.core.ids import new_id
+from redteam.orchestration.diagnostics import DecisionDiagnostic, safe_feedback
+from redteam.orchestration.planner_context import PlannerContextRequest
 from redteam.orchestration.specialist_tasks import (
     HypothesisProbeProposal,
     ProbeTaskProposal,
+    ProbeTaskPurpose,
     SpecialistProposalError,
     validate_probe_subjects,
 )
@@ -49,6 +52,40 @@ if TYPE_CHECKING:
 
 class AtomizationProposalError(SpecialistProposalError):
     """Code-owned split-validation label; never contains model text or secrets."""
+
+    def __init__(
+        self, code: str, *, diagnostic: DecisionDiagnostic | None = None,
+        condition_conflicts: tuple = (),
+    ):
+        super().__init__(code)
+        self.diagnostic = diagnostic
+        self.condition_conflicts = condition_conflicts
+
+
+def _task_rejection(code, *, index, task, field, question, criterion_ids=(),
+                    differing_fields=(), repair="Preserve the supplied question contract."):
+    """Bounded public references and field names, never criterion bodies or raw values."""
+    location = f"$.tasks[{index}].{field}"
+    references = list(criterion_ids)[:8]
+    summary = safe_feedback(
+        f"Task {safe_feedback(task.task_key, 80)} for question "
+        f"{safe_feedback(question.question_id, 80)}: {field} does not match the question. "
+        f"Condition IDs: {', '.join(references[:1]) or 'none'}. "
+        f"Differing fields: {', '.join(differing_fields) or field}. "
+        f"{repair}",
+    )
+    return AtomizationProposalError(code, diagnostic=DecisionDiagnostic(
+        code=code, stage="task_atomization", kind="validation", retryable=True,
+        cause_scope="model_input", owner="orchestration.probe_atomization",
+        location=location, summary=summary, repair_condition=repair,
+        criterion_ids=references,
+        validation_issues=[{"rule": code, "location": location}],
+        trace=[{"task_key": safe_feedback(task.task_key, 80),
+                "question_id": safe_feedback(question.question_id, 80),
+                "criterion_ids": references, "differing_fields": list(differing_fields)}],
+    ))
+
+
 def bind_candidate_updates(
     raw_updates: list[HypothesisUpdate],
     snapshot: PlanningSnapshot,
@@ -133,10 +170,11 @@ class HypothesisPlanDraft(BaseModel):
     reason: str = Field(min_length=1)
     termination: Literal["continue", "replan", "held", "exhausted", "goal_achieved"] = "continue"
     resume_conditions: list[str] = Field(default_factory=list)
+    context_request: PlannerContextRequest | None = None
 
 
 class AtomizedProbeTask(ProbeTaskProposal):
-    """Internal restored probe: original conditions plus a plan-local question_id."""
+    """Internal hydrated probe, never the atomizer's model-output schema."""
 
     question_id: str = Field(min_length=1)
 
@@ -147,101 +185,55 @@ class AtomizedProbeTask(ProbeTaskProposal):
         return self
 
 
-class StandaloneAtomizedProbeTaskSelection(BaseModel):
-    """Stage-2 atomizer selection: names original conditions by criterion_id only.
+class AtomizedProbeSelection(ProbeTaskPurpose):
+    """Model selects whole original conditions by ID; code owns their contents."""
 
-    Binding fields mirror AtomizedProbeTask. Conditions are never accepted from
-    the model; restore_atomized_tasks copies them from the bound question.
-    """
-
-    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
     question_id: str = Field(min_length=1)
-    task_key: str = Field(min_length=1)
-    objective: str = Field(min_length=1)
-    title: str = Field(min_length=1)
-    role_id: str = Field(min_length=1)
-    target_node_ids: list[str] = Field(min_length=1)
-    principal_refs: list[str] = Field(default_factory=list)
     completion_criterion_ids: list[str] = Field(min_length=1)
-    evidence_ids: list[str] = Field(default_factory=list)
-    hypothesis_revisions: dict[str, int] = Field(default_factory=dict)
-    required: bool = False
-    required_reason: str | None = None
-    goal_required_hypothesis_ids: list[str] = Field(default_factory=list)
-    source_task_id: str | None = None
-    source_result_id: str | None = None
-    source_question_id: str | None = None
-    probe_limits: ProbeLimits | None = None
-
-    @model_validator(mode="after")
-    def _binding(self):
-        if not all(value.strip() for value in (
-            self.question_id, self.task_key, self.objective, self.title, self.role_id,
-            *self.target_node_ids, *self.completion_criterion_ids,
-        )):
-            raise ValueError("probe purpose and references must be nonblank")
-        if self.required and not (self.required_reason or "").strip():
-            raise ValueError("goal-required probe needs an explicit reason")
-        return self
 
 
 class TaskAtomizationDraft(BaseModel):
     """Stage-2 judgment: probe tasks only, each referencing a plan-local question."""
 
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
-    tasks: list[StandaloneAtomizedProbeTaskSelection] = Field(min_length=1)
+    tasks: list[AtomizedProbeSelection] = Field(min_length=1)
 
 
-def _question_payload(question: PlannedInvestigationQuestion) -> dict:
-    """Full question purpose; every condition carries the ID the atomizer selects."""
-    payload = question.model_dump(mode="json")
-    payload["completion_criteria"] = [
-        {"criterion_id": criterion_id(condition), **condition.model_dump(mode="json")}
-        for condition in question.completion_criteria
-    ]
-    return payload
-
-
-def restore_atomized_tasks(
-    selections: Sequence[StandaloneAtomizedProbeTaskSelection],
-    *,
-    questions: list[PlannedInvestigationQuestion],
+def resolve_atomized_tasks(
+    selections: list[AtomizedProbeSelection], *, questions: list[PlannedInvestigationQuestion],
 ) -> list[AtomizedProbeTask]:
-    """Restore each selected condition from its own bound question, before validation.
-
-    An ID must belong to the selection's question and appear once per task. It
-    resolves to a deep copy of the original condition, so model text can never
-    rewrite, drop or replace a condition.
-    """
-    originals: dict[str, dict[str, CompletionCriterion]] = {}
-    owner: dict[str, str] = {}
-    for question in questions:
-        by_id: dict[str, CompletionCriterion] = {}
-        for condition in question.completion_criteria:
-            identity = criterion_id(condition)
-            by_id.setdefault(identity, condition)
-            owner.setdefault(identity, question.question_id)
-        originals[question.question_id] = by_id
-    restored: list[AtomizedProbeTask] = []
-    for selection in selections:
-        if selection.question_id not in originals:
-            raise AtomizationProposalError("atomized_unknown_question")
-        identities = selection.completion_criterion_ids
-        if len(set(identities)) != len(identities):
-            raise AtomizationProposalError("atomized_criterion_duplicate_in_task")
-        scope = originals[selection.question_id]
-        conditions: list[CompletionCriterion] = []
-        for identity in identities:
-            if identity not in scope:
-                if identity in owner:
-                    raise AtomizationProposalError("atomized_criterion_cross_question")
-                raise AtomizationProposalError("atomized_criterion_unknown")
-            conditions.append(copy.deepcopy(scope[identity]))
-        restored.append(AtomizedProbeTask.model_validate({
-            **selection.model_dump(exclude={"completion_criterion_ids"}),
-            "completion_criteria": conditions,
-        }))
-    return restored
+    """Resolve only within each captured question; never trust rephrased condition text."""
+    qmap = {question.question_id: question for question in questions}
+    tasks = []
+    for index, selection in enumerate(selections):
+        question = qmap.get(selection.question_id)
+        if question is None:
+            raise AtomizationProposalError("atomized_unknown_question",
+                                           diagnostic=DecisionDiagnostic(
+                code="atomized_unknown_question", stage="task_atomization", kind="validation",
+                location=f"$.tasks[{index}].question_id", retryable=True,
+                cause_scope="model_input", owner="orchestration.probe_atomization",
+                summary=f"Task {safe_feedback(selection.task_key, 80)} must select a supplied "
+                        "question_id; do not invent a question.",
+                validation_issues=[{"rule": "atomized_unknown_question",
+                                    "location": f"$.tasks[{index}].question_id"}],
+            ))
+        conditions = {criterion_id(item): item for item in question.completion_criteria}
+        ids = selection.completion_criterion_ids
+        if len(ids) != len(set(ids)) or set(ids) - conditions.keys():
+            raise _task_rejection(
+                "atomized_criterion_reference_invalid", index=index, task=selection,
+                field="completion_criterion_ids", question=question,
+                criterion_ids=conditions.keys(), differing_fields=["completion_criterion_ids"],
+                repair="Select each ID once from this question's completion_criteria. "
+                       f"Allowed IDs: {', '.join(list(conditions)[:3])}.",
+            )
+        values = selection.model_dump(exclude={"completion_criterion_ids"})
+        values["completion_criteria"] = [
+            conditions[identity].model_copy(deep=True) for identity in ids
+        ]
+        tasks.append(AtomizedProbeTask.model_validate(values))
+    return tasks
 
 
 def bind_plan(
@@ -361,7 +353,7 @@ def needs_atomization(
 
 
 def validate_atomized_tasks(
-    selections: Sequence[StandaloneAtomizedProbeTaskSelection],
+    tasks: list[AtomizedProbeTask],
     *,
     questions: list[PlannedInvestigationQuestion],
     issued: dict[str, str],
@@ -380,7 +372,6 @@ def validate_atomized_tasks(
     subjects and criteria; each task stays within its question. A criterion
     with explicit principal_refs must land on ONE task carrying all of them.
     """
-    tasks = restore_atomized_tasks(selections, questions=questions)
     qmap = {question.question_id: question for question in questions}
     keys = [task.task_key for task in tasks]
     if not tasks or max_tasks < 1 or len(tasks) > max_tasks or len(set(keys)) != len(keys):
@@ -390,6 +381,7 @@ def validate_atomized_tasks(
             raise AtomizationProposalError("atomized_unknown_question")
     grouped = {identity: [task for task in tasks if task.question_id == identity]
                for identity in qmap}
+    indices = {id(task): index for index, task in enumerate(tasks)}
     for children in grouped.values():
         if not children:
             raise AtomizationProposalError("atomized_question_uncovered")
@@ -401,57 +393,88 @@ def validate_atomized_tasks(
                              for ref in question.goal_required_hypothesis_ids}
         original = {criterion_id(item) for item in question.completion_criteria}
         for child in children:
+            def reject(code, field, *, refs=(), fields=(), repair=None,
+                       child=child, question=question):
+                return _task_rejection(
+                    code, index=indices[id(child)], task=child, question=question,
+                    field=field, criterion_ids=refs, differing_fields=fields,
+                    repair=repair or "Preserve the supplied question contract.",
+                )
             if set(child.target_node_ids) - set(question.target_node_ids) or (
                 set(child.principal_refs) - set(question.principal_refs)
             ):
-                raise AtomizationProposalError("atomized_subject_outside_question")
+                fields = [name for name in ("target_node_ids", "principal_refs")
+                          if set(getattr(child, name)) - set(getattr(question, name))]
+                raise reject("atomized_subject_outside_question", fields[0], fields=fields)
             for condition in child.completion_criteria:
                 if criterion_id(condition) not in original:
-                    raise AtomizationProposalError("atomized_criterion_outside_question")
+                    # Internal invariant failure: retain the strict legacy comparison,
+                    # reporting field names only (never the rewritten descriptions).
+                    fields = ["completion_criteria"]
+                    if len(question.completion_criteria) == 1:
+                        expected = question.completion_criteria[0]
+                        fields = [name for name in CompletionCriterion.model_fields
+                                  if expected.model_dump()[name] != condition.model_dump()[name]]
+                    raise reject("atomized_criterion_outside_question", "completion_criteria",
+                                 refs=sorted(original), fields=fields,
+                                 repair="Select the original condition ID instead of rewriting it.")
                 if set(condition.principal_refs) - set(child.principal_refs):
-                    raise AtomizationProposalError(
-                        "atomized_criterion_principals_outside_task")
+                    raise reject("atomized_criterion_principals_outside_task", "principal_refs",
+                                 refs=[criterion_id(condition)], fields=["principal_refs"],
+                                 repair="Keep all principals of this whole condition on one task.")
             resolved = {issued.get(key, key): revision
                         for key, revision in child.hypothesis_revisions.items()}
             if resolved != expected_revisions:
-                raise AtomizationProposalError("atomized_revision_not_preserved")
+                raise reject("atomized_revision_not_preserved", "hypothesis_revisions")
             if child.required != question.required or {
                 issued.get(ref, ref) for ref in child.goal_required_hypothesis_ids
             } != expected_required:
-                raise AtomizationProposalError("atomized_required_not_preserved")
+                raise reject("atomized_required_not_preserved", "required",
+                             fields=["required", "goal_required_hypothesis_ids"])
             if (child.source_task_id, child.source_result_id, child.source_question_id) != (
                 question.source_task_id, question.source_result_id, question.source_question_id
             ):
-                raise AtomizationProposalError("atomized_source_not_preserved")
+                fields = [name for name in
+                          ("source_task_id", "source_result_id", "source_question_id")
+                          if getattr(child, name) != getattr(question, name)]
+                raise reject("atomized_source_not_preserved", fields[0], fields=fields)
             if child.role_id not in roles:
-                raise AtomizationProposalError("probe_role_not_ready")
+                raise reject("probe_role_not_ready", "role_id",
+                             repair="Select a currently ready executable role.")
             if bool(child.source_task_id) != bool(child.source_result_id) or (
                 child.source_question_id and not child.source_task_id
             ):
-                raise AtomizationProposalError("probe_followup_requires_original_task_result_pair")
+                raise reject("probe_followup_requires_original_task_result_pair",
+                             "source_result_id")
             if child.source_task_id:
                 source = snapshot.tasks.get(child.source_task_id)
                 if source is None or source.result is None or (
                     source.result.result_id != child.source_result_id
                 ):
-                    raise AtomizationProposalError("probe_source_result_not_in_snapshot")
+                    raise reject("probe_source_result_not_in_snapshot", "source_result_id")
             if child.probe_limits is not None and limits is not None and (
                 child.probe_limits.max_actions > limits.max_actions
                 or child.probe_limits.max_model_requests > limits.max_model_requests
             ):
-                raise AtomizationProposalError("probe_limits_exceed_profile")
+                raise reject("probe_limits_exceed_profile", "probe_limits",
+                             repair="Use limits within the supplied profile.")
         if {ref for task in children for ref in task.target_node_ids} != set(
             question.target_node_ids
         ):
-            raise AtomizationProposalError("atomized_subject_coverage_mismatch")
+            raise reject("atomized_subject_coverage_mismatch", "target_node_ids")
         if {ref for task in children for ref in task.principal_refs} != set(
             question.principal_refs
         ):
-            raise AtomizationProposalError("atomized_subject_coverage_mismatch")
+            raise reject("atomized_subject_coverage_mismatch", "principal_refs")
         retained = {criterion_id(condition) for task in children
                     for condition in task.completion_criteria}
         if original != retained:
-            raise AtomizationProposalError("atomized_criterion_coverage_mismatch")
+            raise reject("atomized_criterion_coverage_mismatch", "completion_criterion_ids",
+                         refs=sorted(original - retained), fields=["completion_criterion_ids"],
+                         repair="The tasks together must select every original condition ID. "
+                                "Add the missing condition to a task with its full "
+                                "principal scope.",
+                         )
     stripped = [
         ProbeTaskProposal.model_validate(task.model_dump(exclude={"question_id"}))
         for task in tasks
@@ -485,9 +508,62 @@ def build_atomizer_input(
         # existing candidate; the prospective revision lives in versions[id].
         entry["proposed_revision"] = versions[update.hypothesis.hypothesis_id]
         strategy_updates.append(entry)
+    candidate_ids = {issued.get(ref, ref) for question in questions
+                     for ref in question.hypothesis_revisions}
+    candidate_ids.update(update.hypothesis.hypothesis_id for update in updates)
+    candidate_ids.update(ref for update in updates
+                         for ref in update.hypothesis.source_hypothesis_ids)
+    task_ids = {question.source_task_id for question in questions if question.source_task_id}
+    targets = {ref for question in questions for ref in question.target_node_ids}
+    principals = {ref for question in questions for ref in question.principal_refs}
+    evidence_ids = {ref for question in questions for ref in question.evidence_ids}
+    for update in updates:
+        evidence_ids.update(update.hypothesis.supporting_evidence_ids)
+        evidence_ids.update(update.hypothesis.refuting_evidence_ids)
+        if update.review_evidence_id:
+            evidence_ids.add(update.review_evidence_id)
+    tasks = [item for item in payload.get("investigations", [])
+             if item["task_id"] in task_ids or (
+                 item.get("status") in {"pending", "ready", "running", "blocked"}
+                 and targets.intersection(item.get("related_attack_graph_node_ids", [])))]
+    # The hydrated handoff contains source ancestry; retain it transitively.
+    changed = True
+    while changed:
+        ancestors = {ref for item in tasks for ref in (
+            item.get("source_task_id"), *item.get("dependency_task_ids", [])) if ref}
+        missing = [item for item in payload.get("investigations", [])
+                   if item["task_id"] in ancestors and item not in tasks]
+        tasks.extend(missing)
+        changed = bool(missing)
+    evidence_ids.update(ref for item in tasks for ref in (
+        *item.get("evidence_ids", []), *(item.get("result") or {}).get("evidence_ids", [])))
+    related_task_ids = {item["task_id"] for item in tasks}
+    # Explicit handoff: never inherit investigation history, ledger or unrelated receipts.
+    selected = {key: payload[key] for key in (
+        "mission", "constraints", "operator_instructions", "role_readiness", "tools_by_role",
+        "tool_cards", "program_execution_environment", "program_manifest_status",
+        "workroom_status", "tool_cards_total", "tool_cards_truncated", "tool_cards_guidance",
+        "probe_limits", "max_tasks", "remaining_budget", "related_work", "related_executions",
+    ) if key in payload}
     return {
-        **payload,
-        "questions": [_question_payload(question) for question in questions],
+        **selected,
+        "known_target_ids": sorted(targets),
+        "registered_principal_refs": sorted(principals),
+        "candidates": [item for item in payload.get("candidates", [])
+                       if item["hypothesis_id"] in candidate_ids],
+        "investigations": tasks,
+        "execution_history": [item for item in payload.get("execution_history", [])
+                              if item["task_id"] in related_task_ids],
+        "evidence_validity": [item for item in payload.get("evidence_validity", [])
+                              if item["evidence_id"] in evidence_ids],
+        "original_observations": {
+            "records": [item for item in payload.get("original_observations", {}).get("records", [])
+                        if item["evidence_id"] in evidence_ids],
+            "note": "Bounded related original windows, not independent verdict receipts.",
+        },
+        "questions": [{**question.model_dump(mode="json"),
+                       "completion_criteria": completion_conditions(question)}
+                      for question in questions],
         "strategy": {
             "updates": strategy_updates,
             "reason": plan.reason,
@@ -497,5 +573,6 @@ def build_atomizer_input(
             "resume_conditions": list(plan.resume_conditions),
         },
         "issued_candidate_ids": dict(issued),
-        "candidate_revisions": dict(versions),
+        "candidate_revisions": {ref: versions[ref] for ref in sorted(candidate_ids)
+                                if ref in versions},
     }

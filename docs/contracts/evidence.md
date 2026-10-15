@@ -148,8 +148,42 @@ Planner and terminal reports receive bounded `runtime_records` with total and
 omitted counts, separately from Task outcomes, original evidence references
 and authoritative execution rows. Reports stored before this additive field
 still load with an empty view. Historical records are not rewritten. The
-evidence-read and task-settlement contributions/descriptors are version v3;
+evidence-read contribution/descriptor is version v4 and task-settlement remains v3;
 existing selection fingerprint checks govern execution resume compatibility.
+
+## Program originals and protected network linkage
+
+Shell execution accounting remains counts/codes only. Original execution windows
+add `execution` (success, uncertainty, error, declared subject, accounting and
+companion reference) and `program_output` (masked stdout/stderr previews with
+separate display-truncation flags). Text and both preview channels share the
+same character allowance; offset/query reads retain their JSON-window semantics.
+Provider `truncated`/`timed_out` flags are independent of display truncation.
+Full originals and artifacts stay in the existing store/read paths. Neither
+streams nor private reasoning are added to report execution summaries.
+
+The existing SYSTEM `window_egress_admission` record is displayable as
+`view_kind=network_admission`, `execution_original=false`. Shared source/kind
+constants live in the network contract; the Capability source re-export remains
+compatible. Original windows mark a companion `linked` only with a matching
+Run/engagement, exact action/invocation holder, validated companion and payload
+digest. Missing, foreign or altered companions stay `missing`/`unbound`.
+Route/context identities are references into the companion, not repeated large
+configuration snapshots. Missing metering values remain null, never zero.
+`linked` preserves UNKNOWN settlement too: it is not a successful network call.
+The same bounded views reach subsequent native worker requests and Planner
+`original_observations`, retaining original provenance and declared target.
+
+Gate proof establishes metering and destination attempts, not a reached peer,
+HTTP/session receipt or the truth of stdout. Shell envelopes cannot be recorded
+as measured remote graph facts even with a declared target or companion. A
+remote claim based on program output additionally needs the exact protected
+route binding before independent claim review; local-only output cannot ground
+a remote Finding. Targeted program assertions may support hypotheses/review,
+but exit zero, execution success and arbitrary stdout JSON alone prove no
+candidate verdict, Finding, Task or Mission completion. The graph-record
+contribution/descriptor changes to version 3; normal fingerprint checks reject
+incompatible execution resume and historical originals remain readable.
 
 ## Native worker observation delivery
 
@@ -165,7 +199,8 @@ available. Missing or truncated content is unknown, never inferred success.
 The model can request further offsets/queries through the existing EvidenceReader.
 Successful reads carry a source `evidence_read_request` in LocalToolResult.
 Native checkpoint feedback, its runtime-result record and requested_evidence
-context retain the request/metadata and `text_omitted`, not window text. Provider
+context retain the request/metadata and `text_omitted`, not window text or program
+streams (`program_output_omitted`). Provider
 delivery rehydrates that text from the single original store. The original
 read request is retained even if the delivery allowance shortens its shown
 window; the returned limit/truncation describe the delivered content. Reference

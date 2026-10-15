@@ -7,12 +7,14 @@
 # settle. Provider sees IP, port, quantity only.
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from functools import partial
 from typing import cast
 
 from redteam.capability.gate_observer import RunDocker
 from redteam.capability.gated_manifest import (
+    OPERATION_PURPOSE,
     build_gated_descriptors,
     validate_gated_descriptors,
 )
@@ -39,6 +41,8 @@ class GatedActivation:
     ledger: NetworkGrantLedger
     policy: GatedNetworkPolicy
     queue_num: int = GATED_QUEUE_NUM
+    target_route_identity: dict | None = None
+    docker_endpoint: dict | None = None
 
 
 def build_gated_extension(
@@ -53,6 +57,8 @@ def build_gated_extension(
         run_docker=docker_runner,
         policy=activation.policy,
         queue_num=activation.queue_num,
+        target_route_identity=activation.target_route_identity,
+        docker_endpoint=activation.docker_endpoint,
     )
     manager.set_execution_admission(ext)
     return ext
@@ -98,6 +104,8 @@ class GatedProviderConfig:
     network_policy: GatedNetworkPolicy
     queue_num: int = GATED_QUEUE_NUM
     docker_runner: DockerRunner | None = None
+    target_route_identity: dict | None = None
+    docker_endpoint: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -133,6 +141,8 @@ def configure_gated(
         ledger=ledger,
         policy=provider_config.network_policy,
         queue_num=provider_config.queue_num,
+        target_route_identity=provider_config.target_route_identity,
+        docker_endpoint=provider_config.docker_endpoint,
     )
     extension = build_gated_extension(manager, activation, runner)
     validator = cast(ScopeValidator, partial(check_target_scope, scope=scope))
@@ -140,6 +150,25 @@ def configure_gated(
         extension, scope_validator=validator, evidence_store=evidence
     )
     descriptors = build_gated_descriptors(shell.adapter.policy)
+    for descriptor in descriptors:
+        purpose = OPERATION_PURPOSE.get(descriptor.operations[0])
+        registry = (provider_config.network_policy.registry.targets
+                    if purpose is NetworkPurpose.TARGET
+                    else provider_config.network_policy.registry.mirrors)
+        if registry:
+            descriptor.input_schema["properties"]["target_ref"]["enum"] = sorted(registry)
+        if purpose is NetworkPurpose.TARGET:
+            ports = provider_config.network_policy.target_ports
+            if ports:
+                descriptor.input_schema["properties"]["port"]["enum"] = sorted(
+                    {port for values in ports.values() for port in values}
+                )
+            descriptor.description += (
+                " Selected direct target pins/ports (not reachability proof): " + json.dumps(
+                    {name: {"ips": ips, "ports": ports.get(name)}
+                     for name, ips in registry.items()}, sort_keys=True,
+                )
+            )
     validate_gated_descriptors(descriptors, shell.adapter.policy)
     return GatedShellAssembly(
         extension=extension, executor=executor, descriptors=descriptors

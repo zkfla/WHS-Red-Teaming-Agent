@@ -1,17 +1,16 @@
 """TASK-004A: shell evidence through the existing graph.record pointers.
 
-Existing-contract parts only (no remote subject needed): a shell output
-envelope is an ordinary preserved dict, so the stable raw_path / value /
-run / same-run checks already address it; targetless shell results stay
-local (refused, never invented); tool success is never a fact. The
-remote L3 hook/response subject contract stays on HOLD: nothing here
-wires admissions into _write_fact.
+Shell originals remain readable, but a declared remote subject and matching
+pointer cannot promote exit codes/streams into measured target facts. Gate
+admissions are metering/destination attempts only; tool success is never a fact.
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any
+
+import pytest
 
 from redteam.attack_graph.identity import node_id_for_target, node_type_for_target
 from redteam.attack_graph.service import AttackGraphService
@@ -31,6 +30,7 @@ from redteam.core.ids import (
     RunId,
     ToolId,
 )
+from redteam.orchestration.analysis import claim_target_is_grounded
 from redteam.orchestration.graph_recording import GraphRecordingHandler, RecordedFact
 from redteam.orchestration.observations.mapper import ResultMapperRegistry
 from redteam.orchestration.observations.shell_execution import (
@@ -164,20 +164,24 @@ def _fact(**overrides: Any) -> RecordedFact:
     }
     params.update(overrides)
     return RecordedFact(**params)
-    params.update(overrides)
-    return RecordedFact(**params)
 
 
-async def test_shell_envelope_pointer_records_fact_with_subject():
+@pytest.mark.parametrize("pointer", ["exit_code", "stdout"])
+async def test_local_shell_exit_zero_cannot_be_a_remote_fact_even_with_declared_subject(pointer):
     svc = await _service_with_target()
     record = _record(_proposal(targeted=True), _result(success=True), True)
-    accepted, refused = await _write(record, _fact(), svc)
-    assert refused == []
-    assert len(accepted) == 1
-    assert accepted[0]["target_node_id"] == TARGET_NODE
-    assert accepted[0]["fact_name"] == "shell_exit_code"
+    accepted, refused = await _write(
+        record, _fact(raw_path=["output", pointer],
+                      value=record.metadata["tool_result"]["output"][pointer]),
+        svc,
+    )
+    assert accepted == []
+    assert "program assertion" in refused[0]["reason"]
     node = await svc.get_node(GraphNodeId(TARGET_NODE))
     assert node is not None
+    assert not await claim_target_is_grounded(
+        svc, record, TARGET_NODE, evidence_store=_MemoryStore([record]),
+    )
 
 
 async def test_targetless_shell_evidence_names_no_target():
@@ -196,12 +200,12 @@ async def test_targetless_shell_fact_without_target_linkage():
     assert [item["reason"] for item in refused] == ["no target linkage"]
 
 
-async def test_failed_shell_result_still_records_matching_pointer():
+async def test_failed_shell_result_does_not_record_a_remote_fact():
     svc = await _service_with_target()
     record = _record(_proposal(targeted=True), _result(success=False), True)
     accepted, refused = await _write(record, _fact(), svc)
-    assert refused == []
-    assert len(accepted) == 1
+    assert accepted == []
+    assert "program assertion" in refused[0]["reason"]
 
 
 async def test_tool_success_flag_is_not_addressable_as_fact():

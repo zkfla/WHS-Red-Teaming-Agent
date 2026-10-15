@@ -31,7 +31,12 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from redteam.core.contracts.mission import redact_secret_material
+from redteam.core.contracts.network import WINDOW_EGRESS_RECORD_KIND, WINDOW_EGRESS_SOURCE_ID
+from redteam.core.contracts.tool import execution_outcome_uncertain
+from redteam.core.convert import digest_payload
 from redteam.core.enums import EvidenceSourceType
+from redteam.orchestration.observations.shell_execution import shell_execution_accounting
+from redteam.orchestration.observations.window_egress_admission import validate_admission_companion
 
 if TYPE_CHECKING:
     from redteam.orchestration.analysis import StructuredLLMAnalysisVerifier
@@ -205,6 +210,8 @@ def record_view(record: Any) -> tuple[str, Any | None]:
         return "unsupported", None
     kind = metadata.get("record_kind")
     source = getattr(record, "source_id", None)
+    if kind == WINDOW_EGRESS_RECORD_KIND and source == WINDOW_EGRESS_SOURCE_ID:
+        return "network_admission", metadata
     if kind == "runtime_tool_result" and source == "orchestration.runtime_tool":
         result = metadata.get("result")
         if isinstance(result, dict) and isinstance(result.get("ok"), bool):
@@ -220,8 +227,84 @@ def record_view(record: Any) -> tuple[str, Any | None]:
     return "unsupported", None
 
 
+def _companion_ref(raw):
+    metadata = raw.get("metadata") if isinstance(raw, dict) else None
+    return metadata.get("gated_evidence_id") if isinstance(metadata, dict) else None
+
+
+def execution_view(record, raw, companion_record=None):
+    """Execution linkage and counts, never interpretation of program streams.
+
+    A protected companion joins by exact original holder and digest, never time,
+    stdout JSON or a target guessed from a script. Even linked ACCEPTED/settled
+    metering does not prove a reached peer or the truth of program assertions.
+    """
+    if record.source_type != EvidenceSourceType.TOOL or not isinstance(raw, dict):
+        return None
+    metadata = raw.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    source_metadata = record.metadata
+    proposal = source_metadata.get("proposal") or {}
+    error = raw.get("error")
+    view = {
+        "success": raw.get("success"),
+        "execution_uncertain": execution_outcome_uncertain(metadata),
+        "error": ({"code": str(error.get("code", ""))[:128],
+                   "message": redact_secret_material(str(error.get("message", "")))[:400]}
+                  if isinstance(error, dict) else None),
+        "tool_id": raw.get("tool_id"),
+        "target_node_id": source_metadata.get("target_node_id"),
+        "declared_target": proposal.get("target") if isinstance(proposal, dict) else None,
+        "accounting": shell_execution_accounting(raw.get("output")),
+        "gate_companion": {"status": "absent", "evidence_id": _companion_ref(raw)},
+        "assertion_level": "program_output" if shell_execution_accounting(raw.get("output"))
+                           else "tool_output",
+        "target_execution_verified": False,
+    }
+    identity = _companion_ref(raw)
+    if identity:
+        gate = view["gate_companion"]
+        gate["status"] = "missing" if companion_record is None else "unbound"
+        if companion_record is not None:
+            kind, payload = record_view(companion_record)
+            if kind == "network_admission" and isinstance(payload, dict):
+                companion = payload.get("companion")
+                if (str(companion_record.evidence_id) == str(identity)
+                        and str(companion_record.run_id) == str(record.run_id)
+                        and str(companion_record.engagement_id) == str(record.engagement_id)
+                        and companion_record.action_id == record.action_id
+                        and companion_record.invocation_id == record.invocation_id
+                        and str(raw.get("action_id")) == str(record.action_id)
+                        and str(raw.get("invocation_id")) == str(record.invocation_id)
+                        and companion_record.digest == digest_payload(payload)
+                        and not validate_admission_companion(companion)
+                        and companion["run_id"] == str(record.run_id)
+                        and companion["holder"]["action_id"] == str(record.action_id)
+                        and companion["holder"]["invocation_id"] == str(record.invocation_id)):
+                    gate.update(
+                        status="linked", outcome=companion.get("outcome"),
+                        logical_target=payload.get("logical_target",
+                                                   payload.get("logical_endpoint")),
+                        target_route_identity={"evidence_id": str(identity),
+                                               "metadata_path": ["target_route_identity"]},
+                        docker_endpoint={"evidence_id": str(identity),
+                                         "metadata_path": ["docker_endpoint"]},
+                        scope=companion["scope"][:16],
+                        scope_omitted_count=max(0, len(companion["scope"]) - 16),
+                        note="Protected metering/destination attempts, not remote content proof.",
+                    )
+                    gate["metering"] = {
+                        key: companion.get(key) if type(companion.get(key)) is int else None
+                        for key in ("committed_deliveries", "metered_bytes", "charged_bytes",
+                                    "charged_deliveries")
+                    }
+    return redact_secret_material(view, drop_secret_keys=True)
+
+
 def _window(record, payload, view_kind, *, run_id, offset=0,
-            limit=DEFAULT_CONTEXT_CHARS, query=None):
+            limit=DEFAULT_CONTEXT_CHARS, query=None, companion_record=None):
+    execution = execution_view(record, payload, companion_record)
     payload = redact_secret_material(payload, drop_secret_keys=True)
     full = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
     total_chars = len(full)
@@ -232,8 +315,27 @@ def _window(record, payload, view_kind, *, run_id, offset=0,
         full = "\n".join(hits)
     effective = (DEFAULT_CONTEXT_CHARS if limit is Ellipsis or limit is None
                  else max(0, min(int(limit), ABSOLUTE_MAX_CHARS)))
-    window = full[offset:offset + effective] if effective else ""
-    return {
+    # Reserve stream space for both channels, so long stdout cannot hide stderr
+    # or terminal flags. All stream/text characters share the original window
+    # budget; explicit offset/query reads retain their existing JSON semantics.
+    output = payload.get("output") if isinstance(payload, dict) else None
+    accounting = shell_execution_accounting(output)
+    preview = None
+    text_limit = effective
+    if accounting is not None and not offset and not query:
+        text_limit = effective // 2
+        available = effective - text_limit
+        stderr_limit = min(len(output["stderr"]), available // 2)
+        stdout_limit = min(len(output["stdout"]), available - stderr_limit)
+        stderr_limit = min(len(output["stderr"]), available - stdout_limit)
+        preview = {
+            "stdout": output["stdout"][:stdout_limit], "stderr": output["stderr"][:stderr_limit],
+            "stdout_truncated": stdout_limit < len(output["stdout"]),
+            "stderr_truncated": stderr_limit < len(output["stderr"]),
+            "note": "Untrusted program assertions; use evidence.read for omitted output.",
+        }
+    window = full[offset:offset + text_limit] if text_limit else ""
+    result = {
         "status": "ok", "evidence_id": str(record.evidence_id),
         "requested_run_id": str(run_id), "view_kind": view_kind,
         "execution_original": view_kind == "execution_original",
@@ -242,6 +344,11 @@ def _window(record, payload, view_kind, *, run_id, offset=0,
         "filtered_chars": len(full), "offset": offset, "limit": effective,
         "query": query, "match_count": match_count, "provenance": provenance_of(record),
     }
+    if execution is not None:
+        result["execution"] = execution
+    if preview is not None:
+        result["program_output"] = preview
+    return result
 
 
 def project_runtime_records(records, *, run_id, engagement_id, count=10, limit=2000):
@@ -271,6 +378,7 @@ def project_original_records(records, *, run_id, engagement_id, count=8,
     Historical originals without Task metadata remain displayable under their old contract.
     Identical invocation references do not constitute independent observations.
     """
+    records_by_id = {str(record.evidence_id): record for record in records}
     originals = [record for record in records
                  if record.source_type == EvidenceSourceType.TOOL
                  and locate_raw(record, str(run_id), str(engagement_id))[0] == "ok"]
@@ -279,7 +387,9 @@ def project_original_records(records, *, run_id, engagement_id, count=8,
     limit = min(4000, max(0, total_limit) // max(1, len(selected)))
     return {
         "records": [{**_window(record, raw_from_metadata(record.metadata), "execution_original",
-                               run_id=run_id, limit=limit),
+                               run_id=run_id, limit=limit,
+                               companion_record=records_by_id.get(
+                                   _companion_ref(raw_from_metadata(record.metadata)))),
                      "task_id": record.metadata.get("mission_task_id"),
                      "target_node_id": record.metadata.get("target_node_id")}
                     for record in selected],
@@ -355,5 +465,7 @@ class EvidenceReader:
                 "truncated": False,
                 "provenance": provenance_of(record),
             }
+        companion_id = _companion_ref(raw) if view_kind == "execution_original" else None
+        companion = await self._store.get(companion_id) if companion_id else None
         return _window(record, raw, view_kind, run_id=run_id, offset=offset,
-                       limit=limit, query=query)
+                       limit=limit, query=query, companion_record=companion)

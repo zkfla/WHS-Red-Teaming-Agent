@@ -83,6 +83,9 @@ class RuntimeComponentBinding(BaseModel):
     execution_environment_fingerprint: str | None = Field(
         default=None, pattern=r"^[a-f0-9]{64}$",
     )
+    network_environment_fingerprint: str | None = Field(
+        default=None, pattern=r"^[a-f0-9]{64}$",
+    )
 
     @model_serializer(mode="wrap")
     def serialize_optional_fixture(self, handler):
@@ -95,6 +98,8 @@ class RuntimeComponentBinding(BaseModel):
             value.pop("llm_connection_fingerprint", None)
         if self.execution_environment_fingerprint is None:
             value.pop("execution_environment_fingerprint", None)
+        if self.network_environment_fingerprint is None:
+            value.pop("network_environment_fingerprint", None)
         return value
 
     def component_id(self, slot: str) -> str | None:

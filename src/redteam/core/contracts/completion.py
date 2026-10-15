@@ -121,6 +121,16 @@ def completion_contract_hash(task: Any) -> str:
     return _digest(purpose)
 
 
+def contradictory_candidate_verdict(criteria: Sequence[CompletionCriterion]) -> str | None:
+    """Compatibility alias for the first same-candidate confirmed/refuted contradiction.
+
+    The rule and the bounded, sanitized reference come from
+    ``completion_condition_conflicts``, so callers keep the structured guard.
+    """
+    conflicts = completion_condition_conflicts(criteria)
+    return conflicts[0].hypothesis_id if conflicts else None
+
+
 def completion_conditions(task: Any) -> list[dict[str, Any]]:
     return [
         {"criterion_id": criterion_id(item), **item.model_dump(mode="json")}

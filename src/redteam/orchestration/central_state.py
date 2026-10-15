@@ -573,6 +573,16 @@ class CentralTransaction:
             "SELECT payload FROM state_tasks WHERE run_id=? ORDER BY task_id", (self.run_id,),
         )]
 
+    def list_executions(self, *, task_id: str | None = None) -> list[TaskExecution]:
+        """Canonical execution rows; invocation ordering is not chronology."""
+        self.binding()
+        query, args = "SELECT payload FROM state_executions WHERE run_id=?", [self.run_id]
+        if task_id is not None:
+            query += " AND task_id=?"
+            args.append(task_id)
+        return [TaskExecution.model_validate_json(row[0])
+                for row in self.db.execute(query + " ORDER BY invocation_id", args)]
+
     def add_evidence_refs(self, checked: Sequence[CheckedEvidence]) -> None:
         self.binding()
         for item in checked:
@@ -843,6 +853,18 @@ class CentralTransaction:
                 for node in self.graph.query(node_type=GraphNodeType.HYPOTHESIS)}
 
     def check_planner_inventory(self, judgment: dict) -> None:
+        # Optional Planner context reads share this existing atomic commit fence.
+        # Only returned/consumed originals are fenced, not the whole graph page.
+        from redteam.core.ids import GraphEdgeId
+
+        if any(content_hash(self.graph.get_local_edge(GraphEdgeId(identity))) != expected
+               for identity, expected in judgment.get("context_edge_read", {}).items()):
+            raise PlanningInputsChanged("planner_context_edge_changed")
+        if judgment.get("context_execution_read"):
+            executions = {str(item.invocation_id): item for item in self.list_executions()}
+            if any(content_hash(executions.get(identity)) != expected
+                   for identity, expected in judgment["context_execution_read"].items()):
+                raise PlanningInputsChanged("planner_context_execution_changed")
         if judgment["termination"] in {"continue", "replan"}:
             return  # Candidate-local judgments do not fence unrelated siblings.
         if set(judgment["candidate_inventory"]) != self.hypothesis_candidate_inputs().keys() or (
@@ -2236,15 +2258,7 @@ class CentralStateStore:
         return ownership()
 
     async def list_executions(self, *, task_id: str | None = None) -> list[TaskExecution]:
-        def read(tx: CentralTransaction) -> list[TaskExecution]:
-            tx.binding()
-            query, args = "SELECT payload FROM state_executions WHERE run_id=?", [self.run_id]
-            if task_id is not None:
-                query += " AND task_id=?"
-                args.append(task_id)
-            return [TaskExecution.model_validate_json(row[0]) for row in
-                    tx.db.execute(query + " ORDER BY invocation_id", args)]
-        return await self.transaction(read, write=False)
+        return await self.transaction(lambda tx: tx.list_executions(task_id=task_id), write=False)
 
     async def activation_inventory(self, *, instance_ids: set[str] | None = None) -> list[dict]:
         """Original proof rows for explicit quiescent recovery, not scheduling."""

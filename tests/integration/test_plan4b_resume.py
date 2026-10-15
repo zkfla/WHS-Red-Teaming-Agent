@@ -346,7 +346,6 @@ async def test_cli_completed_selection_returns_without_opening_missing_sdk(tmp_p
                                 tool_catalog=tools.catalog, **kwargs)
     monkeypatch.setattr(run, "build_application", assemble)
     monkeypatch.setattr(run, "prepare_shell_runtime", AsyncMock(return_value=None))
-    monkeypatch.setattr(run, "build_gated_provider_config", lambda _: None)
     args = SimpleNamespace(run_id=state.run_id, instance=completed["instance_id"],
                            json=True, workers=None, max_steps=None)
     async with AsyncExitStack() as stack:
@@ -455,7 +454,6 @@ async def test_cli_preserves_nondefault_passive_identity_and_rejects_actual_over
         return result
     monkeypatch.setattr(run, "build_application", assemble)
     monkeypatch.setattr(run, "prepare_shell_runtime", AsyncMock(return_value=None))
-    monkeypatch.setattr(run, "build_gated_provider_config", lambda _: None)
     args = SimpleNamespace(run_id=str(original.run_id), instance=str(original.instance_id),
                            json=True, workers=None, max_steps=99 if changed_limit else None)
     async with AsyncExitStack() as stack:

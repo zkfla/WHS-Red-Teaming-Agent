@@ -1,5 +1,11 @@
 # WHS Red Teaming Agent
 
+## Documentation site
+
+Site sources and deployment are maintained on the
+[docs-site branch](https://github.com/zkfla/WHS-Red-Teaming-Agent/tree/docs-site).
+Submit site changes to that branch; do not merge it into `dev`.
+
 ## Current runtime
 
 The default runtime uses one central SQLite database, a candidate planner,

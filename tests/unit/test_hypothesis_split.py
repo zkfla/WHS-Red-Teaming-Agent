@@ -11,6 +11,7 @@ from redteam.orchestration.probe_atomization import (
     bind_plan,
     build_atomizer_input,
     needs_atomization,
+    resolve_atomized_tasks,
     validate_atomized_tasks,
 )
 
@@ -175,7 +176,8 @@ def test_existing_criterion_hypothesis_id_survives_normalization():
         "hypothesis_revisions": {"cand-a": 2},
     }]})
     (stripped,) = validate_atomized_tasks(
-        parsed.tasks, questions=questions, issued=issued, versions=versions,
+        resolve_atomized_tasks(parsed.tasks, questions=questions),
+        questions=questions, issued=issued, versions=versions,
         targets={"host:a"}, principals=set(), roles={"probe-role"},
         limits=ProbeLimits(), snapshot=snapshot, max_tasks=4,
     )
@@ -183,3 +185,23 @@ def test_existing_criterion_hypothesis_id_survives_normalization():
     assert carried.hypothesis_id == "cand-a"
     assert carried.description == "Inspect response"
     assert criterion_id(carried) == expected_id
+
+
+def test_atomizer_explicit_handoff_omits_unrelated_candidates_and_budget_history():
+    snapshot = _snap(_cand(), _cand("unrelated"))
+    draft = HypothesisPlanDraft.model_validate({"questions": [
+        _question(hypothesis_revisions={"cand-a": 1})], "reason": "One related purpose"})
+    updates, questions, versions = bind_plan(
+        draft, snapshot, issued={}, targets={"host:a"}, principals=set(), max_tasks=4,
+    )
+    output = build_atomizer_input({
+        "candidates": [item.model_dump(mode="json") for item in snapshot.candidates.values()],
+        "model_usage": {"history": ["unrelated"] * 100},
+        "review_receipts": [{"metadata": {"private_reasoning": "Do not forward"}}],
+        "arbitrary_planner_field": "Must not leak into the handoff",
+    }, plan=draft, updates=updates, questions=questions, issued={}, versions=versions)
+    assert versions == {"cand-a": 1, "unrelated": 1}  # Full validation authority is intact.
+    assert output["candidate_revisions"] == {"cand-a": 1}
+    assert [item["hypothesis_id"] for item in output["candidates"]] == ["cand-a"]
+    assert "model_usage" not in output and "review_receipts" not in output
+    assert "arbitrary_planner_field" not in output

@@ -121,13 +121,15 @@ def _terminate_tree(proc, job: WindowsProcessJob | None = None) -> None:
             pass
 
 
-async def _default_runner(cmd: tuple[str, ...], timeout_seconds: float) -> tuple[int, str, str]:
+async def _default_runner(cmd: tuple[str, ...], timeout_seconds: float,
+                          *, stdin: bytes | None = None) -> tuple[int, str, str]:
     job = WindowsProcessJob() if os.name == "nt" else None
     if os.name == "nt":
         assert job is not None
         spawning = asyncio.create_task(
             asyncio.create_subprocess_exec(
                 *job.command(cmd),
+                stdin=asyncio.subprocess.PIPE if stdin is not None else None,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -136,6 +138,7 @@ async def _default_runner(cmd: tuple[str, ...], timeout_seconds: float) -> tuple
         spawning = asyncio.create_task(
             asyncio.create_subprocess_exec(
                 *cmd,
+                stdin=asyncio.subprocess.PIPE if stdin is not None else None,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
@@ -144,7 +147,7 @@ async def _default_runner(cmd: tuple[str, ...], timeout_seconds: float) -> tuple
     proc = None
     try:
         proc = await asyncio.shield(spawning)
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(stdin), timeout=timeout_seconds)
     except asyncio.TimeoutError as exc:
         if proc is None:
             proc = await spawning
@@ -182,6 +185,14 @@ async def _default_runner(cmd: tuple[str, ...], timeout_seconds: float) -> tuple
     if code is None:
         code = 1
     return (code, out, err)
+
+
+async def run_preparation_command(cmd: tuple[str, ...], timeout_seconds: float,
+                                  *, stdin: bytes | None = None) -> tuple[int, str, str]:
+    """Bounded process lifecycle for provider preparation; never a model execution tool."""
+    if stdin is None:
+        return await _default_runner(cmd, timeout_seconds)
+    return await _default_runner(cmd, timeout_seconds, stdin=stdin)
 
 
 def _is_image_id(value: str) -> bool:

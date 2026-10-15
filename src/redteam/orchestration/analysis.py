@@ -27,12 +27,14 @@ from redteam.core.ids import (
     new_id,
 )
 from redteam.core.ports.evidence_store import EvidenceStore
+from redteam.core.scope_rules import resolve_target_hostports
 from redteam.orchestration.action_naming import tool_matches_action_namespace
 from redteam.orchestration.cognition import DecisionBudget, StructuredDecisionClient
 from redteam.orchestration.coordination import content_hash
 from redteam.orchestration.diagnostics import DecisionDiagnostic
-from redteam.orchestration.evidence_access import raw_from_metadata
+from redteam.orchestration.evidence_access import execution_view, raw_from_metadata
 from redteam.orchestration.expectations import Expectation, ExpectationOutcome, verdict_for
+from redteam.orchestration.observations.shell_execution import is_shell_execution_envelope
 from redteam.orchestration.session_proof import (
     actual_account_pairs,
     actual_receipt_conflict,
@@ -338,9 +340,43 @@ async def grounding_edge_for(
 
 
 async def claim_target_is_grounded(
-    graph_service: Any, record: Any, target_node_id: str
+    graph_service: Any, record: Any, target_node_id: str, *, evidence_store: Any = None,
 ) -> bool:
-    """A source target or a measured, source-backed direct relation."""
+    """A source target or a measured, source-backed direct relation.
+
+    A program needs its protected original-holder route binding before even
+    naming a remote subject. This does not validate stdout or prove contact;
+    independent claim review still owns security meaning.
+    """
+    raw = raw_from_metadata(getattr(record, "metadata", None))
+    if isinstance(raw, dict) and is_shell_execution_envelope(raw.get("output")):
+        metadata = raw.get("metadata") or {}
+        ref = metadata.get("gated_evidence_id") if isinstance(metadata, dict) else None
+        if not ref or evidence_store is None:
+            return False
+        companion = await evidence_store.get(ref)
+        execution = execution_view(record, raw, companion)
+        if execution is None or execution["gate_companion"]["status"] != "linked":
+            return False
+        try:
+            proposal = ActionProposal.model_validate(record.metadata.get("proposal"))
+            if proposal.target is None:
+                return False
+            logical = companion.metadata.get("logical_target")
+            if logical is not None:
+                if logical != proposal.target.model_dump(mode="json"):
+                    return False
+            else:
+                endpoint = companion.metadata.get("logical_endpoint") or {}
+                endpoints, error = resolve_target_hostports(proposal.target)
+                if error or not any(
+                    host == endpoint.get("host")
+                    and (port is None or port == endpoint.get("port"))
+                    for host, port in endpoints
+                ):
+                    return False
+        except (ValueError, TypeError, AttributeError):
+            return False
     source = _grounding_source(record)
     if source is None or not target_node_id:
         return False
@@ -686,7 +722,9 @@ class StructuredLLMAnalysisVerifier:
             if gap is not None:
                 return self._unknown_claim(refs, gap)
             try:
-                target_ok = await claim_target_is_grounded(self._graph, record, claim_target)
+                target_ok = await claim_target_is_grounded(
+                    self._graph, record, claim_target, evidence_store=self._store,
+                )
             except Exception:
                 target_ok = False
             if not target_ok:

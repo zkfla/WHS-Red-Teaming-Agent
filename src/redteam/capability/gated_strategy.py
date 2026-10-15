@@ -24,10 +24,6 @@ from typing import Any, Protocol, TypedDict
 
 from redteam.capability.adapters.mcp.base import MCPCallResult
 from redteam.capability.gated_manifest import OPERATION_PURPOSE, TARGET_JOB_START_OPERATION
-from redteam.capability.gated_network_policy import (
-    EndpointRestriction,
-    GatedNetworkPolicyRequest,
-)
 from redteam.capability.gated_window import (
     GATE_SOURCE_ID,
     AllowedFlow,
@@ -38,6 +34,7 @@ from redteam.capability.install_proxy import InstallProxyRoute, proxy_env, route
 from redteam.capability.shell_workroom import ShellWorkroomError, workroom_key_for
 from redteam.core.contracts.evidence import EvidenceRecord
 from redteam.core.contracts.network import (
+    WINDOW_EGRESS_RECORD_KIND,
     GrantRefused,
     NetworkGrant,
     NetworkPurpose,
@@ -149,10 +146,12 @@ class RetainedWindow:
     holder_action_id: ActionId
     holder_invocation_id: InvocationId
     holder_work_id: str | None = None
+    target_route_identity: dict | None = None
+    docker_endpoint: dict | None = None
 
     def to_record(self) -> dict[str, object]:
         """JSON-safe dict for the protected job manifest."""
-        return {
+        result = {
             "key": self.key,
             "window_id": self.window_id,
             "engagement_id": self.engagement_id,
@@ -170,6 +169,11 @@ class RetainedWindow:
             "holder_invocation_id": self.holder_invocation_id,
             "holder_work_id": self.holder_work_id,
         }
+        if self.target_route_identity is not None:
+            result["target_route_identity"] = self.target_route_identity
+        if self.docker_endpoint is not None:
+            result["docker_endpoint"] = self.docker_endpoint
+        return result
 
     @staticmethod
     def from_record(record: dict[str, object]) -> RetainedWindow:
@@ -185,6 +189,11 @@ class RetainedWindow:
                 for entry in allowed_raw
             )
             work_id = record["holder_work_id"]
+            route_identity = record.get("target_route_identity")
+            docker_endpoint = record.get("docker_endpoint")
+            if ((route_identity is not None and not isinstance(route_identity, dict))
+                    or (docker_endpoint is not None and not isinstance(docker_endpoint, dict))):
+                raise ValueError("invalid retained route identity")
             return RetainedWindow(
                 key=str(record["key"]),
                 window_id=str(record["window_id"]),
@@ -199,6 +208,8 @@ class RetainedWindow:
                 holder_action_id=ActionId(str(record["holder_action_id"])),
                 holder_invocation_id=InvocationId(str(record["holder_invocation_id"])),
                 holder_work_id=str(work_id) if work_id is not None else None,
+                target_route_identity=route_identity,
+                docker_endpoint=docker_endpoint,
             )
         except (KeyError, TypeError, ValueError, AssertionError) as exc:
             raise GatedNetworkError("gated_retained_record_invalid") from exc
@@ -346,9 +357,6 @@ class GatedExecutionPolicy:
         ext = self._extension
         if ext is None or ext.policy is None:
             return self._refusal("gated_network_unconfigured")
-        if isinstance(ext.policy, GatedNetworkPolicyRequest):
-            # An unresolved preparation request never reaches reservation or open.
-            return self._refusal("gated_sidecar_unresolved")
         holder_action = str(invocation.action_id)
         holder_invocation = str(invocation.invocation_id)
         if not holder_action or not holder_invocation:
@@ -359,10 +367,14 @@ class GatedExecutionPolicy:
                 holder_action=holder_action,
                 holder_invocation=holder_invocation,
             )
+        identities, error = resolve_target_hostports(invocation.execution_context.approved_target)
+        if (error is not None or len(identities) != 1
+                or identities[0][0].lower().rstrip(".") != name.lower().rstrip(".")
+                or (identities[0][1] is not None and identities[0][1] != args.get("port"))):
+            return self._refusal("gated_approved_target_mismatch")
         return self._resolve_target(
             name=name,
             args=args,
-            approved_target=invocation.execution_context.approved_target,
             holder_action=holder_action,
             holder_invocation=holder_invocation,
         )
@@ -372,7 +384,6 @@ class GatedExecutionPolicy:
         *,
         name: str,
         args: dict[str, Any],
-        approved_target: AnyTarget,
         holder_action: str,
         holder_invocation: str,
     ) -> GatedRoute | GrantRefused:
@@ -384,38 +395,12 @@ class GatedExecutionPolicy:
             return self._refusal("gated_port_required")
         if not 0 < port <= 65535:
             return self._refusal("gated_port_required")
-        # A target route is selected by the approved logical authority, not by
-        # a deployment alias or an arbitrary registry entry. Resolve through
-        # Core's canonical target identity before looking up pins or opening
-        # the ledger window.
-        approved_identities, target_error = resolve_target_hostports(approved_target)
-        if target_error or len(approved_identities) != 1:
-            return self._refusal("gated_approved_target_unresolved")
-        approved_host, approved_port = approved_identities[0]
-        canonical_host = approved_host.lower().rstrip(".")
-        if name.lower().rstrip(".") != canonical_host:
-            return self._refusal("gated_approved_target_mismatch")
-        if approved_port is not None and port != approved_port:
-            return self._refusal("gated_approved_target_mismatch")
-        matching_registry_names = [
-            registry_name
-            for registry_name in ext.policy.registry.targets
-            if registry_name.lower().rstrip(".") == canonical_host
-        ]
-        if len(matching_registry_names) != 1:
-            return self._refusal("gated_approved_target_unresolved")
-        registry_name = matching_registry_names[0]
-        pins = ext.policy.registry.targets.get(registry_name)
+        pins = ext.policy.registry.targets.get(name)
         if not pins:
             return self._refusal("gated_unknown_registry_name")
-        # The selected endpoint set only narrows the original scope; absent means legacy.
-        restriction = getattr(ext.policy, "endpoint_restriction", None)
-        protocols: tuple[str, ...] = ("tcp", "udp")
-        if isinstance(restriction, EndpointRestriction):
-            selected = restriction.protocols_for(registry_name, port)
-            if selected is None:
-                return self._refusal("gated_endpoint_not_selected")
-            protocols = selected
+        selected_ports = ext.policy.target_ports.get(name)
+        if selected_ports is not None and port not in selected_ports:
+            return self._refusal("gated_target_port_unselected")
         canonical: list[str] = []
         for pin in pins:
             item = _canonical_ipv4(pin)
@@ -424,7 +409,7 @@ class GatedExecutionPolicy:
                     return self._refusal("gated_ipv6_unsupported")
                 return self._refusal("gated_pin_invalid")
             canonical.append(item)
-        scope_target = EndpointTarget(host=approved_host, port=port)
+        scope_target = EndpointTarget(host=name, port=port)
         refused = self._check_allowed(scope_target)
         if refused is not None:
             return refused
@@ -434,7 +419,7 @@ class GatedExecutionPolicy:
         allowed = tuple(
             AllowedFlow(ip=ip, port=port, proto=proto)
             for ip in canonical
-            for proto in protocols
+            for proto in ("tcp", "udp")
         )
         return GatedRoute(
             purpose=NetworkPurpose.TARGET,
@@ -622,6 +607,8 @@ class GatedExecutionPolicy:
                 holder_action_id=ActionId(route.holder_action_id),
                 holder_invocation_id=InvocationId(route.holder_invocation_id),
                 holder_work_id=route.holder_work_id,
+                target_route_identity=getattr(ext, "target_route_identity", None),
+                docker_endpoint=getattr(ext, "docker_endpoint", None),
             )
             self._retained[key] = (invocation, pre_record)
         try:
@@ -802,8 +789,12 @@ class GatedExecutionPolicy:
         if companion is None:
             return None, "gated_companion_missing"
         payload: dict[str, object] = {
-            "record_kind": "window_egress_admission",
+            "record_kind": WINDOW_EGRESS_RECORD_KIND,
             "companion": companion,
+            "logical_target": (invocation.execution_context.approved_target.model_dump(mode="json")
+                               if invocation.execution_context.approved_target else None),
+            "target_route_identity": getattr(ext, "target_route_identity", None),
+            "docker_endpoint": getattr(ext, "docker_endpoint", None),
         }
         ctx = invocation.execution_context
         record = EvidenceRecord(
@@ -983,9 +974,12 @@ class GatedExecutionPolicy:
             ),
         }
         payload: dict[str, object] = {
-            "record_kind": "window_egress_admission",
+            "record_kind": WINDOW_EGRESS_RECORD_KIND,
             "companion": companion,
             "recovered_after_restart": True,
+            "logical_endpoint": {"host": record.scope_host, "port": record.scope_port},
+            "target_route_identity": record.target_route_identity,
+            "docker_endpoint": record.docker_endpoint,
         }
         evidence = EvidenceRecord(
             evidence_id=EvidenceId("ev_gwin_" + record.window_id),

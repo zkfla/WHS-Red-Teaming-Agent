@@ -12,9 +12,9 @@ quantity was observed there. An accepted admission can still hit
 quota, drop, or expiry before outbound delivery, so acceptance never
 upgrades an attempt into a measured remote fact on its own.
 
-These helpers are pure and UNWIRED: no graph, store, or ledger consumer
-reads them yet. In particular ``_write_fact`` (graph_recording) does
-NOT promote shell stdout as remote measured facts via admissions; the
+These helpers are pure. Evidence display uses validation for exact-holder
+companion linkage, not admission or remote proof. ``_write_fact`` explicitly
+refuses shell envelopes as remote measured facts even with admissions; the
 remote L3 hook/response subject contract stays on HOLD until concrete
 observable evidence exists. Validation here only decides whether a
 companion is well-formed metering, never whether a fact is true.

@@ -1,16 +1,24 @@
 # Probe task atomizer
 
+This handoff contains the selected questions and their related source Tasks,
+results, candidate revisions, waits and constraints, not the full investigation.
+Absence from this handoff does not prove absence from the central state. Preserve
+every supplied original condition and source binding. A same-candidate followup
+may have a different premise, principal or source; do not reject it by title or
+target similarity. Strategy has already selected the purposes; do not replan the
+mission or request another fixed lookup/replanning stage.
+
 Turn each supplied investigation question into independently assessable probe
 tasks. Cover every supplied question with at least one task; never skip a
 question and never invent a question the planner did not supply.
 
-Preserve every original target, principal binding, and question reference. For
-each task, select completion_criterion_ids only from the bound question's
-completion_criteria, where each entry carries its criterion_id. List each ID once
-per task and never select an ID that belongs to another question. Never write,
-paraphrase, or rewrite a completion condition: code restores the original
-condition for each selected ID before validation, and a full condition object in
-the output is rejected. Use the same-pass issued candidate IDs with the proposed
+Select completion_criterion_ids from the completion_criteria entries of the
+task's supplied question. Emit IDs only, never completion_criteria bodies or
+reworded descriptions. Code attaches the exact original conditions. Select
+each ID once per task, and cover every condition across the question's tasks.
+Keep every principal of a selected condition on the same task; a paired
+comparison is one indivisible condition. Preserve targets, principal binding,
+and question references. Use the same-pass issued candidate IDs with the proposed
 revision exactly as delivered; never reissue IDs or rewrite revisions.
 Existing candidates use their captured IDs and resulting revisions.
 
@@ -27,8 +35,7 @@ investigation work and unproven parallel independence.
 
 Keep each task's related subjects, evidence, and source references explicit so
 the final commit can union question and task reads. State the purpose, subjects,
-return conditions per task, and select its completion criterion IDs. Keep a
-paired-comparison condition as one selected ID on one task.
+return conditions, and selected completion_criterion_ids per task.
 Report structured reasons and original references, never private chain-of-thought.
 
 Decompose the supplied security uncertainty; do not add a preliminary full PoC,

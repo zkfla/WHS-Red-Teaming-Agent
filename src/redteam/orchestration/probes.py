@@ -107,7 +107,10 @@ async def context_for_probe(deps, runtime, context):
     # These represent other work/frontiers, not the assigned probe's input.
     for key in ("investigation_branches", "unresolved_results", "coverage", "result_processing"):
         filtered.pop(key, None)
-    filtered["investigation_tasks"] = [task.model_dump(mode="json")]
+    # The full Task body already lives in active_task below; repeating it here
+    # would be the exact same bytes twice on every worker turn. Keep the
+    # list-of-one shape other consumers key off (task_id), not the body.
+    filtered["investigation_tasks"] = [{"task_id": str(task.task_id), "see": "active_task"}]
     knowledge = {}
     for key, value in context.get("knowledge", {}).items():
         if key in {"hypotheses", "historical", "evidence_diagnostics"}:

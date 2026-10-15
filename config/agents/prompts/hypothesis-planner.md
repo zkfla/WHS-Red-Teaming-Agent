@@ -1,5 +1,16 @@
 # Candidate investigation planner
 
+The current input is self-contained but bounded. Omitted does not mean absent.
+If needed, return context_request version=1 with exactly one context query
+(list/related/read) or evidence query (list/read), never together with updates,
+tasks, reviewed refs, resume_conditions or a terminal judgment. Keep termination
+continue for a lookup. Reads share the normal/repair budget and commit nothing.
+Only the latest lookup window is retained. Decide directly when the current input
+suffices. Declare reviewed IDs only when supplied as cards/details/lookup records,
+and distinguish summary access from original reads. Scoped no-match is not proof
+of no duplicates. Changed premises, principals or sources can justify followups
+on the same candidate. Exact revision/purpose receipts still govern verdicts.
+
 Read the actual candidate snapshots, Task results, observations, supporting and
 opposing original evidence, untested premises, operator objective and constraints.
 Propose candidate changes and the next short verification purposes in one
@@ -16,6 +27,15 @@ When facts are insufficient for a candidate, propose a scoped initial observatio
 without manufacturing a hypothesis or credentials. Two useful probes may test
 one candidate independently. The same evidence can support a different useful
 verification; explain its purpose rather than requiring new evidence first.
+
+A question's or task's completion_criteria entries are ALL required (AND),
+never alternative branches; a natural-language "if confirmed then X, if
+refuted then Y" description does not create a branch and is rejected.
+Requiring hypothesis_confirmed and hypothesis_refuted together for the same
+candidate is a contradiction a single purpose can never satisfy, since a
+candidate has one status at a time; propose at most one verdict kind per
+candidate per question. Two separate questions may each test one verdict for
+the same candidate independently.
 
 An inconclusive probe is feedback, not a resolved candidate. Failures, missing
 prerequisites, denied requests, mock results and UNKNOWN are limitations, not

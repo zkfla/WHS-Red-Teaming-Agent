@@ -461,6 +461,12 @@ _REJECTION_SUMMARIES: dict[str, str] = {
         "entry must also appear in the question/task's own principal_refs.",
     "specialist_unknown_hypothesis": "completion_criteria.hypothesis_id must reference an "
         "existing hypothesis id, or be omitted.",
+    "specialist_contradictory_candidate_verdict": "a question/task cannot require both "
+        "hypothesis_confirmed and hypothesis_refuted for the same hypothesis_id -- a candidate "
+        "has one status at a time, so that AND can never be satisfied. A natural-language "
+        "'if X then confirmed, else refuted' description does not turn completion_criteria "
+        "into a branch; every entry is still required. Keep at most one verdict kind per "
+        "candidate on this item.",
     "specialist_task_count_limit": "reduce the number of tasks to the stated max_tasks limit.",
     "specialist_question_coverage_mismatch": "every task's question_id must match exactly one "
         "proposed question, and every question needs at least one task.",

@@ -61,89 +61,36 @@ function sessionBox(def, draft, onChange) {
     } }));
 }
 
-function endpointBox(def, draft, onChange) {
-  const origins = draft.allowed_hosts || [];
-  const selected = new Map();
-  origins.forEach((value) => {
-    try {
-      const url = new URL(value.includes("://") ? value : `http://${value}`);
-      if (["http:", "https:"].includes(url.protocol)) selected.set(url.origin, url);
-    } catch (_) {
-      // The server reports the field error on preview; keep typing usable meanwhile.
-    }
-  });
-  const rows = draft.kali_endpoints || (draft.kali_endpoints = []);
-  for (const [origin, url] of selected) {
-    if (!rows.some((item) => item.origin === origin)) {
-      rows.push({ origin, port: Number(url.port) || (url.protocol === "https:" ? 443 : 80), transport: "tcp" });
-    }
-  }
-  draft.kali_endpoints = rows.filter((item) => selected.has(item.origin));
-  return h("fieldset", { class: "choices" },
-    h("legend", { text: def.label }),
-    h("p", { class: "note", text: "선택 대상마다 포트와 전송 방식을 지정합니다. 추가 포트는 비워 두지 말고 직접 입력하세요. 원래 허용 범위 안에서만 사용할 수 있습니다." }),
-    ...[...selected.entries()].flatMap(([origin]) => {
-      const endpoints = draft.kali_endpoints.filter((item) => item.origin === origin);
-      return [
-        h("h3", { text: origin }),
-        ...endpoints.map((item) => h("div", { class: "kali-endpoint" },
-          h("label", {}, "대상", h("input", { type: "text", disabled: true, value: item.origin })),
-          h("label", {}, "포트", h("input", {
-            type: "number", min: 1, max: 65535, step: 1, value: item.port ?? "",
-            oninput: (event) => {
-              const value = event.target.value.trim();
-              item.port = value === "" ? null : Number(value);
-              onChange();
-            },
-          })),
-          h("label", {}, "전송 방식", h("select", {
-            value: item.transport,
-            onchange: (event) => { item.transport = event.target.value; onChange(); },
-          }, ["tcp", "udp"].map((value) => h("option", {
-            value, selected: item.transport === value, text: value.toUpperCase(),
-          }))),
-          endpoints.length > 1 ? h("button", { type: "button", text: "포트 제거", onclick: () => {
-            draft.kali_endpoints.splice(draft.kali_endpoints.indexOf(item), 1);
-            onChange(true);
-          } }) : null)),
-        h("button", { type: "button", text: "이 대상에 포트 추가", onclick: () => {
-          draft.kali_endpoints.push({ origin, port: null, transport: "tcp" });
-          onChange(true);
-        } }),
-      ];
-    }));
-}
-
 export function fieldNode(def, draft, onChange) {
   if (def.name === "web_sessions") return sessionBox(def, draft, onChange);
-  if (def.name === "kali_endpoints") return endpointBox(def, draft, onChange);
+  if (def.kind === "object") {
+    const values = draft[def.name] || (draft[def.name] = { ...def.default });
+    return h("fieldset", { class: "choices" }, h("legend", { text: def.label }),
+      h("p", { class: "note", text: "Kali 작업공간을 대상 Docker bridge에 직접 연결합니다. 대상 IP·port는 도구 입력과 조사 범위에서 검사하지만, 별도의 packet gate·트래픽 quota·NFQUEUE는 사용하지 않습니다." }),
+      h("p", { class: "note", text: "127.0.0.1은 Kali 컨테이너 자신입니다. 같은 Docker daemon의 Vuln Bank는 실제 컨테이너 IP·port와 bridge ID를 입력하세요. 실행 중 해당 bridge에 연결하고 실행 종료 후 분리합니다. 주소·port 자동 치환이나 터널 생성은 하지 않습니다." }),
+      def.fields.map((field) => fieldNode(field, values, onChange)));
+  }
   if (def.choices) {
-    if (draft[def.name] == null && def.default != null) draft[def.name] = def.default;
+    if (draft[def.name] == null) draft[def.name] = def.default;
     const control = h("select", { name: def.name,
       onchange: (event) => {
-        draft[def.name] = event.target.value || null;
+        draft[def.name] = event.target.value;
+        if (def.name === "kali_network_mode") {
+          if (event.target.value !== "prepare") draft.kali_network_preparation = null;
+          if (event.target.value !== "configured") draft.kali_network_policy_path = null;
+        }
         if (def.name === "web_policy_mode" && event.target.value !== "paths") draft.web_paths = [];
         if (def.name === "web_policy_mode" && event.target.value === "manual") {
           draft.web_permissions = "read_only"; draft.web_sessions = [];
           draft.kali_network_mode = "inherit"; draft.kali_network_policy_path = null;
-          clearPreparation(draft);
+          draft.kali_network_preparation = null;
         }
-        if (def.name === "kali_network_mode") {
-          if (event.target.value === "prepare") {
-            draft.kali_network_policy_path = null;
-          } else {
-            draft.kali_network_policy_path = event.target.value === "configured"
-              ? draft.kali_network_policy_path : null;
-            clearPreparation(draft);
-          }
-        }
-        if (def.name === "kali_limits_preset" && event.target.value !== "custom") clearCustomLimits(draft);
-        if (def.name === "kali_sidecar_mode" && event.target.value !== "pinned") draft.kali_sidecar_image = null;
         onChange();
       },
-    }, (def.name === "kali_limits_preset" || def.name === "kali_sidecar_mode"
-      ? [{ value: "", label: "직접 선택하세요" }, ...def.choices] : def.choices).map((choice) => h("option", {
+    }, def.choices.map((choice) => h("option", {
       value: choice.value, selected: draft[def.name] === choice.value, text: choice.label,
+      disabled: def.name === "kali_network_mode" && draft.web_policy_mode === "manual"
+        && !["closed", "inherit"].includes(choice.value),
     })));
     return h("label", {}, def.label, control);
   }
@@ -163,11 +110,9 @@ export function fieldNode(def, draft, onChange) {
   const common = { name: def.name, autocomplete: "off", spellcheck: "false",
     disabled: def.name === "web_paths" && draft.web_policy_mode !== "paths" };
   let control;
-  if (def.kind === "integer" || def.kind === "number") {
+  if (def.kind === "integer") {
     control = h("input", {
-      ...common, type: "number", min: def.minimum ?? 0,
-      ...(def.maximum == null ? {} : { max: def.maximum }),
-      step: def.kind === "integer" ? 1 : "any",
+      ...common, type: "number", min: def.min ?? 0, max: def.max, step: 1,
       value: draft[def.name] ?? (def.default ?? ""),
       oninput: (event) => {
         const text = event.target.value.trim();
@@ -190,27 +135,11 @@ export function fieldNode(def, draft, onChange) {
       ...common, ...(tag === "input" ? { type: "text" } : { rows: 3 }),
       value: tag === "input" ? draft[def.name] || "" : null,
       oninput: (event) => {
-        draft[def.name] = event.target.value;
+        draft[def.name] = def.nullable ? event.target.value.trim() || null : event.target.value;
         onChange();
       },
     });
     if (tag === "textarea") control.value = draft[def.name] || "";
   }
   return h("label", {}, def.label, control);
-}
-
-function clearCustomLimits(draft) {
-  draft.kali_limit_deliveries = null;
-  draft.kali_limit_output_bytes = null;
-  draft.kali_limit_duration_seconds = null;
-  draft.kali_limit_delivery_rate_per_second = null;
-}
-
-function clearPreparation(draft) {
-  draft.kali_endpoints = [];
-  draft.kali_limits_preset = null;
-  clearCustomLimits(draft);
-  draft.kali_sidecar_mode = null;
-  draft.kali_sidecar_image = null;
-  draft.kali_docker_context = null;
 }

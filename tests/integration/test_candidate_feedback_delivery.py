@@ -61,9 +61,8 @@ def atomize(payload):
                 "title": "Short premise observation",
                 "role_id": "probe-worker",
                 "probe_limits": {"max_actions": 2, "max_model_requests": 8},
-                "completion_criterion_ids": [
-                    criterion["criterion_id"] for criterion in q["completion_criteria"]
-                ],
+                "completion_criterion_ids": [item["criterion_id"]
+                                             for item in q["completion_criteria"]],
                 **{key: q[key] for key in keys if key in q},
             }
             for q in payload["questions"]

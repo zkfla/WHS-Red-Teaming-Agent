@@ -918,6 +918,17 @@ class ExecutionAdmission:
         """Live attachments owned by the configured execution boundary."""
         return frozenset({"none"})
 
+    def expected_network_ids(self, key: str) -> dict[str, str]:
+        """Optional immutable IDs for operator-selected active attachments."""
+        return {}
+
+    def program_execution_routes(self):
+        from redteam.core.ports.program_discovery import ProgramExecutionRoute
+
+        return [ProgramExecutionRoute(
+            purpose=purpose, status="unavailable", reason_code="gated_network_unconfigured",
+        ) for purpose in ("target", "install")]
+
 
 PROGRAM_MANIFEST_FILENAME = "program-manifest.json"
 
@@ -1274,6 +1285,32 @@ class ShellWorkroomManager:
         # Provider-owned source label for TASK-004 program cards.
         # Card serverIds come from here, never from a central constant.
         return SHELL_SERVER_ID
+
+    def describe_execution_environment(self):
+        """Read owner metadata without Docker calls, grants or reachability claims."""
+        from redteam.capability.shell_manifest import (
+            JOB_START_OPERATION,
+            RUN_OPERATION,
+            build_shell_descriptors,
+        )
+        from redteam.core.ports.program_discovery import (
+            ProgramExecutionEnvironment,
+            ProgramExecutionRoute,
+        )
+
+        local = [str(tool.tool_id) for tool in build_shell_descriptors(self.policy)
+                 if tool.operations[0] in (RUN_OPERATION, JOB_START_OPERATION)]
+        return ProgramExecutionEnvironment(
+            source_id=self.source_id,
+            routes=[ProgramExecutionRoute(
+                purpose="local", status="local_only", reason_code="network_none",
+                tool_ids=local, limits={
+                    "max_timeout_seconds": self.policy.max_timeout_seconds,
+                    "max_script_bytes": self.policy.max_script_bytes,
+                },
+            ), *self._admission_for().program_execution_routes()],
+            unsupported_modes=["raw_socket", "network_admin", "external_ipv6"],
+        )
 
     def known_workrooms(self) -> tuple[str, ...]:
         return tuple(self._known)
@@ -1822,8 +1859,12 @@ class ShellWorkroomManager:
         except AttributeError:
             live_names = None
         expected_networks = self._admission_for().expected_networks(key)
-        if live_names is None or live_names != expected_networks:
+        detached_closed = live_names == set() and expected_networks == frozenset({"none"})
+        if live_names is None or (live_names != expected_networks and not detached_closed):
             raise ShellWorkroomError("shell_workroom_adoption_rejected")
+        for network_name, network_id in self._admission_for().expected_network_ids(key).items():
+            if networks.get(network_name, {}).get("NetworkID") != network_id:
+                raise ShellWorkroomError("shell_workroom_adoption_rejected")
         try:
             labels = config.get("Labels") or {}
             managed_key = SHELL_MANAGED_LABEL.split("=", 1)[0]

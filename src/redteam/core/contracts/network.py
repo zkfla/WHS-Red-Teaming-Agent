@@ -12,6 +12,11 @@ from enum import Enum
 
 from pydantic import BaseModel, ConfigDict, Field
 
+# Storage/display identity of the protected provider's existing companion.
+# This is metering and destination-attempt linkage, never remote content proof.
+WINDOW_EGRESS_SOURCE_ID = "whs-gated-window-v1"
+WINDOW_EGRESS_RECORD_KIND = "window_egress_admission"
+
 
 class NetworkPurpose(str, Enum):
     TARGET = "target"

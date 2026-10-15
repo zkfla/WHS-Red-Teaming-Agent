@@ -48,6 +48,7 @@ from redteam.core.ids import ToolId
 from redteam.core.ports.llm import NativeToolSpec
 from redteam.core.ports.program_discovery import (
     PROGRAM_ABSENT_CODES,
+    ProgramExecutionEnvironment,
     ProgramRecord,
     ShellProgramDiscovery,
     program_error_code,
@@ -70,6 +71,7 @@ from redteam.orchestration.native_binding import exposed_tool_name
 
 CARD_SUMMARY_CHARS = 240
 MAX_LIST_CARDS = 100
+MAX_PASSIVE_PROGRAM_CARDS = 8
 
 
 class NativeInputLimit(BaseModel):
@@ -109,6 +111,30 @@ WORKROOM_STATUS_KEY = "workroom_status"
 PROVIDER_MISSING_NOTE = "shell program provider is not wired (TASK-008)"
 NO_SUBJECT_NOTE = "no trusted workroom subject for this run (identity missing)"
 LIVE_DEFERRED_NOTE = "instance rows need an explicit program.list (no live query here)"
+
+
+def program_execution_environment(provider, eligible_ids=None) -> dict:
+    """Optional owner metadata; absent legacy providers remain explicitly unknown."""
+    describe = getattr(provider, "describe_execution_environment", None)
+    if not callable(describe):
+        return {"status": "unavailable" if provider is None else "unknown",
+                "reason_code": "program_execution_metadata_unavailable",
+                "routes": [], "target_execution_verified": False,
+                "execution_permission_granted": False}
+    try:
+        environment = ProgramExecutionEnvironment.model_validate(describe()).model_dump(mode="json")
+    except Exception as exc:
+        return {"status": "unknown", "reason_code": program_error_code(exc),
+                "routes": [], "target_execution_verified": False,
+                "execution_permission_granted": False}
+    if eligible_ids is not None:
+        eligible = {str(identity) for identity in eligible_ids}
+        for route in environment["routes"]:
+            previously_declared = bool(route["tool_ids"])
+            route["tool_ids"] = [identity for identity in route["tool_ids"] if identity in eligible]
+            if previously_declared and not route["tool_ids"]:
+                route.update(status="unavailable", reason_code="no_eligible_execution_tool")
+    return environment
 
 
 def _summarize(text: str) -> str:
@@ -468,22 +494,29 @@ async def discovery_cards_for_context(
     programs, program_status = await program_cards_for_query(
         provider, runtime=runtime, include_live=include_live_programs
     )
-    cards.extend(programs)
     cards.extend(reference_cards(library))
+    # Samples are navigation hints, never the program allowlist. Callable and
+    # reference cards get the briefing space before an inventory sample.
     ordered = sorted(cards, key=lambda item: (str(item.kind), str(item.tool_id)))
-    page = ordered[:MAX_LIST_CARDS]
+    program_sample = sorted(programs, key=lambda item: str(item.tool_id))[
+        :MAX_PASSIVE_PROGRAM_CARDS
+    ]
+    page = [*ordered, *program_sample][:MAX_LIST_CARDS]
     counts: dict[str, int] = {}
-    for card in ordered:
+    for card in [*ordered, *programs]:
         counts[str(card.kind)] = counts.get(str(card.kind), 0) + 1
     status: dict[str, Any] = dict(program_status)
-    status["cards_total"] = len(ordered)
-    status["cards_truncated"] = len(ordered) > len(page)
+    status["cards_total"] = len(ordered) + len(programs)
+    status["cards_truncated"] = status["cards_total"] > len(page)
     status["cards_counts"] = counts
+    status["program_execution_environment"] = program_execution_environment(provider, eligible)
     if status["cards_truncated"]:
         status["cards_guidance"] = (
             "Passive card briefing is capped; enumerate the full set with "
             "tool.list_cards (kind plus query plus offset/limit) and read "
-            "schemas with tool.get_detail."
+            "schemas with tool.get_detail only when absent. Program samples are not an "
+            "allowlist: use program.list query/offset/limit and program.describe for "
+            "the executable and execution-route constraints."
         )
     return (page, status)
 
@@ -772,6 +805,8 @@ def _select_program_row(
 async def program_describe_handler(
     tool_input: dict[str, Any], context: LocalToolContext
 ) -> LocalToolResult:
+    from redteam.orchestration.agents.tool_access import specialist_tool_ids
+
     deps = getattr(context, "deps", None)
     provider = getattr(deps, "shell_programs", None)
     rows, extra = await collect_program_rows(
@@ -811,9 +846,11 @@ async def program_describe_handler(
             "available_scopes": sorted(
                 {str(row.owner_scope) for row in rows if str(row.name) == str(match.name)}
             ),
-            "run_with": (
-                "shell_run or shell_job_start script input (TASK-003 builtin); "
-                "programs are not callable tool names",
+            "run_with": "Use an eligible execution route's script input; programs are not "
+                        "callable tool names. Enumeration does not prove every program mode "
+                        "works without privileges or network access.",
+            "execution_environment": program_execution_environment(
+                provider, await specialist_tool_ids(deps, getattr(context, "runtime", None)),
             ),
             "program_manifest_status": extra.get(PROGRAM_MANIFEST_STATUS_KEY, ""),
             "workroom_status": extra.get(WORKROOM_STATUS_KEY, ""),
@@ -894,6 +931,7 @@ def _descriptor(
         input_schema=schema,
         contribution_id=contribution_id,
         bootstrap=bootstrap,
+        version="2",
     )
 
 
@@ -1007,7 +1045,7 @@ def _contribution(contribution_id: str, make_descriptor: Any, handler: Any) -> A
     def factory(wiring: Any) -> Any:
         return make_descriptor(), handler
 
-    return runtime_tool_contribution(contribution_id=contribution_id, factory=factory)
+    return runtime_tool_contribution(contribution_id=contribution_id, version="2", factory=factory)
 
 
 def discovery_tool_contributions() -> tuple[Any, ...]:
