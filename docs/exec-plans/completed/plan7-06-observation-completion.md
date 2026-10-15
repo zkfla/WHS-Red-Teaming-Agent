@@ -53,10 +53,10 @@ Pending independent plan review and actual test evidence. Record exact tests/art
 
 | Requirement | Implementation | Verification | Review | Status |
 |---|---|---|---|---|
-| K01 | Pending | Pending | Pending | OPEN |
-| K02 | Pending | Pending | Pending | OPEN |
-| K03 | Pending | Pending | Pending | OPEN |
-| K04 | Pending | Pending | Pending | OPEN |
+| K01 | Shared structured contradiction validation | producer/canonical tests; Sol review | Source-backed independent review | PASS |
+| K02 | Original criteria and observation/review/verdict | chain and actual binding/resume tests | Source-backed independent review | PASS |
+| K03 | Immutable originals and final reuse CAS | root19 reuse + integrated checks | Source-backed independent review | PASS |
+| K04 | Typed owner/reference/recovery diagnostics | native storage/report/reopen checks | Source-backed independent review | PASS |
 
 ### Integrated implementation evidence (2026-10-15)
 

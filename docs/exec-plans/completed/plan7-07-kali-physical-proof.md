@@ -13,7 +13,7 @@ Import is staged after current writers freeze, preserving unrelated local files 
 
 ## Status
 
-PLANNING — 2026-10-14, original Windows checkout, dev at 376b479d. User authorized implementation and stage commits; final review → repair → tests required.
+COMPLETE — 2026-10-15 under the latest direct-provider decision. Original planning/history entries below are retained; final integrated evidence is in docs/agent/plan7-integrated-verification-20261015.md. Final publication is tracked by stage08.
 
 ## Goal and Context
 
@@ -97,11 +97,11 @@ Fresh independent Sol physical source review CLEAR for production approval/same-
 
 | Requirement | Implementation | Verification | Review | Status |
 |---|---|---|---|---|
-| E01 | Pending | Pending | Pending | OPEN |
-| E02 | Pending | Pending | Pending | OPEN |
-| E03 | Pending | Pending | Pending | OPEN |
-| E04 | Pending | Pending | Pending | OPEN |
-| E05 | Pending | Pending | Pending | OPEN |
+| E01 | Pinned Kali/mock receipt and direct route | actual route proof1 PASS; no packet gate claim | Source-backed independent review | PASS |
+| E02 | Production approval/recovery/original consumers | actual chain1 PASS; Sol review | Source-backed independent review | PASS |
+| E03 | Existing state/report and actual accounting | projection/accounting regression evidence | Source-backed independent review | PASS |
+| E04 | Configuration-bound resume and historical read | binding5/environment/recovery/migration checks | Source-backed independent review | PASS |
+| E05 | Direct metadata and unchanged capabilities | HTTP-gate demand superseded; physical capability check | Source-backed independent review | PASS |
 
 ## Completion Criteria
 

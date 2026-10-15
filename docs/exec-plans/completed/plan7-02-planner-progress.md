@@ -52,9 +52,9 @@ Pending independent plan review and actual test evidence. Record exact tests/art
 
 | Requirement | Implementation | Verification | Review | Status |
 |---|---|---|---|---|
-| P01 | Pending | Pending | Pending | OPEN |
-| P02 | Pending | Pending | Pending | OPEN |
-| P03 | Pending | Pending | Pending | OPEN |
+| P01 | Proposal and canonical work witness | progress/replan tests + Sol | Source-backed independent review | PASS |
+| P02 | Durable cap and runtime/report settlement | 30 integrated checks + Sol | Source-backed independent review | PASS |
+| P03 | Atomic registration/judgment/cursor/wake | legacy atomic and replay tests | Source-backed independent review | PASS |
 
 ### Integrated implementation evidence (2026-10-15)
 

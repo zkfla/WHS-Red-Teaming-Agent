@@ -65,9 +65,9 @@ Pending independent plan review and actual test evidence. Record exact tests/art
 
 | Requirement | Implementation | Verification | Review | Status |
 |---|---|---|---|---|
-| A01 | Pending | Pending | Pending | OPEN |
-| A02 | Pending | Pending | Pending | OPEN |
-| A03 | Pending | Pending | Pending | OPEN |
+| A01 | Selected startup environment and build wiring | startup8 + Linux neighbors36 | Source-backed independent review | PASS |
+| A02 | Direct image/manifest/endpoint identity | actual pinned Kali preparation; gate-only demands superseded | Source-backed independent review | PASS |
+| A03 | Truthful readiness and bound resume | preparation/environment/binding regressions | Source-backed independent review | PASS |
 
 ## Original numbered requirement coverage
 

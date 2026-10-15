@@ -13,7 +13,7 @@ Import is staged after current writers freeze, preserving unrelated local files 
 
 ## Status
 
-PLANNING — 2026-10-14, original Windows checkout, dev at 376b479d. User authorized implementation and stage commits; final review → repair → tests required.
+COMPLETE — 2026-10-15 under the latest direct-provider decision. Original planning/history entries below are retained; final integrated evidence is in docs/agent/plan7-integrated-verification-20261015.md. Final publication is tracked by stage08.
 
 ## Goal and Context
 
@@ -64,10 +64,10 @@ Pending independent plan review and actual test evidence. Record exact tests/art
 
 | Requirement | Implementation | Verification | Review | Status |
 |---|---|---|---|---|
-| C01 | Pending | Pending | Pending | OPEN |
-| C02 | Pending | Pending | Pending | OPEN |
-| C03 | Pending | Pending | Pending | OPEN |
-| C04 | Pending | Pending | Pending | OPEN |
+| C01 | Registry selector/manifest and paged discovery | discovery/native input regressions | Source-backed independent review | PASS |
+| C02 | Production Control to original protected result | physical approval/same-invocation proof | Source-backed independent review | PASS |
+| C03 | Bounded original to Task/worker/Planner | actual physical chain + scripted7 | Source-backed independent review | PASS |
+| C04 | Truthful direct readiness and enforcement metadata | direct decision supersedes HTTP-gate blocker | Source-backed independent review | PASS |
 
 ## Original numbered requirement coverage
 

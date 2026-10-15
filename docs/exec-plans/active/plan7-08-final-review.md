@@ -71,8 +71,8 @@ Actual Cat Jam High bank run executed2 GETs and stopped at high-risk approval; a
 
 | Requirement | Implementation | Verification | Review | Status |
 |---|---|---|---|---|
-| F01 | Pending | Pending | Pending | OPEN |
-| F02 | Pending | Pending | Pending | OPEN |
+| F01 | Sol source reviews + agy auxiliary review; concrete repairs reconciled | Integrated verification report and scoped review rechecks | CLEAR | PASS |
+| F02 | CI-path Ruff/mypy/compose; physical direct proof and live bank runs | Full4510 PASS/133 SKIP/2 failures reconciled by isolated2 PASS; targeted late fixes PASS | Scope and limitations documented | PASS |
 | F03 | Pending | Pending | Pending | OPEN |
 
 ## Completion Criteria

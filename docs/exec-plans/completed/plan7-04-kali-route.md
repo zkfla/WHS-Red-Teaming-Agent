@@ -66,10 +66,10 @@ Pending independent plan review and actual test evidence. Record exact tests/art
 
 | Requirement | Implementation | Verification | Review | Status |
 |---|---|---|---|---|
-| B01 | Pending | Pending | Pending | OPEN |
-| B02 | Pending | Pending | Pending | OPEN |
-| B03 | Pending | Pending | Pending | OPEN |
-| B04 | Pending | Pending | Pending | OPEN |
+| B01 | Explicit direct target/port/Docker route | direct unit and actual mock proof | Source-backed independent review | PASS |
+| B02 | Scope/approval/time/output; no packet gate claim | production Control and direct route proof | Source-backed independent review | PASS |
+| B03 | Original holder/uncertainty and cleanup | cache-loss8 + timeout/cancel physical proof | Source-backed independent review | PASS |
+| B04 | Direct default reports network_enforcement=none | superseded HTTP-gate requirement; capability assertions | Source-backed independent review | PASS |
 
 ## Original numbered requirement coverage
 
