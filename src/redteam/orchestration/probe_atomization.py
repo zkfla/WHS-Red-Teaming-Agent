@@ -57,9 +57,9 @@ class AtomizationProposalError(SpecialistProposalError):
         self, code: str, *, diagnostic: DecisionDiagnostic | None = None,
         condition_conflicts: tuple = (),
     ):
-        super().__init__(code)
-        self.diagnostic = diagnostic
-        self.condition_conflicts = condition_conflicts
+        super().__init__(code, condition_conflicts=condition_conflicts)
+        if diagnostic is not None:
+            self.diagnostic = diagnostic
 
 
 def _task_rejection(code, *, index, task, field, question, criterion_ids=(),

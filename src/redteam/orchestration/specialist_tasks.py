@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -20,6 +20,9 @@ from redteam.core.enums import TaskStatus
 from redteam.core.ids import AgentId, EventId, EvidenceId, GraphNodeId, HypothesisId, RunId, TaskId
 from redteam.orchestration.agents.registry import AgentRegistry
 from redteam.orchestration.coordination import content_hash
+
+if TYPE_CHECKING:
+    from redteam.orchestration.central_state import CheckedEvidence
 
 
 class InvestigationQuestion(BaseModel):
@@ -196,7 +199,7 @@ async def register_investigation_tasks(
     from redteam.orchestration.coordination import StateConflict
 
     keys: list[str] = []
-    checked = ()
+    checked: tuple[CheckedEvidence, ...] = ()
     if proposal is not None:
         keys = validate_strategy_tasks(
             proposal, agents=agents, known_targets=known_targets,

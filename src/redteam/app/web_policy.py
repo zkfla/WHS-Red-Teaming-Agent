@@ -407,7 +407,7 @@ async def select_engagement_startup(
     """
     if isinstance(engagement, (str, Path)):
         path: Path | None = Path(engagement)
-        config = load_engagement_config(path)
+        config = load_engagement_config(engagement)
     else:
         config = engagement
         path = Path(engagement_path) if engagement_path is not None else None
