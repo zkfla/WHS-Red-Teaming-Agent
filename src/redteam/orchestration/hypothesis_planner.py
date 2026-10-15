@@ -164,10 +164,48 @@ _SECONDARY_KEY = "related_admission_diagnostics"
 def _generic_admission_rejection() -> DecisionDiagnostic:
     return DecisionDiagnostic(
         code="hypothesis_admission_rejected", stage="hypothesis_planning", kind="validation",
-        summary="The candidate/probe proposal failed original evidence, verdict, scope "
-                "or source admission. No candidate/task change was committed.",
+        summary="Final admission rejected without an owned field diagnostic. Safe exception "
+                "type and spent budget are recorded; original message withheld. No changes "
+                "committed.",
+        repair_condition="Check the original evidence, verdict and scope records for this pass.",
         retryable=False,
     )
+
+
+def _admission_rejection_diagnostic(exc: BaseException, budget) -> DecisionDiagnostic:
+    """Admission rejection carrying the chain's spent counters and a safe exception type/chain.
+
+    A typed diagnostic attached by the rejecting owner is kept, moved to this planning stage and
+    never made retryable here, so the model repair budget cannot bypass current controls. The
+    exception message is never copied because StateConflict and ValueError can carry model values.
+    Counters are read from the budget only; nothing is charged here.
+    """
+    attached = getattr(exc, "diagnostic", None)
+    base = (
+        attached.model_copy(update={"stage": "hypothesis_planning", "retryable": False})
+        if isinstance(attached, DecisionDiagnostic) else _generic_admission_rejection()
+    )
+    spent = budget.diagnostic_details()
+    update: dict[str, Any] = {
+        "attempts": budget.used,
+        "attempt_limit": spent["attempt_limit"],
+        "stage_attempts": spent["stage_attempts"],
+        "normal_limit": spent["normal_limit"],
+        "repair_limit": spent["repair_limit"],
+        "transport_limit": spent["transport_limit"],
+        "normal_used": spent["normal_used"],
+        "repair_used": spent["repair_used"],
+        "transport_used": spent["transport_used"],
+    }
+    if not base.trace:
+        update["trace"] = spent["trace"]
+    if not base.failure_counts:
+        update["failure_counts"] = spent["failure_counts"]
+    if not base.error_type:
+        update["error_type"] = error_type_for(exc)
+    if not base.exception_chain:
+        update["exception_chain"] = exception_chain_for(exc)
+    return base.model_copy(update=update)
 
 
 def _related_projection(item: DecisionDiagnostic) -> dict:
@@ -182,7 +220,7 @@ def _related_projection(item: DecisionDiagnostic) -> dict:
 def _candidate_admission_diagnostic(exc: CandidateAdmissionConflict, budget) -> DecisionDiagnostic:
     """Primary owner diagnostic with planner stage/attempts and one bounded secondary trace row."""
     if not exc.diagnostics:
-        return _generic_admission_rejection()
+        return _admission_rejection_diagnostic(exc, budget)
     primary, *related = exc.diagnostics
     diagnostic = primary.model_copy(
         update={"stage": "hypothesis_planning", "attempts": budget.used},
@@ -576,12 +614,7 @@ async def _finalize_hypothesis_pass(deps, snapshot, budget, *, identity, proposa
                               diagnostic=_candidate_admission_diagnostic(exc, budget)) from exc
     except (StateConflict, ValueError) as exc:
         raise DecisionFailure("hypothesis_planning", "format", budget.used,
-                              diagnostic=DecisionDiagnostic(
-            code="hypothesis_admission_rejected", stage="hypothesis_planning", kind="validation",
-            summary="The candidate/probe proposal failed original evidence, verdict, scope "
-                    "or source admission. No candidate/task change was committed.",
-            retryable=False,
-        )) from exc
+                              diagnostic=_admission_rejection_diagnostic(exc, budget)) from exc
     await deps.event_bus.flush()
     return identities
 
