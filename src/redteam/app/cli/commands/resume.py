@@ -189,7 +189,8 @@ async def _run_central(args, config, *, mcp_stack, on_finished=None,
             config, max_steps=None, mcp_stack=mcp_stack, central_state=state,
             original_stores=original["storage_refs"], original_settings=selected,
             original_component_binding=original.get("component_binding"),
-            component_registry=component_registry, engagement_path=args.engagement_path,
+            component_registry=component_registry,
+            engagement_path=getattr(args, "engagement_path", None),
         )
         if session_channel is not None:
             from redteam.app.central_run import central_root_runtime
@@ -361,7 +362,8 @@ async def _run_collect_central(args, config, *, mcp_stack, component_registry=No
             config, max_steps=None, mcp_stack=mcp_stack, central_state=state,
             original_stores=original["storage_refs"], original_settings=selected,
             original_component_binding=original.get("component_binding"),
-            component_registry=component_registry, engagement_path=args.engagement_path,
+            component_registry=component_registry,
+            engagement_path=getattr(args, "engagement_path", None),
         )
         probe_checkpoint = Path(original["storage_refs"]["checkpoints"]).is_file()
         driver_settings = selected
