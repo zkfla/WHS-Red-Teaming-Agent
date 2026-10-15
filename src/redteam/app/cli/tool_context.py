@@ -28,7 +28,23 @@ def live_tool_context(catalog, engagement=None):
             "mcp_targets": metadata.get("mcp_targets", {}),
             "web_policy": metadata.get("web_policy", {}),
         })
+    gated = _gated_network_projection(catalog)
+    availability["gated_network"] = gated
     return {"tools": catalog_tool_labels(catalog), "tool_availability": availability}
+
+
+def _gated_network_projection(catalog):
+    """Project P readiness from the assembled capability catalog only."""
+    from redteam.capability.gated_manifest import gated_operation_for
+
+    descriptors = catalog.all() if catalog is not None else []
+    prepared = any(gated_operation_for(descriptor.tool_name) is not None
+                   for descriptor in descriptors)
+    return {
+        "state": "network_prerequisites_ready" if prepared else "local_only",
+        "route_and_roe": "pending" if prepared else "closed",
+        "target_ready": False,
+    }
 
 
 def configured_tool_context(config):
@@ -44,17 +60,30 @@ def configured_tool_context(config):
                             "allowed_tool_names": list(settings.allowed_tools or [])})
         except ValueError:
             servers.append({"server_id": identity, "state": "invalid_configuration"})
+    web_policy = config.engagement.metadata.get("web_policy", {})
+    selected_mode = web_policy.get("kali_network_mode") if isinstance(web_policy, dict) else None
     try:
         shell = "prepare_at_run_start" if automatic_shell_setup_from_environment() else (
             "configured_unverified" if shell_policy_path_from_environment() else "disabled"
         )
-        kali_network = "configured_unverified" if gated_network_policy_path_from_environment() \
-            else "closed"
+        kali_network = (
+            "prepare_at_run_start" if selected_mode == "prepare" else
+            "local_only" if selected_mode == "closed" else
+            "configured_unverified" if selected_mode == "configured"
+            or gated_network_policy_path_from_environment() else "local_only"
+        )
     except ValueError:
         shell, kali_network = "invalid_configuration", "invalid_configuration"
     return {"tools": [], "tool_availability": {
         "state": "configured_unverified", "servers": servers,
         "shell": {"state": shell, "target_network": kali_network},
+        "gated_network": {
+            "state": kali_network,
+            "route_and_roe": "pending" if kali_network in {
+                "prepare_at_run_start", "configured_unverified",
+            } else "closed",
+            "target_ready": False,
+        },
         "constraints": redact_secret_material({
             "mcp_targets": config.engagement.metadata.get("mcp_targets", {}),
             "web_policy": config.engagement.metadata.get("web_policy", {}),

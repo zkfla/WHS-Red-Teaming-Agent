@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -69,6 +70,102 @@ def test_resume_is_registered_as_a_cli_command() -> None:
     assert args.handler is resume_command.run
     assert args.run_id == "run_1"
     assert args.engagement_path == "engagement.yaml"
+
+
+async def test_resume_build_uses_recorded_web_request_under_request_local_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from redteam.app.cli.commands import run as run_command
+    from redteam.app.web.engagement import EngagementStore
+    from redteam.app.web_policy import (
+        GATED_PREPARATION_KEY,
+        _load_prepared_policy,
+        select_engagement_startup,
+    )
+    from redteam.capability.gated_network_policy import (
+        GatedNetworkPolicy,
+        GatedNetworkPolicyRequest,
+        policy_content_hash,
+    )
+    from redteam.core.environment import env_snapshot
+
+    monkeypatch.setenv("REDTEAM_RUNTIME_BACKEND", "central")
+    monkeypatch.setenv("REDTEAM_MCP_SERVERS", "")
+    store = EngagementStore(tmp_path / "web-resume.yaml")
+    store.save({
+        "name": "web resume",
+        "allowed_hosts": ["https://127.0.0.1:8443"],
+        "allowed_capabilities": ["web"],
+        "max_actions": 5,
+        "web_policy_mode": "site",
+        "kali_network_mode": "prepare",
+        "kali_endpoints": [{
+            "origin": "https://127.0.0.1:8443", "port": 8443, "transport": "tcp",
+        }],
+        "kali_limits_preset": "probe",
+        "kali_sidecar_mode": "managed",
+        "kali_sidecar_image": None,
+    }, confirm_scope=True, confirm_expansion=True)
+    startup = await select_engagement_startup(store.path, base_environment=env_snapshot())
+    artifact = Path(startup.network_policy_path)
+    original_artifact = artifact.read_bytes()
+    assert "web-http" not in env_snapshot().get("REDTEAM_MCP_SERVERS", "")
+    process_environment = env_snapshot()
+    captured = {}
+
+    async def fake_prepare_shell_runtime(policy_path, **kwargs):
+        selected_path = Path(kwargs["network_policy_path"])
+        request = _load_prepared_policy(selected_path)
+        assert isinstance(request, GatedNetworkPolicyRequest)
+        payload = request.model_dump(mode="json")
+        payload.pop("managed_sidecar")
+        payload["sidecar_image"] = "example.invalid/gate@sha256:" + "b" * 64
+        resolved = GatedNetworkPolicy.model_validate(payload)
+        captured.update(
+            shell_policy_path=policy_path,
+            request_path=selected_path,
+            request_hash=policy_content_hash(request),
+            resolved=resolved,
+            runtime_environment=env_snapshot(),
+        )
+        return SimpleNamespace(
+            preparation_status="network_prerequisites_ready",
+            network_policy=resolved,
+            network_policy_hash=policy_content_hash(request),
+            adapter=object(), concurrency={}, output_limits={}, program_source=None,
+            environment_fingerprint=None,
+        )
+
+    async def fake_build_application(config, **kwargs):
+        captured["gated_shell"] = kwargs["gated_shell"]
+        return object(), SimpleNamespace()
+
+    async def fake_resume_build(args, config, **_kwargs):
+        assert {"web-http", "recon-passive"} <= set(config.capability.mcp_servers)
+        record = config.engagement.metadata[GATED_PREPARATION_KEY]
+        assert record["request_sha256"] == startup.network_policy_hash
+        await run_command.build(
+            config, max_steps=args.max_steps, engagement_path=args.engagement_path,
+        )
+        return 0
+
+    monkeypatch.setattr(run_command, "prepare_shell_runtime", fake_prepare_shell_runtime)
+    monkeypatch.setattr(run_command, "build_application", fake_build_application)
+    monkeypatch.setattr(resume_command, "_run_central", fake_resume_build)
+    args = SimpleNamespace(
+        run_id="run-web-resume", engagement_path=str(store.path), max_steps=2,
+        log_level=None, json=False, state_db=None, workers=None, instance=None,
+    )
+
+    assert await resume_command.run(args) == 0
+    assert captured["shell_policy_path"] is None
+    assert captured["request_path"] == artifact
+    assert captured["request_hash"] != policy_content_hash(captured["resolved"])
+    assert captured["gated_shell"][1].network_policy is captured["resolved"]
+    assert captured["runtime_environment"]["REDTEAM_GATED_NETWORK_POLICY_PATH"] == str(artifact)
+    assert "web-http" in captured["runtime_environment"]["REDTEAM_MCP_SERVERS"]
+    assert artifact.read_bytes() == original_artifact
+    assert env_snapshot() == process_environment
 
 
 

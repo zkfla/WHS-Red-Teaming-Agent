@@ -64,7 +64,6 @@ from redteam.capability.settings import (
     gated_network_policy_path_from_environment,
     shell_policy_path_from_environment,
 )
-from redteam.capability.shell_assembly import build_gated_provider_config
 from redteam.capability.shell_runtime import prepare_shell_runtime
 from redteam.core.config import AppConfig
 from redteam.core.contracts.events import EventEnvelope, EventType
@@ -801,6 +800,55 @@ async def build(
     original_stores=None,
     original_settings=None,
     original_component_binding=None,
+    engagement_path=None,
+    startup_sink=None,
+) -> tuple[Any, RuntimeDeps]:
+    """Apply the selected engagement's request-local inputs, then assemble it."""
+    from redteam.app.web_policy import select_engagement_startup
+    from redteam.capability.settings import mcp_server_ids_from_environment
+    from redteam.core.environment import environment_context
+
+    startup = await select_engagement_startup(
+        config.engagement,
+        engagement_path=engagement_path,
+        require_recorded_preparation=original_stores is not None,
+    )
+    if startup_sink is not None:
+        startup_sink.append(startup)
+    # MCP ids come from the composed startup environment, not the pre-selection snapshot.
+    capability = config.capability.model_copy(update={
+        "mcp_servers": mcp_server_ids_from_environment(source=startup.environment),
+    })
+    selected_config = config.model_copy(
+        update={"engagement": startup.engagement, "capability": capability}
+    )
+    with environment_context(startup.environment):
+        return await _build_selected(
+            selected_config,
+            max_steps=max_steps,
+            mcp_stack=mcp_stack,
+            component_profile=component_profile,
+            component_registry=component_registry,
+            central_state=central_state,
+            original_stores=original_stores,
+            original_settings=original_settings,
+            original_component_binding=original_component_binding,
+            selected_network_policy_path=startup.network_policy_path,
+        )
+
+
+async def _build_selected(
+    config: AppConfig,
+    *,
+    max_steps: int | None,
+    mcp_stack: AsyncExitStack | None = None,
+    component_profile: ComponentProfile | None = None,
+    component_registry: ComponentRegistry | None = None,
+    central_state=None,
+    original_stores=None,
+    original_settings=None,
+    original_component_binding=None,
+    selected_network_policy_path: str | None = None,
 ) -> tuple[Any, RuntimeDeps]:
     """Phase 1 of the shared core (section 17): config -> live
     ``(Engagement, RuntimeDeps)``, via the canonical
@@ -832,11 +880,20 @@ async def build(
         shell_policy_path_from_environment(),
         auto_setup=(automatic_shell_setup_from_environment()
                     if original_stores is None or execution_fingerprint is not None else False),
+        network_policy_path=(selected_network_policy_path
+                             or gated_network_policy_path_from_environment()),
         progress=eprint, expected_fingerprint=execution_fingerprint,
     )
-    gated_provider_config = build_gated_provider_config(
-        gated_network_policy_path_from_environment()
-    )
+    gated_provider_config = None
+    if shell_runtime is not None and (
+        shell_runtime.preparation_status == "network_prerequisites_ready"
+        and shell_runtime.network_policy is not None
+    ):
+        from redteam.capability.gated_activation import GatedProviderConfig
+
+        # The selected request hash is a distinct input to preparation; the
+        # activation consumes P's resolved image-bearing immutable policy.
+        gated_provider_config = GatedProviderConfig(network_policy=shell_runtime.network_policy)
     if gated_provider_config is not None and shell_runtime is None:
         raise MCPConfigurationError(
             "gated network policy requires the shell provider: set "
@@ -1141,9 +1198,14 @@ async def _run(
     component_registry: ComponentRegistry | None = None,
 ) -> int:
     try:
-        config = load_app_config_for_run(args.engagement_path)
-        from redteam.app.cli._shared import runtime_overrides
-        config = runtime_overrides(config, args)
+        from redteam.app.web_policy import select_engagement_startup
+        from redteam.core.environment import environment_context
+
+        startup = await select_engagement_startup(args.engagement_path)
+        with environment_context(startup.environment):
+            config = load_app_config_for_run(args.engagement_path)
+            from redteam.app.cli._shared import runtime_overrides
+            config = runtime_overrides(config, args)
     except (OSError, ValidationError, ValueError) as exc:
         eprint(f"ERROR: {exc}")
         return EXIT_CONFIG_ERROR
@@ -1160,7 +1222,8 @@ async def _run(
         if component_registry is not None:
             build_options["component_registry"] = component_registry
         engagement, deps = await build(
-            config, max_steps=args.max_steps, mcp_stack=mcp_stack, **build_options
+            config, max_steps=args.max_steps, mcp_stack=mcp_stack,
+            engagement_path=args.engagement_path, **build_options
         )
     except MCPConfigurationError as exc:
         eprint(f"ERROR: MCP configuration invalid: {exc}")

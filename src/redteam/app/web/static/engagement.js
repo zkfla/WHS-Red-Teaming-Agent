@@ -58,13 +58,25 @@ export function setupEngagement(afterSave) {
         "전체 허용은 지정 대상의 지원되는 웹 요청에 적용됩니다. 대상 범위·실행 예산·승인 규칙은 유지됩니다. Kali 대상 통신과 인증 계정은 별도로 설정합니다." }));
       const customOnly = new Set(["web_methods", "web_query_keys", "web_all_query_keys",
         "web_request_headers", "web_all_request_headers", "web_request_body"]);
+      const prepareOnly = new Set(["kali_endpoints", "kali_limits_preset", "kali_limit_deliveries",
+        "kali_limit_output_bytes", "kali_limit_duration_seconds",
+        "kali_limit_delivery_rate_per_second", "kali_sidecar_mode", "kali_sidecar_image",
+        "kali_docker_context"]);
       current.fields.filter((name) => {
         if (current.id === "permissions" && draft.web_policy_mode === "manual") return false;
         if (customOnly.has(name)) return draft.web_permissions === "custom";
         if (name === "kali_network_policy_path") return draft.kali_network_mode === "configured";
+        if (prepareOnly.has(name) && draft.kali_network_mode !== "prepare") return false;
+        if (name.startsWith("kali_limit_") && name !== "kali_limits_preset") {
+          return draft.kali_network_mode === "prepare" && draft.kali_limits_preset === "custom";
+        }
+        if (name === "kali_sidecar_image") {
+          return draft.kali_network_mode === "prepare" && draft.kali_sidecar_mode === "pinned";
+        }
         return true;
       }).forEach((name) => nodes.push(fieldNode(byName.get(name), draft, (rebuild) => {
-        if (rebuild || ["web_policy_mode", "web_permissions", "kali_network_mode"].includes(name)) paint();
+        if (rebuild || ["web_policy_mode", "web_permissions", "kali_network_mode",
+          "kali_limits_preset", "kali_sidecar_mode"].includes(name)) paint();
       })));
       if (current.id === "permissions" && draft.web_policy_mode === "manual") nodes.push(
         h("p", { text: "기존 MCP 설정을 사용합니다. 자동 정책을 선택하면 요청 권한을 지정할 수 있습니다." }));

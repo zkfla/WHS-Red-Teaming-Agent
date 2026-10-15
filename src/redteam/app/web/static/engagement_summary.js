@@ -33,8 +33,17 @@ export function summaryNode(preview) {
       ...row("JSON·form 본문", s.web_policy.permissions === "full" || s.web_policy.request_body_enabled ? "허용" : "차단"),
       ...row("응답 본문 분석", s.web_policy.response_body_max_chars ? `마스킹 후 최대 ${s.web_policy.response_body_max_chars}글자` : "본문 제공 안 함"),
       ...row("테스트 계정", (s.web_policy.sessions || []).map((item) => `${item.session_ref} (${item.principal_ref})`).join(", ") || "없음"),
-      ...row("Kali 대상 통신", s.web_policy.kali_network_mode === "configured" ? "검토된 대상 통신 정책 사용 — 실제 실행 준비는 Run 시작 시 확인"
-        : s.web_policy.kali_network_mode === "closed" ? "차단" : "기존 실행 환경 설정 유지"),
+      ...row("Kali 대상 통신", s.web_policy.kali_network_mode === "prepare"
+        ? `준비 요청: ${(s.web_policy.kali_endpoints || []).map((item) => `${item.origin}:${item.port}/${item.transport}`).join(", ")} · ${s.web_policy.kali_limits_preset === "custom" && s.web_policy.kali_limits
+          ? `${s.web_policy.kali_limits.max_flow_init_deliveries} 패킷 / ${s.web_policy.kali_limits.max_output_bytes} 바이트 / ${s.web_policy.kali_limits.duration_seconds}초`
+          : s.web_policy.kali_limits_preset || "예산 미선택"} · ${s.web_policy.kali_sidecar_mode || "sidecar 미선택"} · route/ROE 확인 대기`
+        : s.web_policy.kali_network_mode === "configured" ? "검토된 대상 통신 정책 사용 — 실제 실행 준비는 Run 시작 시 확인"
+          : s.web_policy.kali_network_mode === "closed" ? "차단" : "기존 실행 환경 설정 유지"),
+      ...(s.web_policy.kali_network_mode === "prepare" ? [
+        ...row("Kali Docker context", s.web_policy.kali_docker_context || "기존 실행 환경 선택"),
+        ...(s.web_policy.kali_sidecar_mode === "pinned"
+          ? row("고정 sidecar 이미지", s.web_policy.kali_sidecar_image) : []),
+      ] : []),
       ...row("실행 승인", "현재 조사에 설정된 승인 규칙 적용"),
     ] : []),
     row("허용 기능", join(s.allowed_capabilities) || "제한 없음"),
