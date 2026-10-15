@@ -99,6 +99,25 @@ _DUPLICATE_SUMMARY = (
     "criterion at the location named in the diagnostic and keep one copy."
 )
 
+_REVISION_SUMMARY = (
+    "Each hypothesis_revisions key must name a candidate from the snapshot or this proposal, "
+    "with the revision this proposal yields for it: the current revision when unchanged, "
+    "one more than expected_revision when updated, or 1 when newly issued. Correct the entry "
+    "at the location named in the diagnostic."
+)
+_PRINCIPAL_SUMMARY = (
+    "Each completion criterion principal_refs entry must also be a principal of its question. "
+    "Use only a principal already registered and permitted for this question, or correct the "
+    "criterion to use the question's intended subject at the location named in the diagnostic. "
+    "Do not invent authorization."
+)
+_PURPOSE_SUMMARY = (
+    "Each completion criterion hypothesis_id must be a candidate listed in its question's "
+    "hypothesis_revisions. Use the intended candidate already listed there. If the question "
+    "needs that relation, include the captured candidate with its correct proposed revision. "
+    "Do not invent refs or remove required purpose; correct the location named in the diagnostic."
+)
+
 
 def _plan_rejection(code: str, *, location: str, summary: str) -> AtomizationProposalError:
     """Static, field-precise stage-1 rejection; never echoes model text or identifiers."""
@@ -332,7 +351,11 @@ def bind_plan(
         revisions = {issued.get(identity, identity): revision
                      for identity, revision in question.hypothesis_revisions.items()}
         if any(versions.get(identity) != revision for identity, revision in revisions.items()):
-            raise AtomizationProposalError("plan_question_revision_not_in_proposal")
+            raise _plan_rejection(
+                "plan_question_revision_not_in_proposal",
+                location=f"$.questions[{question_index}].hypothesis_revisions",
+                summary=_REVISION_SUMMARY,
+            )
         if set(question.target_node_ids) - targets or set(question.principal_refs) - principals:
             raise AtomizationProposalError("plan_question_subject_not_registered")
         required = {issued.get(ref, ref) for ref in question.goal_required_hypothesis_ids}
@@ -368,13 +391,22 @@ def bind_plan(
                     unknown_kind=not condition.is_known(),
                 )
             if set(condition.principal_refs) - set(question.principal_refs):
-                raise AtomizationProposalError(
-                    "plan_question_condition_principal_outside_subjects")
+                raise _plan_rejection(
+                    "plan_question_condition_principal_outside_subjects",
+                    location=(f"$.questions[{question_index}]"
+                              f".completion_criteria[{condition_index}].principal_refs"),
+                    summary=_PRINCIPAL_SUMMARY,
+                )
             hypothesis_ref = condition.hypothesis_id or ""
             if hypothesis_ref and issued.get(
                 hypothesis_ref, hypothesis_ref
             ) not in revisions:
-                raise AtomizationProposalError("plan_question_criterion_outside_purpose")
+                raise _plan_rejection(
+                    "plan_question_criterion_outside_purpose",
+                    location=(f"$.questions[{question_index}]"
+                              f".completion_criteria[{condition_index}].hypothesis_id"),
+                    summary=_PURPOSE_SUMMARY,
+                )
         resolved_criteria = [condition.model_copy(update={
             "hypothesis_id": (
                 issued.get(condition.hypothesis_id, condition.hypothesis_id)
