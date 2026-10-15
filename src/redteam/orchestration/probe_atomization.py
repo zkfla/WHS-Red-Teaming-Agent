@@ -22,7 +22,7 @@ Preservation rules:
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from copy import deepcopy
 from typing import TYPE_CHECKING, Literal
 
@@ -35,7 +35,7 @@ from redteam.core.contracts.completion import (
     completion_conditions,
     criterion_id,
 )
-from redteam.core.contracts.graph import HypothesisUpdate
+from redteam.core.contracts.graph import Hypothesis, HypothesisUpdate
 from redteam.core.contracts.specialists import ProbeLimits
 from redteam.core.ids import new_id
 from redteam.orchestration.diagnostics import DecisionDiagnostic, safe_feedback
@@ -119,6 +119,15 @@ _PURPOSE_SUMMARY = (
 )
 
 
+_SUBJECT_SUMMARY = (
+    "Each question's target_node_ids and principal_refs must lie inside every candidate named "
+    "in its {field}. Split the question so each part fits a candidate that covers it, or "
+    "propose a justified candidate update for those subjects. Do not invent or unilaterally "
+    "broaden candidate subjects. Correct the location named in the diagnostic."
+)
+_SUBJECT_FIELDS = {"target": "target_node_ids", "principal": "principal_refs"}
+
+
 def _plan_rejection(code: str, *, location: str, summary: str) -> AtomizationProposalError:
     """Static, field-precise stage-1 rejection; never echoes model text or identifiers."""
     return AtomizationProposalError(code, diagnostic=DecisionDiagnostic(
@@ -126,6 +135,17 @@ def _plan_rejection(code: str, *, location: str, summary: str) -> AtomizationPro
         cause_scope="model_input", owner="orchestration.probe_atomization",
         location=location, summary=summary,
         validation_issues=[{"rule": code, "location": location}],
+    ))
+
+
+def _candidate_view_missing(location: str) -> AtomizationProposalError:
+    """Fail-closed invariant: proposal views and versions must describe the same candidates."""
+    return AtomizationProposalError("candidate_subject_view_missing", diagnostic=DecisionDiagnostic(
+        code="candidate_subject_view_missing", stage="hypothesis_planning", kind="internal",
+        retryable=False, cause_scope="runtime_contract", owner="orchestration.probe_atomization",
+        location=location,
+        summary="A named candidate has no subject view in this proposal. The planner state is "
+                "inconsistent; no change was committed.",
     ))
 
 
@@ -411,6 +431,15 @@ def _bind_updates(
     return updates, versions
 
 
+def post_update_candidates(
+    snapshot: PlanningSnapshot, updates: list[HypothesisUpdate],
+) -> dict[str, Hypothesis]:
+    """Candidate subjects after this proposal: a bound update replaces its snapshot candidate."""
+    views: dict[str, Hypothesis] = dict(snapshot.candidates)
+    views.update({update.hypothesis.hypothesis_id: update.hypothesis for update in updates})
+    return views
+
+
 def bind_plan(
     draft: HypothesisPlanDraft,
     snapshot: PlanningSnapshot,
@@ -435,7 +464,7 @@ def bind_plan(
     )
     questions = _bind_plan_questions(
         draft.questions, snapshot, issued=issued, targets=targets, principals=principals,
-        versions=versions,
+        versions=versions, candidate_views=post_update_candidates(snapshot, updates),
     )
     return _finish_plan_judgment(
         draft, updates, questions, versions, snapshot, existing_work_validator,
@@ -450,6 +479,7 @@ def _bind_plan_questions(
     targets: set[str],
     principals: set[str],
     versions: dict[str, int],
+    candidate_views: Mapping[str, Hypothesis],
     relation_field: str = "hypothesis_revisions",
 ) -> list[PlannedInvestigationQuestion]:
     """Shared per-question route: revisions, subjects, required, criteria and source gates."""
@@ -465,6 +495,19 @@ def _bind_plan_questions(
             )
         if set(question.target_node_ids) - targets or set(question.principal_refs) - principals:
             raise AtomizationProposalError("plan_question_subject_not_registered")
+        for ref in revisions:
+            if ref not in candidate_views:
+                raise _candidate_view_missing(f"$.questions[{question_index}].{relation_field}")
+            mismatches = candidate_views[ref].probe_subject_mismatches(
+                question.target_node_ids, question.principal_refs,
+            )
+            if mismatches:
+                field = _SUBJECT_FIELDS[mismatches[0]]
+                raise _plan_rejection(
+                    f"plan_question_{mismatches[0]}_outside_candidate",
+                    location=f"$.questions[{question_index}].{field}",
+                    summary=_SUBJECT_SUMMARY.format(field=relation_field),
+                )
         required = {issued.get(ref, ref) for ref in question.goal_required_hypothesis_ids}
         if required - revisions.keys() or required and not question.required:
             raise AtomizationProposalError("plan_question_required_invalid")
@@ -637,7 +680,8 @@ def bind_plan_selection(
     )
     questions = _bind_plan_questions(
         draft.questions, snapshot, issued=issued, targets=targets, principals=principals,
-        versions=versions, relation_field="candidate_refs",
+        versions=versions, candidate_views=post_update_candidates(snapshot, updates),
+        relation_field="candidate_refs",
     )
     finished_updates, questions, versions = _finish_plan_judgment(
         draft, updates, questions, versions, snapshot, existing_work_validator,

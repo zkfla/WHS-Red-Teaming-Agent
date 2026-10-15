@@ -53,6 +53,7 @@ from redteam.orchestration.probe_atomization import (
     bind_plan_selection,
     build_atomizer_input,
     needs_atomization,
+    post_update_candidates,
     resolve_atomized_tasks,
     validate_atomized_tasks,
 )
@@ -89,8 +90,10 @@ class HypothesisDecision(BaseModel):
 class HypothesisProposalError(ValueError):
     """Safe, code-owned repair reason; never contains a proposed body or secret."""
 
-    def __init__(self, code: str):
+    def __init__(self, code: str, *, diagnostic: DecisionDiagnostic | None = None):
         self.code = code
+        if diagnostic is not None:
+            self.diagnostic = diagnostic
         super().__init__(code)
 
 
@@ -121,6 +124,38 @@ _REPAIR_GUIDANCE: dict[str, tuple[str, str]] = {
         "The reason and every resume_condition must be nonblank text.",
     ),
 }
+
+
+_LEGACY_SUBJECT_SUMMARY = (
+    "Each task's target_node_ids and principal_refs must lie inside every candidate named in its "
+    "hypothesis_revisions, after this proposal's updates. Narrow the task to those subjects, "
+    "split it, or propose a justified candidate update for them. Do not invent or unilaterally "
+    "broaden candidate subjects. Correct the location named in the diagnostic."
+)
+_SUBJECT_FIELDS = {"target": "target_node_ids", "principal": "principal_refs"}
+
+
+def _legacy_subject_rejection(kind: str, *, index: int) -> HypothesisProposalError:
+    """Attached indexed diagnostic for a task subject outside its post-update candidates."""
+    code = f"probe_{kind}_outside_candidate"
+    location = f"$.tasks[{index}].{_SUBJECT_FIELDS[kind]}"
+    return HypothesisProposalError(code, diagnostic=DecisionDiagnostic(
+        code=code, stage="hypothesis_planning", kind="validation", retryable=True,
+        cause_scope="model_input", owner="orchestration.hypothesis_planner",
+        location=location, summary=_LEGACY_SUBJECT_SUMMARY,
+        validation_issues=[{"rule": code, "location": location}],
+    ))
+
+
+def _legacy_view_missing(index: int) -> HypothesisProposalError:
+    """Fail-closed invariant: proposal views and versions must describe the same candidates."""
+    return HypothesisProposalError("candidate_subject_view_missing", diagnostic=DecisionDiagnostic(
+        code="candidate_subject_view_missing", stage="hypothesis_planning", kind="internal",
+        retryable=False, cause_scope="runtime_contract", owner="orchestration.hypothesis_planner",
+        location=f"$.tasks[{index}].hypothesis_revisions",
+        summary="A named candidate has no subject view in this proposal. The planner state is "
+                "inconsistent; no change was committed.",
+    ))
 
 
 def _proposal_repair_summary(exc: BaseException, fallback: str) -> str:
@@ -328,16 +363,25 @@ def bind_decision(decision, snapshot, *, issued, targets, principals, roles, max
         principals=principals, resume_conditions=decision.resume_conditions,
         error=HypothesisProposalError,
     )
+    views = post_update_candidates(snapshot, updates)
     versions = {identity: candidate.revision for identity, candidate in snapshot.candidates.items()}
     versions.update({update.hypothesis.hypothesis_id: (update.expected_revision or 0) + 1
                      for update in updates})
-    for draft in decision.tasks:
+    for index, draft in enumerate(decision.tasks):
         if draft.role_id not in roles:
             raise HypothesisProposalError("probe_role_not_ready")
         revisions = {issued.get(identity, identity): revision
                      for identity, revision in draft.hypothesis_revisions.items()}
         if any(versions.get(identity) != revision for identity, revision in revisions.items()):
             raise HypothesisProposalError("probe_candidate_revision_not_in_proposal")
+        for identity in revisions:
+            if identity not in views:
+                raise _legacy_view_missing(index)
+            mismatches = views[identity].probe_subject_mismatches(
+                draft.target_node_ids, draft.principal_refs,
+            )
+            if mismatches:
+                raise _legacy_subject_rejection(mismatches[0], index=index)
         if bool(draft.source_task_id) != bool(draft.source_result_id) or (
             draft.source_question_id and not draft.source_task_id
         ):

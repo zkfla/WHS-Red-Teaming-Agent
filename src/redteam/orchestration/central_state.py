@@ -673,11 +673,12 @@ class CentralTransaction:
                     candidate.revision != revision
                 ):
                     raise StateConflict("probe_candidate_revision_changed")
-                if set(map(str, task.related_attack_graph_node_ids)) - set(
-                    candidate.target_node_ids
-                ):
+                mismatches = candidate.probe_subject_mismatches(
+                    task.related_attack_graph_node_ids, task.principal_refs,
+                )
+                if "target" in mismatches:
                     raise StateConflict("probe_target_outside_candidate")
-                if set(task.principal_refs) - set(candidate.principal_refs):
+                if "principal" in mismatches:
                     raise StateConflict("probe_principal_outside_candidate")
         payload = task.model_dump_json(
             exclude={"dependency_task_ids", "parent_task_id", "priority"},

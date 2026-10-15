@@ -6,6 +6,7 @@ Owned by PM (schema) — Agent Team owns the store/service in
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
 from typing import Any, Literal
 
@@ -83,6 +84,20 @@ class Hypothesis(BaseModel):
             if self.hypothesis_id in self.source_hypothesis_ids:
                 raise ValueError("candidate cannot be its own source")
         return self
+
+    def probe_subject_mismatches(
+        self, target_node_ids: Sequence[str], principal_refs: Sequence[str],
+    ) -> tuple[str, ...]:
+        """Probe subjects outside this candidate's registered targets or principals.
+
+        Pure set comparison, no policy: returns "target" and/or "principal", in that order.
+        """
+        mismatches: list[str] = []
+        if set(map(str, target_node_ids)) - set(self.target_node_ids):
+            mismatches.append("target")
+        if set(map(str, principal_refs)) - set(self.principal_refs):
+            mismatches.append("principal")
+        return tuple(mismatches)
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):

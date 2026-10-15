@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
-from redteam.core.contracts.graph import HypothesisUpdate
+from redteam.core.contracts.graph import Hypothesis, HypothesisUpdate
 from redteam.orchestration.probe_atomization import (
     AtomizationProposalError,
     HypothesisPlanDraft,
@@ -61,11 +61,17 @@ def _selection(questions=(), updates=(), termination="continue", reason="Plan th
 
 
 def _snap(candidates=None, tasks=None):
-    return SimpleNamespace(candidates=dict(candidates or {}), tasks=dict(tasks or {}))
+    return SimpleNamespace(candidates={
+        key: value.model_copy(update={"hypothesis_id": key})
+        for key, value in (candidates or {}).items()
+    }, tasks=dict(tasks or {}))
 
 
 def _candidate(revision):
-    return SimpleNamespace(revision=revision)
+    return Hypothesis(
+        contract_version=2, hypothesis_id="fixture-candidate", description="Assess the response",
+        revision=revision, target_node_ids=["n1"], reason="Assess the preserved response",
+    )
 
 
 def _task(result_id):
