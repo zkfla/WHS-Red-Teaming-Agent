@@ -95,4 +95,3 @@ def test_planner_projection_keeps_primary_stage_and_bounds_secondary_trace():
     assert primary.attempts == 2
     secondary = primary.trace[-1]["related_admission_diagnostics"]
     assert len(secondary) == 7 and secondary[0]["code"] == "c1"
-
