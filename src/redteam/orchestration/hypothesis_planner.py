@@ -20,7 +20,12 @@ from redteam.orchestration.central_runtime import (
     task_is_claimable,
 )
 from redteam.orchestration.cognition import DecisionFailure, DecisionValidationError
-from redteam.orchestration.coordination import PlanningInputsChanged, StateConflict, content_hash
+from redteam.orchestration.coordination import (
+    CandidateAdmissionConflict,
+    PlanningInputsChanged,
+    StateConflict,
+    content_hash,
+)
 from redteam.orchestration.diagnostics import DecisionDiagnostic, diagnostic_for_exception
 from redteam.orchestration.engine import InvestigationEngine
 from redteam.orchestration.knowledge_validation import known_principals, known_target_ids
@@ -465,16 +470,54 @@ async def _finalize_hypothesis_pass(deps, snapshot, budget, *, identity, proposa
             {"pass_id": identity, "reason_code": "related_planning_inputs_changed"},
         )))
         identities = []
+    except CandidateAdmissionConflict as exc:
+        raise DecisionFailure("hypothesis_planning", "format", budget.used,
+                              diagnostic=_candidate_admission_diagnostic(exc, budget)) from exc
     except (StateConflict, ValueError) as exc:
         raise DecisionFailure("hypothesis_planning", "format", budget.used,
-                              diagnostic=DecisionDiagnostic(
-            code="hypothesis_admission_rejected", stage="hypothesis_planning", kind="validation",
-            summary="The candidate/probe proposal failed original evidence, verdict, scope "
-                    "or source admission. No candidate/task change was committed.",
-            retryable=False,
-        )) from exc
+                              diagnostic=_generic_admission_rejection()) from exc
     await deps.event_bus.flush()
     return identities
+
+
+_SECONDARY_KEY = "related_admission_diagnostics"
+
+
+def _generic_admission_rejection() -> DecisionDiagnostic:
+    return DecisionDiagnostic(
+        code="hypothesis_admission_rejected", stage="hypothesis_planning", kind="validation",
+        summary="The candidate/probe proposal failed original evidence, verdict, scope "
+                "or source admission. No candidate/task change was committed.",
+        retryable=False,
+    )
+
+
+def _related_projection(item: DecisionDiagnostic) -> dict:
+    return {
+        "code": item.code, "owner": item.owner, "cause_scope": item.cause_scope,
+        "criterion_ids": list(item.criterion_ids[:10]),
+        "evidence_ids": list(item.evidence_ids[:10]),
+        "repair_condition": item.repair_condition,
+    }
+
+
+def _candidate_admission_diagnostic(exc: CandidateAdmissionConflict, budget) -> DecisionDiagnostic:
+    """Primary owner diagnostic with planner stage/attempts and one bounded secondary trace row."""
+    if not exc.diagnostics:
+        return _generic_admission_rejection()
+    primary, *related = exc.diagnostics
+    diagnostic = primary.model_copy(
+        update={"stage": "hypothesis_planning", "attempts": budget.used},
+    )
+    if not related:
+        return diagnostic
+    projections = [_related_projection(item) for item in related[:7]]
+    trace = list(diagnostic.trace)
+    if len(trace) < 20:
+        trace.append({_SECONDARY_KEY: projections})
+    elif _SECONDARY_KEY not in trace[-1]:
+        trace[-1] = {**trace[-1], _SECONDARY_KEY: projections}
+    return diagnostic.model_copy(update={"trace": trace})
 
 
 FEEDBACK_SYSTEM = (

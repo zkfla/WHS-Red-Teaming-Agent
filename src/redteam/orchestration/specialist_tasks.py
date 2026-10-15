@@ -417,6 +417,18 @@ def validate_probe_subjects(proposal, *, known_targets, known_principals, known_
                        frozenset(known_hypotheses))
 
 
+def _candidate_verdict_trace(candidate_id: object, review_id: object) -> list[dict]:
+    """Safe candidate and review identity for a rejected verdict; unsafe values are dropped."""
+    from redteam.orchestration.coordination import safe_identifier
+
+    row = {}
+    for key, value in (("candidate_id", candidate_id), ("review_evidence_id", review_id)):
+        text = safe_identifier(value)
+        if text is not None:
+            row[key] = text
+    return [row] if row else []
+
+
 async def register_probe_tasks(
     deps, *, proposal_id: str, proposal: HypothesisProbeProposal, expected_revision: int,
     expected_binding_hash: str, graph_read: dict[str, str], known_targets: set[str],
@@ -433,7 +445,12 @@ async def register_probe_tasks(
     from redteam.attack_graph.service import AttackGraphService
     from redteam.orchestration.central_state import check_evidence
     from redteam.orchestration.completion import validate_result_claims
-    from redteam.orchestration.coordination import StateConflict
+    from redteam.orchestration.coordination import (
+        CandidateAdmissionConflict,
+        StateConflict,
+        safe_identifiers,
+    )
+    from redteam.orchestration.diagnostics import DecisionDiagnostic
     from redteam.orchestration.evidence_validity import capture_validity
 
     proposal = HypothesisProbeProposal.model_validate(proposal.model_dump())
@@ -496,13 +513,25 @@ async def register_probe_tasks(
     if verdicts:
         validity_read, errors = await capture_validity(deps, sorted(refs), graph_service=service)
         if errors:
-            raise StateConflict("candidate_evidence_not_current")
+            raise CandidateAdmissionConflict("candidate_evidence_not_current", [DecisionDiagnostic(
+                code="candidate_evidence_not_current", stage="candidate_admission",
+                kind="validation", location="$.updates",
+                summary="Cited evidence validity is not current for the candidate verdict.",
+                retryable=False, cause_scope="evidence_validity",
+                owner="orchestration.specialist_tasks",
+                repair_condition=(
+                    "Reassess current evidence validity from the original records and replan "
+                    "the candidate verdict; rereading unchanged records does not repair this."
+                ),
+                evidence_ids=sorted(refs)[:10],
+            )])
     for update in verdicts:
         candidate = update.hypothesis
         kind = "hypothesis_confirmed" if candidate.status == "confirmed" else "hypothesis_refuted"
+        criterion = CompletionCriterion(kind=kind, description=candidate.description,
+                                        hypothesis_id=candidate.hypothesis_id)
         errors = await validate_result_claims(
-            criteria=[CompletionCriterion(kind=kind, description=candidate.description,
-                                          hypothesis_id=candidate.hypothesis_id)],
+            criteria=[criterion],
             evidence_ids=[*candidate.supporting_evidence_ids, *candidate.refuting_evidence_ids,
                           *([update.review_evidence_id] if update.review_evidence_id else [])],
             target_node_ids=candidate.target_node_ids, principal_refs=candidate.principal_refs,
@@ -512,6 +541,25 @@ async def register_probe_tasks(
             task_graph_store=state, work_store=getattr(deps, "work_store", None),
         )
         if errors:
+            # A stale or wrong review often leaves its own diagnostic without refs. The
+            # cited review and the candidate identity are the safe handles for repair.
+            verdict_trace = _candidate_verdict_trace(candidate.hypothesis_id,
+                                                     update.review_evidence_id)
+            diagnostics = [
+                item.model_copy(update={
+                    "criterion_ids": safe_identifiers(
+                        [*item.criterion_ids, criterion_id(criterion)]
+                    ),
+                    "evidence_ids": safe_identifiers([
+                        update.review_evidence_id or "", *item.evidence_ids,
+                        *candidate.supporting_evidence_ids, *candidate.refuting_evidence_ids,
+                    ]),
+                    "trace": [*item.trace, *verdict_trace][-20:],
+                })
+                for item in list(getattr(errors, "diagnostics", None) or [])
+            ]
+            if diagnostics:
+                raise CandidateAdmissionConflict("candidate_verdict_unproven", diagnostics)
             raise StateConflict("candidate_verdict_unproven")
     policy_limits = getattr(getattr(deps, "specialist_policy", None), "probe_limits", None)
     for item in proposal.tasks:

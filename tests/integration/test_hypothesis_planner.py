@@ -364,6 +364,8 @@ async def test_partial_gap_cannot_supply_a_candidate_verdict_receipt(tmp_path):
             "reason": "Attempt to use an unresolved limitation as proof"})
         with pytest.raises(DecisionFailure) as rejected:
             await planner.advance(session.runtime)
-        assert rejected.value.diagnostic.code == "hypothesis_admission_rejected"
+        assert rejected.value.diagnostic.code == (
+            "completion_evidence_reference_has_no_path_linkage_18"
+        )
         saved = await service.get_hypothesis(current.hypothesis_id)
         assert saved.status == "open" and saved.revision == 1

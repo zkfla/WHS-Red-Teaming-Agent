@@ -7,18 +7,23 @@ with one connection. The intent history is a recoverable audit projection.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
-from collections.abc import Callable, Coroutine, Hashable
+import string
+from collections.abc import Callable, Coroutine, Hashable, Iterable, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Protocol, TypeVar, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar, runtime_checkable
 
 from redteam.core.contracts.mission import MissionPlan, MissionTask
 from redteam.core.enums import MissionStatus, TaskStatus
 from redteam.core.ids import EngagementId, MissionId, TaskId
 from redteam.orchestration.paths.models import PathPlan, PathVersionConflict
+
+if TYPE_CHECKING:
+    from redteam.orchestration.diagnostics import DecisionDiagnostic
 
 T = TypeVar("T")
 CLOSED = frozenset({MissionStatus.COMPLETED, MissionStatus.FAILED, MissionStatus.CANCELLED})
@@ -35,6 +40,64 @@ class StateConflict(PathVersionConflict):
 
 class PlanningInputsChanged(StateConflict):
     """A related planner input changed after its captured decision snapshot."""
+
+
+class CandidateAdmissionConflict(StateConflict):
+    """Candidate or probe admission rejected with bounded owner-produced diagnostics.
+
+    The message stays the fixed branch code for existing callers. The first diagnostic is
+    the primary owner diagnostic; later entries are secondary. At most eight are retained.
+    """
+
+    def __init__(self, code: str, diagnostics: Sequence[DecisionDiagnostic] = ()) -> None:
+        self.diagnostics: tuple[DecisionDiagnostic, ...] = tuple(
+            _identifier_projection(item) for item in tuple(diagnostics)[:8]
+        )
+        super().__init__(code)
+
+    @property
+    def diagnostic(self) -> DecisionDiagnostic | None:
+        return self.diagnostics[0] if self.diagnostics else None
+
+
+SAFE_IDENTIFIER_MAX = 100
+SAFE_IDENTIFIER_LIMIT = 10
+_SAFE_IDENTIFIER_CHARS = frozenset(string.ascii_letters + string.digits + "_-")
+
+
+def safe_identifier(value: object) -> str | None:
+    """Owner identifier shape: 1-100 ASCII letters, digits, underscore or hyphen.
+
+    Anything else (free text, secrets, oversize values) is not an identifier and
+    returns None; callers drop it rather than substituting a placeholder.
+    """
+    text = "" if value is None else str(value)
+    if 0 < len(text) <= SAFE_IDENTIFIER_MAX and set(text) <= _SAFE_IDENTIFIER_CHARS:
+        return text
+    return None
+
+
+def safe_identifiers(
+    values: Iterable[object], *, limit: int = SAFE_IDENTIFIER_LIMIT,
+) -> list[str]:
+    """Order-preserving, deduplicated, bounded identifiers; unsafe entries are dropped."""
+    kept: list[str] = []
+    for value in values:
+        text = safe_identifier(value)
+        if text is not None and text not in kept:
+            kept.append(text)
+            if len(kept) >= limit:
+                break
+    return kept
+
+
+def _identifier_projection(item: DecisionDiagnostic) -> DecisionDiagnostic:
+    """Copy a diagnostic and keep only safe identifiers in its ID projections."""
+    copied = copy.deepcopy(item)
+    return copied.model_copy(update={
+        "evidence_ids": safe_identifiers(copied.evidence_ids),
+        "criterion_ids": safe_identifiers(copied.criterion_ids),
+    })
 
 
 def content_hash(value: Any) -> str:

@@ -45,10 +45,13 @@ from redteam.core.ids import EngagementId, EventId, EvidenceId, MissionId, Opera
 from redteam.core.ports.evidence_store import EvidenceStore
 from redteam.core.tool_binding import execution_fingerprint
 from redteam.orchestration.coordination import (
+    CandidateAdmissionConflict,
     CoordinationError,
     PlanningInputsChanged,
     StateConflict,
     content_hash,
+    safe_identifier,
+    safe_identifiers,
 )
 from redteam.orchestration.diagnostics import DecisionDiagnostic
 from redteam.orchestration.execution_journal import checked_receipt, preserved_result
@@ -169,6 +172,76 @@ class CheckedEvidence:
     content_hash: str
 
 
+EVIDENCE_REPAIR = (
+    "Reassess the current original evidence and replan the candidate or probe from its "
+    "current inspection; rereading unchanged records does not repair this."
+)
+
+
+def admission_diagnostic(
+    code: str, summary: str, *, location: str, repair_condition: str,
+    evidence_ids: Sequence[str] = (),
+    trace_refs: Mapping[str, object] | None = None,
+) -> DecisionDiagnostic:
+    """Static canonical-owner diagnostic: no raw record, proposal, or exception text."""
+    return DecisionDiagnostic(
+        code=code, stage="candidate_admission", kind="validation", location=location,
+        summary=summary, retryable=False, cause_scope="evidence_validity",
+        owner="orchestration.central_state", repair_condition=repair_condition,
+        evidence_ids=safe_identifiers(evidence_ids),
+        trace=_typed_trace(trace_refs or {}),
+    )
+
+
+def _typed_trace(refs: Mapping[str, object]) -> list[dict]:
+    """One typed trace row of bounded identifiers; unsafe or empty values are dropped."""
+    typed = {}
+    for key, value in refs.items():
+        text = safe_identifier(value)
+        if text is not None:
+            typed[key] = text
+    return [typed] if typed else []
+
+
+RECEIPT_REPAIR = (
+    "Obtain the final review receipt for this exact candidate revision and purpose, then "
+    "replan the verdict; an unbound receipt is not proof."
+)
+# Checked in this order; the first failing reason becomes the diagnostic summary.
+RECEIPT_REASONS = {
+    "omitted": "No final review receipt was cited for this candidate verdict.",
+    "not_final": "The cited review receipt is not a public final admission.",
+    "candidate": "The cited review receipt belongs to another candidate.",
+    "outcome_unknown": "The cited review receipt is UNKNOWN or does not support this outcome.",
+    "revision": "The cited review receipt is not bound to the current candidate revision.",
+    "purpose": "The cited review receipt is not bound to the current candidate purpose.",
+}
+
+
+def receipt_failure(update, candidate, record) -> str | None:
+    """Ordered static reason that a verdict receipt is unbound; None when it is bound."""
+    from redteam.attack_graph.hypotheses import hypothesis_purpose
+
+    if record is None or not update.review_evidence_id:
+        return "omitted"
+    meta = record.metadata
+    if (meta.get("record_kind") != "review_receipt" or meta.get("public") is not True
+            or meta.get("admission") != "final"):
+        return "not_final"
+    if meta.get("hypothesis_id") != candidate.hypothesis_id:
+        return "candidate"
+    expected = "success" if candidate.status == "confirmed" else "refuted"
+    if (str(meta.get("verdict", "")).lower() == "unknown"
+            or meta.get("hypothesis_outcome", meta.get("outcome")) != expected):
+        return "outcome_unknown"
+    if (update.expected_revision is None
+            or meta.get("candidate_revision") != update.expected_revision):
+        return "revision"
+    if meta.get("candidate_purpose_hash") != content_hash(hypothesis_purpose(candidate)):
+        return "purpose"
+    return None
+
+
 async def check_evidence(
     store: EvidenceStore, *, run_id: str, engagement_id: str, evidence_ids: Sequence[str],
 ) -> tuple[CheckedEvidence, ...]:
@@ -180,12 +253,34 @@ async def check_evidence(
     checked = []
     for identity in sorted(set(evidence_ids)):
         if identity in bad_ids:
-            raise StateConflict("evidence_file_index_disagreement")
+            raise CandidateAdmissionConflict("evidence_file_index_disagreement", [
+                admission_diagnostic(
+                    "evidence_file_index_disagreement",
+                    "The evidence file index disagrees with the original store for a cited "
+                    "reference.",
+                    location="$.evidence_ids", repair_condition=EVIDENCE_REPAIR,
+                    evidence_ids=[identity],
+                ),
+            ])
         record = await store.get(EvidenceId(identity))
         if record is None:
-            raise StateConflict("original_evidence_missing")
+            raise CandidateAdmissionConflict("original_evidence_missing", [
+                admission_diagnostic(
+                    "original_evidence_missing",
+                    "A cited evidence original is missing from the run store.",
+                    location="$.evidence_ids", repair_condition=EVIDENCE_REPAIR,
+                    evidence_ids=[identity],
+                ),
+            ])
         if str(record.run_id) != run_id or str(record.engagement_id) != engagement_id:
-            raise StateConflict("evidence_scope_mismatch")
+            raise CandidateAdmissionConflict("evidence_scope_mismatch", [
+                admission_diagnostic(
+                    "evidence_scope_mismatch",
+                    "A cited evidence original belongs to another run or engagement.",
+                    location="$.evidence_ids", repair_condition=EVIDENCE_REPAIR,
+                    evidence_ids=[identity],
+                ),
+            ])
         if record.metadata.get("receipt_kind") in {"execution_result", "execution_resolution"}:
             # Reuse the existing original/resolution chain validation, including
             # lost-ack originals. This file I/O stays outside the SQLite lock.
@@ -540,7 +635,23 @@ class CentralTransaction:
                     or (task.source_question_id is not None and task.source_question_id not in {
                         q.question_id for q in source.result.questions
                     })):
-                raise StateConflict("follow_up_source_missing_or_mismatched")
+                raise CandidateAdmissionConflict("follow_up_source_missing_or_mismatched", [
+                    admission_diagnostic(
+                        "follow_up_source_missing_or_mismatched",
+                        "The follow-up source Task, result, or question is not the current "
+                        "proven source.",
+                        location="$.source_question_id",
+                        repair_condition=(
+                            "Reread the exact source Task result and question, then replan a "
+                            "follow-up only from that current source."
+                        ),
+                        trace_refs={
+                            "source_task_id": task.source_task_id,
+                            "source_result_id": task.source_result_id,
+                            "source_question_id": task.source_question_id,
+                        },
+                    ),
+                ])
         if task.investigation_contract_version == 2:
             from redteam.attack_graph.identity import hypothesis_node_id
             from redteam.attack_graph.predicates import facts_of
@@ -648,7 +759,6 @@ class CentralTransaction:
         planner_judgment: dict | None = None,
     ) -> dict:
         """Candidate changes, native Tasks, checked refs, receipt and outbox commit once."""
-        from redteam.attack_graph.hypotheses import hypothesis_purpose
         from redteam.attack_graph.identity import hypothesis_node_id
         from redteam.core.ids import GraphNodeId
 
@@ -676,18 +786,22 @@ class CentralTransaction:
                    for identity in candidate.source_hypothesis_ids):
                 raise StateConflict("candidate_source_missing")
             if candidate.status in {"confirmed", "rejected"}:
-                record = inspected.get(update.review_evidence_id or "")
-                meta = record.metadata if record else {}
-                expected_outcome = "success" if candidate.status == "confirmed" else "refuted"
-                if (update.expected_revision is None or meta.get("record_kind") != "review_receipt"
-                        or meta.get("public") is not True or meta.get("admission") != "final"
-                        or meta.get("hypothesis_id") != candidate.hypothesis_id
-                        or meta.get("hypothesis_outcome", meta.get("outcome")) != expected_outcome
-                        or str(meta.get("verdict", "")).lower() == "unknown"
-                        or meta.get("candidate_revision") != update.expected_revision
-                        or meta.get("candidate_purpose_hash") != content_hash(
-                            hypothesis_purpose(candidate))):
-                    raise StateConflict("candidate_verdict_receipt_unbound")
+                reason = receipt_failure(
+                    update, candidate, inspected.get(update.review_evidence_id or ""),
+                )
+                if reason is not None:
+                    raise CandidateAdmissionConflict("candidate_verdict_receipt_unbound", [
+                        admission_diagnostic(
+                            "candidate_verdict_receipt_unbound",
+                            RECEIPT_REASONS[reason],
+                            location="$.updates",
+                            repair_condition=RECEIPT_REPAIR,
+                            evidence_ids=(
+                                [update.review_evidence_id] if update.review_evidence_id else []
+                            ),
+                            trace_refs={"candidate_id": candidate.hypothesis_id, "reason": reason},
+                        ),
+                    ])
             node = self.graph.save_hypothesis(update, now=datetime.now(timezone.utc))
             revisions[candidate.hypothesis_id] = node.properties["facts"]["revision"]
         saved = self.register_batch(request_id, tasks, checked=checked) if tasks else []
