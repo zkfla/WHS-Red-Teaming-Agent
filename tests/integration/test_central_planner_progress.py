@@ -249,4 +249,3 @@ async def test_goal_origin_cas_at_final_commit_is_stored_reported_and_reopened(
         assert await resumed.deps.central_state.transaction(
             lambda tx: tx.planning_diagnostics(), write=False,
         ) == (diagnostic, [diagnostic])
-
