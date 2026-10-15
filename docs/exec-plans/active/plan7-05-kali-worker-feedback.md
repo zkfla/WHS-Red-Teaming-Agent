@@ -92,3 +92,7 @@ Every requirement above proven against current state, required reviews addressed
 
 
 Root pagination correction: native program.list already validates bounded offset/limit in tool_discovery._page_params, emits next_offset from _cards_payload, and applies it in program_list_handler. Provider port listing all source records does not imply the model receives all cards; no port extension is justified without an actual context bypass reproduction. Preliminary missing approval-resume claim must trace shared Control/runtime/gateway consumers, not just react.py; existing prepared ToolInvocation and dispatch IDs are visible there. No stage05 mutation is authorized until concrete disjoint packets and stage04 readiness interfaces are reviewed.
+
+### Common-worker protocol acceptance checkpoint
+
+A new scripted-model/synthetic-gateway integration harness proves bounded original execution-envelope delivery to the next worker and actual structured Planner request, approval wait and same-invocation one-time resume, UNKNOWN execution without fabricated original delivery or Finding, and refused unregistered/unready/missing-required-argument requests. Worker7 PASS/Ruff/format/mypy; root independently7 PASS and Ruff. The missing-argument case is not claimed as unsupported-program coverage. No real Kali/direct execution is represented by this fixture; adopt teammate provider and run the production physical path separately.
