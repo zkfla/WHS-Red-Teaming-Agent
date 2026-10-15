@@ -90,6 +90,26 @@ def _task_rejection(code, *, index, task, field, question, criterion_ids=(),
 _CONDITION_CODE = "plan_question_unknown_completion_condition"
 
 
+_FOLLOWUP_SUMMARY = (
+    "Source linkage is paired: give source_task_id and source_result_id together, copied "
+    "from the captured Task result, or leave both null. source_question_id needs that pair."
+)
+_DUPLICATE_SUMMARY = (
+    "Each completion criterion must be distinct within a question. Remove the repeated "
+    "criterion at the location named in the diagnostic and keep one copy."
+)
+
+
+def _plan_rejection(code: str, *, location: str, summary: str) -> AtomizationProposalError:
+    """Static, field-precise stage-1 rejection; never echoes model text or identifiers."""
+    return AtomizationProposalError(code, diagnostic=DecisionDiagnostic(
+        code=code, stage="hypothesis_planning", kind="validation", retryable=True,
+        cause_scope="model_input", owner="orchestration.probe_atomization",
+        location=location, summary=summary,
+        validation_issues=[{"rule": code, "location": location}],
+    ))
+
+
 def _condition_rejection(*, question_index: int, condition_index: int, unknown_kind: bool):
     """Field-precise stage-1 rejection; never echoes the model's kind or description text."""
     field = "kind" if unknown_kind else "description"
@@ -313,13 +333,29 @@ def bind_plan(
         required = {issued.get(ref, ref) for ref in question.goal_required_hypothesis_ids}
         if required - revisions.keys() or required and not question.required:
             raise AtomizationProposalError("plan_question_required_invalid")
-        if bool(question.source_task_id) != bool(question.source_result_id) or (
-            question.source_question_id and not question.source_task_id
-        ):
-            raise AtomizationProposalError("plan_question_followup_invalid")
-        identities = [criterion_id(item) for item in question.completion_criteria]
-        if len(identities) != len(set(identities)):
-            raise AtomizationProposalError("plan_question_duplicate_completion_condition")
+        if bool(question.source_task_id) != bool(question.source_result_id):
+            field = "source_result_id" if question.source_task_id else "source_task_id"
+            raise _plan_rejection(
+                "plan_question_followup_invalid",
+                location=f"$.questions[{question_index}].{field}",
+                summary=_FOLLOWUP_SUMMARY,
+            )
+        if question.source_question_id and not question.source_task_id:
+            raise _plan_rejection(
+                "plan_question_followup_invalid",
+                location=f"$.questions[{question_index}].source_question_id",
+                summary=_FOLLOWUP_SUMMARY,
+            )
+        seen_criteria = set()
+        for condition_index, item in enumerate(question.completion_criteria):
+            identity = criterion_id(item)
+            if identity in seen_criteria:
+                raise _plan_rejection(
+                    "plan_question_duplicate_completion_condition",
+                    location=f"$.questions[{question_index}].completion_criteria[{condition_index}]",
+                    summary=_DUPLICATE_SUMMARY,
+                )
+            seen_criteria.add(identity)
         for condition_index, condition in enumerate(question.completion_criteria):
             if not condition.is_known() or not condition.description.strip():
                 raise _condition_rejection(
