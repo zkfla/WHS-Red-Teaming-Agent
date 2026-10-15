@@ -142,10 +142,13 @@ is a full canonical Task/candidate/execution read (the same cost class noted
 above for the Planner), not an incremental index. `tests/unit/test_native_context_query.py`
 exercises the handler directly against a real temporary central store (own
 Task list/read, sibling-Task scope rejection, malformed input, missing active
-Task); it does not drive a full native tool-call loop, so a worker actually
-*choosing* to call it mid-turn against a real/scripted model is not yet
-exercised end to end -- only that the tool is correctly wired, scoped and safe
-to expose.
+Task). `tests/integration/test_worker_context_asset_reuse.py` additionally drives
+the real native tool-call loop with an explicit scripted provider. It checks
+initial tool exposure, list → original source reference → stored criterion read
+→ related lookup, sibling exclusion/refusal, and refusal after the admitted
+candidate revision changes mid-turn. No target, MCP or live model call occurs.
+This verifies delivery and reference reuse through the worker loop; a live
+model's decision to request useful context remains a separate measurement.
 
 ## Planner structured lookup (plan8b)
 
@@ -272,7 +275,9 @@ Optional Planner lookup round trips add about 95 KiB in this fixture, so
 lookup should be requested only when needed. A worker-initiated `context.query`
 round trip (an extra `complete_native` call) is not yet in this cumulative
 fixture -- see "Native worker tool (plan8c)" above; `test_native_context_query.py`
-verifies the handler directly, not a full tool-call loop. These are transmitted
+verifies the handler directly. The separate worker context asset integration
+test now covers the tool-call loop without adding its requests to these size
+measurements. These are transmitted
 JSON envelope sizes, not exact tokens or billed savings.
 
 Only scalar sizes/counts are written to the test's temporary artifact. UTF-8 JSON
