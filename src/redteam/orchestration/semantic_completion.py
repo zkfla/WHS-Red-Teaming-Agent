@@ -51,11 +51,16 @@ from redteam.core.enums import EvidenceSourceType, TaskStatus
 from redteam.core.ids import EvidenceId, new_id
 from redteam.event_bus.publisher import EventPublisher
 from redteam.orchestration.completion import (
+    ORIGIN_CHANGED_CODE,
     CompletionIssues,
+    OriginFailure,
+    OriginProof,
     check_record_linkage,
+    origin_diagnostic,
+    origin_row_hash,
     preserved_target_is_absent,
     validate_completion,
-    verify_stored_origin,
+    verify_stored_origin_failures,
 )
 from redteam.orchestration.completion_proposal import (
     CompletionProposal,
@@ -248,6 +253,142 @@ def verify_task_receipt(
     return []
 
 
+def purpose_compare_message(metadata: Any, task: Any, evidence_id: str) -> str | None:
+    """Consuming-purpose compare; only for callers that pass a consuming Task.
+
+    The task and goal reuse paths never call this for an origin that has its own
+    Task row. Legacy origins without one keep it, fail closed (see legacy_purpose_refusal).
+    """
+    if task is None:
+        return None
+    expected_hash = _record_text(metadata.get("task_purpose_hash", "") or "").strip()
+    if not expected_hash:
+        return None
+    current_hash = (completion_contract_hash(task)
+                    if metadata.get("central_execution_version") == 1
+                    else purpose_hash(_record_text(getattr(task, "objective", ""))))
+    if expected_hash == current_hash:
+        return None
+    return "evidence '" + str(evidence_id) + "' purpose changed since the evidence"
+
+
+def origin_refusal(failure: OriginFailure, evidence_id: str) -> CompletionIssues:
+    issues = CompletionIssues()
+    issues.append(failure.message)
+    issues.diagnostics.append(origin_diagnostic(failure, evidence_id))
+    return issues
+
+
+def origin_refusal_from_proof(proof: OriginProof) -> CompletionIssues:
+    issues = CompletionIssues()
+    for diagnostic in proof.issues:
+        issues.append(diagnostic.summary)
+        issues.diagnostics.append(diagnostic)
+    return issues
+
+
+def extend_issues(target: CompletionIssues, source: CompletionIssues) -> None:
+    """Append messages and their known diagnostics together."""
+    target.extend(source)
+    target.diagnostics.extend(source.diagnostics)
+
+
+def legacy_purpose_refusal(metadata: Any, task: Any, evidence_id: str) -> CompletionIssues | None:
+    """Fail-closed consuming compare for an origin with no origin Task row."""
+    message = purpose_compare_message(metadata, task, evidence_id)
+    if message is None:
+        return None
+    return origin_refusal(OriginFailure("origin_purpose_changed", message), evidence_id)
+
+
+async def prove_original(
+    *,
+    evidence_store: Any,
+    path_store: Any,
+    run_id: str,
+    engagement_id: str | None,
+    mission_id: str | None,
+    evidence_id: str,
+    require_proposal: bool = True,
+    task_graph_store: Any | None = None,
+    work_store: Any | None = None,
+) -> tuple[Any | None, OriginProof]:
+    """Prove one stored original's own integrity before any review call.
+
+    Checks the same run and engagement, the preserved raw result, the shared
+    action/invocation/tool/proposal linkage, and the stored origin, including the
+    origin Task purpose against its own row. No consuming Task is compared here.
+    The exact origin Task row read by that purpose check is hashed as a baseline.
+    """
+    key = str(evidence_id)
+
+    def refused(code: str, message: str) -> tuple[None, OriginProof]:
+        failure = OriginFailure(code, message)
+        return None, OriginProof(key, issues=(origin_diagnostic(failure, key),))
+
+    try:
+        record = await evidence_store.get(evidence_id)
+    except Exception as exc:  # noqa: BLE001 - store failure reads as unproven
+        return refused(
+            "origin_evidence_lookup_failed", "evidence lookup failed: " + type(exc).__name__,
+        )
+    if record is None:
+        return refused("origin_evidence_missing", "evidence '" + key + "' does not exist")
+    if _record_text(getattr(record, "run_id", "")) != str(run_id):
+        return refused("origin_run_mismatch", "evidence '" + key + "' belongs to another run")
+    if engagement_id and _record_text(getattr(record, "engagement_id", "")) != str(engagement_id):
+        return refused(
+            "origin_engagement_mismatch", "evidence '" + key + "' belongs to another engagement",
+        )
+    meta = getattr(record, "metadata", None) or {}
+    if not isinstance(meta, dict):
+        return refused("origin_metadata_invalid", "evidence '" + key + "' has unreadable metadata")
+    raw = raw_from_metadata(meta)
+    if not isinstance(raw, dict):
+        return refused("origin_raw_missing", "evidence '" + key + "' has no preserved raw result")
+    linkage = check_record_linkage(record, meta, raw, key, require_proposal=require_proposal)
+    if linkage:
+        return refused(linkage[0][1], linkage[0][0])
+    origin_out: dict[str, str] = {}
+    failures = await verify_stored_origin_failures(
+        path_store=path_store,
+        run_id=str(run_id),
+        m_path_id=_record_text(meta.get("path_id", "")).strip(),
+        m_version=meta.get("path_version", None),
+        m_step_id=_record_text(meta.get("path_step_id", "")).strip(),
+        mission_id=mission_id,
+        metadata=meta,
+        record=record,
+        task_graph_store=task_graph_store,
+        work_store=work_store,
+        origin_out=origin_out,
+    )
+    if failures:
+        return refused(failures[0].code, "evidence '" + key + "' " + failures[0].message)
+    return record, OriginProof(
+        key,
+        origin_task_id=origin_out.get("task_id"),
+        origin_task_hash=origin_out.get("task_hash"),
+    )
+
+
+async def recheck_origin_proofs(
+    proofs: list[OriginProof] | tuple[OriginProof, ...], task_graph_store: Any,
+) -> CompletionIssues | None:
+    """Final admission: every proven origin Task row must still equal its pre-review baseline."""
+    for proof in proofs:
+        if proof.origin_task_id is None:
+            continue
+        current = await task_graph_store.get_task(proof.origin_task_id)
+        if current is None or origin_row_hash(current) != proof.origin_task_hash:
+            failure = OriginFailure(
+                ORIGIN_CHANGED_CODE,
+                "origin task changed since its original was proven; reassessment required",
+            )
+            return origin_refusal(failure, proof.evidence_id)
+    return None
+
+
 async def verify_single_origin(
     *,
     evidence_store: Any,
@@ -260,56 +401,33 @@ async def verify_single_origin(
     task: Any | None = None,
     task_graph_store: Any | None = None,
     work_store: Any | None = None,
- ) -> tuple[Any | None, list[str]]:
-    """Prove one stored origin record against the actual execution.
+) -> tuple[Any | None, list[str]]:
+    """Prove one stored origin record, then the legacy consuming compare when asked.
 
-    Fetch, same run and engagement, preserved raw result, shared
-    action/invocation/tool/proposal linkage, and stored path origin under
-    the same mission. Returns (record, errors); lookups never succeed on
-    failure. Goal and terminal settlement share this single proof.
+    Callers that pass task keep the consuming-purpose compare for their own paths
+    (code artifacts and the legacy goal chain). The task and goal reuse paths use
+    prove_original directly, which never compares against the consuming Task.
     """
-    try:
-        record = await evidence_store.get(evidence_id)
-    except Exception:
-        return None, ["task origin lookup failed; treating as unproven"]
-    if record is None or _record_text(getattr(record, "run_id", "")) != str(run_id):
-        return None, ["task origin is missing or belongs to another run"]
-    if engagement_id is not None and _record_text(getattr(record, "engagement_id", "")) != str(
-        engagement_id
-    ):
-        return None, ["task origin belongs to another engagement"]
-    meta = getattr(record, "metadata", None) or {}
-    if not isinstance(meta, dict):
-        return None, ["task origin '" + str(evidence_id) + "' has unreadable metadata"]
-    raw = raw_from_metadata(meta)
-    if not isinstance(raw, dict):
-        return None, ["task origin '" + str(evidence_id) + "' has no preserved raw result"]
-    linkage = check_record_linkage(
-        record, meta, raw, str(evidence_id), require_proposal=require_proposal
-    )
-    if linkage:
-        return None, [linkage[0][0]]
-    origin_errors = await verify_stored_origin(
+    from redteam.orchestration.evidence_validity import prove_original as assess_original
+
+    record, proof = await assess_original(
+        evidence_store=evidence_store,
         path_store=path_store,
-        run_id=str(run_id),
-        m_path_id=_record_text(meta.get("path_id", "")).strip(),
-        m_version=meta.get("path_version", None),
-        m_step_id=_record_text(meta.get("path_step_id", "")).strip(),
+        run_id=run_id,
+        engagement_id=engagement_id,
         mission_id=mission_id,
-        metadata=meta,
-        record=record,
+        evidence_id=evidence_id,
+        require_proposal=require_proposal,
         task_graph_store=task_graph_store,
         work_store=work_store,
     )
-    if origin_errors:
-        return None, ["task origin '" + str(evidence_id) + "' " + origin_errors[0]]
+    if proof.issues:
+        return None, [issue.summary for issue in proof.issues]
     if task is not None:
-        expected_hash = _record_text(meta.get("task_purpose_hash", "") or "").strip()
-        current_hash = (completion_contract_hash(task)
-                        if meta.get("central_execution_version") == 1
-                        else purpose_hash(_record_text(getattr(task, "objective", ""))))
-        if expected_hash and expected_hash != current_hash:
-            message = "task origin '" + str(evidence_id) + "' purpose changed since the evidence"
+        message = purpose_compare_message(
+            getattr(record, "metadata", None) or {}, task, evidence_id,
+        )
+        if message is not None:
             return None, [message]
     return record, []
 
@@ -447,60 +565,45 @@ async def _verify_task_origin(
     task_graph_store: Any | None = None,
     work_store: Any | None = None,
     graph_service: Any | None = None,
- ) -> tuple[Any | None, list[str], dict[str, str]]:
-    """Task-level origin check: actual linkage, stored origin, relevance.
+) -> tuple[Any | None, CompletionIssues, dict[str, str], OriginProof | None]:
+    """Task-level origin check: source proof, consuming relevance, and edge proof.
 
-    Readonly and purpose-free: no purpose hash is needed here and nothing
-    is written. Other steps or other workers origins pass when stored in
-    this run under the same mission. Declared task targets and subjects
-    are enforced; the review call weighs the rest with the excerpts. The
-    stored proposal is required: the execution path always stores it, so
-    cross-step admission loses nothing by demanding it.
+    Readonly and nothing is written. The source proof runs first and carries the
+    origin Task baseline; the consuming Task is never compared with the origin
+    purpose. A legacy origin with no origin Task row keeps the consuming-purpose
+    compare, which fails closed. Declared task targets and subjects are enforced;
+    the review call weighs the rest with the excerpts.
     """
-    try:
-        record = await evidence_store.get(evidence_id)
-    except Exception as exc:  # noqa: BLE001 - store failure reads as unproven
-        return None, ["evidence lookup failed: " + type(exc).__name__], {}
-    if record is None:
-        return None, ["evidence '" + str(evidence_id) + "' does not exist"], {}
-    if _record_text(getattr(record, "run_id", "")) != str(run_id):
-        return None, ["evidence '" + str(evidence_id) + "' belongs to a different run"], {}
-    if engagement_id and _record_text(getattr(record, "engagement_id", "")) != str(engagement_id):
-        return None, ["evidence '" + str(evidence_id) + "' belongs to a different engagement"], {}
-    meta = getattr(record, "metadata", None) or {}
-    if not isinstance(meta, dict):
-        return None, ["evidence '" + str(evidence_id) + "' has unreadable metadata"], {}
-    raw = raw_from_metadata(meta)
-    if not isinstance(raw, dict):
-        return None, ["evidence '" + str(evidence_id) + "' has no preserved raw result"], {}
-    linkage = check_record_linkage(record, meta, raw, str(evidence_id), require_proposal=True)
-    if linkage:
-        return None, [linkage[0][0]], {}
-    origin_errors = await verify_stored_origin(
+    from redteam.orchestration.evidence_validity import prove_original as assess_original
+
+    record, proof = await assess_original(
+        evidence_store=evidence_store,
         path_store=path_store,
         run_id=str(run_id),
-        m_path_id=_record_text(meta.get("path_id", "")).strip(),
-        m_version=meta.get("path_version", None),
-        m_step_id=_record_text(meta.get("path_step_id", "")).strip(),
+        engagement_id=engagement_id or None,
         mission_id=mission_id,
-        metadata=meta,
-        record=record,
+        evidence_id=evidence_id,
+        require_proposal=True,
         task_graph_store=task_graph_store,
         work_store=work_store,
     )
-    if origin_errors:
-        return None, ["evidence '" + str(evidence_id) + "' " + origin_errors[0]], {}
-    task_hash = _record_text(meta.get("task_purpose_hash", "") or "").strip()
-    if task_hash and task is not None:
-        expected_hash = (completion_contract_hash(task)
-                         if meta.get("central_execution_version") == 1
-                         else purpose_hash(_record_text(getattr(task, "objective", ""))))
-        if task_hash != expected_hash:
-            message = "evidence '" + str(evidence_id) + "' purpose changed since the evidence"
-            return None, [message], {}
+    if proof.issues:
+        return None, origin_refusal_from_proof(proof), {}, None
+    meta = getattr(record, "metadata", None) or {}
+    if proof.origin_task_id is None:
+        legacy = legacy_purpose_refusal(meta, task, evidence_id)
+        if legacy is not None:
+            return None, legacy, {}, None
     target_ref = _record_text(meta.get("target_node_id", "")).strip()
     if not target_ref and not preserved_target_is_absent(meta):
-        return None, ["evidence '" + str(evidence_id) + "' has no target linkage"], {}
+        failure = OriginFailure(
+            "origin_target_linkage_missing",
+            "evidence '" + str(evidence_id) + "' has no target linkage",
+            "target_prerequisite",
+            "orchestration.semantic_completion",
+            "Use an original whose execution target is preserved, or return an unresolved gap.",
+        )
+        return None, origin_refusal(failure, evidence_id), {}, None
     related_nodes: set[str] = set()
     if task is not None:
         for node in list(getattr(task, "related_attack_graph_node_ids", []) or []):
@@ -518,7 +621,12 @@ async def _verify_task_origin(
                 break
         if not edge_proof:
             message = "evidence '" + str(evidence_id) + "' targets an object outside this task"
-            return None, [message], {}
+            failure = OriginFailure(
+                "origin_target_out_of_scope", message, "target_prerequisite",
+                "orchestration.semantic_completion",
+                "Use evidence grounded to this task's subjects or return an unresolved gap.",
+            )
+            return None, origin_refusal(failure, evidence_id), {}, None
     principals: set[str] = set()
     single = meta.get("principal_ref")
     if isinstance(single, str) and single.strip():
@@ -533,8 +641,14 @@ async def _verify_task_origin(
     anonymous = meta.get("anonymous") is True or "anonymous" in lowered
     scope = {str(item).strip() for item in (step_principal_scope or set()) if str(item).strip()}
     if scope and principals and not anonymous and principals.isdisjoint(scope):
-        return None, ["evidence '" + str(evidence_id) + "' uses a principal outside this task"], {}
-    return record, [], edge_proof
+        message = "evidence '" + str(evidence_id) + "' uses a principal outside this task"
+        failure = OriginFailure(
+            "origin_principal_out_of_scope", message, "target_prerequisite",
+            "orchestration.semantic_completion",
+            "Use evidence within this task's principal scope or return an unresolved gap.",
+        )
+        return None, origin_refusal(failure, evidence_id), {}, None
+    return record, CompletionIssues(), edge_proof, proof
 
 
 def _excerpt_of(record: Any, *, limit: int = EXCERPT_CHARS) -> dict[str, Any]:
@@ -798,8 +912,9 @@ async def complete_task(
     verified: list[Any] = []
     excerpt_notes: list[dict[str, Any]] = []
     task_edge_proof: dict[str, str] = {}
+    origin_proofs: list[OriginProof] = []
     for identity in evidence_ids:
-        record, errors, proof = await _verify_task_origin(
+        record, errors, proof, origin_proof = await _verify_task_origin(
             evidence_store=engine.deps.evidence_store,
             path_store=getattr(getattr(engine, "deps", None), "path_store", None),
             run_id=str(runtime.run_id),
@@ -815,9 +930,18 @@ async def complete_task(
         if errors:
             return errors
         if record is not None:
+            if origin_proof is None:
+                return origin_refusal(
+                    OriginFailure(
+                        "completion_origin_proof_missing",
+                        "original integrity proof was not retained for final admission",
+                    ),
+                    identity,
+                )
             verified.append(record)
             excerpt_notes.append(_excerpt_of(record))
             task_edge_proof.update(proof)
+            origin_proofs.append(origin_proof)
     if not verified:
         return CompletionIssues.failure(
             ["task completion needs related stored evidence"], code="completion_evidence_required",
@@ -854,14 +978,14 @@ async def complete_task(
             system=_engine_system(engine) + RESULT_REVIEW_INSTRUCTION,
             budget=budget,
         )
-    await engine.record_completion_review(
-        "task_completion_review",
-        path,
-        runtime,
-        review,
-        [str(getattr(record, "evidence_id", "")) for record in verified],
-    )
     if not review.get("accepted"):
+        await engine.record_completion_review(
+            "task_completion_review",
+            path,
+            runtime,
+            review,
+            [str(getattr(record, "evidence_id", "")) for record in verified],
+        )
         return CompletionIssues.failure(
             ["semantic completion review rejected the evidence"], code="completion_review_rejected",
             summary="Independent review did not accept the proposed completion support.",
@@ -905,6 +1029,17 @@ async def complete_task(
     validity_read, errors = await validity_read.refresh(engine.deps)
     if errors:
         return errors
+    origin_refusal_issues = await recheck_origin_proofs(origin_proofs, investigations)
+    if origin_refusal_issues is not None:
+        return origin_refusal_issues
+    # The accepted-review audit is written only once the proven originals still hold.
+    await engine.record_completion_review(
+        "task_completion_review",
+        path,
+        runtime,
+        review,
+        [str(getattr(record, "evidence_id", "")) for record in verified],
+    )
     revision = int(getattr(mission, "revision", 1) or 1)
     receipt_payload = build_task_receipt(
         task_id=str(task.task_id),
@@ -935,13 +1070,26 @@ async def complete_task(
     # The receipt is immutable evidence; authority still comes only from
     # the atomic task transition below, never from the receipt alone.
     await engine.deps.evidence_store.append(receipt_record)
-    from redteam.orchestration.central_results import complete_reviewed_result
-
-    await complete_reviewed_result(
-        engine.deps, runtime, task, token, receipt_record,
-        CompletionProposal.model_validate(raw_proposal), validity_read=validity_read,
-        graph_proof=graph_proof, edge_proof=task_edge_proof,
+    from redteam.orchestration.central_results import (
+        OriginTaskChangedConflict,
+        complete_reviewed_result,
     )
+
+    try:
+        await complete_reviewed_result(
+            engine.deps, runtime, task, token, receipt_record,
+            CompletionProposal.model_validate(raw_proposal), validity_read=validity_read,
+            graph_proof=graph_proof, edge_proof=task_edge_proof,
+            origin_proofs=tuple(origin_proofs),
+        )
+    except OriginTaskChangedConflict as exc:
+        # The final transaction found a source-row change after the reviewed
+        # proof. Preserve its known producer diagnostic for the native
+        # completion-rejection boundary; unrelated state conflicts still raise.
+        errors = CompletionIssues()
+        errors.append(exc.diagnostic.feedback())
+        errors.diagnostics.append(exc.diagnostic)
+        return errors
     return []
 
 

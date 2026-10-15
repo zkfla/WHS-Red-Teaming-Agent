@@ -10,7 +10,8 @@ as successful completion).
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from dataclasses import dataclass
+from typing import Any, Literal, NamedTuple
 
 from redteam.core.enums import EvidenceSourceType
 from redteam.orchestration.analysis import claim_target_is_grounded, is_final_admission_receipt
@@ -473,6 +474,127 @@ def _has_path_linkage(m_path_id: str, m_version: Any, m_step_id: str) -> bool:
     return bool(m_path_id and m_version is not None and _s(m_version).strip() != "" and m_step_id)
 
 
+#: Generic origin refusal code; known branches below carry their own stable code.
+ORIGIN_UNPROVEN_CODE = "completion_origin_invalid"
+#: Final admission found the origin Task row changed after it was proven before review.
+ORIGIN_CHANGED_CODE = "origin_task_changed_reassessment_required"
+
+
+class OriginFailure(NamedTuple):
+    """One origin refusal: a stable code and the existing human-readable message."""
+
+    code: str
+    message: str
+    cause_scope: Literal[
+        "model_input", "target_prerequisite", "policy_wait", "evidence_validity",
+        "runtime_contract", "unknown",
+    ] = "evidence_validity"
+    owner: str = "orchestration.completion"
+    repair_condition: str = (
+        "Reassess the cited original's stored execution and binding; preserve it unchanged "
+        "or return an unresolved gap when no supported result is available."
+    )
+
+
+def origin_failure(
+    code: str,
+    message: str,
+    *,
+    cause_scope: Literal[
+        "model_input", "target_prerequisite", "policy_wait", "evidence_validity",
+        "runtime_contract", "unknown",
+    ] = "evidence_validity",
+    owner: str = "orchestration.completion",
+    repair_condition: str | None = None,
+) -> OriginFailure:
+    """Build a stable, safe reason at the branch that knows the cause."""
+    defaults = OriginFailure(code, message)
+    return OriginFailure(
+        code,
+        message,
+        cause_scope,
+        owner,
+        repair_condition if repair_condition is not None else defaults.repair_condition,
+    )
+
+
+@dataclass(frozen=True)
+class OriginProof:
+    """Source integrity captured before review; it never carries a review reference.
+
+    origin_task_hash is the hash of the exact origin Task row read by the purpose check.
+    It is a baseline: final admission compares against it and never recaptures it.
+    """
+
+    evidence_id: str
+    origin_task_id: str | None = None
+    origin_task_hash: str | None = None
+    issues: tuple[DecisionDiagnostic, ...] = ()
+
+
+def as_origin_failure(item: Any) -> OriginFailure:
+    if isinstance(item, OriginFailure):
+        return item
+    return OriginFailure(ORIGIN_UNPROVEN_CODE, str(item))
+
+
+def origin_diagnostic(failure: OriginFailure, evidence_id: str) -> DecisionDiagnostic:
+    return DecisionDiagnostic(
+        code=failure.code,
+        stage="completion_validation",
+        kind="validation",
+        location="$.completion",
+        summary=failure.message,
+        cause_scope=failure.cause_scope,
+        owner=failure.owner,
+        repair_condition=failure.repair_condition,
+        evidence_ids=[str(evidence_id)],
+    )
+
+
+def origin_task_changed_diagnostic(
+    evidence_ids: list[str] | tuple[str, ...],
+    *,
+    code: str = ORIGIN_CHANGED_CODE,
+    owner: str = "orchestration.central_results",
+) -> DecisionDiagnostic:
+    """Build the fixed diagnostic for an origin-row CAS failure.
+
+    Callers pass only evidence identifiers already attached to the proof read
+    before review. Source Task identity travels on the typed conflict carrier,
+    rather than being interpolated into free text.
+    """
+    refs = list(dict.fromkeys(str(identity) for identity in evidence_ids))[:10]
+    failure = origin_failure(
+        code,
+        "The source Task changed after its original was assessed; reassessment is required.",
+        cause_scope="evidence_validity",
+        owner=owner,
+        repair_condition=(
+            "Reassess the current source original and repeat independent completion review "
+            "before settlement."
+        ),
+    )
+    diagnostic = origin_diagnostic(failure, refs[0] if refs else "")
+    return diagnostic.model_copy(update={"evidence_ids": refs})
+
+
+def has_origin_task_row(metadata: Any) -> bool:
+    """Native origins with a stored Task row are proven against that row, not a consumer."""
+    if not isinstance(metadata, dict) or not _is_native_origin(metadata):
+        return False
+    return bool(_s(metadata.get("mission_task_id", "") or "").strip())
+
+
+def origin_row_hash(task: Any) -> str:
+    """Hash of the exact origin Task row; pydantic rows hash as stored, plain rows by fields."""
+    from redteam.orchestration.coordination import content_hash as _content_hash
+
+    if hasattr(task, "model_dump"):
+        return _content_hash(task)
+    return _content_hash({key: str(value) for key, value in vars(task).items()})
+
+
 async def _verify_native_work_and_task(
     *,
     metadata: dict[str, Any],
@@ -480,21 +602,30 @@ async def _verify_native_work_and_task(
     mission_id: Any | None,
     task_graph_store: Any | None,
     work_store: Any | None,
-) -> tuple[list[str], bool]:
+    origin_out: dict[str, str] | None = None,
+) -> tuple[list[Any], bool]:
     if metadata.get("central_execution_version") == 1:
         lookup = getattr(task_graph_store, "get_execution", None)
         if lookup is None or task_graph_store is None:
-            return ["central execution origin lookup unavailable"], False
+            return [origin_failure(
+                "origin_execution_unavailable", "central execution origin lookup unavailable",
+            )], False
         from redteam.core.contracts.completion import completion_contract_hash
         from redteam.core.contracts.tool import ToolInvocation
         from redteam.core.convert import execution_input_digest
 
         execution = await lookup(str(metadata.get("invocation_id", "")))
         task = await task_graph_store.get_task(str(metadata.get("mission_task_id", "")))
+        if task is not None and origin_out is not None:
+            origin_out["task_id"] = str(getattr(task, "task_id", ""))
+            origin_out["task_hash"] = origin_row_hash(task)
         original = metadata.get("tool_result", {})
         proposal = metadata.get("proposal", {})
         if original.get("metadata", {}).get("development_double") is True:
-            return ["development double cannot prove successful completion"], False
+            return [origin_failure(
+                "origin_development_double",
+                "development double cannot prove successful completion",
+            )], False
         if (execution is None or task is None or str(execution.run_id) != str(run_id)
                 or str(task.mission_id) != str(mission_id)
                 or str(execution.task_id) != str(task.task_id)
@@ -506,9 +637,15 @@ async def _verify_native_work_and_task(
                 or execution.model_tool_call_id != metadata.get("model_tool_call_id")
                 or execution.ownership_version != metadata.get("task_ownership_version")
                 or completion_contract_hash(task) != metadata.get("task_purpose_hash")):
-            return ["central execution original identity disagrees"], False
+            return [
+                origin_failure(
+                    "origin_identity_mismatch", "central execution original identity disagrees",
+                )
+            ], False
         if not await task_graph_store.has_inspected_evidence(str(execution.proposal_evidence_id)):
-            return ["central original submission is unproven"], False
+            return [origin_failure(
+                "origin_submission_unproven", "central original submission is unproven",
+            )], False
         # The immutable journal supplied the approved subject/input digest.
         prepared = ToolInvocation.model_validate({
             "invocation_id": execution.invocation_id, "action_id": execution.action_id,
@@ -521,7 +658,9 @@ async def _verify_native_work_and_task(
                                   "approved_target": proposal.get("target")},
         })
         if execution_input_digest(prepared) != execution.input_digest:
-            return ["central execution original input disagrees"], False
+            return [origin_failure(
+                "origin_input_mismatch", "central execution original input disagrees",
+            )], False
         return [], True
     # Native origin proves an actual execution: a stored work record plus the
     # live task purpose it was delegated for. Task existence alone is not
@@ -539,24 +678,42 @@ async def _verify_native_work_and_task(
     # success.
     work_id = _s(metadata.get("work_id", "")).strip()
     if not work_id:
-        return (["native origin has no work binding; treating as unproven"], False)
+        return ([origin_failure(
+            "origin_work_binding_missing",
+            "native origin has no work binding; treating as unproven",
+        )], False)
     if work_store is None:
-        return (["native origin needs stored work lookup (work store unavailable)"], False)
+        return ([origin_failure(
+            "origin_work_unavailable",
+            "native origin needs stored work lookup (work store unavailable)",
+        )], False)
     try:
         work = await work_store.get(work_id)  # type: ignore[union-attr]
     except Exception:
-        return (["origin work lookup failed; treating as unproven"], False)
+        return ([origin_failure(
+            "origin_work_lookup_failed", "origin work lookup failed; treating as unproven",
+        )], False)
     if work is None:
-        return (["origin work record is missing; treating as unproven"], False)
+        return ([origin_failure(
+            "origin_work_missing", "origin work record is missing; treating as unproven",
+        )], False)
     if _s(getattr(work, "run_id", "")).strip() != str(run_id):
-        return (["origin work belongs to another run"], False)
+        return ([origin_failure(
+            "origin_run_mismatch", "origin work belongs to another run",
+        )], False)
     for key in ("candidate_key", "model_tool_call_id", "task_purpose_hash"):
         expected = _s(getattr(work, key, "") or "").strip()
         actual = _s(metadata.get(key, "") or "").strip()
         if not expected or not actual:
-            return (["origin work " + key + " has no binding; treating as unproven"], False)
+            return ([origin_failure(
+                "origin_work_binding_missing",
+                "origin work " + key + " has no binding; treating as unproven",
+            )], False)
         if expected != actual:
-            return (["origin work " + key + " disagrees with its stored execution"], False)
+            return ([origin_failure(
+                "origin_work_mismatch",
+                "origin work " + key + " disagrees with its stored execution",
+            )], False)
     # Empty target refs describe a target-free call only when the stored
     # proposal explicitly preserves that native input. Missing input is not
     # permission to erase a targeted execution's binding.
@@ -574,45 +731,79 @@ async def _verify_native_work_and_task(
             or str(raw.get("invocation_id", "")) != str(metadata["invocation_id"])
             or str(metadata["proposal"]["run_id"]) != str(run_id)
         ):
-            return (["target-free origin disagrees with its stored execution"], False)
+            return ([origin_failure(
+                "origin_target_mismatch", "target-free origin disagrees with its stored execution",
+            )], False)
     elif targets is not None and not list(targets):
-        return (["origin work has no target binding; treating as unproven"], False)
+        return ([origin_failure(
+            "origin_target_binding_missing",
+            "origin work has no target binding; treating as unproven",
+        )], False)
     try:
         work_version = int(getattr(work, "execution_origin_version", 0) or 0)
     except (TypeError, ValueError):
         work_version = 0
     if work_version != NATIVE_ORIGIN_VERSION:
-        return (["origin work is not native execution; treating as unproven"], False)
+        return ([origin_failure(
+            "origin_work_not_native", "origin work is not native execution; treating as unproven",
+        )], False)
     work_task = _s(getattr(work, "mission_task_id", "") or "").strip()
     meta_task = _s(metadata.get("mission_task_id", "") or "").strip()
     meta_mission = _s(metadata.get("mission_id", "") or "").strip()
     if not work_task and not meta_task:
         if mission_id is None and not meta_mission:
             return ([], True)
-        return (["native origin has no task binding; treating as unproven"], False)
+        return ([origin_failure(
+            "origin_task_binding_missing",
+            "native origin has no task binding; treating as unproven",
+        )], False)
     if not work_task or not meta_task:
-        return (["origin work mission_task_id has no binding; treating as unproven"], False)
+        return ([origin_failure(
+            "origin_task_binding_missing",
+            "origin work mission_task_id has no binding; treating as unproven",
+        )], False)
     if work_task != meta_task:
-        return (["origin work mission_task_id disagrees with its stored execution"], False)
+        return ([
+            origin_failure(
+                "origin_work_mismatch",
+                "origin work mission_task_id disagrees with its stored execution",
+            )
+        ], False)
     task_id = meta_task
     if task_graph_store is None:
-        return (["native origin needs stored task lookup (task store unavailable)"], False)
+        return ([origin_failure(
+            "origin_task_unavailable",
+            "native origin needs stored task lookup (task store unavailable)",
+        )], False)
     try:
         task = await task_graph_store.get_task(task_id)  # type: ignore[union-attr]
     except Exception:
-        return (["origin task lookup failed; treating as unproven"], False)
+        return ([origin_failure(
+            "origin_task_unavailable", "origin task lookup failed; treating as unproven",
+        )], False)
     if task is None:
-        return (["origin task is missing; treating as unproven"], False)
+        return ([origin_failure(
+            "origin_task_unavailable", "origin task is missing; treating as unproven",
+        )], False)
+    if origin_out is not None:
+        origin_out["task_id"] = str(getattr(task, "task_id", task_id))
+        origin_out["task_hash"] = origin_row_hash(task)
     if mission_id is not None and _s(getattr(task, "mission_id", "") or "").strip():
         if _s(getattr(task, "mission_id", "")).strip() != str(mission_id).strip():
-            return (["origin belongs to another mission"], False)
+            return ([origin_failure(
+                "origin_mission_mismatch", "origin belongs to another mission",
+            )], False)
     expected_hash = _s(metadata.get("task_purpose_hash", "") or "").strip()
     if not expected_hash:
-        return (["origin task purpose has no binding; treating as unproven"], False)
+        return ([origin_failure(
+            "origin_purpose_missing", "origin task purpose has no binding; treating as unproven",
+        )], False)
     from redteam.orchestration.coordination import content_hash as _content_hash
     current_hash = _content_hash({"objective": _s(getattr(task, "objective", "")).strip()})
     if current_hash != expected_hash:
-        return (["origin task purpose changed since the evidence"], False)
+        return ([origin_failure(
+            "origin_purpose_changed", "origin task purpose changed since the evidence",
+        )], False)
     return ([], True)
 
 
@@ -624,13 +815,17 @@ async def _verify_legacy_path_origin(
     m_version: Any,
     m_step_id: str,
     mission_id: Any | None,
-) -> list[str]:
+) -> list[Any]:
     if path_store is None:
-        return ["origin needs stored path lookup (path store unavailable)"]
+        return [origin_failure(
+            "origin_path_unavailable", "origin needs stored path lookup (path store unavailable)",
+        )]
     try:
         plans = await path_store.list_paths(run_id)  # type: ignore[union-attr]
     except Exception:
-        return ["origin lookup failed; treating as unproven"]
+        return [origin_failure(
+            "origin_path_lookup_failed", "origin lookup failed; treating as unproven",
+        )]
     source = None
     for plan in plans or []:
         if _s(getattr(plan, "run_id", "")).strip() != str(run_id):
@@ -642,13 +837,18 @@ async def _verify_legacy_path_origin(
         source = plan
         break
     if source is None:
-        return ["origin path version is not stored in this run"]
+        return [origin_failure(
+            "origin_path_missing", "origin path version is not stored in this run",
+        )]
     if mission_id:
         source_mission = _s(getattr(source, "mission_id", "") or "").strip()
         if not source_mission:
-            return ["origin has no mission binding; treating as unproven"]
+            return [origin_failure(
+                "origin_mission_binding_missing",
+                "origin has no mission binding; treating as unproven",
+            )]
         if source_mission != str(mission_id).strip():
-            return ["origin belongs to another mission"]
+            return [origin_failure("origin_mission_mismatch", "origin belongs to another mission")]
     origin_step = next(
         (
             item
@@ -658,11 +858,11 @@ async def _verify_legacy_path_origin(
         None,
     )
     if origin_step is None:
-        return ["origin step is not stored in this run"]
+        return [origin_failure("origin_step_missing", "origin step is not stored in this run")]
     return []
 
 
-async def verify_stored_origin(
+async def _stored_origin_items(
     *,
     path_store: Any,
     run_id: str,
@@ -674,7 +874,8 @@ async def verify_stored_origin(
     record: Any | None = None,
     task_graph_store: Any | None = None,
     work_store: Any | None = None,
-) -> list[str]:
+    origin_out: dict[str, str] | None = None,
+) -> list[Any]:
     _ = record
     meta = metadata if isinstance(metadata, dict) else {}
     if _is_native_origin(meta):
@@ -684,6 +885,7 @@ async def verify_stored_origin(
             mission_id=mission_id,
             task_graph_store=task_graph_store,
             work_store=work_store,
+            origin_out=origin_out,
         )
         if native_errors:
             return native_errors
@@ -702,10 +904,19 @@ async def verify_stored_origin(
         # origin cannot prove an actual execution. The legacy missing-path
         # message stays for callers that never had path refs.
         if task_graph_store is None and work_store is None:
-            return ["native origin needs stored work/task lookup (stores unavailable)"]
-        return ["native origin has no task/work binding; treating as unproven"]
+            return [origin_failure(
+                "origin_execution_unavailable",
+                "native origin needs stored work/task lookup (stores unavailable)",
+            )]
+        return [origin_failure(
+            "origin_task_binding_missing",
+            "native origin has no task/work binding; treating as unproven",
+        )]
     if not _has_path_linkage(m_path_id, m_version, m_step_id):
-        return ["has no path linkage (path_id/path_version/path_step_id required)"]
+        return [origin_failure(
+            "origin_path_binding_missing",
+            "has no path linkage (path_id/path_version/path_step_id required)",
+        )]
     return await _verify_legacy_path_origin(
         path_store=path_store,
         run_id=str(run_id),
@@ -714,6 +925,65 @@ async def verify_stored_origin(
         m_step_id=m_step_id,
         mission_id=mission_id,
     )
+
+
+async def verify_stored_origin_failures(
+    *,
+    path_store: Any,
+    run_id: str,
+    m_path_id: str,
+    m_version: Any,
+    m_step_id: str,
+    mission_id: Any | None = None,
+    metadata: dict[str, Any] | None = None,
+    record: Any | None = None,
+    task_graph_store: Any | None = None,
+    work_store: Any | None = None,
+    origin_out: dict[str, str] | None = None,
+) -> list[OriginFailure]:
+    """Stored-origin refusals with stable codes; verify_stored_origin keeps the message list."""
+    items = await _stored_origin_items(
+        path_store=path_store,
+        run_id=run_id,
+        m_path_id=m_path_id,
+        m_version=m_version,
+        m_step_id=m_step_id,
+        mission_id=mission_id,
+        metadata=metadata,
+        record=record,
+        task_graph_store=task_graph_store,
+        work_store=work_store,
+        origin_out=origin_out,
+    )
+    return [as_origin_failure(item) for item in items]
+
+
+async def verify_stored_origin(
+    *,
+    path_store: Any,
+    run_id: str,
+    m_path_id: str,
+    m_version: Any,
+    m_step_id: str,
+    mission_id: Any | None = None,
+    metadata: dict[str, Any] | None = None,
+    record: Any | None = None,
+    task_graph_store: Any | None = None,
+    work_store: Any | None = None,
+) -> list[str]:
+    failures = await verify_stored_origin_failures(
+        path_store=path_store,
+        run_id=run_id,
+        m_path_id=m_path_id,
+        m_version=m_version,
+        m_step_id=m_step_id,
+        mission_id=mission_id,
+        metadata=metadata,
+        record=record,
+        task_graph_store=task_graph_store,
+        work_store=work_store,
+    )
+    return [failure.message for failure in failures]
 
 
 async def verify_origin_step(
@@ -757,7 +1027,7 @@ async def verify_origin_step(
             task_graph_store=task_graph_store,
             work_store=work_store,
         )
-        for message in native_errors:
+        for message in [as_origin_failure(item).message for item in native_errors]:
             formatted = (
                 "evidence '" + str(evidence_id) + "' " + message,
                 "completion_origin_invalid",
@@ -1594,8 +1864,8 @@ async def validate_result_claims(
             )
         else:
             origin_errors = [
-                (f"evidence '{eid}' {message}", "completion_origin_invalid", message)
-                for message in await verify_stored_origin(
+                (f"evidence '{eid}' {failure.message}", failure.code, failure.message)
+                for failure in await verify_stored_origin_failures(
                     path_store=path_store,
                     run_id=run,
                     mission_id=mission_id,
@@ -1617,7 +1887,7 @@ async def validate_result_claims(
             )
         if origin_errors:
             continue
-        if expected_task_hash is not None:
+        if expected_task_hash is not None and not has_origin_task_row(meta):
             task_hash = _s(meta.get("task_purpose_hash", "") or "").strip()
             from redteam.core.contracts.completion import completion_contract_hash
             required_task_hash = (completion_contract_hash(task)
