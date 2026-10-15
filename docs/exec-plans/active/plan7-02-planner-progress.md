@@ -56,6 +56,12 @@ Pending independent plan review and actual test evidence. Record exact tests/art
 | P02 | Pending | Pending | Pending | OPEN |
 | P03 | Pending | Pending | Pending | OPEN |
 
+### Integrated implementation evidence (2026-10-15)
+
+The original Pending rows above describe the initial plan, not the present source. P01 now has split/single-stage and legacy continuation-witness validation plus canonical post-update admission checks. P02 has the durable bounded replan projection and explicit held/exhausted/goal proposal handling consumed by runtime settlement/report. P03 commits registration, necessity changes, judgment, cursor and wake atomically; repeated wake and external drift are regression-tested. Source units0a3292d3/da27d0d2/88701c9e/be9b95df were retained through teammate mergebcd08ed3.
+
+Fresh independent Sol post-merge audit traced all P01–P03 producer/consumer/storage paths and found no missing implementation. Root's current integrated progress/replan/legacy atomic/source-reuse/web-diagnostic set30 PASS; the two intermediate follow-up tests also PASS after commit920759e3 supplies valid held/resume fixtures and bound run metadata. Unproven goal proposals still cannot bypass complete_goal. These are scripted-provider/real-store checks. Final full-suite and physical execution acceptance remain with stages07/08, so this document is not moved to completed prematurely.
+
 ## Completion Criteria
 
 Every requirement above proven against current state, required reviews addressed, meaningful checks pass, stage commit contains scoped files, preserved user state. Move to completed only then; otherwise retain precise missing requirements and next action. Parent goal remains active until all stages including physical proof and final review/repair/test pass.

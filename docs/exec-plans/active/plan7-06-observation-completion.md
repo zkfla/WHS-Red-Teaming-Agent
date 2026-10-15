@@ -58,6 +58,12 @@ Pending independent plan review and actual test evidence. Record exact tests/art
 | K03 | Pending | Pending | Pending | OPEN |
 | K04 | Pending | Pending | Pending | OPEN |
 
+### Integrated implementation evidence (2026-10-15)
+
+The initial Pending rows above are superseded by current source evidence: K01 uses the same structured contradiction rule at proposal and canonical registration; K02 restores original criterion IDs and links observation→independent review→Planner verdict with revision/purpose checks; K03 retains immutable originals and revalidates source/validity/graph state inside final Task/goal commit; K04 preserves bounded typed owner/criterion/source/recovery diagnostics through repair, storage, report and reopen. Source commitsa87c2225/0b7de4e2/21bcf63d/88701c9e and merged47745022 contain these units.
+
+Fresh independent Sol post-merge audit found no concrete implementation omission across K01–K04. Root current-state checks include25 transport/conversation/completion-diagnostic tests and30 progress/source-reuse/web-projection tests, with prior19 merged original-source/CAS checks. No fixture or code-generated observation is claimed as a verified vulnerability. Whole-run physical consumption and final integrated gates remain open in07/08; all relevant evidence must survive the final reconciliation before stage completion.
+
 ## Original numbered requirement coverage
 
 The grouped rows above do not permit partial PASS. At completion, inspect each original numbered implementation requirement in docs/plans/plan7-source-20261014/plan7d.md and attach producer/consumer/test evidence independently.
