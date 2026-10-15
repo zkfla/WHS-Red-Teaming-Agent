@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 import pytest
 
 from redteam.app.central_development import build_central_development
-from redteam.app.central_run import open_central_run
+from redteam.app.central_run import bind_run_metadata, open_central_run
 from redteam.core.config import AppConfig, EngagementConfig
 from redteam.core.contracts.execution import ExecutionState
 from redteam.core.contracts.mission import OperatorIntent, Provenance
@@ -424,14 +424,13 @@ async def test_selected_network_ledger_keeps_pool_window_sequence_on_reopen(tmp_
 
 
 async def test_stop_drains_parallel_calls_and_keeps_unconfirmed_resources():
-    llm = FakeLLMClient(structured_responses=[
-        {"questions": [], "reason": "Tasks already registered"} for _ in range(8)
-    ])
+    llm = FakeLLMClient(canned_structured={"questions": [], "reason": "Await investigation"})
     tools = gateway(resource=True)
     tools.release.clear()
     async with build_central_development(
         limits()[0], llm=llm, tools=tools, settings=limits()[1],
     ) as selection:
+        await bind_run_metadata(selection.deps)
         for index in range(2):
             await register(selection, f"registration-{index}")
         for index, task in enumerate(await selection.deps.central_state.list_tasks()):
