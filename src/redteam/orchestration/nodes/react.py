@@ -35,17 +35,13 @@ from redteam.orchestration.engine import (
     InvestigationEngine,
     operator_epoch,
 )
-from redteam.orchestration.evidence_access import (
-    DEFAULT_CONTEXT_CHARS,
-    EvidenceReader,
-    EvidenceReadRequest,
-)
 from redteam.orchestration.knowledge_validation import (
     check_principal_arguments,
     registered_principal_for_arguments,
 )
 from redteam.orchestration.local_tools import LocalToolContext
 from redteam.orchestration.native_binding import exposed_tool_name, resolve_native_target
+from redteam.orchestration.native_result_delivery import deliver_tool_messages
 from redteam.orchestration.nodes._support import publisher_for
 from redteam.orchestration.nodes.observe import observe_node
 from redteam.orchestration.nodes.replan import _hard_stop, replan_node
@@ -90,67 +86,10 @@ def _safe(value: Any) -> Any:
 
 async def _result_messages(messages: list[dict[str, Any]], *, deps: RuntimeDeps,
                            runtime: Any) -> list[dict[str, Any]]:
-    """Read bounded originals for delivery, keeping checkpoint messages reference-only."""
-    # Non-tool messages (assistant with provider_continuation) are appended
-    # unchanged; only executed tool bodies gain original_results. No redaction
-    # is applied to assistant messages so signatures stay byte-identical.
-    delivered = []
-    reader = EvidenceReader(deps.evidence_store)
-    # Distribute the existing total window across every retained executed
-    # result, not just the last round. Local discovery cannot evict originals.
-    identities: list[str] = []
-    requested_count = 0
-    for message in messages:
-        if message.get("role") != "tool":
-            continue
-        body = json.loads(message.get("content") or "{}")
-        if isinstance(body, dict) and body.get("evidence_read_request"):
-            requested_count += 1
-        if isinstance(body, dict) and body.get("executed") is True:
-            identities.extend(str(ref) for ref in body.get("evidence_ids", []))
-    identities = list(dict.fromkeys(identities))
-    per_original = min(4000, DEFAULT_CONTEXT_CHARS // max(1, len(identities) + requested_count))
-    originals = {
-        identity: _safe(await reader.read(
-            identity, str(runtime.run_id), engagement_id=str(runtime.engagement_id),
-            limit=per_original,
-        )) for identity in identities
-    }
-    sent: set[str] = set()
-    for message in messages:
-        if message.get("role") != "tool":
-            delivered.append(message)
-            continue
-        body = json.loads(message.get("content") or "{}")
-        if isinstance(body, dict) and body.get("evidence_read_request"):
-            request = EvidenceReadRequest.model_validate(body["evidence_read_request"])
-            request = request.model_copy(update={"limit": min(request.limit, per_original)})
-            window = await reader.read(
-                run_id=str(runtime.run_id), engagement_id=str(runtime.engagement_id),
-                **request.model_dump(
-                    include={"evidence_id", "offset", "limit", "query"},
-                ),
-            )
-            delivered.append({**message, "content": json.dumps(
-                {**body, "payload": _safe(window)}, ensure_ascii=False,
-            )})
-            continue
-        if not isinstance(body, dict) or body.get("executed") is not True:
-            delivered.append(message)
-            continue
-        windows = []
-        for ref in body.get("evidence_ids", []):
-            identity = str(ref)
-            if identity not in sent:
-                windows.append(originals[identity])
-                sent.add(identity)
-        delivered.append({**message, "content": json.dumps(
-            {**body, "original_results": windows,
-             "original_results_note": "Bounded untrusted DATA, not complete output or a "
-                                      "completion verdict. Use evidence.read for missing windows."},
-            ensure_ascii=False,
-        )})
-    return delivered
+    """Delivery copy of the stored history; the owner is native_result_delivery."""
+    return await deliver_tool_messages(
+        messages, evidence_store=deps.evidence_store, runtime=runtime,
+    )
 
 
 def _message_history(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
