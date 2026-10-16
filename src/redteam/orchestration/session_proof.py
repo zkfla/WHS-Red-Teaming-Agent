@@ -103,6 +103,54 @@ def actual_receipt_conflict(metadata: Any, raw: Any) -> str | None:
     return None
 
 
+def original_session_receipt_matches(
+    metadata: Any,
+    raw: Any,
+    *,
+    unit: str = "request",
+    expected_session_ref: str | None,
+) -> bool:
+    """Whether one original request unit explicitly receipted its expected session.
+
+    Only receipts on the selected original raw unit count. Metadata derivations,
+    request echoes, and receipts belonging to another unit cannot supply proof.
+    """
+    if not isinstance(raw, dict) or raw.get("success") is not True:
+        return False
+    for layer in (metadata, raw.get("metadata")):
+        if isinstance(layer, dict) and any(
+            layer.get(key) for key in ("mock", "fixture_only")
+        ):
+            return False
+
+    if expected_session_ref is None:
+        expected = None
+    else:
+        expected = _cleaned(expected_session_ref)
+        if expected is None:
+            return False
+
+    receipts = _receipt_units(_output_of(raw)).get(unit)
+    if not receipts:
+        return False
+    normalized: list[str | None] = []
+    for receipt in receipts:
+        if receipt is None:
+            normalized.append(None)
+            continue
+        cleaned = _cleaned(receipt)
+        if cleaned is None:
+            return False
+        normalized.append(cleaned)
+    if len(set(normalized)) != 1:
+        return False
+
+    return (
+        actual_receipt_conflict(metadata, raw) is None
+        and normalized[0] == expected
+    )
+
+
 def has_anonymous_receipt(metadata: Any, raw: Any) -> bool:
     """An explicit null on an original request unit, never an echo/declaration.
 
@@ -167,6 +215,49 @@ def actual_account_pairs(raw: Any) -> set[tuple[str, str]]:
             if isinstance(nested, dict):
                 _add_account_pairs(values, nested, _UNIT_ACCOUNT_PAIRS)
     return values
+
+
+def original_unit_account_pairs(raw: Any, unit: str) -> set[tuple[str, str]]:
+    """Return principal/session pairs attached to one original request unit.
+
+    Flat and nested encodings are both supported, but values from different
+    units are never combined. If the same unit contains contradictory pairs,
+    it contributes no account proof.
+    """
+    output = _output_of(raw)
+    if not isinstance(output, dict):
+        return set()
+    if unit == "request":
+        pairs = _UNIT_ACCOUNT_PAIRS
+        encoded = [output]
+    elif unit in {"first", "second"}:
+        principal_key = f"{unit}_principal_ref"
+        session_key = f"{unit}_actual_session_ref"
+        pairs = ((principal_key, session_key),)
+        encoded = [output]
+        nested = output.get(unit)
+        if isinstance(nested, dict):
+            encoded.append(nested)
+        # Recollect with a set so repeated flat/nested representations remain
+        # one pair; multiple principal claims for a unit remain ambiguous.
+        unit_values: set[tuple[str, str]] = set()
+        _add_account_pairs(unit_values, output, pairs)
+        if isinstance(nested, dict):
+            _add_account_pairs(unit_values, nested, _UNIT_ACCOUNT_PAIRS)
+        return unit_values if len(unit_values) <= 1 else set()
+    elif unit in _NESTED_UNITS:
+        nested = output.get(unit)
+        if not isinstance(nested, dict):
+            return set()
+        values: set[tuple[str, str]] = set()
+        _add_account_pairs(values, nested, _UNIT_ACCOUNT_PAIRS)
+        return values
+    else:
+        return set()
+    values = set()
+    for item in encoded:
+        _add_account_pairs(values, item, pairs)
+    return values if len(values) <= 1 else set()
 
 
 def _add_account_pairs(
