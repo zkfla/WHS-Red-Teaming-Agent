@@ -7,6 +7,7 @@ client and metered request ledger; they make no provider or target calls.
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -17,11 +18,13 @@ from redteam.orchestration.specialist_planner import SpecialistPlanner
 from tests.integration.test_candidate_subject_repair import _atomize
 from tests.integration.test_central_development import TARGET
 from tests.integration.test_hypothesis_planner import candidate
+from tests.integration.test_planner_context_lookup import lookup, seed_history
 from tests.integration.test_probe_workers import (
     PROFILE,
     register,
 )
 from tests.integration.test_probe_workers import selection as probe_selection
+from tests.unit.test_unstarted_request_halt import QueuedSemaphore
 
 
 def _plan(captured_candidate: dict, *, include_update: bool) -> dict:
@@ -161,3 +164,83 @@ async def test_visible_unreferenced_sibling_does_not_block_atomizer_or_commit(
         assert len(identities) == 1
         assert len(await session.deps.central_state.list_tasks()) == 4
         assert await _invalidations(session.deps.central_state) == []
+
+
+class _LookupThenMalformedPlanLLM(FakeLLMClient):
+    """Read one exact Task, then reject a plan so the repair queues on the slot."""
+
+    def __init__(self):
+        super().__init__()
+        self.planner_dispatches = 0
+
+    async def complete_structured(self, *, messages, response_schema, system=None, **kwargs):
+        if "questions" not in response_schema.get("properties", {}):
+            return await super().complete_structured(
+                messages=messages, response_schema=response_schema, system=system, **kwargs,
+            )
+        self.planner_dispatches += 1
+        await self._wait_response("complete_structured", messages)
+        if self.planner_dispatches == 1:
+            return lookup(
+                kind="task", mode="read",
+                refs=[{"kind": "task", "identity": "z-source"}],
+            )
+        if self.planner_dispatches == 2:
+            # The JSON object parses, but this extra field violates the delivered schema and
+            # causes a normal format repair inside the same DecisionBudget.
+            return {
+                "updates": [], "questions": [], "reason": "Read a completed Task",
+                "termination": "held", "resume_conditions": ["A new original arrives"],
+                "unexpected_field": "format-repair-trigger",
+            }
+        return {
+            "updates": [], "questions": [], "reason": "Wait for a new original",
+            "termination": "held", "resume_conditions": ["A new original arrives"],
+        }
+
+
+async def test_lookup_task_drift_while_format_repair_waits_is_early_invalidated(tmp_path):
+    llm = _LookupThenMalformedPlanLLM()
+    async with probe_selection(tmp_path, llm=llm, profile=PROFILE) as (session, llm, _):
+        state = session.deps.central_state
+        await seed_history(state)
+        task_count = len(await state.list_tasks())
+        semaphore = QueuedSemaphore(block_at=3)
+        session.deps.llm_client.request_semaphore = semaphore
+
+        planning = asyncio.create_task(SpecialistPlanner(session.deps).advance(session.runtime))
+        try:
+            await asyncio.wait_for(semaphore.waiting.wait(), 5)
+
+            def mutate_read_task(tx):
+                task = tx.get_task("z-source")
+                changed_result = task.result.model_copy(update={
+                    "summary": "The captured original result changed while repair waited",
+                })
+                changed_task = task.model_copy(update={"result": changed_result})
+                tx.db.execute(
+                    "UPDATE state_tasks SET payload=? WHERE run_id=? AND task_id=?",
+                    (changed_task.model_dump_json(), tx.run_id, "z-source"),
+                )
+
+            await state.transaction(mutate_read_task)
+            semaphore.proceed.set()
+            identities = await asyncio.wait_for(planning, 5)
+        finally:
+            semaphore.proceed.set()
+            if not planning.done():
+                planning.cancel()
+            await asyncio.gather(planning, return_exceptions=True)
+
+        assert identities == []
+        # Lookup and first rejected proposal were dispatched; the queued repair was not.
+        assert llm.planner_dispatches == 2
+        usage = await state.request_ledger().snapshot(state.run_id)
+        assert usage["spent"] == 2 and usage["reserved"] == 0
+        assert len(await state.list_tasks()) == task_count
+        cursor = await state.transaction(lambda tx: tx.hypothesis_planner_cursor(), write=False)
+        assert cursor is None
+        invalidations = await _invalidations(state)
+        assert len(invalidations) == 1
+        assert invalidations[0]["reason_code"] == "related_planning_inputs_changed"
+        assert invalidations[0]["cause_code"] == "probe_related_result_changed"
