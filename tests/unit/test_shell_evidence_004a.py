@@ -200,6 +200,47 @@ async def test_targetless_shell_fact_without_target_linkage():
     assert [item["reason"] for item in refused] == ["no target linkage"]
 
 
+async def test_graph_record_fact_target_mismatch_returns_safe_correction():
+    svc = await _service_with_target()
+    record = _record(_proposal(targeted=True), _result(success=True), True)
+    accepted, refused = await _write(
+        record, _fact(target_node_id="host:other.example"), svc,
+    )
+
+    assert accepted == []
+    refusal, = refused
+    assert refusal["reason"] == "observed another target"
+    diagnostic = refusal["diagnostic"]
+    assert diagnostic["code"] == "graph_record_fact_target_mismatch"
+    assert diagnostic["cause_scope"] == "evidence_validity"
+    assert diagnostic["location"] == "$.facts[0].target_node_id"
+    assert diagnostic["validation_issues"] == [{
+        "rule": "observed_target_matches_evidence",
+        "location": "$.facts[0].target_node_id",
+    }]
+    assert "target recorded on this evidence" in diagnostic["repair_condition"]
+    assert "host:other.example" not in str(diagnostic)
+
+
+async def test_graph_record_fact_value_mismatch_points_to_exact_value():
+    svc = await _service_with_target()
+    record = _record(_proposal(targeted=True), _result(success=True), True)
+    accepted, refused = await _write(record, _fact(value=1), svc)
+
+    assert accepted == []
+    refusal, = refused
+    assert refusal["reason"] == "value mismatch"
+    diagnostic = refusal["diagnostic"]
+    assert diagnostic["code"] == "graph_record_fact_value_mismatch"
+    assert diagnostic["location"] == "$.facts[0].value"
+    assert diagnostic["validation_issues"] == [{
+        "rule": "value_matches_preserved_output",
+        "location": "$.facts[0].value",
+    }]
+    assert "exact value at raw_path" in diagnostic["repair_condition"]
+    assert "value mismatch" not in diagnostic["summary"]
+
+
 async def test_failed_shell_result_does_not_record_a_remote_fact():
     svc = await _service_with_target()
     record = _record(_proposal(targeted=True), _result(success=False), True)

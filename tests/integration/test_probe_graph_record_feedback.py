@@ -8,10 +8,12 @@ import json
 
 import pytest
 
+from redteam.attack_graph.hypotheses import hypothesis_purpose
 from redteam.attack_graph.service import AttackGraphService
 from redteam.orchestration.analysis import StructuredLLMAnalysisVerifier
 from redteam.orchestration.central_runtime import ready_workers
 from redteam.orchestration.cognition import DecisionBudget
+from redteam.orchestration.coordination import content_hash
 from redteam.orchestration.graph_recording import GraphRecordingHandler
 from redteam.orchestration.local_tools import LocalToolContext
 from tests.integration.test_central_development import TARGET
@@ -42,6 +44,32 @@ def _handler(session, service, meaning):
     return GraphRecordingHandler(
         evidence_store=session.deps.evidence_store, graph_service=service, verifier=verifier,
     )
+
+
+class _CandidateReadRace:
+    """Simulate a candidate becoming stale or missing after the review snapshot is copied."""
+
+    def __init__(self, service, *, outcome):
+        self._service = service
+        self._outcome = outcome
+        self._candidate_reads = 0
+
+    def __getattr__(self, name):
+        return getattr(self._service, name)
+
+    async def get_hypothesis(self, hypothesis_id):
+        candidate = await self._service.get_hypothesis(hypothesis_id)
+        self._candidate_reads += 1
+        if self._outcome == "missing-before-review" and self._candidate_reads == 1:
+            return None
+        if self._candidate_reads != 2 or candidate is None:
+            return candidate
+        if self._outcome == "missing":
+            return None
+        return candidate.model_copy(update={
+            "revision": candidate.revision + 1,
+            "premise": "Changed after the review snapshot",
+        }, deep=True)
 
 
 async def _snapshot(session, service, task_id):
@@ -157,8 +185,71 @@ async def test_padded_admitted_candidate_reaches_existing_review(tmp_path):
 
         assert result.ok is True, result.payload["findings"][0].get("reason")
         receipt = await _receipt(session, result)
+        finding = result.payload["findings"][0]
         assert receipt.metadata["record_kind"] == "review_receipt"
+        assert finding["candidate_revision"] == receipt.metadata["candidate_revision"]
+        assert finding["candidate_purpose_hash"] == receipt.metadata["candidate_purpose_hash"]
         assert meaning.review_calls == 1
+
+
+@pytest.mark.parametrize("reread", ["stale", "missing"])
+async def test_v2_receipt_return_uses_the_exact_reviewed_snapshot_after_candidate_reread(
+    tmp_path, reread,
+):
+    meaning = MeaningLLM([_meaning("success")])
+    async with selection(tmp_path, llm=ChainLLM([OPENING])) as (session, llm, tools):
+        after_task, source = await _observe_candidate(session, llm)
+        service, _, worker = await _observed_probe(session, after_task)
+        snapshot = await service.get_hypothesis(after_task.hypothesis_id)
+        assert snapshot is not None
+        race = _CandidateReadRace(service, outcome=reread)
+        handler = _handler(session, race, meaning)
+        result = await handler(
+            {"findings": [_finding(
+                hypothesis_id=snapshot.hypothesis_id,
+                evidence_refs=[str(source.evidence_id)],
+            )]},
+            LocalToolContext(session.deps, worker, budget=DecisionBudget()),
+        )
+
+        assert result.ok is True, result.error
+        finding, = result.payload["findings"]
+        receipt = await _receipt(session, result)
+        expected_purpose = content_hash(hypothesis_purpose(snapshot))
+        assert finding["status"] == "reviewed"
+        assert finding["candidate_revision"] == snapshot.revision
+        assert finding["candidate_purpose_hash"] == expected_purpose
+        assert receipt.metadata["candidate_revision"] == snapshot.revision
+        assert receipt.metadata["candidate_purpose_hash"] == expected_purpose
+        assert meaning.review_calls == 1
+
+
+async def test_missing_v2_candidate_before_review_returns_no_receipt_binding(tmp_path):
+    meaning = MeaningLLM([_meaning("success")])
+    async with selection(tmp_path, llm=ChainLLM([OPENING])) as (session, llm, tools):
+        after_task, source = await _observe_candidate(session, llm)
+        service, _, worker = await _observed_probe(session, after_task)
+        before_receipts = await _receipts(session)
+        missing = _CandidateReadRace(service, outcome="missing-before-review")
+        handler = _handler(session, missing, meaning)
+        result = await handler(
+            {"findings": [_finding(
+                hypothesis_id=after_task.hypothesis_id,
+                evidence_refs=[str(source.evidence_id)],
+            )]},
+            LocalToolContext(session.deps, worker, budget=DecisionBudget()),
+        )
+
+        assert result.ok is False
+        finding, = result.payload["findings"]
+        assert finding["status"] == "refused"
+        assert finding["reason"] == "hypothesis claim or target differs"
+        assert "receipt_id" not in finding
+        assert "candidate_revision" not in finding
+        assert "candidate_purpose_hash" not in finding
+        assert await _receipts(session) == before_receipts
+        assert await service.get_hypothesis(after_task.hypothesis_id) == after_task
+        assert meaning.review_calls == 0
 
 
 async def test_corrected_candidate_after_feedback_reaches_existing_review(tmp_path):

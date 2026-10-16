@@ -410,6 +410,52 @@ def test_pydantic_owner_schema_still_hides_undeclared_keys():
     assert secret not in dumped
 
 
+async def test_graph_record_extra_field_feedback_lists_only_declared_fields_at_location():
+    import json
+
+    from redteam.orchestration.graph_recording import (
+        GraphRecordingHandler,
+    )
+
+    secret_key = "node_type"
+    secret_value = "opaque-recording-token"
+    handler = GraphRecordingHandler()
+    result = await handler({
+        "facts": [{
+            "evidence_id": "ev-1",
+            "raw_path": ["output", "name"],
+            "value": "safe-value",
+            "fact_name": "service_name",
+            "target_node_id": "host:example.test",
+            secret_key: secret_value,
+        }],
+    }, None)
+    assert result.ok is False
+    diagnostic = result.payload["diagnostic"]
+    issue = diagnostic["validation_issues"][0]
+    assert diagnostic["location"] == "$.facts[0]"
+    assert issue["rule"] == "extra_forbidden"
+    assert issue["location"] == "$.facts[0]"
+    assert issue["allowed_fields"] == (
+        "edge, entity_raw_path, evidence_id, fact_name, new_entity, raw_path, "
+        "target_node_id, value"
+    )
+    assert "At $.facts[0], use only these declared fields" in result.error
+    rendered = json.dumps(diagnostic) + result.error
+    assert secret_key not in rendered
+    assert secret_value not in rendered
+
+    root_result = await handler({"facts": [], secret_key: secret_value}, None)
+    assert root_result.ok is False
+    root_diagnostic = root_result.payload["diagnostic"]
+    root_issue = root_diagnostic["validation_issues"][0]
+    assert root_diagnostic["location"] == "$"
+    assert root_issue["allowed_fields"] == "branches, facts, findings, hypotheses"
+    root_rendered = json.dumps(root_diagnostic) + root_result.error
+    assert secret_key not in root_rendered
+    assert secret_value not in root_rendered
+
+
 @pytest.mark.parametrize(
     ("read_input", "field", "rule"),
     [

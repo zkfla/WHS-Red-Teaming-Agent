@@ -40,8 +40,17 @@ from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urljoin, urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, TypeAdapter
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    StrictStr,
+    TypeAdapter,
+    ValidationError,
+)
 
+from redteam.attack_graph.hypotheses import hypothesis_purpose
 from redteam.attack_graph.identity import node_id_for_target
 from redteam.attack_graph.predicates import (
     CLAIM_ATTR_PREFIX,
@@ -426,6 +435,155 @@ def _probe_candidate_refusal(
     )
 
 
+def _schema_options(node: Any, schema: dict[str, Any]) -> list[dict[str, Any]]:
+    """Resolve local model-schema references and unions without reading input data."""
+    pending = [node]
+    resolved: list[dict[str, Any]] = []
+    visited: set[str] = set()
+    definitions = schema.get("$defs", {})
+    while pending and len(resolved) < 32:
+        current = pending.pop()
+        if not isinstance(current, dict):
+            continue
+        reference = current.get("$ref")
+        if isinstance(reference, str) and reference.startswith("#/$defs/"):
+            name = reference.removeprefix("#/$defs/")
+            if name not in visited and isinstance(definitions, dict):
+                visited.add(name)
+                pending.append(definitions.get(name))
+            continue
+        expanded = False
+        for key in ("allOf", "anyOf", "oneOf"):
+            alternatives = current.get(key)
+            if isinstance(alternatives, list):
+                pending.extend(alternatives)
+                expanded = True
+        if not expanded:
+            resolved.append(current)
+    return resolved
+
+
+def _schema_properties_at(
+    schema: dict[str, Any], path: tuple[Any, ...],
+) -> list[str]:
+    """Return declared fields at one schema location; unknown path parts stop traversal."""
+    nodes: list[Any] = [schema]
+    for part in path:
+        children: list[Any] = []
+        for node in nodes:
+            for option in _schema_options(node, schema):
+                if isinstance(part, int) and not isinstance(part, bool):
+                    child = option.get("items")
+                elif isinstance(part, str):
+                    properties = option.get("properties", {})
+                    child = properties.get(part) if isinstance(properties, dict) else None
+                else:
+                    child = None
+                if child is not None:
+                    children.append(child)
+        nodes = children
+        if not nodes:
+            return []
+    properties: set[str] = set()
+    for node in nodes:
+        for option in _schema_options(node, schema):
+            declared = option.get("properties", {})
+            if isinstance(declared, dict):
+                properties.update(name for name in declared if isinstance(name, str))
+    return sorted(properties)
+
+
+def _schema_location(schema: dict[str, Any], path: tuple[Any, ...]) -> str:
+    """Render only path names that are declared at their exact schema depth."""
+    rendered = "$"
+    traversed: list[Any] = []
+    for part in path:
+        if isinstance(part, int) and not isinstance(part, bool) and part >= 0:
+            rendered += f"[{part}]"
+            traversed.append(part)
+        elif isinstance(part, str) and part in _schema_properties_at(schema, tuple(traversed)):
+            rendered += f".{part}"
+            traversed.append(part)
+        else:
+            break
+    return rendered
+
+
+def _graph_recording_input_diagnostic(exc: BaseException) -> DecisionDiagnostic:
+    """Use the shared diagnostic shape with safe, schema-derived repair guidance."""
+    schema = GraphRecordingInput.model_json_schema()
+    diagnostic = diagnostic_for_exception(
+        exc, stage="native_local_tool", schema=schema,
+    ).model_copy(update={"cause_scope": "model_input", "owner": "graphrecording"})
+    if not isinstance(exc, ValidationError):
+        return diagnostic
+    try:
+        errors = exc.errors(include_input=False, include_url=False, include_context=False)[:10]
+    except Exception:
+        return diagnostic
+    issues = [dict(issue) for issue in diagnostic.validation_issues]
+    guidance = ""
+    for index, error in enumerate(errors):
+        if error.get("type") != "extra_forbidden" or index >= len(issues):
+            continue
+        location = tuple(error.get("loc", ()))
+        fields = _schema_properties_at(schema, location[:-1])
+        if not fields:
+            continue
+        parent_location = _schema_location(schema, location[:-1])
+        issues[index]["location"] = parent_location
+        allowed = fields[:16]
+        rendered = ", ".join(allowed)
+        issues[index]["allowed_fields"] = rendered
+        pointer = parent_location
+        if not guidance:
+            guidance = f"At {pointer}, use only these declared fields: {rendered}."
+    if not guidance:
+        return diagnostic
+    summary = f"{diagnostic.summary} {guidance}"[:500]
+    location = next(
+        (issue["location"] for issue in issues if "allowed_fields" in issue),
+        diagnostic.location,
+    )
+    return diagnostic.model_copy(update={
+        "location": location,
+        "summary": summary,
+        "repair_condition": guidance[:500],
+        "validation_issues": issues,
+    })
+
+
+def _fact_refusal_diagnostic(reason: str, *, fact_index: int) -> DecisionDiagnostic:
+    if reason == "observed another target":
+        location = f"$.facts[{fact_index}].target_node_id"
+        correction = (
+            "Use the target recorded on this evidence, or cite same-run evidence collected "
+            "against the requested target; evidence target bindings cannot be changed."
+        )
+        code = "graph_record_fact_target_mismatch"
+        rule = "observed_target_matches_evidence"
+    else:
+        location = f"$.facts[{fact_index}].value"
+        correction = (
+            "Set value to the exact value at raw_path in this evidence's preserved output, "
+            "or correct raw_path; do not infer a nearby value."
+        )
+        code = "graph_record_fact_value_mismatch"
+        rule = "value_matches_preserved_output"
+    return DecisionDiagnostic(
+        code=code,
+        stage="native_local_tool",
+        kind="validation",
+        location=location,
+        summary=correction,
+        repair_condition=correction,
+        retryable=True,
+        cause_scope="evidence_validity",
+        owner="graphrecording",
+        validation_issues=[{"rule": rule, "location": location}],
+    )
+
+
 class GraphRecordingHandler:
     """Ground and write one recording call. No independent budget.
 
@@ -472,6 +630,7 @@ class GraphRecordingHandler:
         self,
         fact: RecordedFact,
         *,
+        fact_index: int = 0,
         store: Any,
         service: Any,
         run_id: str,
@@ -523,7 +682,13 @@ class GraphRecordingHandler:
             refused_facts.append({"evidence_id": eid, "reason": "raw path missing"})
             return
         if actual != fact.value:
-            refused_facts.append({"evidence_id": eid, "reason": "value mismatch"})
+            refused_facts.append({
+                "evidence_id": eid,
+                "reason": "value mismatch",
+                "diagnostic": _fact_refusal_diagnostic(
+                    "value mismatch", fact_index=fact_index,
+                ).model_dump(mode="json"),
+            })
             return
         metadata = getattr(record, "metadata", None)
         observed_target = metadata.get("target_node_id") if isinstance(metadata, dict) else None
@@ -531,7 +696,13 @@ class GraphRecordingHandler:
             refused_facts.append({"evidence_id": eid, "reason": "evidence names no target"})
             return
         if observed_target.strip() != target:
-            refused_facts.append({"evidence_id": eid, "reason": "observed another target"})
+            refused_facts.append({
+                "evidence_id": eid,
+                "reason": "observed another target",
+                "diagnostic": _fact_refusal_diagnostic(
+                    "observed another target", fact_index=fact_index,
+                ).model_dump(mode="json"),
+            })
             return
         if is_shell_execution_envelope(output):
             refused_facts.append({
@@ -902,11 +1073,7 @@ class GraphRecordingHandler:
             # this input's declared schema publishes the field and rule,
             # never the raw values or undeclared key names, so the next
             # turn can correct the shape instead of retrying it blind.
-            diagnostic = diagnostic_for_exception(
-                exc,
-                stage="native_local_tool",
-                schema=GraphRecordingInput.model_json_schema(),
-            )
+            diagnostic = _graph_recording_input_diagnostic(exc)
             return LocalToolResult(
                 ok=False,
                 error=diagnostic.feedback(),
@@ -948,10 +1115,11 @@ class GraphRecordingHandler:
         record_ids: list[str] = []
         accepted_facts: list[dict[str, Any]] = []
         refused_facts: list[dict[str, Any]] = []
-        for fact in recording.facts:
+        for fact_index, fact in enumerate(recording.facts):
             _remember(seen_refs, fact.evidence_id)
             await self._write_fact(
                 fact,
+                fact_index=fact_index,
                 store=store,
                 service=service,
                 run_id=run_id,
@@ -1167,6 +1335,12 @@ class GraphRecordingHandler:
         ):
             return _refused_entry(base, "hypothesis claim or target differs", "finding_id")
         reviewed_hypothesis = stored_hypothesis.model_copy(deep=True)
+        candidate_review_binding: dict[str, Any] = {}
+        if reviewed_hypothesis.contract_version == 2:
+            candidate_review_binding = {
+                "candidate_revision": reviewed_hypothesis.revision,
+                "candidate_purpose_hash": content_hash(hypothesis_purpose(reviewed_hypothesis)),
+            }
         for ref in refs:
             source = await store.get(ref)
             if _posthoc_source_gap(source, raw_from_metadata(source.metadata)) is not None:
@@ -1274,7 +1448,8 @@ class GraphRecordingHandler:
         if reviewed_hypothesis.contract_version == 2:
             return {
                 **base, "hypothesis_id": hypothesis_id, "target_node_id": target,
-                "receipt_id": str(receipt.evidence_id), "finding_id": None,
+                "receipt_id": str(receipt.evidence_id), **candidate_review_binding,
+                "finding_id": None,
                 "status": "reviewed", "reason": "candidate judgment belongs to the planner",
                 "review": review_summary,
             }

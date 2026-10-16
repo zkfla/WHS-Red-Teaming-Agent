@@ -127,18 +127,37 @@ async def test_native_worker_corrects_refused_candidate_reference_then_reaches_r
             assert bad_ref not in refused_text
 
         # The next model turn received that same refused result, and the refusal wrote no graph
-        # state. Only the refused call's own tool-result envelope may be added to evidence.
+        # state. The call has one durable submission and one durable result receipt.
         assert llm.observed["feedback"] == bad
         assert llm.observed["meaning_before_correction"] == 0
         before_ids = llm.observed["ids_before_bad"]
         assert llm.observed["ids_after_bad"][:len(before_ids)] == before_ids
         new_ids = llm.observed["ids_after_bad"][len(before_ids):]
-        assert len(new_ids) <= 1
-        for evidence_id in new_ids:
-            added = await session.deps.evidence_store.get(EvidenceId(evidence_id))
-            assert added.metadata["model_tool_call_id"] == "record-bad"
-            assert added.metadata["tool_id"] == GRAPH_RECORD_TOOL_ID
-            assert added.metadata["record_kind"] == "runtime_tool_result"
+        assert len(new_ids) == 2
+        receipts = [
+            await session.deps.evidence_store.get(EvidenceId(evidence_id))
+            for evidence_id in new_ids
+        ]
+        assert {record.metadata["record_kind"] for record in receipts} == {
+            "runtime_tool_submission", "runtime_tool_result",
+        }
+        submission = next(
+            record for record in receipts
+            if record.metadata["record_kind"] == "runtime_tool_submission"
+        )
+        result_receipt = next(
+            record for record in receipts
+            if record.metadata["record_kind"] == "runtime_tool_result"
+        )
+        assert submission.metadata["tool_id"] == result_receipt.metadata["tool_id"]
+        assert submission.metadata["tool_id"] == GRAPH_RECORD_TOOL_ID
+        assert submission.metadata["model_tool_call_id"] == result_receipt.metadata[
+            "model_tool_call_id"
+        ] == "record-bad"
+        assert submission.metadata["call_binding"] == result_receipt.metadata["call_binding"]
+        assert submission.metadata["mission_task_id"] == result_receipt.metadata[
+            "mission_task_id"
+        ] == str(task_id)
         assert await service.list_findings() == []
 
         # The corrected call uses the admitted candidate and reaches the existing review flow.
@@ -147,12 +166,15 @@ async def test_native_worker_corrects_refused_candidate_reference_then_reaches_r
         finding, = good["payload"]["findings"]
         receipt_id = finding["receipt_id"]
         receipt = await session.deps.evidence_store.get(EvidenceId(receipt_id))
+        assert finding["candidate_revision"] == receipt.metadata["candidate_revision"]
+        assert finding["candidate_purpose_hash"] == receipt.metadata["candidate_purpose_hash"]
         assert receipt.metadata["candidate_revision"] == 1
         assert receipt.metadata["candidate_purpose_hash"] == content_hash(
             hypothesis_purpose(current))
         assert receipt.metadata["hypothesis_outcome"] == "success"
         assert llm.meaning_calls == 1
         assert llm.observed["invocations_after_record"] == llm.observed["invocations_before_record"]
+        assert await service.list_findings() == []
         after_worker = await service.get_hypothesis(current.hypothesis_id)
         assert after_worker.status == "open" and after_worker.revision == 1
 
@@ -170,4 +192,13 @@ async def test_native_worker_corrects_refused_candidate_reference_then_reaches_r
         assert matches[0]["metadata"]["hypothesis_outcome"] == "success"
         saved = await service.get_hypothesis(current.hypothesis_id)
         assert saved.status == "confirmed" and saved.revision == 2
-        assert await service.list_findings() == []
+        findings = await service.list_findings()
+        assert len(findings) == 1
+        finding = findings[0]
+        assert finding.verified is True
+        assert set(finding.evidence_ids) == {str(source.evidence_id), receipt_id}
+        assert finding.metadata["hypothesis_id"] == current.hypothesis_id
+        assert finding.metadata["review_receipt_id"] == receipt_id
+        assert finding.metadata["candidate_pre_verdict_revision"] == 1
+        assert finding.metadata["candidate_revision"] == saved.revision
+        assert finding.metadata["target"] == TARGET
