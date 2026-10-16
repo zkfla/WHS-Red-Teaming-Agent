@@ -743,7 +743,10 @@ _SPLIT_PLAN_SYSTEM = FEEDBACK_SYSTEM + (
     "revision. Existing updates use captured IDs and expected revisions. Questions carry "
     "only the investigation purpose -- objective, subjects, completion criteria, candidate_refs "
     "for related candidates (code copies their revisions), evidence and source refs, and the "
-    "required meaning -- never a worker "
+    "required meaning. Every completion criterion's principal_refs must be a subset of its "
+    "question's principal_refs; use only registered principals permitted for that question. "
+    "Correct the criterion or question only when the intended, permitted subject is missing. "
+    "Never broaden subjects or grant authorization. The question carries no worker "
     "role or tool-call order. Question IDs are local to this plan. Identify "
     "reviewed_task_ids/reviewed_hypothesis_ids actually consumed. A followup gives the captured "
     "source_task_id and omits source_result_id; code copies that Task's result, and an explicit "
@@ -787,6 +790,13 @@ _CANDIDATE_REFS_DESCRIPTION = (
     "Include every candidate a completion criterion names. Code copies each candidate's resulting "
     "revision; never write revision numbers."
 )
+_CRITERION_PRINCIPALS_DESCRIPTION = (
+    "Principals this criterion specifically concerns. This list must be a subset of the "
+    "owning question's principal_refs, with every entry registered and permitted for that "
+    "question. "
+    "Correct the criterion or question only when the intended, permitted subject is missing; "
+    "never broaden subjects or grant authorization."
+)
 _SPLIT_PLAN_DESCRIPTIONS = {
     "questions": (
         "Required in every reply. Use [] when no new observation is needed. Completed Tasks, "
@@ -818,6 +828,9 @@ def _split_plan_response_schema(schema: dict[str, Any]) -> dict[str, Any]:
         criterion["required"] = list(dict.fromkeys([
             *criterion.get("required", []), *criterion_required,
         ]))
+        criterion["properties"]["principal_refs"]["description"] = (
+            _CRITERION_PRINCIPALS_DESCRIPTION
+        )
     question = defs.get("PlannedQuestionSelection")
     if question is not None:
         question["required"] = list(dict.fromkeys([

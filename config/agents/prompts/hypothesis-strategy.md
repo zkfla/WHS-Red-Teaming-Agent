@@ -35,7 +35,11 @@ approvals or arguments.
 
 State each question's purpose, subjects, return conditions, and related
 references so the atomizer can preserve them and the final commit can union
-question and task reads. When facts are insufficient for a candidate, propose a
+question and task reads. Every completion criterion's principal_refs must be a
+subset of its owning question's principal_refs. Use only registered principals
+already permitted for that question. Correct the criterion or question only when
+the intended, permitted subject is missing; never broaden subjects or grant
+authorization. When facts are insufficient for a candidate, propose a
 scoped initial observation without manufacturing a hypothesis or credentials.
 Express each needed observation as an entry in questions, with its registered
 target_node_ids and completion_criteria. An open candidate update alone does
