@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -20,6 +20,7 @@ from redteam.core.enums import TaskStatus
 from redteam.core.ids import AgentId, EventId, EvidenceId, GraphNodeId, HypothesisId, RunId, TaskId
 from redteam.orchestration.agents.registry import AgentRegistry
 from redteam.orchestration.coordination import content_hash
+from redteam.orchestration.diagnostics import DecisionDiagnostic
 
 if TYPE_CHECKING:
     from redteam.orchestration.central_state import CheckedEvidence
@@ -62,12 +63,13 @@ class SpecialistProposalError(ValueError):
     def __init__(
         self, code: str, *,
         condition_conflicts: tuple[CompletionConditionConflict, ...] = (),
+        diagnostic: DecisionDiagnostic | None = None,
     ) -> None:
         self.code = code
         self.condition_conflicts = condition_conflicts
-        if condition_conflicts:
-            from redteam.orchestration.diagnostics import DecisionDiagnostic
-
+        if diagnostic is not None:
+            self.diagnostic = diagnostic
+        elif condition_conflicts:
             self.diagnostic = DecisionDiagnostic(
                 code=code,
                 stage="hypothesis_planning",
@@ -113,7 +115,8 @@ def _validate_subjects(
     items: list[InvestigationQuestion] | list[AtomicTaskProposal] | list[ProbeTaskProposal],
     known_targets: set[str], known_principals: set[str], known_hypotheses: frozenset[str],
 ) -> None:
-    for item in items:
+    for item_index, raw_item in enumerate(items):
+        item = cast(InvestigationQuestion | AtomicTaskProposal | ProbeTaskProposal, raw_item)
         if not item.objective.strip() or any(not ref.strip() for ref in item.target_node_ids):
             raise SpecialistProposalError("specialist_blank_subject")
         if isinstance(item, AtomicTaskProposal) and not item.title.strip():
@@ -125,11 +128,39 @@ def _validate_subjects(
         identities = [criterion_id(c) for c in item.completion_criteria]
         if len(identities) != len(set(identities)):
             raise SpecialistProposalError("specialist_duplicate_completion_condition")
-        for condition in item.completion_criteria:
+        for condition_index, condition in enumerate(item.completion_criteria):
             if not condition.is_known() or not condition.description.strip():
                 raise SpecialistProposalError("specialist_unknown_completion_condition")
             if set(condition.principal_refs) - set(item.principal_refs):
-                raise SpecialistProposalError("specialist_condition_principal_outside_subjects")
+                collection = "questions" if isinstance(item, InvestigationQuestion) else "tasks"
+                location = (
+                    f"$.{collection}[{item_index}].completion_criteria"
+                    f"[{condition_index}].principal_refs"
+                )
+                raise SpecialistProposalError(
+                    "specialist_condition_principal_outside_subjects",
+                    diagnostic=DecisionDiagnostic(
+                        code="specialist_condition_principal_outside_subjects",
+                        stage="hypothesis_planning",
+                        kind="validation",
+                        location=location,
+                        summary=(
+                            "Completion criterion principal references must be a subset "
+                            "of the owning item's declared principal references."
+                        ),
+                        retryable=True,
+                        cause_scope="model_input",
+                        owner="orchestration.specialist_tasks",
+                        repair_condition=(
+                            "Use only principal references already declared for this item; "
+                            "this correction does not grant authorization."
+                        ),
+                        validation_issues=[{
+                            "rule": "specialist_condition_principal_outside_subjects",
+                            "location": location,
+                        }],
+                    ),
+                )
             if condition.hypothesis_id and condition.hypothesis_id not in known_hypotheses:
                 raise SpecialistProposalError("specialist_unknown_hypothesis")
         conflicts = completion_condition_conflicts(item.completion_criteria)
