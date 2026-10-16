@@ -24,8 +24,17 @@ missing cached records or images cause a continuity error rather than a
 replacement build. Source updates do not silently upgrade this default.
 There is no automatic image/cache cleanup or refresh command.
 
-`REDTEAM_SHELL_POLICY_PATH` selects an operator policy instead of the
-default. `REDTEAM_SHELL_AUTO_SETUP=false` keeps manual setup and suppresses
+The managed image keeps `baseline` as its default. Set
+`REDTEAM_SHELL_IMAGE_PROFILE=kali-default` to explicitly select Kali's
+standard `kali-linux-default` metapackage profile. The broad profile is never
+selected as a fallback. Both profiles install only while the image is built;
+investigation runtime never performs an implicit pull or `apt` operation.
+`profiles.json` maps each profile to its repository-owned package input, and
+the same selected input is used by the Docker build and manifest generator.
+
+`REDTEAM_SHELL_POLICY_PATH` selects an operator policy instead of the managed
+profiles. A non-baseline managed profile and an explicit policy are mutually
+exclusive. `REDTEAM_SHELL_AUTO_SETUP=false` keeps manual setup and suppresses
 automatic Desktop startup/building. Legacy runs without a recorded
 environment retain their original manual selection on resume.
 
@@ -99,8 +108,8 @@ access. Target access requires the direct target route selected for the investig
   `docker stop`/`docker start` like everything else under `/workroom`.
 - The network is still `--network none`, so only offline/local installs
   work until TASK-005.
-- The Kali image ships the FR-003 baseline analysis set, installed FROM
-  `packages.txt` (the single source: nmap, curl, jq, git, dnsutils,
+- The baseline Kali image ships the FR-003 analysis set, installed FROM
+  `packages.txt` (its single source: nmap, curl, jq, git, dnsutils,
   openssl, netcat-traditional, whois, tcpdump, sqlmap, wordlists, plus
   the provider mechanism deps procps/util-linux and python3-venv /
   python3-setuptools for the venv path). `program-manifest.json` is
@@ -108,12 +117,45 @@ access. Target access requires the direct target route selected for the investig
   built image (`generate-manifest.py`), so versions, requested-to-
   installed resolution (for example `dnsutils` to `bind9-dnsutils`),
   per-command executables, and usable-mode notes never drift from what
-  the image actually contains. Verified usable modes under
+  the image actually contains. The optional `kali-default` profile installs
+  from `packages-kali-default.txt` and inventories the installed dependency
+  closure of the Kali-owned metapackage, rather than pretending the
+  metapackage name itself is an executable. Packages with no executable are
+  retained with `inventory_status=no_executable`. Executable PATH resolution
+  is recorded as `effective`, `shadowed`, or `off_path`; duplicate command/path
+  identities or inconsistent status fail preparation. Verified usable modes under
   `--cap-drop ALL`: `nmap -sT` (connect scan; `-sS` needs `CAP_NET_RAW`
   and is unavailable), `tcpdump -r` file reads (live capture needs
   `CAP_NET_RAW` and is unavailable). Program execution checks here are
   LOCAL-ONLY (versions, loopback); replacement against real targets is
   TASK-005/008.
+
+## Inventory and execution-state vocabulary
+
+These states are deliberately separate:
+
+- **installed**: the immutable image probe observed the owning dpkg package
+  and executable file. It says nothing about networking or privileges.
+- **route configured**: a local, target, or install route has provider
+  configuration. `configured_unverified` still does not claim reachability.
+- **mode supported**: the program metadata does not list the requested mode's
+  required capability as unavailable. For example, installing `tcpdump` does
+  not make live capture supported when `CAP_NET_RAW` is dropped.
+- **execution admitted**: Control and the execution provider accepted one
+  concrete invocation. Inventory and route metadata never grant this.
+- **execution observed**: a bounded execution result/evidence record exists.
+  It is the only one of these states based on an actual invocation.
+
+`program.list`, `program.describe`, and the passive program-card sample all
+project the same image/instance inventory. The passive sample is only a prompt
+budget hint; paging and search continue across the complete inventory. Image
+rows and per-workroom instance rows retain distinct owner scopes.
+
+Managed preparation fingerprints profile name, package-input SHA-256,
+immutable image ID, generated manifest SHA-256, Docker endpoint, and the full
+runtime policy. Resume restores that exact identity and reports which safe
+identity component drifted. The manifest contains no credential, host path, or
+Docker-context value.
 
 ## Output caps (who wins)
 

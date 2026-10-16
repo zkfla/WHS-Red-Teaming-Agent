@@ -67,6 +67,7 @@ class ParsedScript(TypedDict, total=False):
     language: str
     script: str
     timeout_seconds: float | None
+    program: dict[str, Any]
 
 
 Delegate = Callable[[], Awaitable[MCPCallResult]]
@@ -89,6 +90,9 @@ def project_parsed_script(arguments: Mapping[str, Any]) -> ParsedScript:
     script = arguments.get("script")
     if isinstance(script, str):
         projected["script"] = script
+    program = arguments.get("program")
+    if isinstance(program, dict):
+        projected["program"] = dict(program)
     timeout = arguments.get("timeout_seconds")
     if isinstance(timeout, bool):
         pass
@@ -550,7 +554,9 @@ class GatedExecutionPolicy:
         op = self._operation_for(invocation)
         if not isinstance(parsed, dict):
             return self._failure(tool_name=op, code="gated_script_missing")
-        if not parsed.get("language") or not parsed.get("script"):
+        has_script = bool(parsed.get("language") and parsed.get("script"))
+        has_program = isinstance(parsed.get("program"), dict)
+        if has_script == has_program:
             return self._failure(tool_name=op, code="gated_script_missing")
         route = self.resolve(invocation)
         if isinstance(route, GrantRefused):

@@ -28,6 +28,7 @@ from redteam.capability.shell_manifest import (
     SHELL_LANGUAGES,
     SHELL_NAMESPACE,
     SHELL_SERVER_ID,
+    program_input_property,
 )
 from redteam.capability.shell_policy import WORKROOM_KEY_PATTERN, ShellWorkroomPolicy
 from redteam.core.contracts.network import NetworkPurpose
@@ -61,7 +62,8 @@ _GATED_TOOL_NAMES = (SHELL_TARGET_RUN, SHELL_TARGET_JOB_START, SHELL_INSTALL_RUN
 
 _TARGET_RUN_DESCRIPTION = (
     "Stateful shell workroom, gated target route (shell_target_run). "
-    "The script runs inside one exclusive per-instance transmit window "
+    "A script or discovery-bound executable/argv runs inside one exclusive "
+    "per-instance transmit window "
     "that reaches only operator-pinned IPs for the selected registry "
     "target. Enforcement uses pinned IP literals; the registry name is "
     "only a selector. Host/VM loopback is not the workroom loopback. "
@@ -77,7 +79,8 @@ _TARGET_JOB_START_DESCRIPTION = (
 )
 _INSTALL_RUN_DESCRIPTION = (
     "Stateful shell workroom, gated install route (shell_install_run). "
-    "Sync only. Reaches only the operator install proxy for the selected "
+    "Sync script or discovery-bound executable/argv only. Reaches only the "
+    "operator install proxy for the selected "
     "mirror name; the proxy dials pinned mirror IPs out of band. Never "
     "registers a package as a new tool."
 )
@@ -135,6 +138,7 @@ def _script_properties(timeout_max: float, script_max: int) -> dict:
                 "timed_out with a null exit_code."
             ),
         },
+        "program": program_input_property(max_chars=script_max),
     }
 
 
@@ -185,7 +189,13 @@ def _target_run_input_schema(policy: ShellWorkroomPolicy | None) -> dict:
     return {
         "type": "object",
         "properties": properties,
-        "required": ["language", "script", "target_ref", "port"],
+        "required": ["target_ref", "port"],
+        "oneOf": [
+            {"required": ["language", "script"], "not": {"required": ["program"]}},
+            {"required": ["program"], "not": {"anyOf": [
+                {"required": ["language"]}, {"required": ["script"]},
+            ]}},
+        ],
         "additionalProperties": False,
     }
 
@@ -198,7 +208,28 @@ def _install_run_input_schema(policy: ShellWorkroomPolicy | None) -> dict:
     return {
         "type": "object",
         "properties": properties,
-        "required": ["language", "script", "target_ref"],
+        "required": ["target_ref"],
+        "oneOf": [
+            {"required": ["language", "script"], "not": {"required": ["program"]}},
+            {"required": ["program"], "not": {"anyOf": [
+                {"required": ["language"]}, {"required": ["script"]},
+            ]}},
+        ],
+        "additionalProperties": False,
+    }
+
+
+def _target_job_input_schema(policy: ShellWorkroomPolicy | None) -> dict:
+    """Background jobs remain the durable opaque-script contract."""
+    timeout_max, script_max = _bounds(policy)
+    properties = _script_properties(timeout_max, script_max)
+    properties.pop("program", None)
+    properties["target_ref"] = _target_ref_property(False)
+    properties["port"] = _port_property()
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": ["language", "script", "target_ref", "port"],
         "additionalProperties": False,
     }
 
@@ -241,6 +272,7 @@ def _descriptor_for(
 def build_gated_descriptors(policy: ShellWorkroomPolicy | None = None) -> list:
     """Return the three gated descriptors with policy-derived bounds."""
     target_schema = _target_run_input_schema(policy)
+    target_job_schema = _target_job_input_schema(policy)
     install_schema = _install_run_input_schema(policy)
     return [
         _descriptor_for(
@@ -256,7 +288,7 @@ def build_gated_descriptors(policy: ShellWorkroomPolicy | None = None) -> list:
             tool_name=SHELL_TARGET_JOB_START,
             operation=TARGET_JOB_START_OPERATION,
             body_operation=JOB_START_OPERATION,
-            input_schema=target_schema,
+            input_schema=target_job_schema,
             output_schema=dict(JOB_START_OUTPUT_SCHEMA),
             description=_TARGET_JOB_START_DESCRIPTION,
             target_ref_source="logical_host",
@@ -351,13 +383,20 @@ def validate_gated_descriptors(
         if descriptor.tool_name == SHELL_INSTALL_RUN:
             if "port" in properties:
                 raise ValueError("install descriptor must not take a port selector")
-            if required != ["language", "script", "target_ref"]:
+            if required != ["target_ref"] or "program" not in properties:
                 raise ValueError("install descriptor has unexpected required fields")
         else:
             if "port" not in properties:
                 raise ValueError("target descriptor is missing the port selector")
-            if required != ["language", "script", "target_ref", "port"]:
+            expected_required = (
+                ["language", "script", "target_ref", "port"]
+                if descriptor.tool_name == SHELL_TARGET_JOB_START
+                else ["target_ref", "port"]
+            )
+            if required != expected_required:
                 raise ValueError("target descriptor has unexpected required fields")
+            if descriptor.tool_name == SHELL_TARGET_RUN and "program" not in properties:
+                raise ValueError("target run descriptor is missing structured program input")
         if gated_body_operation(descriptor) != body:
             raise ValueError("gated descriptor body tag does not resolve")
     if seen != set(_GATED_TOOL_NAMES):

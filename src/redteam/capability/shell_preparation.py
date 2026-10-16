@@ -18,6 +18,7 @@ from typing import Any
 
 from redteam.capability.settings import MCPConfigurationError
 from redteam.capability.shell_policy import ShellWorkroomPolicy, load_shell_workroom_policy
+from redteam.capability.shell_profiles import DEFAULT_SHELL_IMAGE_PROFILE
 from redteam.core.environment import env_snapshot
 
 READINESS_TIMEOUT = 180.0
@@ -272,6 +273,49 @@ def _manifest_hash(path: str | None, image: str) -> str | None:
     return hashlib.sha256(raw).hexdigest()
 
 
+def _manifest_identity(path: str | None, image: str) -> dict[str, str | None]:
+    digest = _manifest_hash(path, image)
+    if path is None:
+        return {
+            "manifest_sha256": None,
+            "profile": "operator-image",
+            "package_input_sha256": None,
+        }
+    data = json.loads(Path(path).read_bytes())
+    profile = data.get("profile")
+    package_hash = data.get("package_input_sha256")
+    if data.get("inventory_schema_version") == 2 and (
+        not isinstance(profile, str)
+        or not profile
+        or not isinstance(package_hash, str)
+        or len(package_hash) != 64
+        or any(char not in "0123456789abcdef" for char in package_hash)
+    ):
+        raise MCPConfigurationError("Prepared program manifest identity is invalid.")
+    return {
+        "manifest_sha256": digest,
+        "profile": profile if isinstance(profile, str) else "legacy",
+        "package_input_sha256": package_hash if isinstance(package_hash, str) else None,
+    }
+
+
+def _environment_identity(
+    policy: ShellWorkroomPolicy,
+    endpoint: DockerEndpoint,
+    manifest: str | None,
+) -> dict[str, Any]:
+    manifest_identity = _manifest_identity(manifest, policy.image)
+    return {
+        "identity_version": 2,
+        "runtime_policy": policy.model_dump(exclude_none=True),
+        "docker_endpoint": asdict(endpoint),
+        "image_id": policy.image,
+        "image_profile": manifest_identity["profile"],
+        "package_input_sha256": manifest_identity["package_input_sha256"],
+        "manifest_sha256": manifest_identity["manifest_sha256"],
+    }
+
+
 def _atomic_json(path: Path, value: Any) -> None:
     temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
     try:
@@ -289,6 +333,7 @@ async def _restore(
     fingerprint: str,
     endpoint: DockerEndpoint,
     explicit_policy: ShellWorkroomPolicy | None,
+    requested_profile: str,
 ) -> PreparedShellEnvironment:
     if len(fingerprint) != 64 or any(char not in "0123456789abcdef" for char in fingerprint):
         raise MCPConfigurationError("Prepared environment fingerprint is invalid.")
@@ -296,13 +341,53 @@ async def _restore(
     policy = ShellWorkroomPolicy.model_validate(record["policy"])
     policy.validate_image()
     manifest = record["manifest_path"]
-    identity = {
-        "policy": policy.model_dump(exclude_none=True),
-        "endpoint": record["endpoint"],
-        "manifest_hash": _manifest_hash(manifest, policy.image),
-    }
-    if _json_hash(identity) != fingerprint or record["endpoint"] != asdict(endpoint):
-        raise MCPConfigurationError("The recorded Docker environment or endpoint has changed.")
+    if record.get("identity_version") == 2:
+        identity = _environment_identity(policy, endpoint, manifest)
+        recorded_identity = record.get("identity")
+        if not isinstance(recorded_identity, dict) or _json_hash(recorded_identity) != fingerprint:
+            raise MCPConfigurationError("The recorded Kali environment identity is invalid.")
+        if identity["docker_endpoint"] != recorded_identity.get("docker_endpoint"):
+            raise MCPConfigurationError("The recorded Docker endpoint has changed.")
+        if identity["runtime_policy"] != recorded_identity.get("runtime_policy"):
+            raise MCPConfigurationError("The recorded Kali runtime policy has changed.")
+        if identity["image_id"] != recorded_identity.get("image_id"):
+            raise MCPConfigurationError("The recorded immutable Kali image has changed.")
+        if identity["manifest_sha256"] != recorded_identity.get("manifest_sha256"):
+            raise MCPConfigurationError("The recorded Kali program manifest has changed.")
+        if identity["package_input_sha256"] != recorded_identity.get("package_input_sha256"):
+            raise MCPConfigurationError("The recorded Kali package input has changed.")
+        recorded_profile = recorded_identity.get("image_profile")
+        if (
+            explicit_policy is None
+            and recorded_profile not in {"legacy", None}
+            and requested_profile != recorded_profile
+        ):
+            raise MCPConfigurationError("The selected Kali image profile has changed.")
+        if explicit_policy is None and recorded_profile not in {"legacy", None}:
+            from redteam.capability.shell_image import resolve_asset_dir
+            from redteam.capability.shell_profiles import (
+                package_input_sha256,
+                resolve_shell_image_profile,
+            )
+
+            asset_dir = resolve_asset_dir()
+            current_profile = resolve_shell_image_profile(asset_dir, requested_profile)
+            if (
+                package_input_sha256(asset_dir, current_profile)
+                != recorded_identity.get("package_input_sha256")
+            ):
+                raise MCPConfigurationError("The selected Kali package input has changed.")
+        if _json_hash(identity) != fingerprint:
+            raise MCPConfigurationError("The recorded Kali environment identity has changed.")
+    else:
+        # Compatibility for preparation records written before inventory identity v2.
+        identity = {
+            "policy": policy.model_dump(exclude_none=True),
+            "endpoint": record["endpoint"],
+            "manifest_hash": _manifest_hash(manifest, policy.image),
+        }
+        if _json_hash(identity) != fingerprint or record["endpoint"] != asdict(endpoint):
+            raise MCPConfigurationError("The recorded Docker environment or endpoint has changed.")
     if explicit_policy is not None:
         code, selected_image = await _command(
             *explicit_policy.docker_command(
@@ -343,10 +428,15 @@ async def prepare_shell_policy(
     progress: Callable[[str], None] | None = None,
     expected_fingerprint: str | None = None,
     docker_context: str | None = None,
+    image_profile: str = DEFAULT_SHELL_IMAGE_PROFILE,
 ) -> PreparedShellEnvironment:
     """Prepare once, or restore the immutable environment recorded by a Run."""
     try:
         explicit = load_shell_workroom_policy(policy_path) if policy_path is not None else None
+        if explicit is not None and image_profile != DEFAULT_SHELL_IMAGE_PROFILE:
+            raise MCPConfigurationError(
+                "A managed Kali image profile cannot be combined with an explicit shell policy."
+            )
         initial = explicit or ShellWorkroomPolicy(image="sha256:" + "0" * 64)
         if docker_context is not None:
             if explicit is not None and explicit.docker_context not in (None, docker_context):
@@ -371,6 +461,7 @@ async def prepare_shell_policy(
                     expected_fingerprint,
                     endpoint,
                     initial if explicit is not None else None,
+                    image_profile,
                 )
             active_path = cache / "active.json"
             active = (
@@ -383,18 +474,26 @@ async def prepare_shell_policy(
             request = _json_hash(
                 {
                     "endpoint": asdict(endpoint),
-                    "selection": initial.model_dump() if explicit is not None else "default",
+                    "selection": initial.model_dump() if explicit is not None else {
+                        "managed_profile": image_profile,
+                    },
                 }
             )
             if explicit is None and request in active:
                 return await _restore(
-                    cache, active[request], endpoint, initial if explicit else None
+                    cache, active[request], endpoint, initial if explicit else None,
+                    image_profile,
                 )
             manifest: str | None = None
             if explicit is None:
                 from redteam.capability.shell_image import build_default_image
 
-                image, manifest = await build_default_image(initial, cache, progress)
+                if image_profile == DEFAULT_SHELL_IMAGE_PROFILE:
+                    image, manifest = await build_default_image(initial, cache, progress)
+                else:
+                    image, manifest = await build_default_image(
+                        initial, cache, progress, profile_name=image_profile
+                    )
             else:
                 code, image = await _command(
                     *initial.docker_command(
@@ -409,11 +508,7 @@ async def prepare_shell_policy(
                     raise MCPConfigurationError("The configured shell image is unavailable.")
             policy = initial.model_copy(update={"image": image, "allow_unpinned_image": False})
             policy.validate_image()
-            identity = {
-                "policy": policy.model_dump(exclude_none=True),
-                "endpoint": asdict(endpoint),
-                "manifest_hash": _manifest_hash(manifest, image),
-            }
+            identity = _environment_identity(policy, endpoint, manifest)
             fingerprint = _json_hash(identity)
             if manifest is not None:
                 destination = cache / "manifests" / f"{fingerprint}.json"
@@ -423,6 +518,8 @@ async def prepare_shell_policy(
             _atomic_json(
                 cache / "records" / f"{fingerprint}.json",
                 {
+                    "identity_version": 2,
+                    "identity": identity,
                     "policy": policy.model_dump(exclude_none=True),
                     "endpoint": asdict(endpoint),
                     "manifest_path": manifest,

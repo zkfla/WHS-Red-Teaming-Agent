@@ -222,6 +222,7 @@ def check_execution_configuration(app_config: AppConfig) -> list[tuple[str, bool
     from redteam.capability.settings import (
         automatic_shell_setup_from_environment,
         gated_network_policy_path_from_environment,
+        shell_image_profile_from_environment,
         shell_policy_path_from_environment,
     )
     from redteam.capability.shell_assembly import build_gated_provider_config
@@ -236,6 +237,19 @@ def check_execution_configuration(app_config: AppConfig) -> list[tuple[str, bool
     except MCPConfigurationError as exc:
         checks.append(("Automatic shell setup", False, [str(exc)]))
         auto_setup = False
+    try:
+        image_profile = shell_image_profile_from_environment(source=environment)
+    except MCPConfigurationError as exc:
+        checks.append(("Kali image profile", False, [str(exc)]))
+        image_profile = "invalid"
+    else:
+        checks.append((f"Kali image profile ({image_profile})", True, []))
+    if shell_path is not None and image_profile != "baseline":
+        checks.append((
+            "Kali image profile selection",
+            False,
+            ["managed profiles cannot be combined with REDTEAM_SHELL_POLICY_PATH"],
+        ))
     if shell_path is None:
         label = (
             "Shell policy (automatic preparation on run)" if auto_setup

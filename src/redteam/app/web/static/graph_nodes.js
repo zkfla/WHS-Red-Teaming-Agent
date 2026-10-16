@@ -8,8 +8,8 @@ function node(id, selected, onPick, kind, title, status, summary, tone = '') {
     type: 'button', 'data-node': id, 'data-focus': id, title: `${title} · ${status}`,
     class: `gnode ${kind} ${tone}${selected === id ? ' on' : ''}`,
     'aria-pressed': String(selected === id), onclick: () => onPick(id),
-  }, h('span', { class: 'gnode-icon' }, icon(kind === 'planner' ? 'target' : kind === 'task' ? 'file' : kind === 'worker' ? 'terminal' : 'graph')),
-    h('span', { class: 'gnode-copy' }, h('span', { class: 'gnode-kind', text: {planner:'계획 · 판단', candidate:'취약점 후보', task:'검증 작업', worker:'실행 워커', origin:'증거 · 발견사항'}[kind] }),
+  }, h('span', { class: 'gnode-icon' }, icon(kind === 'planner' ? 'target' : kind === 'task' ? 'file' : kind === 'worker' ? 'terminal' : kind === 'llm' ? 'chat' : 'graph')),
+    h('span', { class: 'gnode-copy' }, h('span', { class: 'gnode-kind', text: {planner:'계획 · 판단', candidate:'취약점 후보', task:'검증 작업', worker:'실행 워커', llm:'LLM 요청 · 응답', origin:'증거 · 발견사항'}[kind] }),
       h('strong', { text: title })),
     h('span', { class: 'gmeta', text: summary }),
     h('span', { class: 'gchip', text: status }));
@@ -43,6 +43,16 @@ export function workerNodes(view, selected, onPick) {
     WORKER[worker.phase] || UNKNOWN,
     worker.current_tool || `모델 ${worker.model_requests}회 · 도구 ${worker.tool_calls}회`,
     worker.phase.startsWith('waiting_') ? 'waiting' : worker.phase === 'outcome_unknown' ? 'failed' : ['model', 'tool'].includes(worker.phase) ? 'active' : ''));
+}
+
+export function llmNode(view, selected, onPick) {
+  const model = view.llm || {};
+  const status = model.waiting ? `응답 대기 ${model.waiting}건` :
+    model.failures || model.unknown ? `확인 필요 ${(model.failures || 0) + (model.unknown || 0)}건` :
+      `응답 ${model.responses || 0}건`;
+  return node('llm', selected, onPick, 'llm', 'LLM 경계', status,
+    `전송 ${model.provider_requests || 0}건 · 실패 ${model.failures || 0}건`,
+    model.waiting ? 'active' : model.failures || model.unknown ? 'failed' : '');
 }
 
 export function originNode(view, selected, onPick) {

@@ -433,6 +433,7 @@ class TerminalReportProjection(BaseModel):
     work_status_counts: dict[str, int] = Field(default_factory=dict)
     findings: list[FindingProjection] = Field(default_factory=list)
     candidates: list[CandidateProjection] = Field(default_factory=list)
+    candidate_finding_promotions: list[dict[str, Any]] = Field(default_factory=list)
     evidence_ids: list[EvidenceId] = Field(default_factory=list)
     integrity_blockers: list[str] = Field(default_factory=list)
     unresolved_hypotheses: list[str] = Field(default_factory=list)
@@ -457,6 +458,7 @@ class TerminalReportProjection(BaseModel):
     model_tokens_used: int = Field(default=0, ge=0)
     model_usage_unknown: int = Field(default=0, ge=0)
     llm_request_accounting: dict[str, Any] | None = None
+    task_request_effectiveness: list[dict[str, Any]] = Field(default_factory=list)
     unresolved_evidence_ids: list[str] = Field(default_factory=list)
     evidence_reads: list[EvidenceReadProjection] = Field(default_factory=list)
     unresolved_details: list[InvestigationUnresolvedProjection] = Field(default_factory=list)
@@ -617,8 +619,12 @@ class ReportingAgent:
             )
         evidence_read_projections = _project_evidence_reads(runtime)
         request_accounting = None
+        candidate_finding_promotions: list[dict[str, Any]] = []
         if central_state is not None:
             request_accounting = await central_state.request_ledger().snapshot(str(runtime.run_id))
+            read_promotions = getattr(central_state, "candidate_finding_promotions", None)
+            if callable(read_promotions):
+                candidate_finding_promotions = await read_promotions()
         elif runtime.llm_request_policy is not None and coordinator is not None:
             from redteam.orchestration.llm_requests import RunRequestLedger
 
@@ -690,6 +696,7 @@ class ReportingAgent:
                 source_hypothesis_ids=list(item.source_hypothesis_ids),
                 probe_task_ids=sorted(candidate_tasks.get(item.hypothesis_id, [])),
             ) for item in hypotheses],
+            candidate_finding_promotions=candidate_finding_promotions,
             evidence_ids=[item.evidence_id for item in evidence],
             integrity_blockers=integrity.blocking,
             unresolved_hypotheses=unresolved,
@@ -729,6 +736,32 @@ class ReportingAgent:
             plan = await central_state.get_mission(runtime.mission_id)
             report.investigations = [task.model_dump(mode="json") for task in tasks]
             report.executions = [item.model_dump(mode="json") for item in work]
+            by_task = request_accounting.get("by_task", {})
+            for task in tasks:
+                task_id = str(task.task_id)
+                usage = by_task.get(task_id, {})
+                requests = _safe_nonneg_int(usage.get("spent", 0))
+                external_actions = sum(str(item.task_id) == task_id for item in work)
+                report.task_request_effectiveness.append({
+                    "task_id": task_id,
+                    "model_requests": requests,
+                    "known_tokens": _safe_nonneg_int(usage.get("known_tokens", 0)),
+                    "unknown_usage": _safe_nonneg_int(usage.get("unknown_usage", 0)),
+                    "external_actions": external_actions,
+                    "local_reads": _safe_nonneg_int(usage.get("local_reads", 0)),
+                    "repairs": _safe_nonneg_int(usage.get("repairs", 0)),
+                    "transport_retries": _safe_nonneg_int(
+                        (usage.get("attempts") or {}).get("transport_retry", 0)
+                    ),
+                    "provider_failures": _safe_nonneg_int(
+                        usage.get("provider_failures", 0)
+                    ),
+                    "settlements": _safe_nonneg_int(usage.get("settlements", 0)),
+                    "text_only_held": _safe_nonneg_int(usage.get("text_only_held", 0)),
+                    "external_actions_per_model_request": (
+                        external_actions / requests if requests else None
+                    ),
+                })
             report.criterion_evidence = [item.model_dump(mode="json")
                                          for item in plan.criterion_results]
             required_open = {(task_id, q.question_id) for task_id, q in required_questions(tasks)}

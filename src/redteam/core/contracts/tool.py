@@ -193,6 +193,8 @@ class ToolDescriptor(BaseModel):
         # Preserve existing tool/binding fingerprints when the feature is absent.
         if self.resource_effects is None:
             value.pop("resource_effects", None)
+        if self.execution_route is None:
+            value.pop("execution_route", None)
         return value
 
     # Input argument -> shared target value (host/url/port/path/asset_ref/etc.).
@@ -206,6 +208,9 @@ class ToolDescriptor(BaseModel):
     # not an engagement target selected by the caller. Argument binding and
     # compatible target kinds alone do not imply this permission.
     requires_target: bool = True
+    # Optional provider-owned execution substrate. This is descriptive
+    # metadata for planning/reporting only; it never grants execution.
+    execution_route: Literal["local", "target", "install"] | None = None
     # Provider-declared ordered input components of ONE command, not
     # independent text fields. Consumers assemble strings and string-array
     # elements in field/array order for command-pattern inspection.

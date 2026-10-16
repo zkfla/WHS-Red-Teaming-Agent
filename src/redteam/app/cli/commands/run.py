@@ -61,6 +61,7 @@ from redteam.app.cli.conversation import (
 from redteam.capability.settings import (
     MCPConfigurationError,
     automatic_shell_setup_from_environment,
+    shell_image_profile_from_environment,
     shell_policy_path_from_environment,
 )
 from redteam.capability.shell_runtime import prepare_shell_runtime
@@ -887,6 +888,7 @@ async def _build_selected(
         auto_setup=(automatic_shell_setup_from_environment()
                     if original_stores is None or execution_fingerprint is not None else False),
         progress=eprint, expected_fingerprint=execution_fingerprint,
+        image_profile=shell_image_profile_from_environment(),
         **preparation_options,
     )
     prepared_network = await prepare_kali_network(

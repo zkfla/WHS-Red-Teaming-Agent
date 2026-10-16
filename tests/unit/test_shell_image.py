@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import signal
@@ -19,8 +20,10 @@ from redteam.capability.shell_image import (
     manifest_command,
     recipe_hash,
     resolve_asset_dir,
+    validate_generated_manifest,
 )
 from redteam.capability.shell_policy import ShellWorkroomPolicy
+from redteam.capability.shell_profiles import package_input_sha256, resolve_shell_image_profile
 
 FAKE_ID = "sha256:" + "ab" * 32
 OTHER_ID = "sha256:" + "cd" * 32
@@ -32,8 +35,45 @@ def make_assets(base: Path, marker: str = "one") -> Path:
     base.mkdir(parents=True, exist_ok=True)
     (base / "Dockerfile").write_text("FROM x " + marker, encoding="utf-8")
     (base / "packages.txt").write_text("bash " + marker, encoding="utf-8")
+    (base / "packages-kali-default.txt").write_text("kali-linux-default", encoding="utf-8")
+    (base / "profiles.json").write_text(json.dumps({
+        "version": 1,
+        "profiles": {
+            "baseline": {"package_input": "packages.txt",
+                         "inventory_dependencies": False,
+                         "description": "fixture baseline"},
+            "kali-default": {"package_input": "packages-kali-default.txt",
+                             "inventory_dependencies": True,
+                             "description": "fixture broad"},
+        },
+    }), encoding="utf-8")
     (base / "generate-manifest.py").write_text("# gen " + marker, encoding="utf-8")
     return base
+
+
+def manifest_payload(assets: Path, image_id: str) -> dict:
+    return {
+        "inventory_schema_version": 2,
+        "image_digest": image_id,
+        "profile": "baseline",
+        "package_input": "packages.txt",
+        "package_input_sha256": hashlib.sha256(
+            (assets / "packages.txt").read_bytes()
+        ).hexdigest(),
+        "programs": [],
+    }
+
+
+def profile_manifest_payload(assets: Path, image_id: str, profile_name: str) -> dict:
+    profile = resolve_shell_image_profile(assets, profile_name)
+    return {
+        "inventory_schema_version": 2,
+        "image_digest": image_id,
+        "profile": profile.name,
+        "package_input": profile.package_input,
+        "package_input_sha256": package_input_sha256(assets, profile),
+        "programs": [],
+    }
 class FakeRunner:
     def __init__(self, image_id: str, write_manifest: bool = True, digest: str | None = None):
         self.calls: list[tuple[str, ...]] = []
@@ -50,8 +90,11 @@ class FakeRunner:
             img = cmd[img_index + 1]
             _ = img
             if self.write_manifest:
+                assets = Path(cmd[1]).parent
                 out_path.parent.mkdir(parents=True, exist_ok=True)
-                out_path.write_text(json.dumps({"image_digest": self.digest}), encoding="utf-8")
+                out_path.write_text(
+                    json.dumps(manifest_payload(assets, self.digest)), encoding="utf-8"
+                )
             return (0, "", "")
         if "inspect" in cmd:
             return (0, self.image_id + chr(10), "")
@@ -82,7 +125,7 @@ async def test_build_when_absent_then_resolve_id(tmp_path, monkeypatch):
             idx = list(cmd).index("--output")
             outp = Path(cmd[idx + 1])
             outp.parent.mkdir(parents=True, exist_ok=True)
-            outp.write_text(json.dumps({"image_digest": FAKE_ID}), encoding="utf-8")
+            outp.write_text(json.dumps(manifest_payload(assets, FAKE_ID)), encoding="utf-8")
             return (0, "", "")
         if "inspect" in cmd and len(calls) <= 2:
             return (1, "", "missing")
@@ -102,6 +145,51 @@ def test_recipe_hash_changes_when_file_changes(tmp_path):
     third = make_assets(tmp_path / "third", marker="two")
     assert recipe_hash(first) != recipe_hash(third)
     assert image_tag_for(recipe_hash(first)) != image_tag_for(recipe_hash(third))
+
+
+def test_profiles_have_independent_reproducible_inputs(tmp_path):
+    assets = make_assets(tmp_path / "assets")
+    baseline = resolve_shell_image_profile(assets, "baseline")
+    broad = resolve_shell_image_profile(assets, "kali-default")
+    assert not baseline.inventory_dependencies
+    assert broad.inventory_dependencies
+    assert baseline.package_input != broad.package_input
+    assert package_input_sha256(assets, baseline) != package_input_sha256(assets, broad)
+    assert recipe_hash(assets, "baseline") != recipe_hash(assets, "kali-default")
+
+
+@pytest.mark.parametrize("mutation,message", [
+    ("duplicate", "duplicate"),
+    ("missing_executable_status", "status"),
+    ("bad_shadow", "shadowing"),
+])
+def test_v2_manifest_rejects_inventory_mismatches(tmp_path, mutation, message):
+    assets = make_assets(tmp_path / "assets")
+    profile = resolve_shell_image_profile(assets, "baseline")
+    payload = manifest_payload(assets, FAKE_ID)
+    executable = {
+        "command": "tool",
+        "path": "/usr/bin/tool",
+        "resolved_path": "/usr/local/bin/tool",
+        "path_status": "shadowed",
+    }
+    payload["programs"] = [{
+        "package": "fixture", "inventory_status": "enumerated",
+        "executables": [executable],
+    }]
+    if mutation == "duplicate":
+        payload["programs"][0]["executables"].append(dict(executable))
+    elif mutation == "missing_executable_status":
+        payload["programs"][0]["inventory_status"] = "no_executable"
+    else:
+        payload["programs"][0]["executables"][0]["resolved_path"] = "/usr/bin/tool"
+    with pytest.raises(ShellImageError, match=message):
+        validate_generated_manifest(
+            payload,
+            image_id=FAKE_ID,
+            profile=profile,
+            package_sha256=package_input_sha256(assets, profile),
+        )
 def test_manifest_command_args_and_context(tmp_path):
     assets = make_assets(tmp_path / "assets")
     plain = make_policy()
@@ -111,11 +199,46 @@ def test_manifest_command_args_and_context(tmp_path):
     assert "--image" in cmd
     assert FAKE_ID in cmd
     assert "--docker-binary" in cmd
+    assert cmd[cmd.index("--profile") + 1] == "baseline"
     assert "--docker-context" not in cmd
     ctx = make_policy(docker_context="myctx")
     cmd2 = manifest_command(ctx, assets, FAKE_ID, tmp_path / "out2.json")
     assert "--docker-context" in cmd2
     assert "myctx" in cmd2
+
+
+async def test_broad_profile_is_explicit_in_build_and_manifest_commands(tmp_path, monkeypatch):
+    assets = make_assets(tmp_path / "assets")
+    monkeypatch.setattr(shell_image, "resolve_asset_dir", lambda: assets)
+    calls: list[tuple[str, ...]] = []
+    inspect_count = 0
+
+    async def runner(cmd: tuple[str, ...], timeout_seconds: float):
+        nonlocal inspect_count
+        calls.append(cmd)
+        if cmd[0] == sys.executable:
+            output = Path(cmd[cmd.index("--output") + 1])
+            profile_name = cmd[cmd.index("--profile") + 1]
+            output.write_text(json.dumps(
+                profile_manifest_payload(assets, FAKE_ID, profile_name)
+            ), encoding="utf-8")
+            return (0, "", "")
+        if "inspect" in cmd:
+            inspect_count += 1
+            return ((1, "", "missing") if inspect_count == 1
+                    else (0, FAKE_ID + "\n", ""))
+        if "build" in cmd:
+            return (0, "built", "")
+        return (1, "", "unexpected")
+
+    await shell_image.build_default_image(
+        make_policy(), tmp_path / "cache", runner=runner, profile_name="kali-default"
+    )
+    build = next(call for call in calls if "build" in call)
+    assert "SHELL_IMAGE_PROFILE=kali-default" in build
+    assert "PACKAGE_INPUT=packages-kali-default.txt" in build
+    generated = next(call for call in calls if call[0] == sys.executable)
+    assert generated[generated.index("--profile") + 1] == "kali-default"
 async def test_manifest_digest_mismatch_raises(tmp_path, monkeypatch):
     assets = make_assets(tmp_path / "assets")
     monkeypatch.setattr(shell_image, "resolve_asset_dir", lambda: assets)
@@ -148,7 +271,7 @@ def test_asset_resolution_installed_prefix(tmp_path, monkeypatch):
     fake_data = tmp_path / "data"
     target = fake_data / "share" / "redteam" / "shell-workroom"
     target.mkdir(parents=True)
-    for name in ["Dockerfile", "packages.txt", "generate-manifest.py"]:
+    for name in shell_image.RECIPE_FILES:
         (target / name).write_text("x", encoding="utf-8")
     monkeypatch.setattr(sysconfig, "get_path", lambda *a, **k: str(fake_data))
     orig = Path.is_file
@@ -171,7 +294,7 @@ async def test_context_propagation_in_docker_commands(tmp_path, monkeypatch):
             idx = list(cmd).index("--output")
             outp = Path(cmd[idx + 1])
             outp.parent.mkdir(parents=True, exist_ok=True)
-            outp.write_text(json.dumps({"image_digest": FAKE_ID}), encoding="utf-8")
+            outp.write_text(json.dumps(manifest_payload(assets, FAKE_ID)), encoding="utf-8")
             return (0, "", "")
         if "inspect" in cmd:
             return (0, FAKE_ID + chr(10), "")
@@ -190,7 +313,7 @@ async def test_context_propagation_in_docker_commands(tmp_path, monkeypatch):
             idx = list(cmd).index("--output")
             outp = Path(cmd[idx + 1])
             outp.parent.mkdir(parents=True, exist_ok=True)
-            outp.write_text(json.dumps({"image_digest": FAKE_ID}), encoding="utf-8")
+            outp.write_text(json.dumps(manifest_payload(assets, FAKE_ID)), encoding="utf-8")
             return (0, "", "")
         return (0, FAKE_ID + chr(10), "")
     await shell_image.build_default_image(plain, tmp_path / "cache2", runner=rec2)
@@ -242,7 +365,7 @@ def test_asset_resolution_user_and_site_candidates(tmp_path, monkeypatch):
     userbase = tmp_path / "userbase"
     usertarget = userbase / "share" / "redteam" / "shell-workroom"
     usertarget.mkdir(parents=True)
-    for name in ["Dockerfile", "packages.txt", "generate-manifest.py"]:
+    for name in shell_image.RECIPE_FILES:
         (usertarget / name).write_text("u", encoding="utf-8")
     purelib = tmp_path / "venv" / "Lib" / "site-packages"
     purelib.mkdir(parents=True)
@@ -261,11 +384,11 @@ def test_asset_resolution_user_and_site_candidates(tmp_path, monkeypatch):
         return orig(self)
     monkeypatch.setattr(Path, "is_file", fake_is_file)
     assert resolve_asset_dir() == usertarget
-    for name in ["Dockerfile", "packages.txt", "generate-manifest.py"]:
+    for name in shell_image.RECIPE_FILES:
         (usertarget / name).unlink()
     sitetarget = tmp_path / "venv" / "share" / "redteam" / "shell-workroom"
     sitetarget.mkdir(parents=True)
-    for name in ["Dockerfile", "packages.txt", "generate-manifest.py"]:
+    for name in shell_image.RECIPE_FILES:
         (sitetarget / name).write_text("s", encoding="utf-8")
     assert resolve_asset_dir() == sitetarget
 def test_terminate_tree_terminates_job_even_when_returncode_set():

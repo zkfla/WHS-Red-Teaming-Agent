@@ -21,7 +21,12 @@ from redteam.attack_graph.hypotheses import (
     prepare_hypothesis_update,
 )
 from redteam.attack_graph.identity import split_node_id
-from redteam.attack_graph.predicates import validate_properties
+from redteam.attack_graph.predicates import (
+    CLAIM_PROVENANCE_KEY,
+    Provenance,
+    claim_entries_for_fact_keys,
+    validate_properties,
+)
 from redteam.attack_graph.stores.mutations import (
     GraphMutation,
     GraphMutationConflict,
@@ -37,8 +42,8 @@ from redteam.attack_graph.writes import (
     merge_node,
     validate_node,
 )
-from redteam.core.contracts.graph import GraphEdge, GraphNode, HypothesisUpdate
-from redteam.core.enums import GraphNodeType
+from redteam.core.contracts.graph import Finding, GraphEdge, GraphNode, HypothesisUpdate
+from redteam.core.enums import GraphEdgeType, GraphNodeType
 from redteam.core.ids import GraphEdgeId, GraphNodeId
 
 if TYPE_CHECKING:
@@ -194,6 +199,60 @@ class GraphTransaction:
                 target_id=GraphNodeId(self._prefix + target), created_at=now,
                 properties={"provenance": node.properties["provenance"][-1:]},
             ))
+        return node
+
+    def save_finding(
+        self,
+        finding: Finding,
+        *,
+        hypothesis_id: str,
+        about: GraphNodeId,
+        now: datetime,
+        provenance: Provenance,
+    ) -> GraphNode:
+        """Persist a promoter-approved Finding inside the borrowed transaction."""
+        from redteam.attack_graph.identity import finding_node_id, hypothesis_node_id
+        from redteam.attack_graph.service import AttackGraphService, _edge_id
+        from redteam.attack_graph.writes import UngroundedFindingError
+
+        if finding.verified and not finding.evidence_ids:
+            raise UngroundedFindingError("verified finding requires linked evidence")
+        local_id = finding_node_id(finding.finding_id)
+        identity = GraphNodeId(self._prefix + str(local_id))
+        properties = AttackGraphService._normalize_properties(
+            None,
+            attrs={"verified": finding.verified, "severity": finding.severity},
+            facts=finding.model_dump(mode="json"),
+            provenance=provenance,
+            step=provenance.step,
+        )
+        node = GraphNode(
+            id=identity,
+            type=GraphNodeType.FINDING,
+            properties=properties,
+            created_at=now,
+            updated_at=now,
+        )
+        self.add_node(node)
+
+        def link(edge_type: GraphEdgeType, local_target: GraphNodeId) -> None:
+            edge_properties: dict[str, Any] = {
+                "provenance": [provenance.model_dump(mode="json")],
+            }
+            edge_properties[CLAIM_PROVENANCE_KEY] = claim_entries_for_fact_keys(
+                {}, provenance, provenance.step,
+            )
+            self.add_edge(GraphEdge(
+                id=GraphEdgeId(self._prefix + str(_edge_id(edge_type, local_id, local_target))),
+                type=edge_type,
+                source_id=identity,
+                target_id=GraphNodeId(self._prefix + str(local_target)),
+                properties=edge_properties,
+                created_at=now,
+            ))
+
+        link(GraphEdgeType.SUPPORTED_BY, hypothesis_node_id(hypothesis_id))
+        link(GraphEdgeType.TARGETS, about)
         return node
 
     def mutate_edge(self, edge_id: GraphEdgeId, update: EdgeUpdate) -> GraphEdge | None:

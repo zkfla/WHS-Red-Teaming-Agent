@@ -31,6 +31,14 @@ export function setupSettings(getStore, afterApply) {
     $("s-persist").checked = false;
     $("s-max").value = settings && settings.max_requests ? settings.max_requests : "";
     $("s-conc").value = settings && settings.max_concurrent_requests ? settings.max_concurrent_requests : "";
+    const canReauthenticate = settings && settings.provider === "litellm"
+      && settings.model && settings.model.startsWith("chatgpt/");
+    $("s-reauth").hidden = !canReauthenticate;
+    $("s-reauth").disabled = false;
+    $("s-reauth-note").hidden = !canReauthenticate;
+    $("s-reauth-note").textContent = canReauthenticate
+      ? "401이 반복될 때 사용하세요. 로그인 URL과 코드는 서버를 실행한 터미널에 표시됩니다."
+      : "";
     let profiles = [];
     try {
       profiles = (await api.profiles()).profiles;
@@ -89,6 +97,19 @@ export function setupSettings(getStore, afterApply) {
     }
   });
   $("settings-cancel").addEventListener("click", () => dialog.close());
+  $("s-reauth").addEventListener("click", async () => {
+    error.textContent = "";
+    $("s-reauth").disabled = true;
+    $("s-reauth-note").textContent = "재로그인을 시작했습니다. 서버 터미널의 URL과 코드를 확인하세요.";
+    try {
+      await api.reauthenticateChatGPT();
+      dialog.close();
+      afterApply("ChatGPT 재로그인 대기 중입니다. 터미널에서 인증을 완료하면 세션이 자동으로 다시 시작됩니다.");
+    } catch (failure) {
+      error.textContent = describeError(failure);
+      $("s-reauth").disabled = false;
+    }
+  });
   $("open-settings").addEventListener("click", open);
   return { open };
 }

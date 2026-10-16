@@ -55,7 +55,7 @@ async def run(args: argparse.Namespace) -> int:
         from redteam.app.web.host import RealLauncher, SessionHost
         from redteam.app.web.security import GuardPolicy, normalize_origin, validate_bind_host
         from redteam.app.web.server import create_app
-        from redteam.app.web.settings import SettingsStore
+        from redteam.app.web.settings import ENV_MODEL, ENV_PROVIDER, SettingsStore
     except ImportError:
         eprint('ERROR: web UI dependencies are missing; run pip install -e ".[web]"')
         return EXIT_CONFIG_ERROR
@@ -91,6 +91,21 @@ async def run(args: argparse.Namespace) -> int:
 
     settings = SettingsStore()
     settings.load_saved()
+
+    async def reauthenticate() -> object:
+        from redteam.llm.chatgpt_reauth import reauthenticate_chatgpt
+
+        return await reauthenticate_chatgpt(
+            provider=settings.env.get(ENV_PROVIDER),
+            model=settings.env.get(ENV_MODEL),
+            env=settings.env,
+        )
+
+    def can_reauthenticate() -> bool:
+        provider = settings.env.get(ENV_PROVIDER)
+        model = settings.env.get(ENV_MODEL, "")
+        return provider == "litellm" and model.startswith("chatgpt/")
+
     catalog = EngagementCatalog(directory, pinned)
     active_id = catalog.pinned_ids()[0] if pinned else None
     host = SessionHost(
@@ -99,6 +114,8 @@ async def run(args: argparse.Namespace) -> int:
         catalog=catalog,
         active_id=active_id,
         mirror=sys.__stderr__,
+        reauthenticator=reauthenticate,
+        reauthentication_available=can_reauthenticate,
     )
     app = create_app(host, GuardPolicy.for_loopback(args.port, extra_origins=origins))
     config = uvicorn.Config(

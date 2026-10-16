@@ -44,6 +44,13 @@ from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt
 
 from redteam.core.contracts.mission import redact_secret_material
 from redteam.core.ports.llm import LLMProviderFailure
+from redteam.core.request_scope import (
+    RequestAttemptKind,
+    RequestPurpose,
+    current_request_scope,
+    llm_request_metadata,
+    take_completed_request,
+)
 from redteam.orchestration.diagnostics import (
     DecisionDiagnostic,
     JsonNormalizationContext,
@@ -62,6 +69,40 @@ DECISION_KINDS = ("transport", "format", "budget", "unknown")
 
 _MAX_FEEDBACK_CHARS = 500
 _EMPTY_OBJECT_TEXT = "{}"
+
+
+def _request_purpose(stage: str) -> RequestPurpose:
+    if stage == "task_atomization":
+        return "atomization"
+    if stage == "native_action":
+        return "worker_decision"
+    if "planning" in stage or stage == "attack_path_proposal":
+        return "planning"
+    if "review" in stage or "completion" in stage or "verify" in stage:
+        return "review"
+    if "conversation" in stage:
+        return "conversation"
+    return "other"
+
+
+def _capture_completed_request(
+    budget: DecisionBudget, llm: Any = None, value: Any = None,
+    request_id: str | None = None,
+) -> None:
+    if request_id is not None:
+        budget.last_request_id = request_id
+        return
+    resolver = getattr(llm, "request_id_for", None)
+    if callable(resolver) and value is not None:
+        request_id = resolver(value)
+        if request_id is not None:
+            budget.last_request_id = request_id
+            return
+    scope = current_request_scope()
+    if scope is not None:
+        request_id = take_completed_request(scope.run_id)
+        if request_id is not None:
+            budget.last_request_id = request_id
 
 
 class DecisionFailure(Exception):
@@ -178,6 +219,8 @@ class DecisionBudget:
         self.trace: list[dict[str, Any]] = []
         self.stage_attempts: dict[str, int] = {}
         self.failure_counts: dict[str, int] = {}
+        # Request identity only; prompts/responses stay outside the budget trace.
+        self.last_request_id: str | None = None
 
     def diagnostic_details(self) -> dict[str, Any]:
         return {
@@ -621,6 +664,25 @@ class StructuredDecisionClient:
             limits.append(remaining)
         return min(limits) if limits else None
 
+    async def classify_last_request(
+        self,
+        budget: DecisionBudget,
+        *,
+        purpose: RequestPurpose | None = None,
+        outcome: str,
+        valid: bool,
+        made_progress: bool | None = None,
+    ) -> None:
+        """Finalize a metered row when the caller knows protocol semantics."""
+        request_id = budget.last_request_id
+        classify = getattr(self._llm, "classify_request", None)
+        if request_id is None or not callable(classify):
+            return
+        await classify(
+            request_id, purpose=purpose, outcome=outcome, valid=valid,
+            made_progress=made_progress,
+        )
+
     async def ask(
         self,
         *,
@@ -738,12 +800,17 @@ class StructuredDecisionClient:
                 break
             attempt_timeout = self._timeout_for_attempt("native_action", active)
             active.consume(stage="native_action", repair=repair, transport=transport)
+            attempt_kind: RequestAttemptKind = (
+                "transport_retry" if transport else "format_repair" if repair else "normal"
+            )
+            active.last_request_id = None
+            request_metadata = None
             try:
                 from redteam.orchestration.prompts import instruction_scope
 
-                with instruction_scope("native_action", role_id), _metered_guard_scope(
-                    self._llm, before_call
-                ):
+                with instruction_scope("native_action", role_id), llm_request_metadata(
+                    "worker_decision", attempt_kind=attempt_kind,
+                ) as request_metadata, _metered_guard_scope(self._llm, before_call):
                     request_call = request(
                         messages=messages, tools=tools, system=system, num_retries=0
                     )
@@ -754,6 +821,13 @@ class StructuredDecisionClient:
                             request_call, timeout=attempt_timeout,
                         )
             except asyncio.TimeoutError:
+                _capture_completed_request(
+                    active, self._llm,
+                    request_id=request_metadata.request_id if request_metadata else None,
+                )
+                await self.classify_last_request(
+                    active, outcome="transport_failure", valid=False, made_progress=False,
+                )
                 active.add_usage(None)
                 diagnostic = _request_timeout_diagnostic(
                     "native_action", attempts=active.used,
@@ -763,11 +837,13 @@ class StructuredDecisionClient:
                 repair, transport = False, True
                 continue
             except ReasoningHalted as halted:
+                _capture_completed_request(active, self._llm, halted)
                 raise DecisionFailure(
                     "native_action", "budget", active.used,
                     diagnostic=halted.diagnostic.model_copy(update={"stage": "native_action"}),
                 ) from halted
             except Exception as exc:
+                _capture_completed_request(active, self._llm, exc)
                 active.add_usage(None)
                 diagnostic = diagnostic_for_exception(exc, stage="native_action")
                 if isinstance(exc, LLMProviderFailure):
@@ -788,6 +864,7 @@ class StructuredDecisionClient:
                     if diagnostic.kind == "transport" else (True, False)
                 )
                 continue
+            _capture_completed_request(active, self._llm, response)
             active.add_usage(getattr(response, "total_tokens", None))
             active.record(
                 "native_action", "native_response",
@@ -828,6 +905,7 @@ class StructuredDecisionClient:
         attempt_timeout: float | None,
         guard: Callable[..., Any] | None = None,
         request_context: Callable[[], Any] | None = None,
+        attempt_kind: RequestAttemptKind = "normal",
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         current = dict(working)
         if request_context is not None:
@@ -842,8 +920,12 @@ class StructuredDecisionClient:
         messages = [{"role": "user", "content": self._prompt_for(current, feedback, kind)}]
         use_metered = callable(getattr(self._llm, "complete_structured_with_usage", None))
         attempt_start = time.perf_counter()
+        budget.last_request_id = None
+        request_metadata = None
         try:
-            with _metered_guard_scope(self._llm, guard):
+            with llm_request_metadata(
+                _request_purpose(stage), attempt_kind=attempt_kind,
+            ) as request_metadata, _metered_guard_scope(self._llm, guard):
                 if use_metered:
                     request_call = self._llm.complete_structured_with_usage(
                         messages=messages,
@@ -876,6 +958,10 @@ class StructuredDecisionClient:
                     # this request is unknown, never zero.
                     budget.add_usage(None)
         except asyncio.TimeoutError as exc:
+            _capture_completed_request(
+                budget, self._llm,
+                request_id=request_metadata.request_id if request_metadata else None,
+            )
             budget.add_usage(None)
             elapsed_ms = max(0, int((time.perf_counter() - attempt_start) * 1000))
             raise _RetryableDecisionError(
@@ -883,11 +969,13 @@ class StructuredDecisionClient:
                 response_shape={"type": "absent", "observed": False},
             ) from exc
         except ReasoningHalted as halted:
+            _capture_completed_request(budget, self._llm, halted)
             raise DecisionFailure(
                 stage, "budget", budget.used,
                 diagnostic=halted.diagnostic.model_copy(update={"stage": stage}),
             ) from halted
         except Exception as exc:
+            _capture_completed_request(budget, self._llm, exc)
             # A request was attempted but no usage was reported: unknown.
             budget.add_usage(None)
             elapsed_ms = max(0, int((time.perf_counter() - attempt_start) * 1000))
@@ -934,6 +1022,7 @@ class StructuredDecisionClient:
             raise _RetryableDecisionError(
                 diagnostic, parse_context, elapsed_ms=elapsed_ms, response_shape=response_shape,
             ) from exc
+        _capture_completed_request(budget, self._llm, completion if use_metered else raw)
         proposal_context = {"proposal_shape": {"observed": False, "reason": "unparsed"}}
         normalization_sink: list[JsonNormalizationContext] = []
         try:
@@ -1069,6 +1158,11 @@ class StructuredDecisionClient:
                 attempt_timeout = self._timeout_for_attempt(stage, budget)
                 budget.consume(stage=stage, repair=is_repair, transport=is_transport)
                 budget.record(stage, "request", feedback=safe_feedback(feedback))
+                attempt_kind: RequestAttemptKind = (
+                    "transport_retry" if is_transport else
+                    "semantic_repair" if is_repair and kind == "validation" else
+                    "format_repair" if is_repair else "normal"
+                )
                 with attempt:
                     try:
                         result, metrics = await self._attempt_once(
@@ -1082,6 +1176,7 @@ class StructuredDecisionClient:
                             attempt_timeout=attempt_timeout,
                             guard=before_call,
                             request_context=request_context,
+                            attempt_kind=attempt_kind,
                         )
                         if validate_response is not None:
                             try:
@@ -1090,6 +1185,9 @@ class StructuredDecisionClient:
                                 raise _RetryableDecisionError(
                                     rejected.diagnostic.model_copy(update={"stage": stage}),
                                 ) from rejected
+                        await self.classify_last_request(
+                            budget, outcome="accepted", valid=True, made_progress=True,
+                        )
                         budget.record(
                             stage, "response_validated",
                             **metrics,
@@ -1097,6 +1195,18 @@ class StructuredDecisionClient:
                         )
                         return result
                     except _RetryableDecisionError as exc:
+                        await self.classify_last_request(
+                            budget,
+                            outcome=(
+                                "semantic_rejected"
+                                if exc.diagnostic.kind == "validation"
+                                else "format_rejected"
+                                if exc.diagnostic.kind != "transport"
+                                else "transport_failure"
+                            ),
+                            valid=False,
+                            made_progress=False,
+                        )
                         budget.record_failure(exc.diagnostic.code)
                         budget.last_failure = exc.diagnostic.model_copy(
                             update={"attempts": budget.used}

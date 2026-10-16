@@ -835,6 +835,7 @@ async def program_describe_handler(
         owner_scope=scope,
         source_id=provider.source_id,
     )
+    static_metadata = getattr(match, "metadata", None)
     return LocalToolResult(
         ok=True,
         payload={
@@ -845,6 +846,11 @@ async def program_describe_handler(
             "version": str(match.version or ""),
             "provenance": str(match.provenance or ""),
             "owner_scope": scope,
+            "program_metadata": (
+                static_metadata.model_dump(mode="json")
+                if static_metadata is not None
+                else None
+            ),
             "resolution": resolution,
             "available_scopes": sorted(
                 {str(row.owner_scope) for row in rows if str(row.name) == str(match.name)}

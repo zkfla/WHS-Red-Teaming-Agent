@@ -1,14 +1,14 @@
 // Layout is presentation only; connections always come from the server's edge list.
 export const NODE_WIDTH = 238;
 export const NODE_HEIGHT = 112;
-export const COLUMNS = [70, 380, 690, 1000, 1310];
+export const COLUMNS = [70, 380, 690, 1000, 1310, 1620];
 
 export function graphLayout(view) {
   const positions = new Map();
   const candidates = view.candidates || [];
   const tasks = view.tasks;
   const workers = view.workers;
-  let y = 122;
+  let y = 280;
   for (const task of tasks) {
     const mine = workers.filter((worker) => worker.task_id === task.task_id);
     const block = Math.max(1, mine.length) * 158;
@@ -26,14 +26,15 @@ export function graphLayout(view) {
   }
   candidates.forEach((candidate, index) => positions.set(
     `candidate:${candidate.hypothesis_id}`,
-    { x: COLUMNS[1], y: 122 + index * 158 },
+    { x: COLUMNS[1], y: 280 + index * 158 },
   ));
-  y = Math.max(y, 122 + candidates.length * 158);
-  const height = Math.max(490, y + 118);
-  const center = (122 + Math.max(122, y - 158)) / 2;
+  y = Math.max(y, 280 + candidates.length * 158);
+  const height = Math.max(650, y + 118);
+  const center = (280 + Math.max(280, y - 158)) / 2;
   positions.set('planner', { x: COLUMNS[0], y: center });
-  positions.set('origin', { x: COLUMNS[4], y: center });
-  return { positions, width: 1620, height };
+  positions.set('llm', { x: COLUMNS[4], y: 90 });
+  positions.set('origin', { x: COLUMNS[5], y: center });
+  return { positions, width: 1930, height };
 }
 
 export function connectedPath(edges, selected) {

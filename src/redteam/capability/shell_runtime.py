@@ -22,6 +22,7 @@ from redteam.capability.shell_adapter import BuiltinShellAdapter
 from redteam.capability.shell_assembly import build_shell_entries, shell_server_output_limits
 from redteam.capability.shell_manifest import SHELL_SERVER_ID
 from redteam.capability.shell_policy import ShellWorkroomPolicy, load_shell_workroom_policy
+from redteam.capability.shell_profiles import DEFAULT_SHELL_IMAGE_PROFILE
 from redteam.core.contracts.tool import ToolDescriptor
 from redteam.core.ports.program_discovery import ShellProgramDiscovery
 
@@ -84,6 +85,7 @@ async def prepare_shell_runtime(
     progress: Callable[[str], None] | None = None,
     expected_fingerprint: str | None = None,
     docker_context: str | None = None,
+    image_profile: str = DEFAULT_SHELL_IMAGE_PROFILE,
 ) -> ShellRuntime | None:
     """Prepare Docker only at execution startup, then use the pure assembly.
 
@@ -105,9 +107,10 @@ async def prepare_shell_runtime(
     from redteam.capability.shell_preparation import prepare_shell_policy
 
     options = {"docker_context": docker_context} if docker_context is not None else {}
+    if image_profile != DEFAULT_SHELL_IMAGE_PROFILE:
+        options["image_profile"] = image_profile
     prepared = await prepare_shell_policy(
-        policy_path, progress=progress, expected_fingerprint=expected_fingerprint,
-        **options,
+        policy_path, progress=progress, expected_fingerprint=expected_fingerprint, **options,
     )
     runtime = build_shell_runtime(
         None, policy=prepared.policy, program_manifest_path=prepared.manifest_path,

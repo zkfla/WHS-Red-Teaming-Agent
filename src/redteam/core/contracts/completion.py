@@ -103,8 +103,8 @@ def criterion_id(criterion: CompletionCriterion) -> str:
     return "criterion_" + _digest(payload)
 
 
-def completion_contract_hash(task: Any) -> str:
-    """Purpose contract only; runtime status, ownership and revision are excluded."""
+def _completion_purpose(task: Any, *, include_probe_limits: bool) -> dict[str, Any]:
+    """Build the code-owned semantic purpose used by stable task identities."""
     purpose = {
         "version": task.completion_contract_version,
         "objective": task.objective.strip(),
@@ -116,9 +116,26 @@ def completion_contract_hash(task: Any) -> str:
     if getattr(task, "investigation_contract_version", 1) == 2:
         purpose["investigation_version"] = 2
         purpose["hypothesis_revisions"] = dict(task.hypothesis_revisions)
-        if task.probe_limits is not None:
+        if include_probe_limits and task.probe_limits is not None:
             purpose["probe_limits"] = task.probe_limits.model_dump(mode="json")
+    return purpose
+
+
+def completion_contract_hash(task: Any) -> str:
+    """Purpose contract only; runtime status, ownership and revision are excluded."""
+    purpose = _completion_purpose(task, include_probe_limits=True)
     return _digest(purpose)
+
+
+def probe_failure_circuit_key(task: Any) -> str:
+    """Return a purpose key that cannot be reset by changing only probe limits.
+
+    Probe limits remain part of the completion contract and resume binding, but
+    changing only those limits must not turn a cloned Task into a fresh provider
+    circuit. All semantic purpose fields still distinguish genuinely different
+    Tasks.
+    """
+    return _digest(_completion_purpose(task, include_probe_limits=False))
 
 
 def contradictory_candidate_verdict(criteria: Sequence[CompletionCriterion]) -> str | None:

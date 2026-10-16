@@ -48,9 +48,9 @@ import time
 import uuid
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 from redteam.capability.adapters.mcp.base import (
     ContextualInvocationAdapter,
@@ -156,6 +156,36 @@ class _ScriptArgs(BaseModel):
     language: str
     script: str
     timeout_seconds: float | None = None
+
+
+class _ProgramInvocation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    executable: str
+    owner_scope: Literal["image", "instance"]
+    argv: list[str]
+    stdin: str = ""
+
+
+class _RunArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    workroom_key: str
+    language: str | None = None
+    script: str | None = None
+    program: _ProgramInvocation | None = None
+    timeout_seconds: float | None = None
+
+    @model_validator(mode="after")
+    def exactly_one_execution_kind(self):
+        script_mode = self.language is not None or self.script is not None
+        if self.program is None:
+            if self.language is None or self.script is None:
+                raise ValueError("language and script are required")
+        elif script_mode:
+            raise ValueError("program and script are mutually exclusive")
+        return self
 
 
 class _JobArgs(BaseModel):
@@ -312,6 +342,13 @@ class BuiltinShellAdapter(ContextualInvocationAdapter, ExecutionRecoveryProvider
     def script_digest(language: str, script: str) -> str:
         return hashlib.sha256((language + "\x00" + script).encode("utf-8")).hexdigest()
 
+    @staticmethod
+    def program_digest(program: _ProgramInvocation) -> str:
+        payload = program.model_dump(mode="json")
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
     async def discover_tools(self) -> list[ToolDescriptor]:
         # Policy-derived bounds so the schema never advertises values the
         # runtime would reject.
@@ -335,8 +372,11 @@ class BuiltinShellAdapter(ContextualInvocationAdapter, ExecutionRecoveryProvider
         message: str,
         *,
         uncertain: bool = False,
+        detail_metadata: dict[str, Any] | None = None,
     ) -> MCPCallResult:
         metadata: dict[str, Any] = {"tool_name": tool.tool_name}
+        if detail_metadata:
+            metadata.update(detail_metadata)
         if uncertain:
             # Producer side of the root-owned uncertain-execution
             # contract: execution may already have started (supervisor
@@ -376,6 +416,7 @@ class BuiltinShellAdapter(ContextualInvocationAdapter, ExecutionRecoveryProvider
                 str(exc),
                 "shell workroom rejected the call",
                 uncertain=exc.uncertainty,
+                detail_metadata=exc.metadata,
             )
         except Exception:
             return self._failure(tool, started, "shell_internal_error", "shell call failed")
@@ -438,7 +479,7 @@ class BuiltinShellAdapter(ContextualInvocationAdapter, ExecutionRecoveryProvider
             raise ValueError("shell supervisor identity out of range")
         return trusted, supervisor_id
 
-    _PROJECTION_FIELDS = ("workroom_key", "language", "script", "timeout_seconds")
+    _PROJECTION_FIELDS = ("workroom_key", "language", "script", "program", "timeout_seconds")
 
     def _execution_arguments(self, invocation: ToolInvocation) -> ToolInvocation:
         # Provider-internal copy carrying only the closed-provider
@@ -561,6 +602,11 @@ class BuiltinShellAdapter(ContextualInvocationAdapter, ExecutionRecoveryProvider
         narrowed = self._execution_arguments(invocation)
         spool_digest = execution_input_digest(invocation)
         projected = project_parsed_script(invocation.arguments)
+        parsed_run = self._parse_run(narrowed.arguments)
+        if parsed_run.program is not None:
+            await self._validate_discovered_program(
+                invocation, parsed_run.program, self._program_purpose(descriptor)
+            )
         # Install executions seed the provider-owned installer env into
         # the delegate BEFORE the window opens, so an unroutable mirror
         # fails closed without holding a window. Install is sync-only:
@@ -602,7 +648,7 @@ class BuiltinShellAdapter(ContextualInvocationAdapter, ExecutionRecoveryProvider
         async def delegate_run() -> MCPCallResult:
             return await self._invoke_run_contextual(
                 descriptor, narrowed, started, input_digest=spool_digest,
-                extra_env=extra_env,
+                extra_env=extra_env, program_validated=True,
             )
         return await policy.execute(invocation, projected, delegate_run)
 
@@ -712,6 +758,7 @@ class BuiltinShellAdapter(ContextualInvocationAdapter, ExecutionRecoveryProvider
                 return self._failure(
                     gated, started, str(exc), "shell workroom rejected the call",
                     uncertain=exc.uncertainty,
+                    detail_metadata=exc.metadata,
                 )
             except Exception:
                 return self._failure(gated, started, "shell_internal_error", "shell call failed")
@@ -731,6 +778,7 @@ class BuiltinShellAdapter(ContextualInvocationAdapter, ExecutionRecoveryProvider
             return self._failure(
                 tool, started, str(exc), "shell workroom rejected the call",
                 uncertain=exc.uncertainty,
+                detail_metadata=exc.metadata,
             )
         except Exception:
             return self._failure(tool, started, "shell_internal_error", "shell call failed")
@@ -743,39 +791,134 @@ class BuiltinShellAdapter(ContextualInvocationAdapter, ExecutionRecoveryProvider
         *,
         input_digest: str | None = None,
         extra_env: dict[str, str] | None = None,
+        program_validated: bool = False,
     ) -> MCPCallResult:
         workroom_key, supervisor_id = self._trusted_supervisor(invocation)
         if input_digest is None:
             input_digest = execution_input_digest(invocation)
         spool_digest = input_digest
-        parsed = self._parse_script(invocation.arguments)
+        parsed = self._parse_run(invocation.arguments)
         if parsed.workroom_key != workroom_key:
             raise ShellWorkroomError("shell_workroom_key_mismatch")
-        digest = self.script_digest(parsed.language, parsed.script)
-        result = await self._workroom.exec_script(
-            workroom_key,
-            parsed.language,
-            parsed.script,
-            parsed.timeout_seconds,
-            exec_tag=supervisor_id,
-            invocation_id=supervisor_id,
-            input_digest=spool_digest,
-            retain_record=True,
-            extra_env=extra_env,
-        )
-        return MCPCallResult(
-            success=True,
-            started_at=started,
-            finished_at=datetime.now(timezone.utc),
-            output=result.to_output_dict(digest),
-            error=None,
-            metadata={
+        if parsed.program is None:
+            assert parsed.language is not None and parsed.script is not None
+            digest = self.script_digest(parsed.language, parsed.script)
+            result = await self._workroom.exec_script(
+                workroom_key,
+                parsed.language,
+                parsed.script,
+                parsed.timeout_seconds,
+                exec_tag=supervisor_id,
+                invocation_id=supervisor_id,
+                input_digest=spool_digest,
+                retain_record=True,
+                extra_env=extra_env,
+            )
+            output = result.to_output_dict(digest)
+            metadata = {
                 "tool_name": tool.tool_name,
                 "workroom_key": workroom_key,
                 "script_sha256": digest,
                 EXECUTION_STARTED_METADATA_KEY: True,
-            },
+            }
+        else:
+            purpose = self._program_purpose(tool)
+            if not program_validated:
+                await self._validate_discovered_program(invocation, parsed.program, purpose)
+            digest = self.program_digest(parsed.program)
+            result = await self._workroom.exec_program(
+                workroom_key,
+                parsed.program.executable,
+                parsed.program.argv,
+                parsed.program.stdin,
+                parsed.timeout_seconds,
+                exec_tag=supervisor_id,
+                invocation_id=supervisor_id,
+                input_digest=spool_digest,
+                retain_record=True,
+                extra_env=extra_env,
+            )
+            output = result.to_output_dict(digest)
+            output.update({
+                "execution_kind": "program",
+                "program_sha256": digest,
+                "program_executable": parsed.program.executable,
+                "program_argv": [parsed.program.executable, *parsed.program.argv],
+            })
+            metadata = {
+                "tool_name": tool.tool_name,
+                "workroom_key": workroom_key,
+                "execution_kind": "program",
+                "program_name": parsed.program.name,
+                "program_sha256": digest,
+                "program_executable": parsed.program.executable,
+                "program_argv": [parsed.program.executable, *parsed.program.argv],
+                "route_purpose": purpose,
+                EXECUTION_STARTED_METADATA_KEY: True,
+            }
+        return MCPCallResult(
+            success=True,
+            started_at=started,
+            finished_at=datetime.now(timezone.utc),
+            output=output,
+            error=None,
+            metadata=metadata,
         )
+
+    @staticmethod
+    def _program_purpose(tool: ToolDescriptor) -> str:
+        for operation in tool.operations or []:
+            purpose = OPERATION_PURPOSE.get(operation)
+            if purpose is not None:
+                return purpose.value
+        return "local"
+
+    async def _validate_discovered_program(
+        self,
+        invocation: ToolInvocation,
+        program: _ProgramInvocation,
+        purpose: str,
+    ) -> None:
+        try:
+            if program.owner_scope == "image":
+                rows = await self._workroom.list_image_programs()
+            else:
+                context = invocation.execution_context
+                if context.instance_id is None:
+                    raise ShellWorkroomError("shell_program_not_discovered")
+                rows = await self._workroom.list_instance_programs(
+                    run_id=str(invocation.run_id),
+                    instance_id=str(context.instance_id),
+                )
+        except ShellWorkroomError as exc:
+            if exc.reason_code == "shell_manifest_unreadable":
+                raise ShellWorkroomError("shell_program_metadata_invalid") from exc
+            raise
+        matches = [
+            row for row in rows
+            if row.name == program.name
+            and row.executable == program.executable
+            and row.owner_scope == program.owner_scope
+        ]
+        if len(matches) != 1:
+            raise ShellWorkroomError("shell_program_not_discovered")
+        metadata = matches[0].metadata
+        if metadata is None:
+            raise ShellWorkroomError("shell_program_metadata_invalid")
+        if purpose not in metadata.purposes:
+            raise ShellWorkroomError("shell_program_route_unsupported")
+        if metadata.required_capabilities:
+            # No broad capabilities are ever added to the shared workroom.
+            # A future operator-selected one-shot profile must implement a
+            # separate admission boundary before this can become executable.
+            raise ShellWorkroomError(
+                "shell_program_privilege_unsupported",
+                metadata={
+                    "required_capabilities": list(metadata.required_capabilities),
+                    "unsupported_modes": list(metadata.unsupported_modes),
+                    "unprivileged_alternatives": list(metadata.unprivileged_alternatives),
+                },
+            )
 
     async def _await_spawn_verified(
         self, workroom_key: str, supervisor_id: str, *, timeout_seconds: float = 15.0
@@ -970,7 +1113,7 @@ class BuiltinShellAdapter(ContextualInvocationAdapter, ExecutionRecoveryProvider
                 for k in self._PROJECTION_FIELDS
                 if isinstance(invocation.arguments, dict) and k in invocation.arguments
             }
-            parsed = self._parse_script(narrowed)
+            parsed = self._parse_run(narrowed)
             if parsed.workroom_key != workroom_key:
                 return None
             context = invocation.execution_context
@@ -978,9 +1121,24 @@ class BuiltinShellAdapter(ContextualInvocationAdapter, ExecutionRecoveryProvider
             handle: dict[str, object] = {
                 "workroom_key": workroom_key,
                 "supervisor_id": supervisor_id,
-                "script_sha256": self.script_digest(parsed.language, parsed.script),
                 "tool": name,
             }
+            if parsed.program is None:
+                assert parsed.language is not None and parsed.script is not None
+                handle["script_sha256"] = self.script_digest(
+                    parsed.language, parsed.script
+                )
+            else:
+                program_sha = self.program_digest(parsed.program)
+                # Keep the legacy digest slot populated because the durable
+                # recovery envelope predates structured execution. The
+                # explicit execution_kind/program_sha256 fields disambiguate
+                # its meaning; no script is fabricated.
+                handle["script_sha256"] = program_sha
+                handle["program_sha256"] = program_sha
+                handle["execution_kind"] = "program"
+                handle["program_executable"] = parsed.program.executable
+                handle["program_argv"] = [parsed.program.executable, *parsed.program.argv]
             handle["kind"] = kind
             if kind == "job_start":
                 handle["job_id"] = self._deterministic_job_id(
@@ -1009,6 +1167,25 @@ class BuiltinShellAdapter(ContextualInvocationAdapter, ExecutionRecoveryProvider
             raise ShellWorkroomError("shell_unsupported_language")
         if not parsed.script:
             raise ShellWorkroomError("shell_empty_script")
+        return parsed
+
+    def _parse_run(self, arguments: dict[str, Any]) -> _RunArgs:
+        try:
+            parsed = _RunArgs.model_validate(arguments)
+        except ValidationError:
+            raise ShellWorkroomError("shell_invalid_arguments") from None
+        check_workroom_key(parsed.workroom_key)
+        if parsed.program is None:
+            if parsed.language not in SHELL_LANGUAGES:
+                raise ShellWorkroomError("shell_unsupported_language")
+            if not parsed.script:
+                raise ShellWorkroomError("shell_empty_script")
+        else:
+            program = parsed.program
+            if (not program.name or not program.executable.startswith("/")
+                    or any("\x00" in item for item in program.argv)
+                    or "\x00" in program.executable):
+                raise ShellWorkroomError("shell_program_invalid")
         return parsed
 
     def _parse_job(self, arguments: dict[str, Any]) -> _JobArgs:
@@ -2484,6 +2661,7 @@ class BuiltinShellAdapter(ContextualInvocationAdapter, ExecutionRecoveryProvider
                 "script_sha256": script_sha,
                 EXECUTION_STARTED_METADATA_KEY: True,
             }
+            self._restore_program_envelope(handle, envelope, metadata)
             if outcome == "cancelled":
                 # Verified teardown with preserved raw: failure of the
                 # execution (cancelled), not of the command. The RUN
@@ -2582,6 +2760,13 @@ class BuiltinShellAdapter(ContextualInvocationAdapter, ExecutionRecoveryProvider
                 "script_sha256": script_sha,
                 "workroom_key": key,
             }
+            metadata: dict[str, object] = {
+                "tool_name": handle.get("tool", RUN_TOOL_NAME),
+                "workroom_key": key,
+                "script_sha256": script_sha,
+                EXECUTION_STARTED_METADATA_KEY: True,
+            }
+            self._restore_program_envelope(handle, envelope, metadata)
             return ToolResult(
                 invocation_id=reference.invocation_id,
                 action_id=reference.action_id,
@@ -2595,12 +2780,31 @@ class BuiltinShellAdapter(ContextualInvocationAdapter, ExecutionRecoveryProvider
                 ),
                 started_at=datetime.fromtimestamp(float(started_raw), tz=timezone.utc),
                 finished_at=datetime.fromtimestamp(float(finished_raw), tz=timezone.utc),
-                metadata={
-                    "tool_name": handle.get("tool", RUN_TOOL_NAME),
-                    "workroom_key": key,
-                    "script_sha256": script_sha,
-                    EXECUTION_STARTED_METADATA_KEY: True,
-                },
+                metadata=metadata,
             )
         except Exception:
             return None
+
+    @staticmethod
+    def _restore_program_envelope(
+        handle: dict[str, Any],
+        envelope: dict[str, Any],
+        metadata: dict[str, object],
+    ) -> None:
+        if handle.get("execution_kind") != "program":
+            return
+        digest = handle.get("program_sha256")
+        executable = handle.get("program_executable")
+        argv = handle.get("program_argv")
+        if not isinstance(digest, str) or not isinstance(executable, str):
+            return
+        if not isinstance(argv, list) or not all(isinstance(item, str) for item in argv):
+            return
+        fields = {
+            "execution_kind": "program",
+            "program_sha256": digest,
+            "program_executable": executable,
+            "program_argv": list(argv),
+        }
+        envelope.update(fields)
+        metadata.update(fields)

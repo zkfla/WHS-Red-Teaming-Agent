@@ -186,6 +186,16 @@ def create_app(
             return _host_failure(exc)
         return JSONResponse({**result, "settings": host.settings.summary()})
 
+    async def reauthenticate(request: Request) -> Response:
+        body = await _json_body(request)
+        if isinstance(body, JSONResponse):
+            return body
+        try:
+            await host.begin_reauthentication()
+        except HostError as exc:
+            return _host_failure(exc)
+        return JSONResponse({"state": host.state}, status_code=202)
+
     def _engagement_failure(exc: EngagementError) -> JSONResponse:
         if exc.code == "unknown_engagement":
             return _error(404, exc.code)
@@ -345,6 +355,7 @@ def create_app(
         Route(f"{API}/settings", get_settings, methods=["GET"]),
         Route(f"{API}/settings", put_settings, methods=["PUT"]),
         Route(f"{API}/settings/profiles", get_profiles, methods=["GET"]),
+        Route(f"{API}/settings/chatgpt/reauth", reauthenticate, methods=["POST"]),
         Route(f"{API}/engagement", get_engagement, methods=["GET"]),
         Route(f"{API}/engagement", put_engagement, methods=["PUT"]),
         Route(f"{API}/engagements", list_engagements, methods=["GET"]),

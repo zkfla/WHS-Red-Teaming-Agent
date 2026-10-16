@@ -142,6 +142,17 @@ def _render_markdown(report: TerminalReportProjection) -> str:
             "and Mission completion.",
             "",
         ]
+    if report.candidate_finding_promotions:
+        lines += ["## Candidate finding promotion", ""]
+        for item in report.candidate_finding_promotions:
+            lines.append(
+                f"- {item.get('candidate_id')}: status={item.get('status')}; "
+                f"finding={item.get('finding_id')}; reason={item.get('reason') or '-'}"
+            )
+        lines += [
+            "- Refusal is a promotion diagnostic, not a verified Finding.",
+            "",
+        ]
     if report.llm_request_accounting is not None:
         usage = report.llm_request_accounting
         policy = usage.get("policy") or {}
@@ -160,7 +171,41 @@ def _render_markdown(report: TerminalReportProjection) -> str:
         for name, counts in usage.get("usage", {}).items():
             lines += [f"- {name}: reported sum={counts['known']}; "
                       f"unreported requests={counts['unknown']}"]
+        cooldown = usage.get("provider_cooldown")
+        if cooldown is not None:
+            lines += [
+                f"- Provider cooldown: state={cooldown.get('state', 'unknown')}; "
+                f"consecutive={cooldown.get('consecutive', 0)}; "
+                f"retry_at={cooldown.get('until', 0)}"
+            ]
+            failure = cooldown.get("last_failure") or {}
+            if failure:
+                lines += [
+                    "- Last provider outcome: "
+                    f"kind={failure.get('kind', 'unknown')}; "
+                    f"status={failure.get('provider_status')}; "
+                    f"code={failure.get('provider_code', 'unknown')}; "
+                    f"retryable={failure.get('retryable')}; "
+                    f"retry_after={failure.get('retry_after')}"
+                ]
         lines += ["- Cache read/write are input subsets. Actual provider cost is unmeasured."]
+        task_usage = getattr(report, "task_request_effectiveness", []) or []
+        if task_usage:
+            lines += ["", "### Task request effectiveness", ""]
+            for task in task_usage:
+                ratio = task.get("external_actions_per_model_request")
+                ratio_text = "unknown" if ratio is None else f"{ratio:.3f}"
+                lines += [
+                    f"- {task.get('task_id')}: model={task.get('model_requests', 0)}; "
+                    f"tokens={task.get('known_tokens', 0)} known/"
+                    f"{task.get('unknown_usage', 0)} unknown; "
+                    f"external={task.get('external_actions', 0)}; "
+                    f"local reads={task.get('local_reads', 0)}; "
+                    f"repairs={task.get('repairs', 0)}; "
+                    f"transport retries={task.get('transport_retries', 0)}; "
+                    f"provider failures={task.get('provider_failures', 0)}; "
+                    f"settlements={task.get('settlements', 0)}; external/model={ratio_text}"
+                ]
     if report.mission is not None:
         contracted = [t for t in report.mission.tasks if t.completion_contract_version == 2]
         if contracted:
@@ -170,6 +215,33 @@ def _render_markdown(report: TerminalReportProjection) -> str:
                 for condition in task.completion_criteria:
                     lines += [f"  - {json.dumps(condition, ensure_ascii=False)}"]
             lines += [""]
+    projected_executions = [
+        item for item in report.executions
+        if item.get("selection") or item.get("outcome") or item.get("wait_reason")
+        or item.get("state") == "unknown"
+    ]
+    if projected_executions:
+        lines += ["## Execution routes and results", ""]
+        for item in projected_executions:
+            selection = item.get("selection") or {}
+            outcome = item.get("outcome") or {}
+            program = outcome.get("executed_program") or selection.get("selected_program")
+            lines.append(
+                f"- {item.get('invocation_id')}: state={item.get('state')}; "
+                f"route={selection.get('route') or 'unknown'} "
+                f"({selection.get('route_status', 'unknown')}/"
+                f"{selection.get('route_reason_code', 'unknown')}); "
+                f"program={program or 'unknown'}; "
+                f"result={outcome.get('result_kind') or 'unknown'}; "
+                f"diagnostic={outcome.get('diagnostic_category') or 'none'}"
+            )
+            if outcome.get("resume_condition"):
+                lines.append(f"  - Resume condition: {outcome['resume_condition']}")
+        lines += [
+            "- Generic program output, canonical protocol receipts, execution success, "
+            "candidate verdicts and Findings are separate states.",
+            "",
+        ]
     for observation in report.runtime_observations:
         if observation.diagnostic is None:
             continue
@@ -216,6 +288,15 @@ def _render_markdown(report: TerminalReportProjection) -> str:
         cause = diagnostic.last_cause
         while cause is not None:
             lines.append(f"- Cause [{cause.stage}/{cause.code}]: {cause.feedback()}")
+            if cause.provider_status is not None:
+                lines.append(f"  - Provider status: {cause.provider_status}")
+            if cause.provider_code:
+                lines.append(f"  - Provider code: {cause.provider_code}")
+            if cause.retry_after is not None:
+                lines.append(f"  - Provider retry after: {cause.retry_after}s")
+            lines.append(f"  - Provider retryable: {cause.retryable}")
+            if cause.repair_condition:
+                lines.append(f"  - Recovery condition: {cause.repair_condition}")
             lines += _diagnostic_detail_lines(cause)
             if cause.validation_issues:
                 lines.append(f"- Validation issues: {json.dumps(cause.validation_issues)}")

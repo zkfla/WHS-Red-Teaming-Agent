@@ -149,12 +149,23 @@ async def context_for_probe(deps, runtime, context):
     filtered["evidence_omitted_count"] = max(
         filtered["evidence_count"] - len(filtered.get("evidence", [])), 0,
     )
+    usage = await deps.central_state.transaction(
+        lambda tx: tx.probe_usage(str(task.task_id)), write=False,
+    )
     filtered["probe"] = {
         "candidates": runtime.probe_hypotheses,
         "original_evidence_ids": [str(record.evidence_id) for record in originals],
-        "usage": await deps.central_state.transaction(
-            lambda tx: tx.probe_usage(str(task.task_id)), write=False,
-        ),
+        "usage": usage,
+        "remaining": {
+            "actions": max(task.probe_limits.max_actions - usage["actions"], 0),
+            "model_requests": max(
+                task.probe_limits.max_model_requests - usage["model_requests"], 0,
+            ),
+            "repairs": (
+                max(task.probe_limits.max_repair_requests - usage["repairs"], 0)
+                if task.probe_limits.max_repair_requests is not None else None
+            ),
+        },
         "purpose": task.objective,
         "return_conditions": [item.model_dump(mode="json") for item in task.completion_criteria],
         "result_schema": InvestigationResult.model_json_schema(),

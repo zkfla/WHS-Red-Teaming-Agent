@@ -129,3 +129,39 @@ def test_the_finding_is_ordered_evidence_deduplicated() -> None:
 
     assert decision.finding is not None
     assert decision.finding.evidence_ids == ["ev_a", "ev_b"]
+
+
+def test_v2_claim_identity_is_run_scoped_and_deterministic() -> None:
+    promoter = FindingPromoter()
+    first = promoter.promote(request(run_id="run_1", claim_identity="a" * 64))
+    replay = promoter.promote(request(
+        run_id="run_1", claim_identity="a" * 64, evidence_ids=["ev_replayed"],
+    ))
+
+    assert first.finding is not None and replay.finding is not None
+    assert first.finding.finding_id == replay.finding.finding_id
+    assert first.finding.metadata["claim_key"] == replay.finding.metadata["claim_key"]
+    assert first.finding.metadata["legacy_claim_key"]
+    assert promoter.claim_key(request(run_id="run_2", claim_identity="a" * 64)) != (
+        first.finding.metadata["claim_key"]
+    )
+
+
+def test_v2_identity_must_supply_run_and_claim_together() -> None:
+    for overrides in ({"run_id": "run_1"}, {"claim_identity": "a" * 64}):
+        decision = FindingPromoter().promote(request(**overrides))
+        assert decision.finding is None
+        assert decision.refused_reason == "incomplete_v2_claim_identity"
+
+
+def test_v2_finding_exposes_legacy_alias_for_cross_path_deduplication() -> None:
+    promoter = FindingPromoter()
+    v2 = promoter.promote(request(run_id="run_1", claim_identity="a" * 64))
+    assert v2.finding is not None
+
+    legacy = promoter.promote(
+        request(), existing_claims={v2.finding.metadata["legacy_claim_key"]},
+    )
+
+    assert legacy.finding is None
+    assert legacy.refused_reason == "duplicate_finding"

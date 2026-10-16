@@ -190,6 +190,11 @@ class NativeCallState(BaseModel):
     evidence_ids: list[str] = Field(default_factory=list)
     feedback: dict[str, Any] = Field(default_factory=dict)
     completed: bool = False
+    # The settled request row that produced this call. It is an accounting
+    # reference only, never provider-visible content or an execution identity.
+    decision_request_id: str | None = None
+    made_progress: bool | None = None
+    decision_valid: bool = False
 
 
 class GraphState(TypedDict, total=False):

@@ -605,14 +605,42 @@ async def register_probe_tasks(
         if policy_limits is not None and item.probe_limits is not None and (
             item.probe_limits.max_actions > policy_limits.max_actions
             or item.probe_limits.max_model_requests > policy_limits.max_model_requests
+            or (
+                item.probe_limits.max_repair_requests is not None
+                and policy_limits.max_repair_requests is not None
+                and item.probe_limits.max_repair_requests > policy_limits.max_repair_requests
+            )
+            or (
+                item.probe_limits.max_consecutive_provider_failures is not None
+                and policy_limits.max_consecutive_provider_failures is not None
+                and item.probe_limits.max_consecutive_provider_failures
+                > policy_limits.max_consecutive_provider_failures
+            )
         ):
             raise StateConflict("probe_override_exceeds_profile_limits")
+    def effective_limits(item):
+        if item.probe_limits is None or policy_limits is None:
+            return item.probe_limits or policy_limits
+        total = item.probe_limits.max_model_requests
+
+        def inherited(name):
+            selected = getattr(item.probe_limits, name)
+            if selected is None:
+                selected = getattr(policy_limits, name)
+            return min(selected, total) if selected is not None else None
+
+        return item.probe_limits.model_copy(update={
+            "max_repair_requests": inherited("max_repair_requests"),
+            "max_consecutive_provider_failures": inherited(
+                "max_consecutive_provider_failures"
+            ),
+        })
     tasks = [MissionTask(
         task_id=TaskId("task_" + content_hash([state.run_id, proposal_id, item.task_key])),
         mission_id=mission.mission_id, title=item.title, objective=item.objective,
         assigned_agent=AgentId(item.role_id), status=TaskStatus.READY,
         investigation_contract_version=2, completion_contract_version=2,
-        probe_limits=item.probe_limits or policy_limits,
+        probe_limits=effective_limits(item),
         completion_criteria=item.completion_criteria, principal_refs=item.principal_refs,
         required=item.required,
         goal_required_hypothesis_ids=[HypothesisId(ref)

@@ -110,14 +110,42 @@ do not transfer another invocation's identity or session proof.
 HTTP observation metadata comes from the selected registered result mapper,
 including catalog-bound physical ToolIds. Bounded untrusted body previews do
 not prevent status/header/identity projection; their contents are not copied
-into graph facts. The built-in HTTP request mapper bundle is version 2 so the
+into graph facts. The built-in HTTP request mapper bundle is version 3 so the
 normal extension fingerprint changes for new assemblies. Incompatible stored
 bindings must fail normal resume checks, while old records remain readable.
 No historical originals are backfilled with anonymous receipts.
 
+For a fully verified local web deployment with a selected direct Kali route,
+the `web-http` provider is replaced at composition time without changing its
+public server id, canonical ToolIds, operations, or request schemas. Its v1
+`http_receipt` binds the request method, canonical origin/path/query digest,
+allowed header names, body digest/size, principal/session scope and redirect
+policy to an independent response receipt. The response records whether a
+response was received, status, safe header projection, body digest/size and
+retention, pinned peer/transport, and a structured failure phase. Credentials
+travel only in the provider's bounded stdin envelope and are not copied to the
+receipt, audit, telemetry, or model output; the protected transport spool is
+discarded after projection, and an unverified discard fails the operation with
+an uncertain execution marker. The current body retention mode is `digest_only`;
+an operator-enabled bounded, redacted `body_preview` remains untrusted DATA in
+the original Evidence window. `artifact_ref` is explicitly null until a
+configured immutable response-artifact store owns that content.
+
+The v3 consumer validates both receipt halves and their session/anonymous
+scope before graph projection. A declared but contradictory receipt is not
+interpreted through the legacy summary path. Transport timeout, TLS/connect,
+partial response and out-of-scope redirect results remain failed originals and
+cannot create an HTTP graph observation. Arbitrary shell/curl stdout has no
+web-http mapper registration and therefore cannot manufacture this receipt.
+
 Successful observation coverage still needs the normal independent Task
 review. It does not confirm a candidate, create a Finding, or satisfy the
 Mission; those retain their existing revision/purpose and evidence gates.
+A posthoc security review receipt likewise creates no Finding by itself. The
+canonical consumer is the later exact Planner confirmation: central admission
+cross-checks the receipt against its inspected originals and invokes the shared
+promotion gate atomically with the candidate revision. Promotion does not imply
+Task or Mission completion.
 
 ## Runtime diagnostic and review windows
 

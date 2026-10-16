@@ -5,6 +5,7 @@ from redteam.app.cli.conversation import catalog_tool_labels
 from redteam.capability.settings import (
     MCPServerSettings,
     automatic_shell_setup_from_environment,
+    shell_image_profile_from_environment,
     shell_policy_path_from_environment,
 )
 from redteam.core.contracts.mission import redact_secret_material
@@ -47,6 +48,7 @@ def configured_tool_context(config):
         shell = "prepare_at_run_start" if automatic_shell_setup_from_environment() else (
             "configured_unverified" if shell_policy_path_from_environment() else "disabled"
         )
+        shell_profile = shell_image_profile_from_environment()
         kali_network = "closed"
         from redteam.app.kali_preparation import kali_selection
         from redteam.app.web_policy import KALI_NETWORK_MODE_KEY
@@ -57,10 +59,16 @@ def configured_tool_context(config):
             kali_network = {"closed": "closed", "configured": "configured_unverified",
                             "prepare": "prepare_at_run_start"}[selected_mode]
     except ValueError:
-        shell, kali_network = "invalid_configuration", "invalid_configuration"
+        shell, shell_profile, kali_network = (
+            "invalid_configuration", "invalid_configuration", "invalid_configuration"
+        )
     return {"tools": [], "tool_availability": {
         "state": "configured_unverified", "servers": servers,
-        "shell": {"state": shell, "target_network": kali_network},
+        "shell": {
+            "state": shell,
+            "image_profile": shell_profile,
+            "target_network": kali_network,
+        },
         "constraints": redact_secret_material({
             "mcp_targets": config.engagement.metadata.get("mcp_targets", {}),
             "web_policy": config.engagement.metadata.get("web_policy", {}),

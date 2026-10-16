@@ -245,6 +245,7 @@ def bind_plan(
     principals: set[str],
     max_tasks: int,
     existing_work_validator: Callable[[list[str], dict[str, int]], set[str]] | None = None,
+    require_initial_candidate: bool = False,
 ) -> tuple[list[HypothesisUpdate] | None, list[PlannedInvestigationQuestion], dict[str, int]]:
     """Resolve local references for stage-1 updates+questions without mutating originals.
 
@@ -272,6 +273,8 @@ def bind_plan(
         principals=principals, resume_conditions=draft.resume_conditions,
         error=AtomizationProposalError,
     )
+    if require_initial_candidate and not snapshot.candidates and not updates:
+        raise AtomizationProposalError("candidate_inventory_empty_requires_new_candidate")
     versions = {identity: candidate.revision for identity, candidate in snapshot.candidates.items()}
     versions.update({update.hypothesis.hypothesis_id: (update.expected_revision or 0) + 1
                      for update in updates})
@@ -455,6 +458,17 @@ def validate_atomized_tasks(
             if child.probe_limits is not None and limits is not None and (
                 child.probe_limits.max_actions > limits.max_actions
                 or child.probe_limits.max_model_requests > limits.max_model_requests
+                or (
+                    child.probe_limits.max_repair_requests is not None
+                    and limits.max_repair_requests is not None
+                    and child.probe_limits.max_repair_requests > limits.max_repair_requests
+                )
+                or (
+                    child.probe_limits.max_consecutive_provider_failures is not None
+                    and limits.max_consecutive_provider_failures is not None
+                    and child.probe_limits.max_consecutive_provider_failures
+                    > limits.max_consecutive_provider_failures
+                )
             ):
                 raise reject("probe_limits_exceed_profile", "probe_limits",
                              repair="Use limits within the supplied profile.")
