@@ -295,7 +295,7 @@ async def test_mobsf_scan_claim_fences_aliases_across_clients_and_after_cancel(p
     assert scan_calls == 1
     with client._db() as db:
         status = db.execute("SELECT status FROM scans WHERE ref=?", (first.scan_ref,)).fetchone()[0]
-    assert status == "cancelled"
+    assert status == "running"
 
 
 @pytest.mark.parametrize(
@@ -456,18 +456,59 @@ async def test_scan_failure_and_cancel_are_distinct(policy):
     cancel_client, _ = client_for(isolated)
     uploaded = await cancel_client.submit("apk", isolated.hashes["apk"], "eng", "run")
     original = cancel_client._request
+    scan_entered = asyncio.Event()
+    scan_calls = []
 
     async def cancel(route, **kwargs):
         if route == "scan":
-            raise asyncio.CancelledError()
+            scan_calls.append(route)
+            scan_entered.set()
+            await asyncio.Event().wait()
         return await original(route, **kwargs)
 
     cancel_client._request = cancel
+    scan = asyncio.create_task(
+        cancel_client.start("apk", uploaded.scan_ref, "eng", "run")
+    )
+    await asyncio.wait_for(scan_entered.wait(), 2)
+    scan.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await cancel_client.start("apk", uploaded.scan_ref, "eng", "run")
-    assert (
-        await cancel_client.status("apk", uploaded.scan_ref, "eng", "run")
-    ).status == "cancelled"
+        await scan
+    with cancel_client._db() as db:
+        assert db.execute(
+            "SELECT status FROM scans WHERE ref=?", (uploaded.scan_ref,)
+        ).fetchone()[0] == "running"
+
+    restarted, _ = client_for(isolated, missing_report=True)
+    with pytest.raises(MobSFError, match="scan_already_started"):
+        await restarted.start("apk", uploaded.scan_ref, "eng", "run")
+    pending = await restarted.status("apk", uploaded.scan_ref, "eng", "run")
+    assert pending.status == "running"
+    expected_md5 = hashlib.md5(
+        Path(isolated.analysis.apks["apk"].path).read_bytes(), usedforsecurity=False
+    ).hexdigest()
+
+    async def mismatched_report(route, **kwargs):
+        if route == "report_json":
+            return 200, {"md5": "0" * 32}
+        if route == "scan":
+            raise AssertionError("resume must not start the remote scan again")
+        return await restarted._request_original(route, **kwargs)
+
+    restarted._request_original = restarted._request
+    restarted._request = mismatched_report
+    assert (await restarted.status("apk", uploaded.scan_ref, "eng", "run")).status == "running"
+
+    async def matching_report(route, **kwargs):
+        if route == "report_json":
+            return 200, {"md5": expected_md5}
+        if route == "scan":
+            raise AssertionError("resume must not start the remote scan again")
+        return await restarted._request_original(route, **kwargs)
+
+    restarted._request = matching_report
+    assert (await restarted.status("apk", uploaded.scan_ref, "eng", "run")).status == "completed"
+    assert scan_calls == ["scan"]
 
 
 async def test_output_caps_schema_drift_and_section_allowlist(policy):

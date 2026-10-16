@@ -396,9 +396,6 @@ class MobSFClient:
                         return self._output(self._record(apk_ref, scan_ref, engagement_id, run_id))
                     await asyncio.sleep(self.policy.poll_interval_seconds)
                 raise MobSFError("mobsf_poll_limit")
-            except asyncio.CancelledError:
-                self._status(scan_ref, "cancelled")
-                raise
             except MobSFError as exc:
                 self._status(
                     scan_ref,

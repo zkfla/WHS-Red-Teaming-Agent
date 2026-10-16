@@ -32,7 +32,8 @@ approval under the default approval policy. No other REST route is exposed.
   "hashes": {"bank-app": "<approved-apk-sha256>"},
   "engagement_id": "<engagement-id>",
   "run_id": "<run-id>",
-  "state_path": "/operator-private/mobsf-scans.sqlite3"
+  "state_path": "/operator-private/mobsf-scans.sqlite3",
+  "max_concurrency": 1
 }
 ```
 
@@ -56,6 +57,22 @@ UNKNOWN primary does not establish that condition. Raw discovery/health stays
 available for diagnostics. Fallbacks provide bounded ZIP/ADB diagnostics, not
 the same result contract as apktool/mobile-next; `mobile.device_shell` needs an
 explicit ROE allowlist entry before Agent execution.
+
+For independent APK scans, set policy `max_concurrency` and
+`REDTEAM_MCP_MOBSF_MAX_CONCURRENCY` together (for example, both `6`). Both default
+to `1`; raising one does not raise the other. The provider serializes operations
+by MobSF's actual content MD5 and atomically reserves quota/scan state in SQLite.
+All clients for the same engagement/run must share that private state file.
+Discovery also declares a stable endpoint/approved-SHA resource identity, so APK
+aliases with the same approved bytes share the durable scheduler fence. Approved
+files are still validated when used, rather than eagerly read during discovery.
+
+An upload reservation is retained after cancellation, timeout, malformed responses
+and HTTP errors, including 4xx: a returned error does not prove the remote service
+stored nothing. Unsettled scan records also block another upload or start for the
+same MD5. Expiry does not release those fences or quota. Operator reconciliation
+of the backend is required before retiring uncertain state; automatic retry is
+not authorized by local caller cancellation.
 
 `mobsf_start_scan` makes one static scan request, then polls the owned hash's JSON
 report within configured limits. A timeout/cancellation records uncertainty and
