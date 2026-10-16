@@ -3,9 +3,9 @@
 # selection contract; they never grant scope or execution permission.
 schema_version: '3'
 profile_id: native-probes
-version: '20'
+version: '21'
 common: {path: prompts/common.md, version: '3', contract_version: '1'}
-probe_limits: {max_actions: 4, max_model_requests: 8, max_repair_requests: 6, max_consecutive_provider_failures: 6}
+probe_limits: {max_actions: 16, max_model_requests: 64, max_repair_requests: 16, max_consecutive_provider_failures: 6}
 max_instances: 2
 max_activations: 8
 max_tasks_per_strategy: 8

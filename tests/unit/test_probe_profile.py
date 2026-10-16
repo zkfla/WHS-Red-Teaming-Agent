@@ -31,11 +31,11 @@ def test_probe_profile_uses_one_common_executor_and_split_atomizer():
 
     assert len(executors) == 1
     assert loaded.run_policy().probe_limits == ProbeLimits(
-        max_actions=4, max_model_requests=16, max_repair_requests=6,
+        max_actions=16, max_model_requests=64, max_repair_requests=16,
         max_consecutive_provider_failures=6,
     )
 
-    assert loaded.profile.version == "27"
+    assert loaded.profile.version == "28"
     atomizer_id = loaded.profile.stages.get("task_atomization")
     assert atomizer_id == "probe-atomizer"
     assert atomizer_id != loaded.profile.stages["hypothesis_planning"]
@@ -63,9 +63,9 @@ def test_probe_profile_uses_one_common_executor_and_split_atomizer():
 
 def test_legacy_single_stage_profile_has_no_atomizer():
     loaded = load_specialist_profile(LEGACY)
-    assert loaded.profile.version == "20"
+    assert loaded.profile.version == "21"
     assert loaded.run_policy().probe_limits == ProbeLimits(
-        max_actions=4, max_model_requests=8, max_repair_requests=6,
+        max_actions=16, max_model_requests=64, max_repair_requests=16,
         max_consecutive_provider_failures=6,
     )
     assert "task_atomization" not in loaded.profile.stages
@@ -86,6 +86,10 @@ def test_new_cli_and_application_config_default_to_candidate_profile():
     assert loaded.profile.schema_version == "3"
     assert loaded.profile.stages["task_atomization"] == "probe-atomizer"
     assert loaded.run_policy().probe_atomization is True
+    assert loaded.run_policy().probe_limits == ProbeLimits(
+        max_actions=16, max_model_requests=64, max_repair_requests=16,
+        max_consecutive_provider_failures=6,
+    )
 
 
 def test_legacy_profile_fingerprint_is_not_changed_by_optional_probe_fields():

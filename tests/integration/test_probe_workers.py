@@ -328,7 +328,10 @@ async def test_model_boundary_returns_without_another_request_and_budget_never_r
 async def test_task_request_admission_is_atomic_and_limits_cannot_expand(tmp_path):
     async with selection(tmp_path) as (session, llm, tools):
         with pytest.raises(StateConflict, match="probe_override_exceeds_profile_limits"):
-            await register(session, "oversized", actions=5)
+            await register(
+                session, "oversized",
+                actions=session.deps.specialist_policy.probe_limits.max_actions + 1,
+            )
         assert not await session.deps.central_state.list_tasks()
         identity = await register(session, "reservation", requests=1)
         worker, = await ready_workers(session.deps, session.runtime)
