@@ -1585,31 +1585,27 @@ class CentralTransaction:
                         (execution.model_dump_json(), self.run_id, invocation_id))
         self._refresh_execution_wait(task)
 
-    def reserve_resource_actor(self, task_id: str, *, owner: str, version: int,
-                               instance_id: str, now: float, max_instances: int,
-                               max_calls: int, per_target: int,
-                               comparison_keys: Mapping[str, Sequence[str]] | None = None) -> bool:
-        """Live continuation of a returned actor, never owner transfer or replay."""
+    def _reserve_returned_actor(
+        self, task_id: str, *, owner: str, version: int, instance_id: str,
+        blocking_prefix: str, pending: Sequence[TaskExecution], now: float,
+        max_instances: int, max_calls: int, per_target: int,
+        comparison_keys: Mapping[str, Sequence[str]] | None = None,
+    ) -> bool:
+        """CAS one returned continuation after its caller proved the wait set."""
         self.admit()
         task = self._owned(task_id, owner, version)
         if (task.status is not TaskStatus.BLOCKED
-                or not str(task.blocking_reason).startswith("resource:")):
+                or not str(task.blocking_reason).startswith(blocking_prefix)):
             return False
-        proof = self.db.execute("SELECT launch_stage FROM state_activations WHERE run_id=? "
-                                "AND instance_id=? AND owner=? AND ownership_version=?",
-                                (self.run_id, instance_id, owner, version)).fetchone()
-        if proof != ("returned",) or self.active_activation_count() >= max_instances:
+        _, binding_hash = self.binding()
+        proof = self.db.execute(
+            "SELECT task_id,owner,ownership_version,proof_version,binding_hash,launch_stage "
+            "FROM state_activations WHERE run_id=? AND instance_id=?",
+            (self.run_id, instance_id),
+        ).fetchone()
+        if proof != (task_id, owner, version, 1, binding_hash, "returned"):
             return False
-        executions = [TaskExecution.model_validate_json(row[0]) for row in self.db.execute(
-            "SELECT payload FROM state_executions WHERE run_id=? AND task_id=?",
-            (self.run_id, task_id),
-        )]
-        pending = [item for item in executions if item.state is ExecutionState.PENDING
-                   and item.wait_reason == "resource"]
-        if not pending or any(execution_occupies_capacity(item)
-                              or (item.wait_reason not in {None, "resource"})
-                              or (item.state not in _RESOLVED and item not in pending)
-                              for item in executions):
+        if not pending or self.active_activation_count() >= max_instances:
             return False
         if self._active_requests(owner):
             return False
@@ -1637,12 +1633,119 @@ class CentralTransaction:
                           max_instances=max_instances)
         return True
 
+    def reserve_resource_actor(self, task_id: str, *, owner: str, version: int,
+                               instance_id: str, now: float, max_instances: int,
+                               max_calls: int, per_target: int,
+                               comparison_keys: Mapping[str, Sequence[str]] | None = None) -> bool:
+        """Live continuation of a returned resource-wait actor, never replay."""
+        if (max_instances < 1 or max_calls < 1 or per_target < 1):
+            return False
+        executions = [TaskExecution.model_validate_json(row[0]) for row in self.db.execute(
+            "SELECT payload FROM state_executions WHERE run_id=? AND task_id=?",
+            (self.run_id, task_id),
+        )]
+        pending = [item for item in executions if item.state is ExecutionState.PENDING
+                   and item.wait_reason == "resource"]
+        if (not pending or any(execution_occupies_capacity(item)
+                or (item.wait_reason not in {None, "resource"})
+                or (item.state not in _RESOLVED and item not in pending)
+                for item in executions)):
+            return False
+        return self._reserve_returned_actor(
+            task_id, owner=owner, version=version, instance_id=instance_id,
+            blocking_prefix="resource:", pending=pending, now=now,
+            max_instances=max_instances, max_calls=max_calls, per_target=per_target,
+            comparison_keys=comparison_keys,
+        )
+
+    def reserve_approved_actor(
+        self, task_id: str, *, owner: str, version: int, instance_id: str,
+        approval_invocation_ids: Sequence[str], now: float, max_instances: int,
+        max_calls: int, per_target: int,
+        comparison_keys: Mapping[str, Sequence[str]] | None = None,
+    ) -> bool:
+        """Reserve the same returned actor for verified, approved original waits.
+
+        Approval status is read by the orchestration caller from Control. This
+        transaction binds that read to the exact still-pending invocation set;
+        the resumed runner and Control recheck approval and admission before
+        execution, so this is only a scheduler reservation, never permission.
+        """
+        if (max_instances < 1 or max_calls < 1 or per_target < 1):
+            return False
+        expected = tuple(sorted(set(approval_invocation_ids)))
+        if not expected or len(expected) != len(approval_invocation_ids):
+            return False
+        if (comparison_keys is None
+                or tuple(sorted(comparison_keys)) != expected):
+            return False
+        executions = [TaskExecution.model_validate_json(row[0]) for row in self.db.execute(
+            "SELECT payload FROM state_executions WHERE run_id=? AND task_id=?",
+            (self.run_id, task_id),
+        )]
+        pending = [item for item in executions if item.state is ExecutionState.PENDING
+                   and item.wait_reason == "approval" and item.approval_ref]
+        if (tuple(sorted(str(item.invocation_id) for item in pending)) != expected
+                or any(
+                    str(item.run_id) != self.run_id
+                    or str(item.engagement_id) != self.engagement_id
+                    or str(item.task_id) != task_id
+                    or str(item.instance_id) != instance_id
+                    or item.ownership_version > version
+                    for item in executions
+                )
+                or any(
+                    item.state not in _RESOLVED
+                    and item not in pending
+                    for item in executions
+                )
+                or any(
+                    (item.wait_reason is not None and item not in pending)
+                    or item.resource_execution_pending
+                    or (item.job_ref is not None and item.state not in _RESOLVED)
+                    for item in executions
+                )):
+            return False
+        return self._reserve_returned_actor(
+            task_id, owner=owner, version=version, instance_id=instance_id,
+            blocking_prefix="approval:", pending=pending, now=now,
+            max_instances=max_instances, max_calls=max_calls, per_target=per_target,
+            comparison_keys=comparison_keys,
+        )
+
+    def release_unlaunched_continuation(
+        self, task_id: str, *, owner: str, version: int, instance_id: str,
+    ) -> bool:
+        """Return a newly reserved slot only when no runner coroutine was made."""
+        task = self._owned(task_id, owner, version)
+        if (task.status is not TaskStatus.BLOCKED
+                or not (str(task.blocking_reason).startswith("approval:")
+                        or str(task.blocking_reason).startswith("resource:"))
+                or self._active_requests(owner)):
+            return False
+        _, binding_hash = self.binding()
+        updated = self.db.execute(
+            "UPDATE state_activations SET launch_stage='returned' WHERE run_id=? "
+            "AND instance_id=? AND task_id=? AND owner=? AND ownership_version=? "
+            "AND proof_version=1 AND binding_hash=? AND launch_stage='entered'",
+            (self.run_id, instance_id, task_id, owner, version, binding_hash),
+        )
+        return updated.rowcount == 1
+
     def hold_resource_actor(self, task_id: str, *, owner: str, version: int) -> None:
         task = self._owned(task_id, owner, version)
         if (task.status is TaskStatus.BLOCKED
                 and str(task.blocking_reason).startswith("resource:")):
             self._write_task(task.model_copy(update={
                 "blocking_reason": "needs_review:resource_original_unverified",
+            }))
+
+    def hold_approval_actor(self, task_id: str, *, owner: str, version: int) -> None:
+        task = self._owned(task_id, owner, version)
+        if (task.status is TaskStatus.BLOCKED
+                and str(task.blocking_reason).startswith("approval:")):
+            self._write_task(task.model_copy(update={
+                "blocking_reason": "needs_review:approval_original_unverified",
             }))
 
     def check_execution_capacity(self, execution: TaskExecution, *, max_calls: int,

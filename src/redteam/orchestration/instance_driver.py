@@ -25,9 +25,10 @@ from contextlib import AbstractAsyncContextManager
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 if TYPE_CHECKING:
+    from redteam.orchestration.central_state import CentralTransaction
     from redteam.orchestration.execution_collection import ExecutionOriginalCollection
     from redteam.orchestration.execution_reconciliation import ExecutionReconciliation
 
@@ -751,6 +752,9 @@ class InstanceDriver:
                                     "goal_settlement_admission_closed"}:
                     raise
                 return builders
+            except BaseException:
+                await self._return_unlaunched_continuations(builders)
+                raise
             for runtime in runtimes:
                 assert runtime.instance_id is not None
                 runner = self.runner_for(runtime)
@@ -769,11 +773,27 @@ class InstanceDriver:
     async def _resource_builders(
         self, base: RuntimeState, *, max_instances: int, instance_ids: set[str] | None,
     ) -> _DriveBuilders:
-        """Recheck canonical waits on notifications/results, with the same SDK owner."""
+        builders: _DriveBuilders = []
+        try:
+            await self._collect_returned_wait_builders(
+                base, max_instances=max_instances, instance_ids=instance_ids,
+                builders=builders,
+            )
+        except BaseException:
+            await self._return_unlaunched_continuations(builders)
+            raise
+        return builders
+
+    async def _collect_returned_wait_builders(
+        self, base: RuntimeState, *, max_instances: int, instance_ids: set[str] | None,
+        builders: _DriveBuilders,
+    ) -> _DriveBuilders:
+        """Recheck returned resource and approved-approval waits in this driver."""
         from redteam.core.enums import ApprovalStatus, MissionStatus, TaskStatus
         from redteam.core.ports.control_plane import DurableControlRecovery
         from redteam.orchestration.central_recovery import original_resource_keys
         from redteam.orchestration.central_runtime import tool_limit, worker_limit
+        from redteam.orchestration.execution_journal import ExecutionReceiptError
 
         state = self._deps.central_state
         if state is None or base.mission_id is None:
@@ -782,7 +802,6 @@ class InstanceDriver:
         if mission is None or mission.status is not MissionStatus.ACTIVE:
             return []
         max_instances = min(max_instances, worker_limit(self._deps))
-        builders: _DriveBuilders = []
         driving = {str(record[0]) for record in self._active.values()}
         for row in await state.activation_inventory(instance_ids=instance_ids):
             identity = row["instance_id"]
@@ -790,24 +809,76 @@ class InstanceDriver:
                 continue
             task = await state.get_task(row["task_id"])
             if (task is None or task.status is not TaskStatus.BLOCKED
-                    or not str(task.blocking_reason).startswith("resource:")):
+                    or not (str(task.blocking_reason).startswith("resource:")
+                            or str(task.blocking_reason).startswith("approval:"))):
                 continue
             waits = await state.list_executions(task_id=row["task_id"])
-            approved = True
             control = self._deps.control_plane
-            for execution in waits:
-                if execution.wait_reason == "resource" and execution.approval_ref:
-                    if not isinstance(control, DurableControlRecovery):
-                        approved = False
-                        break
-                    approval = await control.inspect_approval(
-                        execution.approval_ref,
-                    )
-                    if approval is None or approval.status is not ApprovalStatus.APPROVED:
-                        approved = False
-                        break
-            if not approved:
-                continue
+            approval_wait = str(task.blocking_reason).startswith("approval:")
+            if approval_wait:
+                # The task's blocking reason is only a projection. Revalidate
+                # every execution before deciding that its original actor is
+                # safe to continue, and inspect every unresolved approval.
+                pending_approvals = [item for item in waits
+                    if item.state.value == "pending" and item.wait_reason == "approval"
+                    and item.approval_ref]
+                if (not pending_approvals or not isinstance(control, DurableControlRecovery)
+                        or any(item.instance_id != identity
+                               or item.ownership_version > row["ownership_version"]
+                               or item.resource_execution_pending
+                               or (item.state.value not in {"succeeded", "failed", "cancelled"}
+                                   and item not in pending_approvals)
+                               or (item.wait_reason is not None and item not in pending_approvals)
+                               or (item.job_ref is not None
+                                   and item.state.value not in {"succeeded", "failed", "cancelled"})
+                               for item in waits)):
+                    continue
+                statuses = []
+                for item in pending_approvals:
+                    statuses.append((item, await control.inspect_approval(
+                        str(item.approval_ref),
+                    )))
+                if any(
+                    approval is None
+                    or approval.status is not ApprovalStatus.APPROVED
+                    or str(approval.approval_id) != str(execution.approval_ref)
+                    or approval.action_id != execution.action_id
+                    or approval.execution_fingerprint != execution.approval_fingerprint
+                    for execution, approval in statuses
+                ):
+                    continue
+                approval_invocation_ids = tuple(sorted(
+                    str(item.invocation_id) for item in pending_approvals
+                ))
+                comparands = pending_approvals
+            else:
+                # Preserve the existing resource-wait behavior, including its
+                # approval check when an approval is part of that wait.
+                approved = True
+                for execution in waits:
+                    if execution.wait_reason == "resource" and execution.approval_ref:
+                        if not isinstance(control, DurableControlRecovery):
+                            approved = False
+                            break
+                        try:
+                            approval = await control.inspect_approval(execution.approval_ref)
+                        except Exception as exc:
+                            logger.warning("Resource continuation deferred: %s",
+                                           type(exc).__name__)
+                            approved = False
+                            break
+                        if approval is None or approval.status is not ApprovalStatus.APPROVED:
+                            approved = False
+                            break
+                if not approved:
+                    continue
+                approval_invocation_ids = ()
+                comparands = [item for item in waits if item.wait_reason == "resource"]
+                if (not comparands or any(
+                    item.state.value != "pending" or item.resource_execution_pending
+                    or item.wait_reason != "resource" for item in comparands
+                )):
+                    continue
             runner = self.runner_for(base.model_copy(update={"instance_id": identity}))
             try:
                 original = await runner.original_central_runtime(base.run_id, identity)
@@ -816,34 +887,93 @@ class InstanceDriver:
                         or str(original.active_task_id) != row["task_id"]):
                     raise CoordinationError("central_resource_checkpoint_owner_mismatch")
                 comparisons = {str(e.invocation_id): await original_resource_keys(self._deps, e)
-                               for e in waits if e.wait_reason == "resource"}
-            except Exception as exc:  # Originals remain held with an explicit review diagnostic.
-                def hold(tx, proof=row):
-                    tx.hold_resource_actor(proof["task_id"], owner=proof["owner"],
-                                           version=proof["ownership_version"])
+                               for e in comparands}
+            except (CoordinationError, StateConflict, ExecutionReceiptError,
+                    ValidationError) as exc:
+                def hold(tx, proof=row, is_approval=approval_wait):
+                    if is_approval:
+                        tx.hold_approval_actor(
+                            proof["task_id"], owner=proof["owner"],
+                            version=proof["ownership_version"],
+                        )
+                    else:
+                        tx.hold_resource_actor(proof["task_id"], owner=proof["owner"],
+                                               version=proof["ownership_version"])
                 await state.transaction(hold)
-                logger.warning("Resource continuation held: %s", type(exc).__name__)
+                logger.warning("Actor continuation held: %s", type(exc).__name__)
                 continue
             try:
-                def reserve(tx, proof=row, instance=identity, keys=comparisons):
-                    return tx.reserve_resource_actor(
-                        proof["task_id"], owner=proof["owner"], version=proof["ownership_version"],
+                def reserve(tx, proof=row, instance=identity, keys=comparisons,
+                            approval_ids=approval_invocation_ids,
+                            approval_required=approval_wait):
+                    args = dict(
+                        owner=proof["owner"], version=proof["ownership_version"],
                         instance_id=instance, now=datetime.now(timezone.utc).timestamp(),
                         max_instances=max_instances, max_calls=tool_limit(self._deps),
                         per_target=self._settings.per_target_concurrency,
                         comparison_keys=keys,
                     )
-                reserved = await state.transaction(reserve)
+                    if approval_required:
+                        return tx.reserve_approved_actor(
+                            proof["task_id"], approval_invocation_ids=approval_ids, **args,
+                        )
+                    return tx.reserve_resource_actor(proof["task_id"], **args)
+                reservation = asyncio.create_task(state.transaction(reserve))
+                try:
+                    reserved = await asyncio.shield(reservation)
+                except asyncio.CancelledError as cancelled:
+                    try:
+                        reserved = await reservation
+                    except BaseException as reservation_error:
+                        raise cancelled from reservation_error
+                    if reserved:
+                        assert original.instance_id is not None
+                        await self._return_unlaunched_continuations([
+                            (original.instance_id, runner, original, runner.resume_resource),
+                        ])
+                    raise cancelled
             except (CoordinationError, StateConflict) as exc:
-                # Operator changes can close admission between the read and CAS.
-                if str(exc) in {"mission_not_active", "goal_settlement_admission_closed",
-                                "pending_operator_mutation"}:
-                    break
+                # Admission closure and known compare-and-set/capacity races
+                # defer this original actor. Unknown conflicts remain visible.
+                if str(exc) in {
+                    "mission_not_active", "goal_settlement_admission_closed",
+                    "pending_operator_mutation", "stale_task_ownership",
+                    "activation_original_binding_mismatch", "central_worker_limit_reached",
+                    "central_tool_capacity_occupied", "central_target_capacity_occupied",
+                    "shared_resource_execution_conflict", "task_has_unreconciled_network_activity",
+                }:
+                    continue
                 raise
             if reserved:
                 assert original.instance_id is not None
                 builders.append((original.instance_id, runner, original, runner.resume_resource))
         return builders
+
+    async def _return_unlaunched_continuations(self, builders: _DriveBuilders) -> None:
+        """Release only returned-actor reservations whose runner was not made."""
+        state = self._deps.central_state
+        if state is None:
+            return
+        for instance_id, _runner, runtime, make_coro in builders:
+            if make_coro != _runner.resume_resource:
+                continue
+            try:
+                def release(
+                    tx: CentralTransaction,
+                    rt: RuntimeState = runtime,
+                    iid: AgentInstanceId = instance_id,
+                ) -> bool:
+                    return tx.release_unlaunched_continuation(
+                        str(rt.active_task_id), owner=rt.work_owner,
+                        version=rt.task_ownership_version, instance_id=str(iid),
+                    )
+
+                released = await state.transaction(release)
+                if not released:
+                    logger.warning("Unlaunched actor continuation was not released")
+            except Exception as exc:  # keep Run ownership if cleanup cannot prove the slot
+                logger.warning("Unlaunched actor continuation remains owned: %s",
+                               type(exc).__name__)
 
     def _reject_driving_ids(self, instance_ids: list[Any]) -> None:
         if self._recovery_lock.locked():
@@ -866,34 +996,54 @@ class InstanceDriver:
         """
         from redteam.orchestration.central_runtime import worker_limit
 
-        if len(builders) + len(self._active) > worker_limit(self._deps):
-            raise StateConflict("central_worker_limit_reached")
-        self._reject_driving_ids([instance_id for instance_id, _, _, _ in builders])
-        if getattr(self._deps, "specialist_policy", None) is not None and builders:
-            await self.own_run(str(builders[0][2].run_id))
-            self._reject_driving_ids([instance_id for instance_id, _, _, _ in builders])
-            if (self._deps.central_state is not None
-                    and len(builders) + len(self._active) > worker_limit(self._deps)):
+        try:
+            if len(builders) + len(self._active) > worker_limit(self._deps):
                 raise StateConflict("central_worker_limit_reached")
+            self._reject_driving_ids([instance_id for instance_id, _, _, _ in builders])
+            if getattr(self._deps, "specialist_policy", None) is not None and builders:
+                await self.own_run(str(builders[0][2].run_id))
+                self._reject_driving_ids([instance_id for instance_id, _, _, _ in builders])
+                if (self._deps.central_state is not None
+                        and len(builders) + len(self._active) > worker_limit(self._deps)):
+                    raise StateConflict("central_worker_limit_reached")
+        except BaseException:
+            await self._return_unlaunched_continuations(builders)
+            raise
         pending: dict[
             asyncio.Task[RuntimeState],
             tuple[AgentInstanceId, AgentLoopRunner, RuntimeState],
         ] = {}
-        for instance_id, runner, base, make_coro in builders:
-            task = asyncio.create_task(make_coro(base), name=f"instance:{instance_id}")
-            pending[task] = (instance_id, runner, base)
-            self._active[task] = (instance_id, runner, base)
+        initial_launches: set[str] = set()
+        try:
+            for instance_id, runner, base, make_coro in builders:
+                task = asyncio.create_task(make_coro(base), name=f"instance:{instance_id}")
+                initial_launches.add(str(instance_id))
+                pending[task] = (instance_id, runner, base)
+                self._active[task] = (instance_id, runner, base)
+        except BaseException:
+            await self._return_unlaunched_continuations([
+                builder for builder in builders if str(builder[0]) not in initial_launches
+            ])
+            raise
         try:
             while True:
                 if replenish is not None:
                     if wake is not None:
                         wake.clear()
                     more = await replenish()
-                    self._reject_driving_ids([iid for iid, _, _, _ in more])
-                    for iid, runner, base, make_coro in more:
-                        task = asyncio.create_task(make_coro(base), name=f"instance:{iid}")
-                        pending[task] = (iid, runner, base)
-                        self._active[task] = (iid, runner, base)
+                    launched: set[str] = set()
+                    try:
+                        self._reject_driving_ids([iid for iid, _, _, _ in more])
+                        for iid, runner, base, make_coro in more:
+                            task = asyncio.create_task(make_coro(base), name=f"instance:{iid}")
+                            pending[task] = (iid, runner, base)
+                            self._active[task] = (iid, runner, base)
+                            launched.add(str(iid))
+                    except BaseException:
+                        await self._return_unlaunched_continuations([
+                            builder for builder in more if str(builder[0]) not in launched
+                        ])
+                        raise
                 # The application owns the deadline and its planner task. This
                 # callback only observes/signals; it must not await model I/O.
                 # Central selection may wait for that owned planner while idle;
