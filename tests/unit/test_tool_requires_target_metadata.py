@@ -38,6 +38,48 @@ def test_owner_false_roundtrips_through_provider_metadata() -> None:
     assert descriptor.requires_target is False
 
 
+async def test_web_session_inventory_discovery_remains_targetless() -> None:
+    from redteam.capability.adapters.mcp.streamable_http import MCPServerAdapter
+    from redteam.capability.adapters.mcp.transport import (
+        RemoteCallResult,
+        RemoteTool,
+        remote_tool_metadata,
+    )
+    from redteam.capability.servers.config import ServerPolicy, TargetProfile
+    from redteam.capability.servers.web_http import create_server
+    from redteam.orchestration.knowledge_validation import InternalAssessment
+    from redteam.orchestration.native_binding import resolve_native_target
+
+    server = create_server(ServerPolicy(
+        targets={"inventory-target": TargetProfile(origin="http://127.0.0.1", allowed_paths=["/"])},
+        allowed_networks=["127.0.0.1/32"],
+    ))
+
+    class DiscoveryOnlyTransport:
+        async def list_tools(self) -> list[RemoteTool]:
+            return [RemoteTool(
+                name=tool.name, description=tool.description or "",
+                input_schema=dict(tool.input_schema),
+                metadata=remote_tool_metadata(tool),
+            ) for tool in await server.list_tools()]
+
+        async def health_check(self) -> bool:
+            return True
+
+        async def call_tool(self, tool_name: str, arguments: dict) -> RemoteCallResult:
+            raise AssertionError("discovery must not execute a tool")
+
+    adapter = MCPServerAdapter(
+        server_id="web-http", tool_namespace="web", capability_tags=("web",),
+        transport=DiscoveryOnlyTransport(),
+    )
+    descriptors = {tool.tool_name: tool for tool in await adapter.discover_tools()}
+    inventory = descriptors["session_list"]
+    assert inventory.requires_target is False
+    assert all(tool.requires_target for name, tool in descriptors.items() if name != "session_list")
+    assert await resolve_native_target(None, inventory, {}, InternalAssessment()) is None
+
+
 def test_owner_true_roundtrips_through_provider_metadata() -> None:
     descriptor = _descriptor(requires_target=False)
     _apply_provider_metadata(descriptor, {PROVIDER_METADATA_REQUIRES_TARGET: True})
