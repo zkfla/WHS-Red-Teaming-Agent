@@ -133,7 +133,10 @@ def target_network_tool(function):
             return await function(*args, **kwargs)
         except TargetRequestError as exc:
             return CallToolResult(
-                meta={PROVIDER_RESULT_EXECUTION_UNCERTAIN: exc.diagnostic["execution_uncertain"]},
+                _meta={
+                    PROVIDER_RESULT_EXECUTION_UNCERTAIN:
+                    exc.diagnostic["execution_uncertain"]
+                },
                 is_error=True,
                 content=[TextContent(type="text", text=str(exc))],
                 structured_content={"diagnostic": exc.diagnostic},

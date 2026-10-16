@@ -475,8 +475,8 @@ def _schema_properties_at(
                 if isinstance(part, int) and not isinstance(part, bool):
                     child = option.get("items")
                 elif isinstance(part, str):
-                    properties = option.get("properties", {})
-                    child = properties.get(part) if isinstance(properties, dict) else None
+                    declared = option.get("properties", {})
+                    child = declared.get(part) if isinstance(declared, dict) else None
                 else:
                     child = None
                 if child is not None:
@@ -484,13 +484,13 @@ def _schema_properties_at(
         nodes = children
         if not nodes:
             return []
-    properties: set[str] = set()
+    field_names: set[str] = set()
     for node in nodes:
         for option in _schema_options(node, schema):
             declared = option.get("properties", {})
             if isinstance(declared, dict):
-                properties.update(name for name in declared if isinstance(name, str))
-    return sorted(properties)
+                field_names.update(name for name in declared if isinstance(name, str))
+    return sorted(field_names)
 
 
 def _schema_location(schema: dict[str, Any], path: tuple[Any, ...]) -> str:
@@ -526,11 +526,11 @@ def _graph_recording_input_diagnostic(exc: BaseException) -> DecisionDiagnostic:
     for index, error in enumerate(errors):
         if error.get("type") != "extra_forbidden" or index >= len(issues):
             continue
-        location = tuple(error.get("loc", ()))
-        fields = _schema_properties_at(schema, location[:-1])
+        error_path = tuple(error.get("loc", ()))
+        fields = _schema_properties_at(schema, error_path[:-1])
         if not fields:
             continue
-        parent_location = _schema_location(schema, location[:-1])
+        parent_location = _schema_location(schema, error_path[:-1])
         issues[index]["location"] = parent_location
         allowed = fields[:16]
         rendered = ", ".join(allowed)
@@ -541,12 +541,12 @@ def _graph_recording_input_diagnostic(exc: BaseException) -> DecisionDiagnostic:
     if not guidance:
         return diagnostic
     summary = f"{diagnostic.summary} {guidance}"[:500]
-    location = next(
+    location_pointer = next(
         (issue["location"] for issue in issues if "allowed_fields" in issue),
         diagnostic.location,
     )
     return diagnostic.model_copy(update={
-        "location": location,
+        "location": location_pointer,
         "summary": summary,
         "repair_condition": guidance[:500],
         "validation_issues": issues,

@@ -810,9 +810,10 @@ async def _has_unchanged_task_result(call: NativeCallState, state, *, deps) -> b
     """
     runtime = state["runtime"]
     task_id = str(runtime.active_task_id or "")
-    current_invocation = call.dispatch.invocation if call.dispatch is not None else None
-    if not task_id or current_invocation is None:
+    current_dispatch = call.dispatch
+    if not task_id or current_dispatch is None or current_dispatch.invocation is None:
         return False
+    current_invocation = current_dispatch.invocation
 
     from redteam.orchestration.execution_journal import checked_receipt
 
@@ -844,7 +845,7 @@ async def _has_unchanged_task_result(call: NativeCallState, state, *, deps) -> b
             or current_original.tool_id != current_invocation.tool_id
             or current_step.get("mission_task_id") != task_id
             or current_step.get("task_purpose_hash")
-            != call.dispatch.plan_step.task_purpose_hash
+            != current_dispatch.plan_step.task_purpose_hash
         ):
             return False
         executions = await deps.central_state.list_executions(task_id=task_id)

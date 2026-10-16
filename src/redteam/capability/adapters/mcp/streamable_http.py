@@ -113,7 +113,7 @@ class MCPServerAdapter:
                 message=_safe_error_message(result.output),
                 retryable=False,
             )
-        provider_metadata = {
+        provider_metadata: dict[str, Any] = {
             "mcp_server_id": self.server_id, "mcp_tool_name": tool.tool_name,
             **({"resource_effects": [effect.model_dump(mode="json")
                                       for effect in tool.resource_effects]}

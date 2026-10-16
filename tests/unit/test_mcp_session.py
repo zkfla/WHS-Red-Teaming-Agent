@@ -84,7 +84,7 @@ async def test_transport_preserves_result_meta_separately_from_structured_output
         content=[],
         is_error=True,
         structured_content={"diagnostic": {"execution_uncertain": False}},
-        meta={PROVIDER_RESULT_EXECUTION_UNCERTAIN: True},
+        _meta={PROVIDER_RESULT_EXECUTION_UNCERTAIN: True},
     )
 
     async def call_tool(*args: Any, **kwargs: Any) -> CallToolResult:
