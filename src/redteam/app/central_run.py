@@ -596,7 +596,6 @@ class CentralRun:
 
     async def resume(self, *, instance_id=None, transfer_owner=True):
         """Original actor recovery through the same bounded InstanceDriver."""
-        from redteam.orchestration.central_completion import unsafe
         from redteam.orchestration.central_recovery import recovery_diagnostic
         if (self.runtime.planning_diagnostic is not None
                 and self.runtime.planning_diagnostic.stage == "execution_reconciliation"):
@@ -696,7 +695,10 @@ class CentralRun:
                 "mission_status": mission.status,
                 "planning_diagnostic": self.runtime.planning_diagnostic,
             })
-        if recovery_errors or any(unsafe(item) for item in await state.list_executions()):
+        # Unsettled executions retain their original actor and resource claim.
+        # Per-action admission fences other work, while goal settlement still
+        # rejects unresolved originals. Independent planning can continue.
+        if recovery_errors:
             return await self.settle(self.runtime.model_copy(update={
                 "phase": AgentPhase.FINISHED,
                 "termination_reason": TerminationReason.INVESTIGATION_HELD,
