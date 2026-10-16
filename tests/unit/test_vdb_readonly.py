@@ -216,6 +216,10 @@ def test_lookup_worker_timeout_kills_and_reaps_child(tmp_path, monkeypatch):
 def test_uncertain_worker_cleanup_is_bounded_and_retains_slots(
     tmp_path, monkeypatch, uncertain_resource
 ):
+    retained = []
+    monkeypatch.setattr(vdb_readonly, "_retain_lookup_slots", lambda *args: retained.append(
+        vdb_readonly._RetainedLookupSlots(*args)
+    ))
     class Pipe:
         def __init__(self):
             self.closed = False
@@ -235,8 +239,11 @@ def test_uncertain_worker_cleanup_is_bounded_and_retains_slots(
             self.stdout = Pipe()
             self.killed = False
             self.wait_timeouts = []
+            self.finished = False
 
         def poll(self):
+            if self.finished:
+                return 0
             if uncertain_resource == "process":
                 return None
             return -9 if self.killed else 0
@@ -256,6 +263,7 @@ def test_uncertain_worker_cleanup_is_bounded_and_retains_slots(
     class FakeThread:
         next_index = 0
         instances = []
+        finished = False
 
         def __init__(self, target, daemon):
             del target, daemon
@@ -273,7 +281,7 @@ def test_uncertain_worker_cleanup_is_bounded_and_retains_slots(
 
         def is_alive(self):
             stuck_index = {"reader": 0, "writer": 1}.get(uncertain_resource)
-            return self.started and self.index == stuck_index
+            return self.started and self.index == stuck_index and not self.finished
 
     monkeypatch.setattr(vdb_readonly, "Thread", FakeThread)
     policy_slots = threading.BoundedSemaphore(1)
@@ -302,6 +310,54 @@ def test_uncertain_worker_cleanup_is_bounded_and_retains_slots(
     else:
         assert process.stdin.closed is False
         assert process.stdout.closed is True
+
+    assert len(retained) == 1 and not retained[0].reap()
+    process.finished = True
+    FakeThread.finished = True
+    assert retained[0].reap()
+    assert retained[0].reap()  # A repeated proof cannot over-release bounded semaphores.
+    assert policy_slots.acquire(timeout=0) and worker_slots.acquire(timeout=0)
+    assert not policy_slots.acquire(timeout=0) and not worker_slots.acquire(timeout=0)
+    policy_slots.release()
+    worker_slots.release()
+    output = vdb_readonly.VDBLookup(
+        database=vdb_readonly.VDBStatus(asset_ref="vdb-test", state="missing", synthetic=True),
+        query="CVE-2026-900001", matches=[], truncated=False,
+        interpretation="no_known_match_in_loaded_snapshot",
+    )
+    monkeypatch.setattr(vdb_readonly, "_invoke_lookup_worker", lambda *_args: output)
+    assert reader.lookup("cve", "CVE-2026-900001", 1) == output
+
+
+def test_background_reaper_restores_only_owned_slots_after_termination():
+    policy_slots = threading.BoundedSemaphore(1)
+    worker_slots = threading.BoundedSemaphore(1)
+    other_reader_slots = threading.BoundedSemaphore(1)
+    assert policy_slots.acquire(timeout=0) and worker_slots.acquire(timeout=0)
+    assert other_reader_slots.acquire(timeout=0)
+    process_done = threading.Event()
+    pipe_done = threading.Event()
+    inspected = threading.Event()
+
+    def stopped():
+        inspected.set()
+        return process_done.is_set() and pipe_done.is_set()
+
+    vdb_readonly._retain_lookup_slots(stopped, policy_slots, worker_slots)
+    assert inspected.wait(1)
+    assert not policy_slots.acquire(timeout=0) and not worker_slots.acquire(timeout=0)
+    process_done.set()
+    inspected.clear()
+    assert inspected.wait(1)
+    assert not policy_slots.acquire(timeout=0) and not worker_slots.acquire(timeout=0)
+    pipe_done.set()
+    assert policy_slots.acquire(timeout=2) and worker_slots.acquire(timeout=2)
+    assert not other_reader_slots.acquire(timeout=0)
+    # Slots remain consumed by this subsequent owner, not returned on each reaper tick.
+    assert not policy_slots.acquire(timeout=0.2) and not worker_slots.acquire(timeout=0)
+    policy_slots.release()
+    worker_slots.release()
+    other_reader_slots.release()
 
 
 def test_lookup_worker_uses_overlapping_isolated_real_processes(tmp_path, monkeypatch):

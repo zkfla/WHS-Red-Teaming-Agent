@@ -100,7 +100,10 @@ are not live service validation. Python 3.14.6 uses the authorized interpreter w
 - VDB termination waits and pipe-thread joins share a bounded 0.5-second cleanup
   budget. No unbounded wait remains. If the child or pipe threads are not proven
   stopped, `vdb_lookup_cleanup_uncertain` retains both the reader's policy slot and
-  the process-wide slot. Active pipe handles are not synchronously closed. Tests
+  the process-wide slot. A background reaper retains the child and pipe-thread
+  handles, checks actual termination and returns both owned slots exactly once
+  when all have stopped. It never retries the lookup or releases on elapsed time.
+  Active pipe handles are not synchronously closed. Tests
   cover an unending process wait and stuck reader/writer threads, plus real child
   kill/reap. Final focused VDB run: 28 passed, two Windows symlink cases deselected.
   Cold worker startup measured 2.29–3.06 seconds here and counts against the default
@@ -114,3 +117,17 @@ are not live service validation. Python 3.14.6 uses the authorized interpreter w
   928 source/test files. No permission assertion, Control rule or live-call boundary
   was relaxed. Scope is complete for implementation and the stated offline checks;
   actual AppThreat backend and live integration remain explicit external validation.
+
+## Follow-up: reclaim delayed VDB termination
+
+Code review found that a transient cleanup delay permanently consumed the held
+slots. The cleanup diagnostic now carries a termination probe retaining the actual
+child and pipe-thread handles. Lookup transfers the exact acquired semaphores to
+a bounded registry before unwinding; one background thread polls those records
+without waiting on the child or pipe threads. A record releases both slots once,
+only after child exit and both pipe threads have stopped. Failed reaper startup
+keeps the record and is retried on later calls. No lookup is replayed and no result
+is changed to success. Regression checks cover delayed child/reader/writer exit,
+subsequent lookup success, repeated proof, and isolation from another reader's slots.
+Validation: 29 focused tests passed; two Windows symlink-privilege cases remained
+deselected. Scoped Ruff, Linux-platform mypy and `git diff --check` passed.

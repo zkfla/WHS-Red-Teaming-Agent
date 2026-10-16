@@ -51,8 +51,82 @@ class VDBError(ValueError):
 class _LookupWorkerCleanupUncertain(VDBError):
     """The child or one of its pipe threads outlived bounded cleanup."""
 
-    def __init__(self) -> None:
+    def __init__(self, stopped: Callable[[], bool]) -> None:
         super().__init__("vdb_lookup_cleanup_uncertain")
+        self.stopped = stopped
+
+
+class _RetainedLookupSlots:
+    """Own the exact acquired slots until the original worker has stopped."""
+
+    def __init__(
+        self, stopped: Callable[[], bool], policy_slots: threading.BoundedSemaphore,
+        worker_slots: threading.BoundedSemaphore,
+    ) -> None:
+        self.stopped = stopped
+        self.policy_slots = policy_slots
+        self.worker_slots = worker_slots
+        self.released = False
+        self.lock = threading.Lock()
+
+    def reap(self) -> bool:
+        with self.lock:
+            if self.released:
+                return True
+            try:
+                if not self.stopped():
+                    return False
+            except (OSError, RuntimeError, ValueError):
+                return False
+            self.released = True
+            self.policy_slots.release()
+            self.worker_slots.release()
+            return True
+
+
+_REAPER_CONDITION = threading.Condition()
+_RETAINED_LOOKUPS: list[_RetainedLookupSlots] = []
+_REAPER_THREAD: threading.Thread | None = None
+
+
+def _reap_lookup_slots() -> None:
+    while True:
+        with _REAPER_CONDITION:
+            while not _RETAINED_LOOKUPS:
+                _REAPER_CONDITION.wait()
+            pending = tuple(_RETAINED_LOOKUPS)
+        for record in pending:
+            if record.reap():
+                with _REAPER_CONDITION:
+                    if record in _RETAINED_LOOKUPS:
+                        _RETAINED_LOOKUPS.remove(record)
+        with _REAPER_CONDITION:
+            if _RETAINED_LOOKUPS:
+                _REAPER_CONDITION.wait(timeout=0.1)
+
+
+def _ensure_lookup_reaper() -> None:
+    global _REAPER_THREAD
+    with _REAPER_CONDITION:
+        if _RETAINED_LOOKUPS and (_REAPER_THREAD is None or not _REAPER_THREAD.is_alive()):
+            thread = threading.Thread(target=_reap_lookup_slots, daemon=True)
+            try:
+                thread.start()
+            except RuntimeError:
+                # Keep ownership in the registry; a later call retries startup.
+                return
+            _REAPER_THREAD = thread
+
+
+def _retain_lookup_slots(
+    stopped: Callable[[], bool], policy_slots: threading.BoundedSemaphore,
+    worker_slots: threading.BoundedSemaphore,
+) -> None:
+    # Each record holds a global slot, so this registry is bounded by that cap.
+    with _REAPER_CONDITION:
+        _RETAINED_LOOKUPS.append(_RetainedLookupSlots(stopped, policy_slots, worker_slots))
+        _REAPER_CONDITION.notify_all()
+    _ensure_lookup_reaper()
 
 
 class _BackendConfig(Protocol):
@@ -342,6 +416,7 @@ class VDBReader:
         sources: list[str] | None = None,
         deadline: float | None = None,
     ) -> VDBLookup:
+        _ensure_lookup_reaper()
         self._validate_lookup(kind, query, limit, sources, deadline)
         policy_deadline = time.monotonic() + self.policy.query_timeout_seconds
         batch_deadline = deadline
@@ -362,9 +437,10 @@ class VDBReader:
         if not self._lookup_slots.acquire(timeout=remaining):
             raise VDBError(timeout_error_code)
         retain_policy_slot = False
+        worker_slots = _LOOKUP_WORKER_SLOTS
         try:
             remaining = lookup_deadline - time.monotonic()
-            if remaining <= 0 or not _LOOKUP_WORKER_SLOTS.acquire(timeout=max(0.0, remaining)):
+            if remaining <= 0 or not worker_slots.acquire(timeout=max(0.0, remaining)):
                 raise VDBError(timeout_error_code)
             retain_worker_slot = False
             try:
@@ -381,13 +457,14 @@ class VDBReader:
                 )
                 try:
                     return _invoke_lookup_worker(request, lookup_deadline, timeout_error_code)
-                except _LookupWorkerCleanupUncertain:
+                except _LookupWorkerCleanupUncertain as exc:
                     retain_worker_slot = True
                     retain_policy_slot = True
+                    _retain_lookup_slots(exc.stopped, self._lookup_slots, worker_slots)
                     raise
             finally:
                 if not retain_worker_slot:
-                    _LOOKUP_WORKER_SLOTS.release()
+                    worker_slots.release()
         finally:
             if not retain_policy_slot:
                 self._lookup_slots.release()
@@ -685,6 +762,24 @@ def _stop_lookup_worker_bounded(
     return exited and reader_stopped and writer_stopped
 
 
+def _lookup_worker_stopped(
+    process: subprocess.Popen[bytes], reader: Thread, reader_started: bool,
+    writer: Thread, writer_started: bool,
+) -> bool:
+    """Nonblocking termination proof; poll also reaps an exited OS child."""
+    if process.poll() is None:
+        return False
+    if (reader_started and reader.is_alive()) or (writer_started and writer.is_alive()):
+        return False
+    for pipe in (process.stdin, process.stdout):
+        if pipe is not None:
+            try:
+                pipe.close()
+            except (OSError, ValueError):
+                pass
+    return True
+
+
 def _invoke_lookup_worker(
     request: _LookupWorkerRequest,
     deadline: float,
@@ -731,7 +826,7 @@ def _invoke_lookup_worker(
                 except (OSError, ValueError):
                     pass
         if not exited:
-            raise _LookupWorkerCleanupUncertain() from None
+            raise _LookupWorkerCleanupUncertain(lambda: process.poll() is not None) from None
         raise VDBError("vdb_lookup_unavailable")
 
     worker_stdin = process.stdin
@@ -781,6 +876,10 @@ def _invoke_lookup_worker(
     writer = Thread(target=write_input, daemon=True)
     reader_started = False
     writer_started = False
+
+    def stopped() -> bool:
+        return _lookup_worker_stopped(process, reader, reader_started, writer, writer_started)
+
     try:
         reader.start()
         reader_started = True
@@ -794,20 +893,20 @@ def _invoke_lookup_worker(
         if not _stop_lookup_worker_bounded(
             process, worker_stdin, worker_stdout, reader, reader_started, writer, writer_started
         ):
-            raise _LookupWorkerCleanupUncertain() from None
+            raise _LookupWorkerCleanupUncertain(stopped) from None
         raise VDBError(timeout_error_code) from None
     except (OSError, RuntimeError):
         if not _stop_lookup_worker_bounded(
             process, worker_stdin, worker_stdout, reader, reader_started, writer, writer_started
         ):
-            raise _LookupWorkerCleanupUncertain() from None
+            raise _LookupWorkerCleanupUncertain(stopped) from None
         raise VDBError("vdb_lookup_unavailable") from None
 
     if not _join_worker_threads_until(reader, reader_started, writer, writer_started, deadline):
         if not _stop_lookup_worker_bounded(
             process, worker_stdin, worker_stdout, reader, reader_started, writer, writer_started
         ):
-            raise _LookupWorkerCleanupUncertain() from None
+            raise _LookupWorkerCleanupUncertain(stopped) from None
         raise VDBError(timeout_error_code) from None
     _close_stopped_worker_pipes(
         worker_stdin, worker_stdout, reader, reader_started, writer, writer_started
