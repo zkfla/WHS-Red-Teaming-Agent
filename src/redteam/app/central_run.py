@@ -455,7 +455,14 @@ class CentralRun:
                             ):
                                 history.append(diagnostic)
                         final = final.model_copy(update={
-                            "planning_diagnostic": diagnostics[-1],
+                            # Recovery's exact original failure remains actionable;
+                            # completion cannot replace it with a generic held summary.
+                            "planning_diagnostic": (
+                                final.planning_diagnostic
+                                if final.planning_diagnostic is not None
+                                and final.planning_diagnostic.stage == "execution_reconciliation"
+                                else diagnostics[-1]
+                            ),
                             "planning_diagnostic_history": history,
                         })
                         planner_events = tuple(SpecialistPlanner(self.deps).wake_events())
