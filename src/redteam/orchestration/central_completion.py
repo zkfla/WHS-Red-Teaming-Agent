@@ -135,8 +135,23 @@ async def goal_inputs(
         errors.append("goal_required_questions_unresolved")
     executions = await deps.central_state.list_executions()
     from redteam.orchestration.resource_cleanup import unmapped_resource_effects
-    if await unmapped_resource_effects(deps.evidence_store, executions):
-        errors.append("resource_effects_unmapped_cleanup_unverified")
+    unmapped = await unmapped_resource_effects(deps.evidence_store, executions)
+    if unmapped:
+        errors.add(
+            "resource_effects_unmapped_cleanup_unverified",
+            code="resource_effects_unmapped_cleanup_unverified",
+            summary=(
+                "Cleanup cannot be verified because original tool results lack valid "
+                "resource-effect mappings."
+            ),
+            location="$.executions.resource_effects",
+            cause_scope="runtime_contract",
+            owner="orchestration.central_completion",
+            repair_condition=(
+                "Use a supported resource-effect mapping and verify cleanup from preserved "
+                "originals before settling the goal."
+            ),
+        )
     if any(unsafe(item) for item in executions):
         errors.append("original_execution_unsettled")
     if await deps.central_state.transaction(lambda tx: tx.active_activation_count(), write=False):

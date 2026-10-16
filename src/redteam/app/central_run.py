@@ -398,6 +398,7 @@ class CentralRun:
         from redteam.orchestration.central_completion import complete_goal, goal_snapshot, unsafe
         from redteam.orchestration.central_results import OriginTaskChangedConflict
         from redteam.orchestration.coordination import CoordinationError, StateConflict
+        from redteam.orchestration.diagnostics import DecisionDiagnostic
         from redteam.orchestration.reasoning_time import reasoning_time_failure
 
         state = self.deps.central_state
@@ -424,6 +425,39 @@ class CentralRun:
                     if not errors:
                         reason = TerminationReason.GOAL_ACHIEVED
                     else:
+                        typed = [
+                            item for item in getattr(errors, "diagnostics", ())
+                            if isinstance(item, DecisionDiagnostic)
+                        ]
+                        untyped_count = max(len(errors) - len(typed), 0)
+                        diagnostics = list(typed)
+                        if untyped_count:
+                            diagnostics.append(DecisionDiagnostic(
+                                code="goal_completion_rejected",
+                                stage="goal_completion",
+                                kind="validation",
+                                location="$.completion",
+                                summary=(
+                                    "Goal completion was rejected with "
+                                    f"{untyped_count} untyped issue(s)."
+                                ),
+                                cause_scope="unknown",
+                                owner="app.central_run",
+                                repair_condition=(
+                                    "Review the completion blockers and preserve original "
+                                    "evidence before attempting settlement again."
+                                ),
+                            ))
+                        history = list(final.planning_diagnostic_history)
+                        for diagnostic in [final.planning_diagnostic, *diagnostics]:
+                            if diagnostic is not None and (
+                                not history or history[-1] != diagnostic
+                            ):
+                                history.append(diagnostic)
+                        final = final.model_copy(update={
+                            "planning_diagnostic": diagnostics[-1],
+                            "planning_diagnostic_history": history,
+                        })
                         planner_events = tuple(SpecialistPlanner(self.deps).wake_events())
 
                         def judgment(tx):
@@ -486,16 +520,14 @@ class CentralRun:
                         ):
                             reason = TerminationReason.NO_ACTIONABLE_PLAN
                             diagnostic = progress.diagnostic
-                            final = final.model_copy(update={
-                                "planning_diagnostic": diagnostic,
-                                "planning_diagnostic_history": [
-                                    *final.planning_diagnostic_history,
-                                    *([diagnostic] if diagnostic is not None
-                                      and (not final.planning_diagnostic_history
-                                           or final.planning_diagnostic_history[-1] != diagnostic)
-                                      else []),
-                                ],
-                            })
+                            if diagnostic is not None:
+                                history = list(final.planning_diagnostic_history)
+                                if not history or history[-1] != diagnostic:
+                                    history.append(diagnostic)
+                                final = final.model_copy(update={
+                                    "planning_diagnostic": diagnostic,
+                                    "planning_diagnostic_history": history,
+                                })
                         else:
                             reason = TerminationReason.INVESTIGATION_HELD
                 except (DecisionFailure, ReasoningHalted) as exc:

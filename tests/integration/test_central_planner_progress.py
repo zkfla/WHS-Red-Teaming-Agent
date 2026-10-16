@@ -88,15 +88,26 @@ async def test_current_replan_exhaustion_is_stored_and_reported_after_reopen(tmp
 
         assert final.termination_reason == TerminationReason.NO_ACTIONABLE_PLAN
         assert final.planning_diagnostic == expected.diagnostic
+        generic, = [item for item in final.planning_diagnostic_history
+                    if item.code == "goal_completion_rejected"]
+        assert generic.stage == "goal_completion" and generic.kind == "validation"
+        assert generic.location == "$.completion"
+        assert generic.summary == "Goal completion was rejected with 1 untyped issue(s)."
+        assert generic.owner == "app.central_run" and generic.cause_scope == "unknown"
+        assert final.planning_diagnostic_history == [generic, expected.diagnostic]
         run_id, engagement_id = str(final.run_id), str(final.engagement_id)
         path = state.path
 
     _, _, report = await inspect_central_run(path, run_id)
     assert report.termination_reason == TerminationReason.NO_ACTIONABLE_PLAN
     assert report.planning_diagnostic == expected.diagnostic
+    assert report.planning_diagnostic_history == [generic, expected.diagnostic]
     from redteam.app.cli.commands.report import _render_markdown
 
-    assert "planner_replan_exhausted" in _render_markdown(report)
+    rendered = _render_markdown(report)
+    assert "planner_replan_exhausted" in rendered
+    assert "goal_completion_rejected" in rendered
+    assert "goal_criteria_unmet" not in rendered
 
     # Reopening the original Run reads the same mission-bound diagnostic; it does not
     # manufacture a new planner result or clear the safe exhaustion report.
@@ -113,7 +124,7 @@ async def test_current_replan_exhaustion_is_stored_and_reported_after_reopen(tmp
     ) as resumed:
         assert await resumed.deps.central_state.transaction(
             lambda tx: tx.planning_diagnostics(), write=False,
-        ) == (expected.diagnostic, [expected.diagnostic])
+        ) == (expected.diagnostic, [generic, expected.diagnostic])
 
 
 async def test_a_new_planner_wake_makes_prior_replan_exhaustion_stale(tmp_path):
@@ -130,9 +141,12 @@ async def test_a_new_planner_wake_makes_prior_replan_exhaustion_stale(tmp_path):
         final = await session.settle(session.runtime)
 
         assert final.termination_reason == TerminationReason.INVESTIGATION_HELD
-        assert final.planning_diagnostic is None
+        diagnostic = final.planning_diagnostic
+        assert diagnostic is not None and diagnostic.code == "goal_completion_rejected"
+        assert diagnostic.summary == "Goal completion was rejected with 1 untyped issue(s)."
+        assert final.planning_diagnostic_history == [diagnostic]
         assert await state.transaction(lambda tx: tx.planning_diagnostics(), write=False) == (
-            None, [],
+            diagnostic, [diagnostic],
         )
 
 
