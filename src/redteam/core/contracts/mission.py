@@ -223,10 +223,19 @@ class ResultQuestion(BaseModel):
 
     @model_validator(mode="after")
     def _required_reason(self) -> ResultQuestion:
-        if not self.question_id.strip() or not self.question.strip():
-            raise ValueError("result question must be nonblank")
+        if not self.question_id.strip():
+            raise PydanticCustomError(
+                "question_id_blank", "result question id must be nonblank"
+            )
+        if not self.question.strip():
+            raise PydanticCustomError(
+                "question_text_blank", "result question must be nonblank"
+            )
         if self.required_for_goal and not self.reason:
-            raise ValueError("goal-required question needs a reason")
+            raise PydanticCustomError(
+                "question_required_reason_missing",
+                "goal-required question needs a reason",
+            )
         return self
 
 
@@ -252,7 +261,10 @@ class InvestigationResult(BaseModel):
     @classmethod
     def _safe_items(cls, values: list[str]) -> list[str]:
         if any(not value.strip() for value in values):
-            raise ValueError("result observations and limitations must be nonblank")
+            raise PydanticCustomError(
+                "result_observation_blank",
+                "result observations and limitations must be nonblank",
+            )
         return list(dict.fromkeys(redact_sensitive_text(value.strip()) for value in values))
 
     @model_serializer(mode="wrap")
@@ -271,10 +283,19 @@ class InvestigationResult(BaseModel):
     @model_validator(mode="after")
     def _unique_questions(self) -> InvestigationResult:
         ids = [item.question_id for item in self.questions]
-        if not self.result_id.strip() or not self.summary or len(ids) != len(set(ids)):
-            raise ValueError("invalid result identity, summary or repeated question id")
+        if not self.result_id.strip():
+            raise PydanticCustomError("result_id_blank", "result id must be nonblank")
+        if not self.summary:
+            raise PydanticCustomError("result_summary_blank", "result summary must be nonblank")
+        if len(ids) != len(set(ids)):
+            raise PydanticCustomError(
+                "result_question_duplicate", "result question ids must be unique"
+            )
         if self.contract_version == 1 and (self.observations or self.limitations):
-            raise ValueError("structured probe observations require result contract v2")
+            raise PydanticCustomError(
+                "result_v1_extensions_forbidden",
+                "structured probe observations require result contract v2",
+            )
         return self
 
 

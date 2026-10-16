@@ -70,6 +70,34 @@ _KNOWN_FIELDS = frozenset(
     }
 ) | _READ_FIELDS
 
+_RESULT_PUBLICATION_RULES = {
+    "result_id_blank": (
+        ("result_id",), "Provide a nonblank result id."
+    ),
+    "result_summary_blank": (
+        ("summary",), "Provide a nonblank result summary."
+    ),
+    "result_question_duplicate": (
+        ("questions",), "Give each result question a unique id."
+    ),
+    "result_v1_extensions_forbidden": (
+        ("contract_version",),
+        "Use contract version 2 when observations or limitations are present.",
+    ),
+    "question_id_blank": (
+        ("question_id",), "Provide a nonblank question id."
+    ),
+    "question_text_blank": (
+        ("question",), "Provide a nonblank question."
+    ),
+    "question_required_reason_missing": (
+        ("reason",), "Provide a reason for a question required for the goal."
+    ),
+    "result_observation_blank": (
+        (), "Provide nonblank observations and limitations."
+    ),
+}
+
 
 def safe_feedback(text: str, limit: int = 500) -> str:
     """Redact first, then bound public feedback and durable summaries."""
@@ -758,6 +786,44 @@ def diagnostic_for_exception(
             ),
         }
         rule = str(first.get("type") or "")
+        if rule in _RESULT_PUBLICATION_RULES:
+            suffix, summary = _RESULT_PUBLICATION_RULES[rule]
+            raw_location = tuple(first.get("loc", ()))
+            # Pydantic's model validators report the model boundary. Add only
+            # code-owned field names; retain structural list indexes from the
+            # validation location so caller data never supplies a path label.
+            safe_fields = frozenset({
+                "result", "questions", "observations", "limitations", "result_id",
+                "summary", "question_id", "question", "reason", "contract_version",
+            })
+            safe_prefix = tuple(
+                part for part in raw_location
+                if (isinstance(part, int) and not isinstance(part, bool) and part >= 0)
+                or (isinstance(part, str) and part in safe_fields)
+            )
+            owner_path = (
+                safe_prefix if rule == "result_observation_blank"
+                else (*safe_prefix, *suffix)
+            )
+            owner_fields = frozenset(part for part in owner_path if isinstance(part, str))
+            location = known_location(
+                owner_path,
+                fields=(fields | owner_fields),
+            )
+            return DecisionDiagnostic(
+                code=rule,
+                stage=_identifier(stage, "decision"),
+                kind="format",
+                location=location,
+                summary=summary,
+                repair_condition=summary,
+                cause_scope="model_input",
+                owner="core.contracts.mission",
+                retryable=True,
+                validation_issues=[{"rule": rule, "location": location}],
+                error_type=error_type_for(exc),
+                exception_chain=exception_chain_for(exc),
+            )
         if rule in action_rules:
             return DecisionDiagnostic(
                 code=rule,
