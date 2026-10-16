@@ -258,12 +258,16 @@ def create_server(policy: ServerPolicy, binary: str = "nuclei") -> MCPServer:
         async with lock:
             response = await request(policy, target_ref, path, session_ref=session_ref)
             matched = await analyze(executable, response, check_id, policy.timeout_seconds + 10)
-        return {
+        result = {
             "target_ref": target_ref, "check_id": check_id, "matched": matched,
             "status_code": response.status, "request_count": 1,
             "engine_mode": "passive", "raw_output_omitted": True,
             "verdict": "observation_only",
         }
+        summary = response.summary()
+        if "actual_session_ref" in summary:
+            result["actual_session_ref"] = summary["actual_session_ref"]
+        return result
 
     @server.tool()
     async def nuclei_active_query_probe(

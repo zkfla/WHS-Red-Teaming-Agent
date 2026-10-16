@@ -52,7 +52,13 @@ async def test_nuclei_check_uses_scoped_fetch_and_sanitized_local_response(
 
     async def fetch(*args: Any, **kwargs: Any) -> CapturedResponse:
         calls.append(args[2])
-        return CapturedResponse(200, {"set-cookie": "secret", "content-length": "99"}, b"secret")
+        return CapturedResponse(
+            200,
+            {"set-cookie": "secret", "content-length": "99"},
+            b"secret",
+            actual_session_ref="bank-session",
+            has_session_receipt=True,
+        )
 
     async def engine(binary: str, directory: Path, timeout: float) -> bytes:
         temporary_paths.append(directory)
@@ -72,7 +78,13 @@ async def test_nuclei_check_uses_scoped_fetch_and_sanitized_local_response(
             "target_ref": "bank", "path": "/", "check_id": "missing-csp",
         })
     assert result.structured_content is not None and result.structured_content["matched"]
+    assert result.structured_content["actual_session_ref"] == "bank-session"
+    assert set(result.structured_content) == {
+        "target_ref", "check_id", "matched", "status_code", "request_count",
+        "engine_mode", "raw_output_omitted", "verdict", "actual_session_ref",
+    }
     assert "must-be-omitted" not in str(result.structured_content)
+    assert "secret" not in str(result.structured_content)
     assert calls == ["/"] and not temporary_paths[0].exists()
 
 

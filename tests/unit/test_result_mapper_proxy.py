@@ -396,6 +396,80 @@ def test_passive_nuclei_match_does_not_create_a_finding() -> None:
 
 
 @pytest.mark.parametrize(
+    ("session_ref", "actual_session_ref"),
+    [("alice", "alice"), (None, None)],
+)
+def test_passive_nuclei_preserves_matching_actual_session_receipt_without_identity(
+    session_ref: str | None, actual_session_ref: str | None
+) -> None:
+    output = {
+        "target_ref": "bank",
+        "check_id": "missing-csp",
+        "matched": True,
+        "status_code": 200,
+        "request_count": 1,
+        "engine_mode": "passive",
+        "raw_output_omitted": True,
+        "verdict": "observation_only",
+        "actual_session_ref": actual_session_ref,
+    }
+    mutation = _map(
+        "web.nuclei_response_check",
+        {
+            "target_ref": "bank",
+            "path": "/accounts/123",
+            "check_id": "missing-csp",
+            **({"session_ref": session_ref} if session_ref is not None else {}),
+        },
+        output,
+    )
+
+    observation = mutation.nodes[0].observations[0]
+    assert observation["actual_session_ref"] == actual_session_ref
+    assert all(node.node_type is not GraphNodeType.PRINCIPAL for node in mutation.nodes)
+    assert all(node.node_type is not GraphNodeType.FINDING for node in mutation.nodes)
+    assert all(edge.edge_type is not GraphEdgeType.CAN_ACCESS for edge in mutation.edges)
+
+
+@pytest.mark.parametrize(
+    ("session_ref", "actual_session_ref"),
+    [("alice", None), ("alice", "bob")],
+)
+def test_passive_nuclei_keeps_missing_or_mismatched_receipt_unknown(
+    session_ref: str, actual_session_ref: str | None
+) -> None:
+    output = {
+        "target_ref": "bank",
+        "check_id": "missing-csp",
+        "matched": True,
+        "status_code": 200,
+        "request_count": 1,
+        "engine_mode": "passive",
+        "raw_output_omitted": True,
+        "verdict": "observation_only",
+    }
+    if actual_session_ref is not None:
+        output["actual_session_ref"] = actual_session_ref
+    mutation = _map(
+        "web.nuclei_response_check",
+        {
+            "target_ref": "bank",
+            "path": "/accounts/123",
+            "check_id": "missing-csp",
+            "session_ref": session_ref,
+        },
+        output,
+    )
+
+    observation = mutation.nodes[0].observations[0]
+    assert observation["kind"] == "passive_response_check"
+    assert "actual_session_ref" not in observation
+    assert all(node.node_type is not GraphNodeType.PRINCIPAL for node in mutation.nodes)
+    assert all(node.node_type is not GraphNodeType.FINDING for node in mutation.nodes)
+    assert all(edge.edge_type is not GraphEdgeType.CAN_ACCESS for edge in mutation.edges)
+
+
+@pytest.mark.parametrize(
     ("tool_id", "arguments", "output"),
     [
         (

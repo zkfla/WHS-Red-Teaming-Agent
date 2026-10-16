@@ -615,6 +615,15 @@ def map_web_nuclei_response_check(
         "raw_output_omitted": True,
         "verdict": "observation_only",
     }
+    session_ref = arguments.get("session_ref")
+    if session_ref is not None:
+        session_ref = _safe_reference(session_ref)
+        if session_ref is None:
+            return GraphMutation()
+    if original_session_receipt_matches(
+        {}, result.model_dump(mode="json"), expected_session_ref=session_ref
+    ):
+        observation["actual_session_ref"] = output["actual_session_ref"]
     facts: dict[str, Any] = {
         "host": host,
         "target_ref": target_ref,
