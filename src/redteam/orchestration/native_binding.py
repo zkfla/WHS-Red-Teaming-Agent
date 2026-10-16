@@ -14,7 +14,7 @@ from urllib.parse import urlsplit
 
 from redteam.attack_graph.identity import node_id_for_target, target_for_node
 from redteam.attack_graph.predicates import facts_of
-from redteam.core.contracts.target import AnyTarget, EndpointTarget, UrlTarget
+from redteam.core.contracts.target import AnyTarget, EndpointTarget, HostTarget, UrlTarget
 from redteam.core.ids import GraphNodeId
 from redteam.orchestration.knowledge_validation import InternalAssessment
 from redteam.orchestration.target_binding import network_identity
@@ -31,6 +31,13 @@ def _execution_target_key(target: AnyTarget) -> str:
     # Graph identities may normalize concrete resource paths. Deduplicate
     # only equal execution addresses, ignoring an attached graph reference.
     return json.dumps(target.model_dump(mode="json", exclude={"graph_node_id"}), sort_keys=True)
+
+
+def _same_network_identity(left: AnyTarget, right: AnyTarget) -> bool:
+    """Whether two target forms name the same fully pinned network address."""
+    left_identity = network_identity(left)
+    right_identity = network_identity(right)
+    return left_identity is not None and left_identity == right_identity
 
 
 async def resolve_native_target(
@@ -137,6 +144,27 @@ async def resolve_native_target(
         return exact_paths[0]
     if len(matches) == 1:
         return matches[0]
+    target_ref_fields = {"target_ref"} | {
+        remote for remote, common in tool.argument_bindings.items() if common == "target_ref"
+    }
+    # One registered target_ref may point at both the authority's HostTarget
+    # and an observed EndpointTarget rooted at "/". A path argument to an
+    # HTTP tool selects another route on that same registered authority; it
+    # does not select the old root endpoint. In that case the HostTarget is
+    # the explicit authority anchor. Keep candidates distinct everywhere else:
+    # different addresses, ports, schemes, or target kinds remain ambiguous.
+    if (
+        any(arguments.get(field) is not None for field in target_ref_fields)
+        and not explicit_urls
+        and len(matches) > 1
+        and all(isinstance(target, (HostTarget, EndpointTarget)) for target in matches)
+    ):
+        host_matches = [target for target in matches if isinstance(target, HostTarget)]
+        if (
+            len(host_matches) == 1
+            and all(_same_network_identity(host_matches[0], target) for target in matches)
+        ):
+            return host_matches[0]
     if not matches and target_ref_rejection is not None:
         raise target_ref_rejection
     raise DecisionRuleError(

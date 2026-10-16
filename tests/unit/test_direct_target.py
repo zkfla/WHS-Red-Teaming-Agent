@@ -26,6 +26,7 @@ from redteam.core.contracts.tool import (
     EXECUTION_UNCERTAIN_METADATA_KEY,
     ExecutionContext,
     ToolInvocation,
+    ToolTargetBinding,
     model_input_schema,
 )
 from redteam.core.ids import (
@@ -278,6 +279,121 @@ async def test_native_selector_uses_declared_host_binding_despite_mcp_alias():
     # An opaque MCP selector retains its original exact reference check.
     with pytest.raises(DecisionRuleError):
         validate_argument_target(target, arguments, {"opaque-mcp-id"})
+
+
+def _native_network_binding_fixture(*targets, aliases=None, target_types=None):
+    from redteam.orchestration.knowledge_validation import (
+        InternalAssessment,
+        InternalTarget,
+    )
+
+    reference = "target_651d3da821c34898"
+    deps = SimpleNamespace(
+        graph_store=object(),
+        engagement=SimpleNamespace(metadata={
+            "target_refs": (
+                aliases if aliases is not None else {"bank.test:18101": reference}
+            ),
+        }),
+        operation_bindings=None,
+    )
+    material = InternalAssessment(targets={
+        str(index): InternalTarget(
+            node_id=str(index), execution_target=target,
+        )
+        for index, target in enumerate(targets)
+    })
+    tool = SimpleNamespace(
+        requires_target=True,
+        target_types=(target_types if target_types is not None else ["host", "endpoint"]),
+        argument_bindings={},
+        target_binding=ToolTargetBinding(binds_target_arguments=True),
+    )
+    return deps, material, tool, reference
+
+
+async def test_native_selector_uses_host_anchor_for_unobserved_path():
+    from redteam.core.contracts.target import EndpointTarget, HostTarget
+    from redteam.orchestration.engine import DecisionRuleError
+    from redteam.orchestration.native_binding import resolve_native_target
+
+    host = HostTarget(host="bank.test:18101")
+    root = EndpointTarget(host="bank.test", port=18101, path="/")
+    deps, material, tool, reference = _native_network_binding_fixture(host, root)
+
+    selected = await resolve_native_target(
+        deps, tool, {"target_ref": reference, "path": "/health"}, material,
+    )
+
+    assert selected == host
+    with pytest.raises(DecisionRuleError) as rejected:
+        await resolve_native_target(deps, tool, {"path": "/health"}, material)
+    assert rejected.value.diagnostic.code == "ambiguous_tool_target"
+
+
+async def test_native_selector_keeps_exact_endpoint_path_selection():
+    from redteam.core.contracts.target import EndpointTarget, HostTarget
+    from redteam.orchestration.native_binding import resolve_native_target
+
+    host = HostTarget(host="bank.test:18101")
+    root = EndpointTarget(host="bank.test", port=18101, path="/")
+    deps, material, tool, reference = _native_network_binding_fixture(host, root)
+
+    selected = await resolve_native_target(
+        deps, tool, {"target_ref": reference, "path": "/"}, material,
+    )
+
+    assert selected == root
+
+
+async def test_native_selector_keeps_scheme_specific_url_target_ambiguous():
+    from redteam.core.contracts.target import HostTarget, UrlTarget
+    from redteam.orchestration.engine import DecisionRuleError
+    from redteam.orchestration.native_binding import resolve_native_target
+
+    host = HostTarget(host="bank.test:443")
+    url = UrlTarget(url="https://bank.test:443/")
+    deps, material, tool, reference = _native_network_binding_fixture(
+        host, url, aliases={"bank.test:443": "target_651d3da821c34898"},
+        target_types=["host", "url"],
+    )
+
+    with pytest.raises(DecisionRuleError) as rejected:
+        await resolve_native_target(
+            deps, tool, {"target_ref": reference, "path": "/health"}, material,
+        )
+
+    assert rejected.value.diagnostic.code == "ambiguous_tool_target"
+
+
+@pytest.mark.parametrize(
+    ("targets", "aliases"),
+    [
+        (
+            ("bank.test:18101", "other.test:18101"),
+            {"bank.test:18101": "shared-ref", "other.test:18101": "shared-ref"},
+        ),
+        (
+            ("bank.test", "bank.test:18101"),
+            {"bank.test": "shared-ref", "bank.test:18101": "shared-ref"},
+        ),
+    ],
+)
+async def test_native_selector_keeps_distinct_authorities_and_ports_ambiguous(targets, aliases):
+    from redteam.core.contracts.target import HostTarget
+    from redteam.orchestration.engine import DecisionRuleError
+    from redteam.orchestration.native_binding import resolve_native_target
+
+    deps, material, tool, _ = _native_network_binding_fixture(
+        *(HostTarget(host=target) for target in targets), aliases=aliases,
+    )
+
+    with pytest.raises(DecisionRuleError) as rejected:
+        await resolve_native_target(
+            deps, tool, {"target_ref": "shared-ref", "path": "/health"}, material,
+        )
+
+    assert rejected.value.diagnostic.code == "ambiguous_tool_target"
 
 
 class _NoLock:
