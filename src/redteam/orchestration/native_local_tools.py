@@ -168,10 +168,16 @@ async def _settle(
     except Exception as exc:
         # Same shared validation contract as the evidence reader: known
         # fields and rules only, never raw values or unknown key names.
-        diagnostic = diagnostic_for_exception(exc, stage="native_local_tool")
+        diagnostic = diagnostic_for_exception(
+            exc, stage="native_local_tool", schema=CompletionProposal.model_json_schema(),
+        )
         diagnostic = diagnostic.model_copy(update={
             "cause_scope": "model_input", "owner": "orchestration.completion_proposal",
-            "repair_condition": "Correct the completion arguments using the registered schema.",
+            "repair_condition": "`outcome`, `reason`, `evidence_ids`는 등록된 형식을 따르세요. "
+                                "미해결 결과의 각 `gaps` 항목은 비어 있지 않은 "
+                                "`description`이 있는 객체여야 합니다. 예: "
+                                "{\"code\":\"insufficient_evidence\",\"description\":\"...\"}. "
+                                "저장된 evidence ID와 기존 검증 규칙을 유지하세요.",
         })
         return LocalToolResult(
             ok=False,
@@ -226,12 +232,17 @@ async def context_query_handler(
     try:
         query = ContextQuery.model_validate(tool_input or {})
     except Exception as exc:
+        context_schema = ContextQuery.model_json_schema()
         diagnostic = context_rule_diagnostic(
-            exc, stage="native_local_tool", schema=ContextQuery.model_json_schema(),
-        ) or diagnostic_for_exception(exc, stage="native_local_tool")
+            exc, stage="native_local_tool", schema=context_schema,
+        ) or diagnostic_for_exception(
+            exc, stage="native_local_tool", schema=context_schema,
+        )
         diagnostic = diagnostic.model_copy(update={
             "cause_scope": "model_input", "owner": "orchestration.investigation_context",
-            "repair_condition": "Correct the context query using the registered schema.",
+            "repair_condition": "`refs` 항목은 `{kind, identity}` 객체로 보내세요. "
+                                "`statuses`는 kind가 허용하는 상태만 받으며, 등록된 쿼리 "
+                                "스키마에 없는 필드는 보내지 마세요.",
         })
         return LocalToolResult(
             ok=False,
@@ -309,11 +320,13 @@ def task_settle_descriptor() -> LocalToolDescriptor:
             "blocked records a canonical unresolved gap and blocks it. "
             "Provide outcome, reason, the stored evidence ids that prove "
             "it, and gaps for unresolved results. The current task and its "
-            "purpose come from the run; no path is required."
+            "purpose come from the run; no path is required. 미해결 결과의 `gaps`는 "
+            "문자열 배열이 아니라 비어 있지 않은 `description`이 든 객체 배열입니다 "
+            "(예: `[{\"code\":\"insufficient_evidence\",\"description\":\"...\"}]`)."
         ),
         input_schema=CompletionProposal.model_json_schema(),
         contribution_id=TASK_SETTLE_CONTRIBUTION_ID,
-        version="v4", initial_exposure=True, decision_kind="settlement",
+        version="v5", initial_exposure=True, decision_kind="settlement",
     )
 
 
@@ -325,11 +338,14 @@ def goal_settle_descriptor() -> LocalToolDescriptor:
             "refuted requires every required task settled and the operator "
             "criteria covered; inconclusive or blocked records a canonical "
             "unresolved gap and finishes the investigation. After the last "
-            "task closes completed, the mission still needs this call."
+            "task closes completed, the mission still needs this call. 미해결 결과의 "
+            "`gaps`는 문자열 배열이 아니라 비어 있지 않은 `description`이 든 "
+            "객체 배열입니다 (예: `[{\"code\":\"insufficient_evidence\","
+            "\"description\":\"...\"}]`)."
         ),
         input_schema=CompletionProposal.model_json_schema(),
         contribution_id=GOAL_SETTLE_CONTRIBUTION_ID,
-        version="v2", decision_kind="settlement",
+        version="v3", decision_kind="settlement",
     )
 
 
@@ -345,11 +361,13 @@ def context_query_descriptor() -> LocalToolDescriptor:
             "max_bytes bounds the reply. blocked is not terminal; held/inconclusive "
             "candidates are not rejected. No match is a scoped result, not proof the "
             "work does not exist elsewhere in the mission. This never settles a Task, "
-            "proposes a verdict or grants execution/scope; it is read-only."
+            "proposes a verdict or grants execution/scope; it is read-only. `refs` 항목은 "
+            "문자열이 아니라 `{kind, identity}` 객체입니다. `statuses`(복수)는 kind별 "
+            "허용 상태만 받으며, 등록된 스키마 밖의 필드는 보내지 마세요."
         ),
         input_schema=ContextQuery.model_json_schema(),
         contribution_id=CONTEXT_QUERY_CONTRIBUTION_ID,
-        version="v2", initial_exposure=True, decision_kind="local_read",
+        version="v3", initial_exposure=True, decision_kind="local_read",
     )
 
 
@@ -369,7 +387,7 @@ def task_settle_contribution() -> Contribution:
 
     return runtime_tool_contribution(
         contribution_id=TASK_SETTLE_CONTRIBUTION_ID,
-        version="v4", factory=factory,
+        version="v5", factory=factory,
     )
 
 
@@ -379,7 +397,7 @@ def goal_settle_contribution() -> Contribution:
 
     return runtime_tool_contribution(
         contribution_id=GOAL_SETTLE_CONTRIBUTION_ID,
-        version="v2", factory=factory,
+        version="v3", factory=factory,
     )
 
 
@@ -389,7 +407,7 @@ def context_query_contribution() -> Contribution:
 
     return runtime_tool_contribution(
         contribution_id=CONTEXT_QUERY_CONTRIBUTION_ID,
-        version="v2", factory=factory,
+        version="v3", factory=factory,
     )
 
 

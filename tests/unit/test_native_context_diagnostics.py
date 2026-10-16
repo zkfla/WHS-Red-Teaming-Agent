@@ -13,6 +13,9 @@ from redteam.orchestration.native_local_tools import context_query_handler
     ({"mode": "read", "refs": [{"kind": "task", "identity": "PRIVATE-MARK\u0000"}]},
      "context_identity_invalid", "$.refs[0].identity"),
     ({"statuses": ["PRIVATE-MARK"]}, "context_status_invalid", "$"),
+    ({"refs": ["PRIVATE-MARK"]}, "model_validation", "$.refs[0]"),
+    ({"origin": "PRIVATE-MARK"}, "model_validation", "$"),
+    ({"status": "PRIVATE-MARK"}, "model_validation", "$"),
 ])
 async def test_native_context_query_returns_owned_safe_correction(query, code, location):
     result = await context_query_handler(query, LocalToolContext(deps=None, runtime=None))
@@ -24,3 +27,11 @@ async def test_native_context_query_returns_owned_safe_correction(query, code, l
     assert diagnostic["summary"] in result.error
     assert "PRIVATE-MARK" not in json.dumps(result.payload)
     assert "PRIVATE-MARK" not in result.error
+    if "refs" in query:
+        assert "kind, identity" in diagnostic["repair_condition"]
+    if "statuses" in query or "status" in query:
+        assert "statuses" in diagnostic["repair_condition"]
+    for unknown in ("origin", "status"):
+        if unknown in query:
+            assert f".{unknown}" not in json.dumps(result.payload)
+            assert f".{unknown}" not in result.error

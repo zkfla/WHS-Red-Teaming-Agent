@@ -288,6 +288,61 @@ async def test_settle_validation_keeps_safe_field_diagnostics() -> None:
     assert "bogus-outcome-secret-value" not in str(result.error)
 
 
+@pytest.mark.parametrize(("proposal", "location"), [
+    ({"outcome": "inconclusive", "reason": "PRIVATE-MARK", "gaps": ["PRIVATE-MARK"]},
+     "$.gaps[0]"),
+    ({"outcome": "blocked", "reason": "PRIVATE-MARK", "gaps": [{"code": "unknown"}]},
+     "$.gaps[0].description"),
+])
+async def test_settle_validation_keeps_safe_nested_schema_locations(proposal, location) -> None:
+    deps = SimpleNamespace(
+        evidence_store=_EvidenceStore(),
+        task_graph_store=InMemoryTaskGraphStore(),
+        path_store=InMemoryPathStore(),
+        work_store=_WorkStore(),
+        llm_client=object(),
+        settings=SimpleNamespace(decision_max_attempts=2),
+        planning_provider=None,
+        coordinator=None,
+    )
+    result = await task_settle_handler(proposal, _context(_runtime(), deps=deps))
+
+    assert result.ok is False
+    diagnostic = result.payload["diagnostic"]
+    assert diagnostic["location"] == location
+    assert diagnostic["cause_scope"] == "model_input"
+    assert "description" in diagnostic["repair_condition"]
+    assert "PRIVATE-MARK" not in str(result.error)
+    assert "PRIVATE-MARK" not in str(result.payload)
+
+
+async def test_valid_structured_gap_reaches_canonical_settlement(monkeypatch) -> None:
+    from redteam.orchestration import central_results
+
+    received: dict[str, Any] = {}
+
+    async def settle(scope, proposal, context):
+        received.update(scope=scope, proposal=proposal, context=context)
+        return LocalToolResult(ok=True, payload={"scope": scope})
+
+    monkeypatch.setattr(central_results, "settle_central", settle)
+    context = _context(_runtime(), deps=SimpleNamespace())
+    result = await task_settle_handler({
+        "outcome": "inconclusive",
+        "reason": "The stored observation is not conclusive.",
+        "evidence_ids": ["ev-stored"],
+        "gaps": [{"code": "insufficient_evidence",
+                  "description": "Check the remaining criterion."}],
+    }, context)
+
+    assert result.ok is True
+    assert received["scope"] == "task"
+    assert received["context"] is context
+    assert received["proposal"].gaps[0].code == "insufficient_evidence"
+    assert received["proposal"].gaps[0].description == "Check the remaining criterion."
+    assert received["proposal"].evidence_ids == ["ev-stored"]
+
+
 
 
 def test_builtin_registration_includes_native_local_tools() -> None:
