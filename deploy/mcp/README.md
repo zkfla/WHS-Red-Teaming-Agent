@@ -20,6 +20,44 @@ use one of the Web/API, Mobile, Recon, or Analysis adapters.
   possible; if a server needs persistent state, mount a named volume
   under `redteam-mcp-<server-id>-data` and document it here.
 
+## Owned provider concurrency
+
+The gateway and provider each enforce a separate finite capacity. To request six
+independent concurrent calls, set the provider policy field below to `6` and its
+matching `REDTEAM_MCP_<PREFIX>_MAX_CONCURRENCY=6`. Defaults remain `1`; the checked-in
+examples do not enable parallel traffic. These are the example server IDs, not a
+new runtime allowlist; a custom server ID uses its own normalized prefix.
+
+| Owned provider | Example environment prefix | Provider policy field |
+| --- | --- | --- |
+| Active recon | `RECON_ACTIVE` | `ServerPolicy.max_concurrency` |
+| Mobile diagnostics | `MOBILE_LOCAL` | `MobileDiagnosticsPolicy.max_concurrency` |
+| Proxy | `WEB_PROXY` | `ServerPolicy.max_concurrency` |
+| ZAP HAR export | `WEB_ZAP` | `ServerPolicy.max_concurrency` |
+| Nuclei | `WEB_NUCLEI` (and `WEB_NUCLEI_ACTIVE` if selected) | `ServerPolicy.max_concurrency` |
+| MobSF | `MOBSF` | `MobSFPolicy.max_concurrency` |
+| VDB | `VDB_READONLY` or `VDB_EXTENDED` | `VDBPolicy.max_concurrent_lookups` |
+
+VDB supports up to eight lookup workers; the other listed policy fields support
+up to 32 calls. These bounds are not throughput guarantees. Proxy calls to the
+same origin/path, mobile calls to the same serial, and MobSF work on the same
+backend content remain serialized. UNKNOWN content/execution fences remain held.
+VDB gives each lookup a separate process and read-only database handles.
+
+For the finance lab, update the private copy of `finance/policy.json` and the
+selected gateway entries in `finance/framework.env.example` and
+`finance/extensions.env.example` together. MobSF/mobile use their own private
+policy files; VDB uses the policy referenced by its selected environment example.
+Regenerate pinned policy hashes after intentional policy changes. Existing run
+identity and resume checks can reject configuration drift.
+
+The approved deployment generator currently provisions only web HTTP and passive
+recon, and derives both sides from its approved policy. Other owned providers
+retain explicit launcher/policy and gateway settings. Raising only one side leaves
+the other as a bottleneck. Worker/global/per-target limits, scope, approval, ROE
+and shared budget limits still apply independently. External ZAP/Burp/browser MCP
+servers are outside this owned-provider implementation.
+
 ## Health check
 
 Each MCP Adapter performs a protocol-level connection health check.
