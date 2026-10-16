@@ -474,6 +474,15 @@ class ReasoningHalted(Exception):
         super().__init__(self.reason_code)
 
 
+class UnstartedRequestHalt(ReasoningHalted):
+    """A typed owner refusal before request reservation or provider dispatch.
+
+    Unlike a policy/budget stop, the owning workflow handles this refusal. It must
+    never be raised by a provider after dispatch. A provisional decision attempt
+    can be released only while the metered request identity is still absent.
+    """
+
+
 def should_halt_for_token_budget(budget: DecisionBudget, max_tokens: int | None) -> bool:
     """Public token-guard check for delegation owners (root/E).
 
@@ -1068,6 +1077,10 @@ class StructuredDecisionClient:
                 _request_timeout_diagnostic(stage), elapsed_ms=elapsed_ms,
                 response_shape={"type": "absent", "observed": False},
             ) from exc
+        except UnstartedRequestHalt:
+            if request_metadata is None or request_metadata.request_id is None:
+                budget.release_unstarted(stage=stage, repair=repair, transport=transport)
+            raise
         except ReasoningHalted as halted:
             _capture_completed_request(budget, self._llm, halted)
             raise DecisionFailure(
@@ -1211,7 +1224,7 @@ class StructuredDecisionClient:
                 guard_result = before_call()
                 if inspect.isawaitable(guard_result):
                     await guard_result
-            except DecisionFailure:
+            except (DecisionFailure, UnstartedRequestHalt):
                 raise
             except ReasoningHalted as halted:
                 diagnostic = halted.diagnostic.model_copy(update={

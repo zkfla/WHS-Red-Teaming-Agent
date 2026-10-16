@@ -52,6 +52,16 @@ canonical `capture_snapshot`, related reads, exact source/result·후보 revisio
 의미대로 처리한다. atomizer는 기존의 관련 handoff, issued IDs, coverage 검증을 유지하며
 전체 Planner 자료·모델 원장을 다시 받지 않는다.
 
+다음 모델 요청을 허가할 때도 이미 알려진 관련 readset을 같은 소유 검사로 확인한다.
+명시적 lookup의 소비 참조와, 수락된 stage1의 후보·질문·source 참조는 atomizer 및 보정
+요청에 이어진다. 단순히 화면에 표시된 형제 Task/후보 전체를 readset으로 확대하지 않는다.
+metered 요청은 semaphore/cooldown 뒤 reserve/dispatch 직전에도 검사한다. 그때 관련 입력이
+바뀌면 typed `UnstartedRequestHalt`를 소유 workflow로 돌려 같은 `HypothesisPlanningInvalidated`
+사건을 기록한다. provider 요청 ID가 없는 provisional decision 시도만 반환하며, 이미 실행한
+요청·사용량은 유지한다. transport retry·unknown usage·부분 Task/candidate/cursor 저장으로
+바꾸지 않는다. 검사를 통과한 뒤 응답 중 발생한 변경은 기존 최종 CAS가 계속 거절한다.
+관련 참조를 아직 알 수 없는 거절 응답에서 모든 snapshot 항목을 관련 입력으로 추측하지 않는다.
+
 Planner가 깨어난 시점의 canonical 후보 inventory가 비어 있으면 최종 judgment는 등록된
 target에 연결된 검증 전 후보를 최소 하나 제안해야 한다. 후보에는 아직 확인하지 않은 전제를
 명시하고 `open`/`inconclusive`/`held` 상태를 사용한다. 코드 validator가 이 조건을 검사하며,

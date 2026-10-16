@@ -24,7 +24,11 @@ from redteam.orchestration.central_runtime import (
     task_is_claimable,
 )
 from redteam.orchestration.central_state import receipt_failure
-from redteam.orchestration.cognition import DecisionFailure, DecisionValidationError
+from redteam.orchestration.cognition import (
+    DecisionFailure,
+    DecisionValidationError,
+    UnstartedRequestHalt,
+)
 from redteam.orchestration.coordination import (
     CandidateAdmissionConflict,
     PlanningInputsChanged,
@@ -625,7 +629,67 @@ def related_reads(decision, proposal, snapshot, records, *, questions=(), issued
             {identity: content_hash(snapshot.tasks[identity]) for identity in tasks})
 
 
+class _PlanningPassInvalidated(UnstartedRequestHalt):
+    """Only the coordination owner's allow-listed cause crosses the request boundary."""
+
+    def __init__(self, changed: PlanningInputsChanged):
+        self.cause_code = changed.code
+        super().__init__("related_planning_inputs_changed")
+
+
+class _PlanningRequestGuard:
+    """Fence known related reads before a request; the final CAS remains authoritative."""
+
+    def __init__(self, state, snapshot, pass_context, engine):
+        self.state, self.snapshot = state, snapshot
+        self.context, self.engine = pass_context, engine
+        self.graph_read: dict[str, str] = {}
+        self.task_read: dict[str, str] = {}
+
+    def include(self, graph_read, task_read):
+        self.graph_read.update(graph_read)
+        self.task_read.update(task_read)
+
+    async def __call__(self):
+        await self.engine.guard_reasoning()
+        graph_read, task_read = self.context.read_dependencies()
+        graph_read.update(self.graph_read)
+        task_read.update(self.task_read)
+
+        def check(tx):
+            tx.check_planning_inputs(
+                self.snapshot.mission.revision, self.snapshot.binding, graph_read, task_read,
+            )
+            # Only captured explicit edge/execution reads; never the whole inventory.
+            tx.check_planner_inventory({
+                "termination": "continue", **self.context.auxiliary_reads(),
+            })
+
+        try:
+            await self.state.transaction(check, write=False)
+        except PlanningInputsChanged as changed:
+            raise _PlanningPassInvalidated(changed) from changed
+
+
+async def _queue_planning_invalidation(deps, identity, cause_code):
+    state = deps.central_state
+    await state.transaction(lambda tx: tx.queue(event(
+        state, PLANNING_INVALIDATED,
+        {"pass_id": identity, "reason_code": "related_planning_inputs_changed",
+         "cause_code": cause_code},
+    )))
+
+
 async def advance_hypotheses(planner, runtime, schema):
+    try:
+        return await _advance_hypotheses(planner, runtime, schema)
+    except _PlanningPassInvalidated as changed:
+        await _queue_planning_invalidation(planner.deps, new_id("planner_pass"), changed.cause_code)
+        await planner.deps.event_bus.flush()
+        return []
+
+
+async def _advance_hypotheses(planner, runtime, schema):
     deps, state = planner.deps, planner.deps.central_state
     await process_controls(deps)
     await runtime_token(deps, runtime, require_task=False)
@@ -647,6 +711,7 @@ async def advance_hypotheses(planner, runtime, schema):
         evidence_store=deps.evidence_store, graph=AttackGraphService(deps.graph_store),
     )
     fields = pass_context.base_fields()
+    request_guard = _PlanningRequestGuard(state, snapshot, pass_context, engine)
     payload = redact_secret_material({
         "mission": snapshot.mission.model_dump(mode="json"),
         **fields,
@@ -673,7 +738,7 @@ async def advance_hypotheses(planner, runtime, schema):
     if getattr(planner.policy, "probe_atomization", False) is True:
         return await _advance_split(
             planner, runtime, schema, snapshot, engine, budget, payload,
-            targets, principals, roles, records, pass_context,
+            targets, principals, roles, records, pass_context, request_guard,
         )
 
     def bind(raw):
@@ -718,7 +783,7 @@ async def advance_hypotheses(planner, runtime, schema):
             response_schema=planner_candidate_wire_schema(
                 schema(HypothesisDecision.model_json_schema())
             ),
-            validate_response=validate, before_call=engine.guard_reasoning,
+            validate_response=validate, before_call=request_guard,
             system=_SINGLE_PLAN_SYSTEM,
         )
     decision, proposal, (graph_read, task_read) = bind(raw)
@@ -761,12 +826,7 @@ async def _finalize_hypothesis_pass(deps, snapshot, budget, *, identity, proposa
             await state.transaction(commit)
             identities = []
     except PlanningInputsChanged as exc:
-        cause_code = exc.code
-        await state.transaction(lambda tx: tx.queue(event(
-            state, PLANNING_INVALIDATED,
-            {"pass_id": identity, "reason_code": "related_planning_inputs_changed",
-             "cause_code": cause_code},
-        )))
+        await _queue_planning_invalidation(deps, identity, exc.code)
         identities = []
     except CandidateAdmissionConflict as exc:
         raise DecisionFailure("hypothesis_planning", "format", budget.used,
@@ -1096,11 +1156,11 @@ async def _ask_with_context(planner, pass_context, engine, *, payload, budget, *
         if request is None:
             return raw
         parsed = PlannerContextRequest.model_validate(request)
-        await engine.guard_reasoning()
+        await kwargs["before_call"]()
         consumed_before = {kind: set(values) for kind, values in pass_context.consumed.items()}
         evidence_before = set(pass_context.used_evidence)
         cache_before = dict(pass_context.cache)
-        result, visible = await pass_context.lookup(parsed, before_each=engine.guard_reasoning)
+        result, visible = await pass_context.lookup(parsed, before_each=kwargs["before_call"])
         pass_context.last_request = parsed.model_dump(mode="json")
         if not pass_context.retain_lookup_window(
                 _planner_base_payload(current),
@@ -1129,7 +1189,7 @@ def _planner_base_payload(current):
 
 
 async def _advance_split(planner, runtime, schema, snapshot, engine, budget, payload,
-                         targets, principals, roles, records, pass_context):
+                         targets, principals, roles, records, pass_context, request_guard):
     """Two asks on ONE DecisionBudget: questions first, then probe tasks, one CAS commit.
 
     Empty/held/update-only plans skip the atomizer (no second request). A
@@ -1185,12 +1245,18 @@ async def _advance_split(planner, runtime, schema, snapshot, engine, budget, pay
             response_schema=_split_plan_response_schema(
                 planner_candidate_wire_schema(schema(HypothesisPlanSelection.model_json_schema()))
             ),
-            validate_response=validate_plan, before_call=engine.guard_reasoning,
+            validate_response=validate_plan, before_call=request_guard,
             system=_SPLIT_PLAN_SYSTEM,
         )
     draft, updates, questions, versions = bind_stage_one(plan_raw)
     identity = new_id("planner_pass")
     if updates is not None and needs_atomization(draft, questions):
+        request_guard.include(*related_reads(
+            draft, HypothesisProbeProposal(updates=updates, tasks=[]) if updates else None,
+            snapshot, records,
+            questions=questions, issued=issued, eligible_roles=roles,
+            require_probe_limits=planner.policy.probe_limits is not None,
+        ))
         try:
             handoff = pass_context.handoff(questions, updates)
             atom_payload = redact_secret_material(build_atomizer_input(
@@ -1233,7 +1299,7 @@ async def _advance_split(planner, runtime, schema, snapshot, engine, budget, pay
             tasks_raw = await planner.client.ask(
                 stage="task_atomization", payload=atom_payload, budget=budget,
                 response_schema=schema(TaskAtomizationDraft.model_json_schema()),
-                validate_response=validate_tasks, before_call=engine.guard_reasoning,
+                validate_response=validate_tasks, before_call=request_guard,
                 system=_SPLIT_ATOMIZE_SYSTEM,
             )
         parsed = TaskAtomizationDraft.model_validate(tasks_raw)
