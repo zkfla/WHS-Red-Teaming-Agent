@@ -336,4 +336,15 @@ Final root checks:47profile/intake/schema/delivery tests passed with one symlink
 
 At13:39:56KST two isolated synthetic fixtures started under Temp catjam-parallel-fixtures-20261016-132938753, target ports18101/18102 with separate config/state/evidence/audit/approval/report paths and containers. Each uses existing CatJamFreeHigh opencode-go,1800seconds/300requests/3concurrent modelrequests/3workers. Separate canonical original-ID monitors retain the session's approval authorization. Both share provider account quota; a429remains possible. Source frozen6629f90e until both terminal. Initial expected-container-absence Windows launcher error occurred before model/target runs and was corrected only in Temp helpers. Run IDs and terminal outcomes are pending.
 
-User explicitly requested read-only inspection of teammate dev before applying: fetched origin/dev de799df3→7037d56f, with new nonmerge92ec7f6f,f13fdf3d,a020b09c. Separate audit is active; no integration or push performed.
+User explicitly requested read-only inspection of teammate dev before applying: fetched origin/dev de799df3→7037d56f, with new nonmerge a5890f0a,92ec7f6f,a020b09c (f13fdf3d is a reconciliation merge). Separate audit is active; no integration or push performed.
+
+
+### Parallel cohort terminal observations
+
+Both original process trios have exited. RunA run_67dad363bd57/eng_3145d5770774 ended13:46:05KST; reportfailed/planning_error/unresolved,7/7originalexecutions successful,3completedTasks,89evidence,0candidates/0Findings,readyfalse. Requestledger53=40settledknown+13terminalunknown,1048227knownproviderTOTALtokens. All13unknown outcomes carry provider_failure/rate_limited/HTTP429/code429. Finaldecisiontransportbudget5/5 exhausted, with sixrate-limit causes and oneplanner_evidence_list_rejects_evidence_id correction in the finaldecision chain.
+
+RunB run_a05662b42584/eng_20702259b25f ended13:44:02KST; reportfailed/planning_error/unresolved,6/6originalexecutions successful,2completedTasks,66evidence,0candidates/0Findings,readyfalse.27requests=24settledknown+3terminalunknown,641572knownTOTALtokens. All3unknown outcomes are structuredHTTP429. Finalcode reasoning_guard_blocked,summary llm_consecutive_rate_limit_exhausted. No requests remaininflight. Known tokens exclude unknownusage; noaccountcost claim.
+
+Approval continuation has directliveevidence: fourBoriginals started0.148s,1.765s,0.094s,0.074s aftertheir ActionApproved events, with planner/reviewmodelrequests stillinflight. The larger26.936–49.054s request-to-approval intervals concern the separatemonitor and must notbe attributed toresumption. Approvaland originalidentitygates remainedactive.
+
+The parallel cohort exposed account-levelproviderlimits before a valid candidate verdict was reached. It cannot isolate promptquality or establish finalanalysis success. A freshsingleRuncontrol is beingprepared onunchangedsource/scope/model, with existingvalidatedrequestpolicyconcurrency1/rate-limitthreshold6/base5s/cap60s, retaining1800seconds/300requests/3workers. This only changes temporarytestconfig, notglobaldefaults orControl. No exhaustedhistoricalRun is reset or resumed.
