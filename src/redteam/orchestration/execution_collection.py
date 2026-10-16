@@ -19,7 +19,12 @@ from redteam.core.contracts.execution import (
     ExecutionReference,
     ExecutionState,
 )
-from redteam.core.contracts.tool import ToolInvocation, ToolResult, execution_outcome_uncertain
+from redteam.core.contracts.tool import (
+    EXECUTION_TERMINATED_METADATA_KEY,
+    ToolInvocation,
+    ToolResult,
+    execution_outcome_uncertain,
+)
 from redteam.core.ids import EvidenceId
 from redteam.orchestration.agents.base import PlanStep
 from redteam.orchestration.context import RuntimeDeps
@@ -64,11 +69,26 @@ async def collect_execution_termination(
     data = checked_receipt(submission)
     if data["receipt_kind"] != "execution_submission":
         raise ExecutionReceiptError("execution_collection_requires_submission")
+    invocation = ToolInvocation.model_validate(data["invocation"])
+    original = await preserved_result(
+        deps.evidence_store, run_id=submission.run_id, action_id=invocation.action_id,
+        instance_id=invocation.execution_context.instance_id, work_id=data.get("work_id"),
+    )
+    if (original is not None and execution_outcome_uncertain(original[0].metadata)
+            and original[0].metadata.get(EXECUTION_TERMINATED_METADATA_KEY) is True):
+        record = await deps.evidence_store.get(original[1])
+        if record is None:
+            raise ExecutionReceiptError("execution_termination_original_missing")
+        return await append_execution_termination(
+            deps.evidence_store, submission,
+            ExecutionRecoveryAnswer(state=ExecutionState.UNKNOWN, verified=True,
+                                    uncertain=True, execution_terminated=True),
+            original=record,
+        )
     provider = deps.execution_recovery
     raw = data.get("execution_reference")
     if provider is None or raw is None:
         return None
-    invocation = ToolInvocation.model_validate(data["invocation"])
     reference = ExecutionReference.model_validate(raw)
     expected = provider.prepare_reference(invocation.model_copy(deep=True))
     if expected is None or expected.model_dump(exclude={"provider_handle"}) != (

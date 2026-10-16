@@ -32,7 +32,7 @@ def object_document(body: bytes) -> dict[str, Any]:
 
 def create_server(policy: ServerPolicy) -> MCPServer:
     server = MCPServer("recon-passive", log_level="WARNING")
-    execution_lock = asyncio.Lock()
+    execution_lock = asyncio.BoundedSemaphore(policy.max_concurrency)
 
     @server.tool()
     async def dns_resolve(target_ref: str) -> dict[str, Any]:

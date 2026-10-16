@@ -210,6 +210,8 @@ class OrchestrationConfig(BaseModel):
     runtime_backend: Literal["central"] = "central"
     central_state_path: str = Field(default="data/orchestration/state.sqlite3", min_length=1)
     max_workers: int = Field(default=2, ge=1)
+    global_concurrency: int = Field(default=4, ge=1)
+    per_target_concurrency: int = Field(default=1, ge=1)
     llm_request_policy: LLMRequestPolicy | None = None
     specialist_profile_path: str | None = Field(
         default=DEFAULT_SPECIALIST_PROFILE_PATH, min_length=1, max_length=4096

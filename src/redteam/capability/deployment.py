@@ -197,7 +197,7 @@ def connection_environment(spec: DeploymentSpec, policy_path: str, policy_digest
                 f"{prefix}_COMMAND": sys.executable,
                 f"{prefix}_ARGS_JSON": json.dumps(role_args(role, policy_path, policy_digest)),
                 f"{prefix}_RISK_LEVEL": role_specification.risk_level,
-                f"{prefix}_MAX_CONCURRENCY": str(role_specification.max_concurrency),
+                f"{prefix}_MAX_CONCURRENCY": str(spec.policy.max_concurrency),
                 f"{prefix}_MAX_OUTPUT_BYTES": str(role_specification.max_output_bytes),
                 f"{prefix}_PASSTHROUGH_ENV": ",".join(
                     sorted(

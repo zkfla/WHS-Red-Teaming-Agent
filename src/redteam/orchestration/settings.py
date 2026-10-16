@@ -203,6 +203,8 @@ class OrchestrationSettings(BaseModel):
             base["max_steps"] = config.max_steps
             base["central_state_path"] = config.central_state_path
             base["max_workers"] = config.max_workers
+            base["global_concurrency"] = config.global_concurrency
+            base["per_target_concurrency"] = config.per_target_concurrency
             base["tool_timeout_seconds"] = config.tool_timeout_seconds
             base["resource_wait_timeout_seconds"] = config.resource_wait_timeout_seconds
             base["llm_request_policy"] = config.llm_request_policy

@@ -2,7 +2,7 @@
 
 from mcp import Client
 
-from redteam.capability.servers import web_http
+from redteam.capability.servers import recon, web_http
 from redteam.capability.servers.config import ServerPolicy
 from redteam.capability.servers.network import (
     CapturedResponse,
@@ -10,7 +10,10 @@ from redteam.capability.servers.network import (
     ToolInputError,
     target_request_rejected,
 )
-from redteam.core.contracts.tool import PROVIDER_RESULT_EXECUTION_UNCERTAIN
+from redteam.core.contracts.tool import (
+    PROVIDER_RESULT_EXECUTION_TERMINATED,
+    PROVIDER_RESULT_EXECUTION_UNCERTAIN,
+)
 
 
 def _policy() -> ServerPolicy:
@@ -56,6 +59,7 @@ async def test_compare_preflight_rejection_proves_no_http_request(monkeypatch):
     assert diagnostic["execution_uncertain"] is False
     assert "execution_started" not in diagnostic
     assert result.meta[PROVIDER_RESULT_EXECUTION_UNCERTAIN] is False
+    assert PROVIDER_RESULT_EXECUTION_TERMINATED not in result.meta
 
 
 async def test_compare_second_preflight_failure_retains_first_completed_request(monkeypatch):
@@ -103,3 +107,25 @@ async def test_target_network_tool_emits_uncertainty_in_result_metadata(monkeypa
     assert result.is_error
     assert result.meta[PROVIDER_RESULT_EXECUTION_UNCERTAIN] is True
     assert result.structured_content["diagnostic"]["execution_uncertain"] is True
+
+
+async def test_recon_tool_emits_verified_termination_in_mcp_result_metadata(monkeypatch):
+    async def timed_out_after_cleanup(*args, **kwargs):
+        raise TargetRequestError(
+            "target_http_response_timeout",
+            "request_or_response",
+            "Reconcile before another request.",
+            http_request_attempted=True,
+            execution_uncertain=True,
+            execution_terminated=True,
+        )
+
+    monkeypatch.setattr(recon, "request", timed_out_after_cleanup)
+    async with Client(recon.create_server(_policy())) as client:
+        result = await client.call_tool("html_inventory", {
+            "target_ref": "target", "path": "/account",
+        })
+
+    assert result.is_error
+    assert result.meta[PROVIDER_RESULT_EXECUTION_UNCERTAIN] is True
+    assert result.meta[PROVIDER_RESULT_EXECUTION_TERMINATED] is True

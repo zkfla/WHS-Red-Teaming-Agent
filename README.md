@@ -305,6 +305,19 @@ redteam run engagement.yaml --workers 2 --state-db data/orchestration/state.sqli
 redteam resume <run-id> engagement.yaml --state-db data/orchestration/state.sqlite3
 ```
 
+Worker, model-request, action and per-target concurrency are separate finite
+limits. For an explicitly approved lab profile of six workers and four model,
+action and same-target calls, set `REDTEAM_MAX_WORKERS=6`,
+`REDTEAM_GLOBAL_CONCURRENCY=6`, `REDTEAM_PER_TARGET_CONCURRENCY=4`, and set
+`max_concurrent_requests` to `4` in the bounded request policy above. The
+engagement's `rate_limit_policy.max_concurrent_actions` and each applicable
+ROE `max_parallel_actions` must also allow four; the runtime does not raise
+either policy. `--workers 6` changes the specialist worker cap only, so the
+effective worker limit is still bounded by `global_concurrency` and the
+selected specialist profile. An approved local MCP deployment can separately
+set `policy.max_concurrency`; its generated server settings are checked against
+that policy, and the existing default remains one.
+
 The request count above is an example operator budget. Tool, target, token and
 time limits still apply. Approval/job waits free worker and model capacity while
 retaining the original execution and any occupied resources. Stop closes new

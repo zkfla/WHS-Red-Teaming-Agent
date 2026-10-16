@@ -22,6 +22,11 @@
 - `framework.env`: Registry 등록, canonical operation, stdio 실행 인수·정책 해시.
 - `deployment.json`: 승인 원본의 정규화된 사본. 입력 파일과 기존 `.env`는 덮어쓰지 않는다.
 
+`policy.max_concurrency`는 해당 로컬 MCP 서버의 유한 동시 실행 상한이다.
+생략하면 기존 값 1을 유지하고, 값을 지정하면 `framework.env`의 각 서버
+`MAX_CONCURRENCY`와 App/CLI 재개 검증이 같은 승인 정책 값을 사용한다.
+다른 환경 변수만 올려 정책 상한을 넘길 수 없다.
+
 App/CLI 시작·재개 시 해시·경로·세션·Registry 설정 일치를 검증한다.
 MCP 자식 프로세스도 실제로 읽은 정책 바이트의 해시를 검사한다.
 따라서 원본과 정책을 따로 고치거나 다른 정책을 실행 인수로 지정하면 시작이 거부된다.

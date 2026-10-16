@@ -26,6 +26,8 @@ from redteam.capability.adapters.mcp.web_api import WebAPIMCPAdapter
 from redteam.capability.gateway import MCPToolGateway
 from redteam.capability.registry import MCPToolRegistry, ToolRegistrationConflictError
 from redteam.core.contracts.tool import (
+    EXECUTION_TERMINATED_METADATA_KEY,
+    PROVIDER_RESULT_EXECUTION_TERMINATED,
     PROVIDER_RESULT_EXECUTION_UNCERTAIN,
     ExecutionContext,
     ToolDescriptor,
@@ -320,6 +322,40 @@ async def test_adapter_promotes_uncertainty_only_from_provider_result_metadata()
 
     assert result.metadata["execution_uncertain"] is True
     assert result.output == {"diagnostic": {"execution_uncertain": False}}
+
+
+@pytest.mark.parametrize(
+    "trusted,value,expected",
+    [
+        (False, True, None),
+        (True, True, True),
+        (True, False, False),
+        (True, 1, None),
+        (True, "true", None),
+    ],
+)
+async def test_adapter_promotes_termination_only_from_trusted_boolean_result_metadata(
+    trusted: bool, value: Any, expected: bool | None,
+) -> None:
+    transport = FakeTransport(
+        tools=[RemoteTool(name="request", description="", input_schema={})],
+        result=RemoteCallResult(
+            is_error=True,
+            output={"execution_terminated": True},
+            metadata={PROVIDER_RESULT_EXECUTION_TERMINATED: value},
+        ),
+    )
+    adapter = WebAPIMCPAdapter(server_id="web-server", transport=transport)
+    if trusted:
+        adapter.configure_execution_termination_trust(trusted)
+
+    result = await adapter.invoke((await adapter.discover_tools())[0], {})
+
+    if expected is None:
+        assert EXECUTION_TERMINATED_METADATA_KEY not in result.metadata
+    else:
+        assert result.metadata[EXECUTION_TERMINATED_METADATA_KEY] is expected
+    assert result.output == {"execution_terminated": True}
 
 
 async def test_gateway_preserves_provider_uncertainty_separately_from_adapter_entry():

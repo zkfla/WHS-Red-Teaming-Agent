@@ -26,7 +26,7 @@ from redteam.core.contracts.tool import (
 
 def create_server(policy: ServerPolicy) -> MCPServer:
     server = MCPServer("web-http", log_level="WARNING")
-    execution_lock = asyncio.Lock()
+    execution_lock = asyncio.BoundedSemaphore(policy.max_concurrency)
 
     @server.tool(meta={
         PROVIDER_METADATA_REQUIRES_TARGET: False,

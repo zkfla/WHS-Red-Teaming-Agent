@@ -25,6 +25,28 @@ def test_from_config_reads_the_shared_contract() -> None:
     assert settings.central_payload()["max_retries"] == 3
 
 
+def test_concurrency_settings_map_and_survive_the_run_snapshot() -> None:
+    settings = OrchestrationSettings.for_durable_run(
+        OrchestrationConfig(max_workers=6, global_concurrency=6, per_target_concurrency=4)
+    )
+    assert (settings.max_workers, settings.global_concurrency,
+            settings.per_target_concurrency) == (6, 6, 4)
+
+    restored = OrchestrationSettings.model_validate(settings.durable_payload())
+    assert restored.central_payload() == settings.central_payload()
+    assert restored.global_concurrency == 6
+    assert restored.per_target_concurrency == 4
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["global_concurrency", "per_target_concurrency"],
+)
+def test_concurrency_settings_must_be_finite_positive_limits(field: str) -> None:
+    with pytest.raises(ValidationError):
+        OrchestrationConfig.model_validate({field: 0})
+
+
 def test_overrides_win_over_config_and_none_is_ignored() -> None:
     settings = OrchestrationSettings.from_config(
         OrchestrationConfig(max_steps=12), max_steps=3, checkpointing=None

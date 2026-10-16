@@ -114,6 +114,12 @@ class OrchestrationEnvInput(_SnapshotSettings):
     runtime_backend: str | None = Field(default=None, validation_alias="REDTEAM_RUNTIME_BACKEND")
     central_state_path: str | None = Field(default=None, validation_alias="REDTEAM_STATE_DB")
     max_workers: str | None = Field(default=None, validation_alias="REDTEAM_MAX_WORKERS")
+    global_concurrency: str | None = Field(
+        default=None, validation_alias="REDTEAM_GLOBAL_CONCURRENCY"
+    )
+    per_target_concurrency: str | None = Field(
+        default=None, validation_alias="REDTEAM_PER_TARGET_CONCURRENCY"
+    )
     code_fixture_policy_path: str | None = Field(
         default=None, validation_alias="REDTEAM_CODE_FIXTURE_POLICY_PATH"
     )

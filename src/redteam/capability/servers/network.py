@@ -25,7 +25,10 @@ from mcp.types import CallToolResult, TextContent
 from redteam.capability.servers.config import ServerPolicy, TargetProfile
 from redteam.capability.servers.session_state import cookie_header
 from redteam.core.contracts.mission import redact_secret_material
-from redteam.core.contracts.tool import PROVIDER_RESULT_EXECUTION_UNCERTAIN
+from redteam.core.contracts.tool import (
+    PROVIDER_RESULT_EXECUTION_TERMINATED,
+    PROVIDER_RESULT_EXECUTION_UNCERTAIN,
+)
 from redteam.core.redaction import SECRET_KEY_PARTS, redact_sensitive_text
 
 
@@ -104,6 +107,7 @@ class TargetRequestError(ToolInputError):
         *,
         http_request_attempted: bool,
         execution_uncertain: bool,
+        execution_terminated: bool = False,
         message: str | None = None,
     ):
         self.diagnostic = {
@@ -115,14 +119,36 @@ class TargetRequestError(ToolInputError):
             # TLS connection may already have used the network when it is false.
             "http_request_attempted": http_request_attempted,
             "execution_uncertain": execution_uncertain,
+            "execution_terminated": execution_terminated,
             "response_received": False
             if phase in {"connect", "tls", "pool", "preflight"} else None,
         }
+        self.execution_terminated = execution_terminated
         super().__init__(message or f"target HTTP request failed ({code}): {repair}")
 
     def include_completed_http_request(self) -> None:
         """Include an earlier successful request in a multi-request tool call."""
         self.diagnostic["http_request_attempted"] = True
+
+
+class _TrackedAsyncByteStream(httpx.AsyncByteStream):
+    """Observe the first HTTPX response-stream close without retrying it."""
+
+    def __init__(self, stream: httpx.AsyncByteStream) -> None:
+        self._stream = stream
+        self.close_attempted = False
+        self.close_completed = False
+
+    async def __aiter__(self):
+        async for chunk in self._stream:
+            yield chunk
+
+    async def aclose(self) -> None:
+        if self.close_attempted:
+            return
+        self.close_attempted = True
+        await self._stream.aclose()
+        self.close_completed = True
 
 
 def target_network_tool(function):
@@ -135,7 +161,9 @@ def target_network_tool(function):
             return CallToolResult(
                 _meta={
                     PROVIDER_RESULT_EXECUTION_UNCERTAIN:
-                    exc.diagnostic["execution_uncertain"]
+                    exc.diagnostic["execution_uncertain"],
+                    **({PROVIDER_RESULT_EXECUTION_TERMINATED: True}
+                       if exc.execution_terminated is True else {}),
                 },
                 is_error=True,
                 content=[TextContent(type="text", text=str(exc))],
@@ -156,7 +184,9 @@ def target_request_rejected(exc: ToolInputError) -> TargetRequestError:
     )
 
 
-def _target_request_error(exc: BaseException) -> TargetRequestError:
+def _target_request_error(
+    exc: BaseException, *, execution_terminated: bool = False,
+) -> TargetRequestError:
     if isinstance(exc, httpx.ConnectTimeout):
         code, phase = "target_http_connect_timeout", "connect"
     elif isinstance(exc, httpx.PoolTimeout):
@@ -200,7 +230,26 @@ def _target_request_error(exc: BaseException) -> TargetRequestError:
         repair,
         http_request_attempted=attempted,
         execution_uncertain=attempted,
+        execution_terminated=execution_terminated,
     )
+
+
+async def _close_client(client: httpx.AsyncClient, timeout_seconds: float) -> bool:
+    """Return true only when the first awaited close completes within its bound.
+
+    HTTPX marks a client closed before awaiting its transport's close operation,
+    so ``is_closed`` and a later no-op ``aclose`` cannot establish completion.
+    Keep this await in the request task: a shielded, bounded close must not leave
+    detached cleanup work behind when a request is cancelled.
+    """
+    try:
+        with anyio.CancelScope(shield=True):
+            with anyio.fail_after(timeout_seconds):
+                await client.aclose()
+            return True
+    except Exception:
+        return False
+    return False  # A scope suppressing cancellation did not complete the close.
 
 
 @dataclass(frozen=True)
@@ -388,44 +437,102 @@ async def request(
         )
     # Connect to the validated IP, preserving HTTP Host and TLS hostname verification/SNI.
     url = httpx.URL(profile.origin + path).copy_with(host=target.addresses[0])
+    client = httpx.AsyncClient(
+        transport=transport,
+        trust_env=False,
+        follow_redirects=False,
+        timeout=policy.timeout_seconds,
+    )
+    captured: CapturedResponse | None = None
+    response_stream: _TrackedAsyncByteStream | None = None
+    response_was_preloaded = False
+    request_failure: BaseException | None = None
     try:
-        async with httpx.AsyncClient(
-            transport=transport,
-            trust_env=False,
-            follow_redirects=False,
-            timeout=policy.timeout_seconds,
-        ) as client:
-            with anyio.fail_after(policy.timeout_seconds):
-                async with client.stream(
-                    method,
-                    url,
-                    headers=headers,
-                    content=content,
-                    params=query,
-                    extensions={"sni_hostname": target.host},
-                ) as response:
-                    if response.headers.get("content-encoding", "identity").lower() != "identity":
-                        raise ToolInputError("compressed response is not accepted")
-                    body = bytearray()
-                    async for chunk in response.aiter_bytes():
-                        body.extend(chunk)
-                        if len(body) > policy.max_response_bytes:
-                            raise ToolInputError("response exceeds configured byte limit")
-                    return CapturedResponse(
-                        response.status_code,
-                        dict(response.headers),
-                        bytes(body),
-                        tuple(response.headers.get_list("set-cookie")),
-                        host=target.host,
-                        port=target.port,
-                        scheme=url.scheme,
-                        protocol=response.http_version,
-                        url=profile.origin + path,
-                        actual_session_ref=session_ref,
-                        has_session_receipt=True,
-                    )
-    except (httpx.HTTPError, OSError, asyncio.TimeoutError, TimeoutError) as exc:
-        raise _target_request_error(exc) from exc
+        with anyio.fail_after(policy.timeout_seconds):
+            async with client.stream(
+                method,
+                url,
+                headers=headers,
+                content=content,
+                params=query,
+                extensions={"sni_hostname": target.host},
+            ) as response:
+                # For live streams, HTTPX marks Response.is_closed before
+                # awaiting the underlying close. Track that await explicitly;
+                # a later response/client close cannot prove it completed.
+                response_was_preloaded = response.is_stream_consumed
+                if not isinstance(response.stream, httpx.AsyncByteStream):
+                    raise ToolInputError("HTTP transport did not provide an async response stream")
+                response_stream = _TrackedAsyncByteStream(response.stream)
+                response.stream = response_stream
+                if response.headers.get("content-encoding", "identity").lower() != "identity":
+                    raise ToolInputError("compressed response is not accepted")
+                body = bytearray()
+                async for chunk in response.aiter_bytes():
+                    body.extend(chunk)
+                    if len(body) > policy.max_response_bytes:
+                        raise ToolInputError("response exceeds configured byte limit")
+                captured = CapturedResponse(
+                    response.status_code,
+                    dict(response.headers),
+                    bytes(body),
+                    tuple(response.headers.get_list("set-cookie")),
+                    host=target.host,
+                    port=target.port,
+                    scheme=url.scheme,
+                    protocol=response.http_version,
+                    url=profile.origin + path,
+                    actual_session_ref=session_ref,
+                    has_session_receipt=True,
+                )
+    except BaseException as exc:
+        # Preserve cancellation and non-transport errors after the client has
+        # been given one bounded cleanup opportunity below.
+        request_failure = exc
+
+    client_close_completed = await _close_client(client, policy.timeout_seconds)
+    # Before response headers there is no independently observed closure for
+    # the target's response stream. A closed pool/client alone cannot prove a
+    # connection or TLS cleanup completed, so only a tracked response stream
+    # plus the client close can establish this receipt.
+    cleanup_completed = (
+        client_close_completed
+        and response_stream is not None
+        and response_stream.close_completed
+    )
+
+    if request_failure is not None:
+        if isinstance(request_failure, (httpx.HTTPError, OSError, asyncio.TimeoutError,
+                                        TimeoutError)):
+            raise _target_request_error(
+                request_failure, execution_terminated=cleanup_completed,
+            ) from request_failure
+        if isinstance(request_failure, anyio.get_cancelled_exc_class()):
+            raise request_failure
+        if (
+            isinstance(request_failure, ToolInputError)
+            and response_was_preloaded
+            and client_close_completed
+        ):
+            # Buffered transports can raise a local response validation
+            # error without entering the async stream close path. Preserve
+            # that error, but do not treat pre-consumption as a termination
+            # receipt.
+            raise request_failure
+        if not cleanup_completed:
+            # The response/request path has ended, but a failed client close is
+            # not proof that its provider-owned work is finished.
+            raise _target_request_error(RuntimeError("request cleanup did not complete")) \
+                from request_failure
+        raise request_failure
+
+    if captured is not None and client_close_completed:
+        return captured
+    if not cleanup_completed:
+        # Never turn a response into success when the only cleanup attempt did
+        # not complete; keep the result uncertain and omit the termination receipt.
+        raise _target_request_error(RuntimeError("request cleanup did not complete"))
+    raise AssertionError("HTTP response completed without a captured result")
 
 
 async def _prepare_request(

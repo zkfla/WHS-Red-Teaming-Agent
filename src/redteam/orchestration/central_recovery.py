@@ -180,9 +180,19 @@ async def reconcile_termination(deps, runtime, execution):
         engagement_id=deps.central_state.engagement_id,
         evidence_ids=[str(termination_id)],
     )
+    proof_data = checked_receipt(proofs[0].record)
+    original_result = None
+    if proof_data.get("termination_basis") == "original_result":
+        originals = await check_evidence(
+            deps.evidence_store, run_id=deps.central_state.run_id,
+            engagement_id=deps.central_state.engagement_id,
+            evidence_ids=[proof_data["termination_original_id"]],
+        )
+        original_result = originals[0]
     await deps.central_state.transaction(lambda tx: tx.record_execution_termination(
         str(execution.invocation_id), submission=checked[0], proof=proofs[0],
         owner=runtime.work_owner, version=runtime.task_ownership_version,
+        original_result=original_result,
     ))
     return True
 

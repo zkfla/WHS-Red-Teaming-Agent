@@ -758,11 +758,16 @@ No source database was migrated as part of this change.
 
 ## Plan2d: completion, cleanup, reports and default CLI
 
-The application and CLI default to `OrchestrationConfig.runtime_backend=central`
-and `max_workers=2`. `build_application` assembles the central state and durable
+The application and CLI default to `OrchestrationConfig.runtime_backend=central`,
+`max_workers=2`, `global_concurrency=4`, and `per_target_concurrency=1`.
+`build_application` assembles the central state and durable
 checkpoint path when no state is supplied. `run --workers`, `--state-db` and
 `--runtime` override validated selection. Environment equivalents are
-`REDTEAM_MAX_WORKERS`, `REDTEAM_STATE_DB`, and `REDTEAM_RUNTIME_BACKEND`.
+`REDTEAM_MAX_WORKERS`, `REDTEAM_GLOBAL_CONCURRENCY`,
+`REDTEAM_PER_TARGET_CONCURRENCY`, `REDTEAM_STATE_DB`, and
+`REDTEAM_RUNTIME_BACKEND`. Resume retains the original stored limits unless an
+operator explicitly supplies a new concurrency environment value; changed
+limits are checked against the existing Run binding.
 The operator must select `REDTEAM_SPECIALIST_PROFILE` and a shared request
 policy in `REDTEAM_LLM_REQUEST_POLICY_JSON`; no missing profile, policy, provider
 or tool catalog is replaced by a test double. Actual worker, global call,

@@ -172,10 +172,15 @@ async def _run_central(args, config, *, mcp_stack, on_finished=None,
         # silently rebuilt with new candidate-planner meaning.
         from redteam.core.environment import env_snapshot
 
-        if env_snapshot().get("REDTEAM_SPECIALIST_PROFILE"):
+        selected_environment = env_snapshot()
+        if selected_environment.get("REDTEAM_SPECIALIST_PROFILE"):
             overrides["specialist_profile_path"] = config.orchestration.specialist_profile_path
         if config.orchestration.llm_request_policy is not None:
             overrides["llm_request_policy"] = config.orchestration.llm_request_policy
+        if "REDTEAM_GLOBAL_CONCURRENCY" in selected_environment:
+            overrides["global_concurrency"] = config.orchestration.global_concurrency
+        if "REDTEAM_PER_TARGET_CONCURRENCY" in selected_environment:
+            overrides["per_target_concurrency"] = config.orchestration.per_target_concurrency
         if getattr(args, "workers", None) is not None:
             overrides["max_workers"] = args.workers
         if getattr(args, "max_steps", None) is not None:

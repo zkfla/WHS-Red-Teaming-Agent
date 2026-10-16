@@ -93,7 +93,7 @@ def _verify(
                     or Path(settings.command).parent.resolve()
                     != Path(sys.executable).parent.resolve()
                     or Path(settings.command).resolve() != Path(sys.executable).resolve()
-                    or settings.max_concurrency != specification.max_concurrency
+                    or settings.max_concurrency != spec.policy.max_concurrency
                     or settings.max_output_bytes != specification.max_output_bytes
                     or set(settings.process_environment)
                     != {

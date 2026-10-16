@@ -1,16 +1,19 @@
 """CLI configuration reaches the runtime and each new Mission reads current ROE."""
 
+import argparse
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 from pydantic import ValidationError
 
-from redteam.app.cli._shared import load_app_config_for_run
+from redteam.app.cli._shared import load_app_config_for_run, runtime_overrides
 from redteam.app.cli.commands import interactive
+from redteam.app.cli.commands import run as run_command
 from redteam.app.cli.conversation import ConversationAssistant
 from redteam.app.cli.interactive_commands import InteractiveSession
 from redteam.core.config import (
+    AppConfig,
     CapabilityConfig,
     EngagementConfig,
     LLMConfig,
@@ -39,6 +42,9 @@ async def test_runtime_environment_reaches_both_cli_entrypoints(tmp_path, monkey
     monkeypatch.setenv("REDTEAM_LLM_PROVIDER", "fake")
     monkeypatch.setenv("REDTEAM_ORCHESTRATION_LLM_CANDIDATE_GENERATION", "true")
     monkeypatch.setenv("REDTEAM_ORCHESTRATION_MAX_STEPS", "17")
+    monkeypatch.setenv("REDTEAM_MAX_WORKERS", "6")
+    monkeypatch.setenv("REDTEAM_GLOBAL_CONCURRENCY", "6")
+    monkeypatch.setenv("REDTEAM_PER_TARGET_CONCURRENCY", "4")
     path = tmp_path / "engagement.yaml"
     path.write_text(dump_engagement_yaml(_engagement()), encoding="utf-8")
     config = load_app_config_for_run(str(path))
@@ -47,8 +53,32 @@ async def test_runtime_environment_reaches_both_cli_entrypoints(tmp_path, monkey
     settings = OrchestrationSettings.for_durable_run(config.orchestration)
     assert settings.llm_candidate_generation is True
     assert settings.max_steps == 17
+    assert (settings.max_workers, settings.global_concurrency,
+            settings.per_target_concurrency) == (6, 6, 4)
     assert settings.tool_timeout_seconds == 20
     assert OrchestrationSettings.for_durable_run(config.orchestration, max_steps=9).max_steps == 9
+
+
+def test_run_workers_override_reaches_the_worker_admission_limit():
+    parser = argparse.ArgumentParser()
+    commands = parser.add_subparsers()
+    run_command.add_parser(commands)
+    args = parser.parse_args(["run", "engagement.yaml", "--workers", "6"])
+    config = AppConfig(engagement=_engagement(), orchestration=OrchestrationConfig(
+        max_workers=2, global_concurrency=6, per_target_concurrency=4,
+    ))
+
+    selected = runtime_overrides(config, args)
+    settings = OrchestrationSettings.from_config(selected.orchestration)
+    from redteam.orchestration.central_runtime import worker_limit
+
+    deps = SimpleNamespace(
+        settings=settings,
+        specialist_policy=SimpleNamespace(max_instances=settings.max_workers),
+    )
+    assert (settings.max_workers, settings.global_concurrency,
+            settings.per_target_concurrency) == (6, 6, 4)
+    assert worker_limit(deps) == 6
 
 
 def test_new_tool_timeout_does_not_change_a_saved_run():
@@ -65,10 +95,18 @@ def test_new_tool_timeout_does_not_change_a_saved_run():
     [
         ("LLM_CANDIDATE_GENERATION", "perhaps"),
         ("MAX_STEPS", "0"),
+        ("MAX_WORKERS", "0"),
+        ("GLOBAL_CONCURRENCY", "0"),
+        ("PER_TARGET_CONCURRENCY", "0"),
     ],
 )
 def test_invalid_runtime_environment_is_rejected(monkeypatch, field, value):
-    monkeypatch.setenv(f"REDTEAM_ORCHESTRATION_{field}", value)
+    variable = (
+        f"REDTEAM_ORCHESTRATION_{field}"
+        if field in {"LLM_CANDIDATE_GENERATION", "MAX_STEPS"}
+        else f"REDTEAM_{field}"
+    )
+    monkeypatch.setenv(variable, value)
     with pytest.raises(ValidationError):
         OrchestrationConfig.from_environment()
 

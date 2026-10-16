@@ -19,6 +19,7 @@ from redteam.core.contracts.execution import (
 )
 from redteam.core.contracts.tool import (
     EXECUTION_STARTED_METADATA_KEY,
+    EXECUTION_TERMINATED_METADATA_KEY,
     ToolInvocation,
     ToolResult,
     execution_outcome_uncertain,
@@ -45,13 +46,21 @@ class ExecutionReceiptError(ValueError):
 
 async def append_execution_termination(
     store: EvidenceStore, submission: EvidenceRecord, answer: ExecutionRecoveryAnswer,
+    *, original: EvidenceRecord | None = None,
 ) -> EvidenceRecord:
     """Persist verified cessation, never a result or permission to replay."""
     payload = dict(checked_receipt(submission))
     if (payload["receipt_kind"] != "execution_submission"
-            or payload.get("execution_reference") is None
+            or (payload.get("execution_reference") is None and original is None)
             or not answer.verified or not answer.execution_terminated):
         raise ExecutionReceiptError("execution_termination_unverified")
+    if original is not None:
+        check_termination_original(payload, original)
+        payload.update(
+            termination_basis="original_result",
+            termination_original_id=str(original.evidence_id),
+            termination_original_digest=original.digest,
+        )
     payload.update(
         receipt_kind="execution_termination", submission_id=str(submission.evidence_id),
         submission_digest=submission.digest, recovery_answer=answer.model_dump(mode="json"),
@@ -75,6 +84,34 @@ async def append_execution_termination(
     checked_receipt(record)
     await store.append(record)
     return record
+
+
+def check_termination_original(binding: dict[str, Any], original: EvidenceRecord) -> None:
+    """Require an explicit assertion in the exact preserved provider result.
+
+    Output DATA, generic function return and a missing result cannot establish
+    cessation. Consumers must reread this original, including after restart.
+    """
+    data = checked_receipt(original)
+    if (data["receipt_kind"] != "execution_result"
+            or any(data.get(key) != binding.get(key) for key in (
+                "invocation", "proposal", "plan_step", "candidate_key", "work_id",
+                "instance_id", "execution_reference",
+            ))):
+        raise ExecutionReceiptError("execution_termination_original_mismatch")
+    invocation = ToolInvocation.model_validate(data["invocation"])
+    result = ToolResult.model_validate(data.get("original_result"))
+    if (result.invocation_id != invocation.invocation_id
+            or result.action_id != invocation.action_id or result.tool_id != invocation.tool_id
+            or result.metadata.get(EXECUTION_TERMINATED_METADATA_KEY) is not True
+            or result.metadata.get(EXECUTION_STARTED_METADATA_KEY) is False
+            or not execution_outcome_uncertain(result.metadata)):
+        raise ExecutionReceiptError("execution_termination_original_unverified")
+    if binding.get("termination_basis") == "original_result" and (
+        binding.get("termination_original_id") != str(original.evidence_id)
+        or binding.get("termination_original_digest") != original.digest
+    ):
+        raise ExecutionReceiptError("execution_termination_original_mismatch")
 
 
 async def append_execution_receipt(
@@ -203,8 +240,13 @@ def checked_receipt(record: EvidenceRecord) -> dict[str, Any]:
             raise ExecutionReceiptError("execution_termination_input_mismatch")
     if payload["receipt_kind"] == "execution_termination":
         answer = ExecutionRecoveryAnswer.model_validate(payload.get("recovery_answer"))
+        basis = payload.get("termination_basis", "recovery_query")
         if (not answer.verified or not answer.execution_terminated
-                or payload.get("execution_reference") is None
+                or basis not in {"recovery_query", "original_result"}
+                or (basis == "recovery_query" and payload.get("execution_reference") is None)
+                or (basis == "original_result" and (
+                    not payload.get("termination_original_id")
+                    or not payload.get("termination_original_digest")))
                 or not payload.get("submission_id") or not payload.get("submission_digest")
                 or record.source_id != "orchestration.execution_reconciliation"):
             raise ExecutionReceiptError("execution_termination_unverified")

@@ -423,7 +423,7 @@ async def test_active_status_uses_current_actor_and_keeps_previous_reason_readon
             await asyncio.wait_for(running, 10)
 
 
-@pytest.mark.parametrize("changed_limit", [False, True])
+@pytest.mark.parametrize("changed_limit", ["unchanged", "steps", "global", "target"])
 async def test_cli_preserves_nondefault_passive_identity_and_rejects_actual_override(
     tmp_path, monkeypatch, capsys, changed_limit,
 ):
@@ -444,7 +444,14 @@ async def test_cli_preserves_nondefault_passive_identity_and_rejects_actual_over
         path = str(state.path)
         before = await state.activation_inventory()
         used = await state.request_ledger().snapshot(state.run_id)
-    config.orchestration = OrchestrationConfig(runtime_backend="central", central_state_path=path)
+    orchestration_values = {"runtime_backend": "central", "central_state_path": path}
+    if changed_limit == "global":
+        monkeypatch.setenv("REDTEAM_GLOBAL_CONCURRENCY", "3")
+        orchestration_values["global_concurrency"] = 3
+    elif changed_limit == "target":
+        monkeypatch.setenv("REDTEAM_PER_TARGET_CONCURRENCY", "3")
+        orchestration_values["per_target_concurrency"] = 3
+    config.orchestration = OrchestrationConfig(**orchestration_values)
     captured = []
     real_build = run.build_application
     async def assemble(config, **kwargs):
@@ -455,13 +462,14 @@ async def test_cli_preserves_nondefault_passive_identity_and_rejects_actual_over
     monkeypatch.setattr(run, "build_application", assemble)
     monkeypatch.setattr(run, "prepare_shell_runtime", AsyncMock(return_value=None))
     args = SimpleNamespace(run_id=str(original.run_id), instance=str(original.instance_id),
-                           json=True, workers=None, max_steps=99 if changed_limit else None)
+                           json=True, workers=None,
+                           max_steps=99 if changed_limit == "steps" else None)
     async with AsyncExitStack() as stack:
         result = await resume._run_central(args, config, mcp_stack=stack)
     output = capsys.readouterr()
     assert not tools.inner.invocations
     assert captured[0].settings.central_payload()["max_no_progress_turns"] == 1
-    if changed_limit:
+    if changed_limit != "unchanged":
         assert result == 1 and "resume refused" in output.err
         assert await state.activation_inventory() == before
         assert await state.request_ledger().snapshot(state.run_id) == used

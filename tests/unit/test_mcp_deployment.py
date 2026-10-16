@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from redteam.app.mcp_deployment import synchronize_deployment
+from redteam.app.mcp_deployment import synchronize_deployment, verified_deployment
 from redteam.capability.deployment import DeploymentSpec, connection_environment, provision
 from redteam.capability.servers.config import ServerPolicy
 from redteam.capability.servers.network import ToolInputError, session_header
@@ -49,10 +49,12 @@ def engagement():
     )
 
 
-def installed(tmp_path, monkeypatch):
+def installed(tmp_path, monkeypatch, *, max_concurrency=1):
     monkeypatch.setenv("TEST_ALICE", "synthetic-a")
     monkeypatch.setenv("TEST_BOB", "synthetic-b")
-    spec = DeploymentSpec.model_validate(source())
+    value = source()
+    value["policy"]["max_concurrency"] = max_concurrency
+    spec = DeploymentSpec.model_validate(value)
     path = provision(spec, engagement(), tmp_path / "deployment")
     loaded = load_engagement_config(path)
     binding = loaded.metadata["mcp_deployment"]
@@ -73,6 +75,14 @@ def test_generated_settings_preserve_scope_approval_and_secret_indirection(tmp_p
     assert "TEST_ALICE" not in public and "bearer_env" not in public
     assert resolved.metadata["mcp_targets"]["bank-test"]["origin"] == "https://127.0.0.1:8443"
     assert resolved.metadata["mcp_targets"]["bank-test"]["allowed_paths"] == ["/", "/accounts/123"]
+    assert all(
+        value == "1"
+        for key, value in connection_environment(
+            spec, config.metadata["mcp_deployment"]["policy_path"],
+            config.metadata["mcp_deployment"]["policy_sha256"],
+        ).items()
+        if key.endswith("_MAX_CONCURRENCY")
+    )
     for path in (tmp_path / "deployment").iterdir():
         assert path.stat().st_mode & 0o077 == 0
     with pytest.raises(FileExistsError):
@@ -215,6 +225,27 @@ def test_server_policy_hash_is_checked_on_the_bytes_loaded(tmp_path):
     path.write_text(DeploymentSpec.model_validate(source()).server_policy().model_dump_json())
     with pytest.raises(ValueError, match="digest mismatch"):
         ServerPolicy.load(str(path), expected_sha256="0" * 64)
+
+
+def test_deployment_capacity_is_generated_from_the_approved_server_policy(tmp_path, monkeypatch):
+    # The historical default is omitted from the canonical policy payload;
+    # explicit capacity is bound into policy bytes and both generated roles.
+    default = DeploymentSpec.model_validate(source()).server_policy()
+    assert "max_concurrency" not in default.model_dump(mode="json")
+
+    spec, config = installed(tmp_path, monkeypatch, max_concurrency=4)
+    environment = connection_environment(
+        spec, config.metadata["mcp_deployment"]["policy_path"],
+        config.metadata["mcp_deployment"]["policy_sha256"],
+    )
+    verified = verified_deployment(config, list(spec.roles))
+    assert verified is not None and verified.spec.policy.max_concurrency == 4
+    monkeypatch.setenv("REDTEAM_MCP_WEB_HTTP_MAX_CONCURRENCY", "5")
+    with pytest.raises(ValueError, match="MCP deployment validation failed"):
+        synchronize_deployment(config, list(spec.roles))
+    assert environment["REDTEAM_MCP_WEB_HTTP_MAX_CONCURRENCY"] == "4"
+    assert environment["REDTEAM_MCP_RECON_PASSIVE_MAX_CONCURRENCY"] == "4"
+    assert spec.server_policy().max_concurrency == 4
 
 
 def test_old_manual_engagement_is_unchanged():

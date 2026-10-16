@@ -55,7 +55,11 @@ from redteam.orchestration.coordination import (
     safe_identifiers,
 )
 from redteam.orchestration.diagnostics import DecisionDiagnostic
-from redteam.orchestration.execution_journal import checked_receipt, preserved_result
+from redteam.orchestration.execution_journal import (
+    check_termination_original,
+    checked_receipt,
+    preserved_result,
+)
 from redteam.orchestration.llm_requests import (
     RequestAdmissionError,
     RequestChange,
@@ -2066,7 +2070,7 @@ class CentralTransaction:
 
     def record_execution_termination(
         self, invocation_id: str, *, submission: CheckedEvidence, proof: CheckedEvidence,
-        owner: str, version: int,
+        owner: str, version: int, original_result: CheckedEvidence | None = None,
     ) -> TaskExecution:
         """Release capacity only after a correlated provider cessation receipt."""
         execution = self.get_execution(invocation_id)
@@ -2085,13 +2089,22 @@ class CentralTransaction:
                     "instance_id", "execution_reference",
                 ))):
             raise StateConflict("execution_termination_submission_mismatch")
+        evidence = [submission, proof]
+        if data.get("termination_basis") == "original_result":
+            if original_result is None:
+                raise StateConflict("execution_termination_original_missing")
+            check_termination_original(data, original_result.record)
+            if (execution.result_evidence_id is not None
+                    and execution.result_evidence_id != original_result.record.evidence_id):
+                raise StateConflict("execution_termination_original_mismatch")
+            evidence.append(original_result)
         if execution.state not in {ExecutionState.RUNNING, ExecutionState.UNKNOWN}:
             raise StateConflict("execution_termination_requires_unsettled_original")
         if execution.termination_evidence_id is not None:
             if execution.termination_evidence_id != proof.record.evidence_id:
                 raise StateConflict("execution_termination_proof_changed")
             return execution
-        self.add_evidence_refs([submission, proof])
+        self.add_evidence_refs(evidence)
         execution = execution.model_copy(update={
             "state": ExecutionState.UNKNOWN,
             "termination_evidence_id": proof.record.evidence_id,

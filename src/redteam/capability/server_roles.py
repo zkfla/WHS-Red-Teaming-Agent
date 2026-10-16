@@ -24,6 +24,8 @@ class ServerRoleSpec:
     max_output_bytes: int
     forwards_session_credentials: bool
     operations: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    # Only verified local deployment assembly may enable this result contract.
+    supports_execution_termination: bool = False
 
 
 BUILTIN_SERVER_ROLES: tuple[ServerRoleSpec, ...] = (
@@ -35,6 +37,7 @@ BUILTIN_SERVER_ROLES: tuple[ServerRoleSpec, ...] = (
         max_concurrency=1,
         max_output_bytes=262144,
         forwards_session_credentials=True,
+        supports_execution_termination=True,
         operations={
             "session_list": ("response_analysis",),
             "http_request": ("http_request",),
@@ -51,6 +54,7 @@ BUILTIN_SERVER_ROLES: tuple[ServerRoleSpec, ...] = (
         max_concurrency=1,
         max_output_bytes=262144,
         forwards_session_credentials=False,
+        supports_execution_termination=True,
         operations={
             "dns_resolve": ("service_discovery",),
             "http_probe": ("service_discovery",),

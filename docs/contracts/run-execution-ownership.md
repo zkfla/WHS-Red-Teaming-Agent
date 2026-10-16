@@ -8,11 +8,28 @@ UNKNOWN 결과라도 프로세스 트리와 실행 경로의 종료가 증명되
 단순 coroutine 취소·timeout·빈 결과·컨테이너 연결 실패는 종료 증명이 아니다.
 
 기존 evidence store의 `execution_termination` 영수증은 원 제출 ID/digest, 입력과
-제공자 reference에 결속된다. 중앙 원장은 검사한 영수증을
+제공자 reference에 결속된다. 반환된 원본 결과에 제공자의 명시적 종료 증명이
+있는 경우에는 reference 대신 원본 결과 영수증의 ID/digest에 결속할 수 있다.
+이 `termination_basis=original_result` 경로는 저장된 제출·원본 결과·종료 증명을
+함께 다시 검사하며, 누락된 recovery handle을 만들어 내지 않는다. 중앙 원장은 검사한 영수증을
 `TaskExecution.termination_evidence_id`로 저장한다. 이 필드는 일반 실행 갱신으로
 설정할 수 없다. 재개는 저장된 증명도 다시 확인한다. 이로써 UNKNOWN이 차지하던
 실행 용량만 반환하며, 원래 자원 키·UNKNOWN 상태·재전송 금지·목표 완료 차단은
 유지한다. 결과 확정은 기존 execution_resolution 경로에서 별도로 처리한다.
+
+MCP의 `redteam.execution_terminated`는 CallToolResult 메타데이터의 엄격한 boolean
+계약이다. 출력 DATA, MCP 함수 반환, 오류 응답 또는 timeout 자체는 이 증명이 아니다.
+일반 원격 MCP adapter는 이 종료 주장을 기본적으로 무시한다. 검증된 로컬 배포의
+등록된 역할이 종료 계약을 지원할 때만 조립 지점이 명시적으로 신뢰를 주입한다.
+출력·discovery metadata·환경 변수만으로 이 신뢰를 켤 수 없다.
+제공자는 호출이 소유한 모든 작업과 로컬 transport 정리를 완료한 경우에만 true를
+발급할 수 있다. 요청을 분리 실행하거나 외부 job을 만든 제공자는 해당 작업까지
+별도로 확인하기 전에는 이 계약을 사용할 수 없다. HTTP 제공자의 연결 종료는
+원격 대상의 처리·부작용 종료를 뜻하지 않으며 outcome uncertainty와 자원 잠금을
+해제하지 않는다. 정리 오류·취소·응답 유실로 증명이 없으면 held를 유지한다.
+HTTPX가 응답 헤더 전에 실패한 연결을 내부 pool에서 제거할 수 있으므로, 응답
+스트림을 받기 전 실패는 client close 성공만으로 증명하지 않는다. 응답 스트림의
+최초 실제 close 완료와 client의 최초 close 완료를 모두 관측한 실패만 해당한다.
 
 구형 요청/원장에는 새 필드가 없고 기본 false/None이므로 보수적으로 용량을
 계속 점유한다. None 필드는 TaskExecution 직렬화에서 생략해 과거 식별 hash를

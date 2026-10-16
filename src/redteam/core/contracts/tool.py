@@ -94,6 +94,10 @@ PROVIDER_METADATA_RESOURCE_EFFECTS = "redteam.resource_effects"
 # Provider result metadata travels through MCP CallToolResult.meta, separately
 # from structured_content that may contain untrusted DATA.
 PROVIDER_RESULT_EXECUTION_UNCERTAIN = "redteam.execution_uncertain"
+# Explicit provider assertion: all invocation-owned work and local transport
+# cleanup have ended. This says nothing about remote effects or known outcome.
+# A returned MCP envelope alone is not this assertion.
+PROVIDER_RESULT_EXECUTION_TERMINATED = "redteam.execution_terminated"
 
 
 def model_input_schema(schema: dict[str, Any]) -> dict[str, Any]:
@@ -121,6 +125,7 @@ EXECUTION_UNCERTAIN_METADATA_KEY = "execution_uncertain"
 # An explicit False proves the provider invocation was never entered. True
 # reports entry at the execution boundary, not a successful external effect.
 EXECUTION_STARTED_METADATA_KEY = "execution_started"
+EXECUTION_TERMINATED_METADATA_KEY = "execution_terminated"
 
 
 def execution_outcome_uncertain(metadata: Mapping[str, Any]) -> bool:

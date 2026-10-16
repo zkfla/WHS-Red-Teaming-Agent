@@ -16,6 +16,7 @@ from redteam.capability.adapters.mcp.transport import (
     StreamableHTTPMCPTransport,
 )
 from redteam.core.contracts.tool import (
+    EXECUTION_TERMINATED_METADATA_KEY,
     EXECUTION_UNCERTAIN_METADATA_KEY,
     PROVIDER_METADATA_AVAILABILITY_IMPACT,
     PROVIDER_METADATA_COMMAND_FIELDS,
@@ -23,6 +24,7 @@ from redteam.core.contracts.tool import (
     PROVIDER_METADATA_RESOURCE_BINDINGS,
     PROVIDER_METADATA_RESOURCE_EFFECTS,
     PROVIDER_METADATA_TARGET_BINDING,
+    PROVIDER_RESULT_EXECUTION_TERMINATED,
     PROVIDER_RESULT_EXECUTION_UNCERTAIN,
     ToolDescriptor,
     ToolError,
@@ -48,6 +50,7 @@ class MCPServerAdapter:
         risk_level: RiskLevel = RiskLevel.LOW,
         headers: Mapping[str, str] | None = None,
         transport: MCPTransport | None = None,
+        trust_execution_termination: bool = False,
     ) -> None:
         if not server_id.strip():
             raise ValueError("server_id must not be empty")
@@ -62,7 +65,14 @@ class MCPServerAdapter:
                 raise ValueError("endpoint is required when transport is not provided")
             transport = StreamableHTTPMCPTransport(endpoint, headers=headers)
         self._transport = transport
+        self._trust_execution_termination = trust_execution_termination is True
         self._discovered_output_schemas: dict[ToolId, dict[str, Any]] = {}
+
+    def configure_execution_termination_trust(self, trusted: bool) -> None:
+        """Set assembly-verified trust before tool discovery and invocation."""
+        if not isinstance(trusted, bool):
+            raise ValueError("execution termination trust must be a bool")
+        self._trust_execution_termination = trusted
 
     async def discover_tools(self) -> list[ToolDescriptor]:
         health = await self.health_check()
@@ -125,6 +135,9 @@ class MCPServerAdapter:
             uncertain = result.metadata.get(PROVIDER_RESULT_EXECUTION_UNCERTAIN)
             if isinstance(uncertain, bool):
                 provider_metadata[EXECUTION_UNCERTAIN_METADATA_KEY] = uncertain
+            terminated = result.metadata.get(PROVIDER_RESULT_EXECUTION_TERMINATED)
+            if self._trust_execution_termination and isinstance(terminated, bool):
+                provider_metadata[EXECUTION_TERMINATED_METADATA_KEY] = terminated
         return MCPCallResult(
             success=not result.is_error,
             output=result.output,

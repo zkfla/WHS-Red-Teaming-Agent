@@ -51,6 +51,7 @@ async def build_mcp_tool_gateway(
     builtin_adapters: Sequence[MCPAdapter] = (),
     builtin_concurrency: Mapping[str, int] | None = None,
     builtin_output_limits: Mapping[str, int] | None = None,
+    trusted_termination_servers: Sequence[str] = (),
 ) -> MCPToolGateway:
     """Discover configured servers and return a ready-to-invoke gateway.
 
@@ -70,6 +71,7 @@ async def build_mcp_tool_gateway(
         builtin_adapters=builtin_adapters,
         builtin_concurrency=builtin_concurrency,
         builtin_output_limits=builtin_output_limits,
+        trusted_termination_servers=trusted_termination_servers,
     )
 
 
@@ -85,6 +87,7 @@ async def open_mcp_tool_gateway(
     builtin_adapters: Sequence[MCPAdapter] = (),
     builtin_concurrency: Mapping[str, int] | None = None,
     builtin_output_limits: Mapping[str, int] | None = None,
+    trusted_termination_servers: Sequence[str] = (),
 ) -> AsyncIterator[MCPToolGateway]:
     """Engagement-scoped connections, required for stateful browser operations.
 
@@ -104,6 +107,7 @@ async def open_mcp_tool_gateway(
             builtin_adapters=builtin_adapters,
             builtin_concurrency=builtin_concurrency,
             builtin_output_limits=builtin_output_limits,
+            trusted_termination_servers=trusted_termination_servers,
         )
 
 
@@ -119,12 +123,16 @@ async def _build_gateway(
     builtin_adapters: Sequence[MCPAdapter] = (),
     builtin_concurrency: Mapping[str, int] | None = None,
     builtin_output_limits: Mapping[str, int] | None = None,
+    trusted_termination_servers: Sequence[str] = (),
 ) -> MCPToolGateway:
     bundles = dict(profile_bundles) if profile_bundles is not None else None
     from redteam.core.environment import env_snapshot
 
     environment = env_snapshot(env)
     builtin_ids = {adapter.server_id for adapter in builtin_adapters}
+    trusted_termination = set(trusted_termination_servers)
+    if trusted_termination - (set(server_ids) | builtin_ids):
+        raise MCPConfigurationError("termination trust requires a registered provider")
     configured_concurrency = dict(builtin_concurrency or {})
     configured_output_limits = dict(builtin_output_limits or {})
     if set(configured_concurrency) - builtin_ids:
@@ -167,6 +175,12 @@ async def _build_gateway(
         if stack is not None:
             await stack.enter_async_context(transport.session())
         adapter = _create_adapter(settings, transport, bundles)
+        if server_id in trusted_termination:
+            if not isinstance(adapter, MCPServerAdapter):
+                raise MCPConfigurationError(
+                    "provider does not support verified termination metadata"
+                )
+            adapter.configure_execution_termination_trust(True)
         descriptors = await adapter.discover_tools()
         if not descriptors:
             raise MCPConfigurationError(f"MCP server {server_id!r} discovered no tools")

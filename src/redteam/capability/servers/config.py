@@ -212,12 +212,21 @@ class ServerPolicy(BaseModel):
     targets: dict[str, TargetProfile] = Field(min_length=1)
     allowed_networks: list[str] = Field(min_length=1)
     sessions: dict[str, SessionProfile] = Field(default_factory=dict)
+    max_concurrency: int = Field(default=1, ge=1, le=32)
     max_response_bytes: int = Field(default=262144, ge=1024, le=1048576)
     timeout_seconds: float = Field(default=5, gt=0, le=15)
     active_enabled: bool = False
     active_ports: list[int] = Field(default_factory=lambda: [80, 443], max_length=16)
     proxy_replay_enabled: bool = False
     proxy_max_flows: int = Field(default=500, ge=1, le=1000)
+
+    @model_serializer(mode="wrap")
+    def compatible_payload(self, handler):
+        payload = handler(self)
+        # Keep default policy JSON and digests stable for existing deployments.
+        if self.max_concurrency == 1:
+            payload.pop("max_concurrency", None)
+        return payload
 
     @field_validator("allowed_networks")
     @classmethod

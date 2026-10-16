@@ -207,14 +207,29 @@ async def _build_default_capability(
     builtin_adapters: Sequence[MCPAdapter] = (),
     builtin_concurrency: Mapping[str, int] | None = None,
     builtin_output_limits: Mapping[str, int] | None = None,
+    trusted_termination_servers: Sequence[str] = (),
 ) -> tuple[ToolGateway, ToolCatalog]:
     """Build one configured gateway and expose its read-only tool catalog."""
     gateway = await build_mcp_tool_gateway(
         config.mcp_servers, profile_bundles=profile_bundles, env=env,
         builtin_adapters=builtin_adapters, builtin_concurrency=builtin_concurrency,
         builtin_output_limits=builtin_output_limits,
+        trusted_termination_servers=trusted_termination_servers,
     )
     return gateway, gateway
+
+
+def _trusted_termination_servers(verified_deployment) -> tuple[str, ...]:
+    """Trust only role-declared result receipts from a fully verified local deployment."""
+    if verified_deployment is None:
+        return ()
+    from redteam.capability.server_roles import role_spec
+
+    return tuple(
+        role for role in verified_deployment.spec.roles
+        if (definition := role_spec(role)) is not None
+        and definition.supports_execution_termination
+    )
 
 
 async def _build_default_tool_gateway(config: CapabilityConfig) -> ToolGateway:
@@ -367,6 +382,7 @@ async def build_application(
     verified_mcp_deployment = verified_deployment(
         config.engagement, config.capability.mcp_servers, env=environment
     )
+    trusted_termination_servers = _trusted_termination_servers(verified_mcp_deployment)
     config = config.model_copy(update={"engagement": (
         verified_mcp_deployment.engagement
         if verified_mcp_deployment is not None
@@ -519,7 +535,8 @@ async def build_application(
             role = role_spec("web-http")
             assert role is not None
             builtin_concurrency = {
-                **dict(builtin_concurrency or {}), "web-http": role.max_concurrency,
+                **dict(builtin_concurrency or {}),
+                "web-http": verified_mcp_deployment.spec.server_policy().max_concurrency,
             }
             builtin_output_limits = {
                 **dict(builtin_output_limits or {}), "web-http": role.max_output_bytes,
@@ -624,6 +641,7 @@ async def build_application(
                     [], builtin_adapters=[ExampleMCPAdapter(), *builtin_adapters],
                     builtin_concurrency=builtin_concurrency,
                     builtin_output_limits=builtin_output_limits,
+                    trusted_termination_servers=trusted_termination_servers,
                 )
             else:
                 discovered_catalog = await build_mcp_tool_gateway([])
@@ -633,6 +651,7 @@ async def build_application(
                 config.capability, profile_bundles=profile_bundles, env=environment,
                 builtin_adapters=builtin_adapters, builtin_concurrency=builtin_concurrency,
                 builtin_output_limits=builtin_output_limits,
+                trusted_termination_servers=trusted_termination_servers,
             )
         else:
             # The caller enters/exits this stack in the run's owning task.
@@ -642,6 +661,7 @@ async def build_application(
                     config.capability.mcp_servers, profile_bundles=profile_bundles, env=environment,
                     builtin_adapters=builtin_adapters, builtin_concurrency=builtin_concurrency,
                     builtin_output_limits=builtin_output_limits,
+                    trusted_termination_servers=trusted_termination_servers,
                 )
             )
             resolved_tool_gateway, discovered_catalog = scoped_gateway, scoped_gateway
