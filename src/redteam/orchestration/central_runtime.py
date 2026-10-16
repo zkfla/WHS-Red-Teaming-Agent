@@ -30,6 +30,13 @@ from redteam.orchestration.central_graph_batch import CentralGraphBatch
 from redteam.orchestration.central_state import check_evidence
 from redteam.orchestration.coordination import CoordinationError, StateConflict, content_hash
 from redteam.orchestration.execution_journal import append_execution_receipt, preserved_result
+from redteam.orchestration.execution_projection import (
+    execution_outcome,
+    execution_selection,
+    policy_outcome,
+    unknown_outcome,
+    waiting_outcome,
+)
 from redteam.orchestration.operator_intents.models import IntentStatus
 from redteam.orchestration.operator_intents.service import is_task_suppressed
 from redteam.orchestration.resource_conflicts import execution_resource_keys
@@ -552,6 +559,13 @@ async def register_submission(deps, runtime, step, proposal, invocation, decisio
     )
     mission = await state.get_mission(runtime.mission_id)
     tool = deps.tool_catalog.get(invocation.tool_id)
+    from redteam.orchestration.tool_discovery import program_execution_environment
+
+    selection = execution_selection(
+        tool,
+        invocation,
+        program_execution_environment(getattr(deps, "shell_programs", None)),
+    )
     record = TaskExecution(
         engagement_id=runtime.engagement_id,
         run_id=runtime.run_id,
@@ -577,6 +591,8 @@ async def register_submission(deps, runtime, step, proposal, invocation, decisio
         resource_keys=execution_resource_keys(tool, invocation, step.principal_ref),
         resource_lease_until=datetime.now(timezone.utc).timestamp()
         + deps.settings.lease_ttl_seconds,
+        selection=selection,
+        outcome=policy_outcome(decision),
     )
     try:
         await state.transaction(
@@ -593,6 +609,7 @@ async def register_submission(deps, runtime, step, proposal, invocation, decisio
         if str(exc) != "shared_resource_execution_conflict":
             raise
         record = record.model_copy(update={"wait_reason": "resource", "resource_lease_until": 0})
+        record = record.model_copy(update={"outcome": waiting_outcome("resource")})
         await state.transaction(
             lambda tx: tx.record_execution(
                 record,
@@ -605,7 +622,11 @@ async def register_submission(deps, runtime, step, proposal, invocation, decisio
         )
     if decision.verdict is PolicyVerdict.DENY:
         record = (await state.get_execution(str(invocation.invocation_id))).model_copy(
-            update={"state": ExecutionState.CANCELLED, "wait_reason": None}
+            update={
+                "state": ExecutionState.CANCELLED,
+                "wait_reason": None,
+                "outcome": policy_outcome(decision),
+            }
         )
         await state.transaction(
             lambda tx: tx.update_execution(
@@ -821,6 +842,11 @@ async def commit_result(deps, local, item):
         unknown = execution_outcome_uncertain(result.metadata)
         current = await deps.central_state.get_execution(str(result.invocation_id))
         job = current.job_ref
+        mapped_metadata = None
+        if local.get("result_evidence_id"):
+            mapped_record = await deps.evidence_store.get(local["result_evidence_id"])
+            if mapped_record is not None:
+                mapped_metadata = mapped_record.metadata
         update = current.model_copy(
             update={
                 "state": (
@@ -833,6 +859,15 @@ async def commit_result(deps, local, item):
                 "result_evidence_id": receipt_id,
                 "wait_reason": "job" if job and unknown else None,
                 "job_ref": job if unknown else None,
+                "outcome": (
+                    unknown_outcome(result)
+                    if unknown
+                    else execution_outcome(
+                        result,
+                        selection=current.selection,
+                        mapped_evidence_metadata=mapped_metadata,
+                    )
+                ),
             }
         )
         identities = [str(receipt_id)]

@@ -298,6 +298,77 @@ async def test_idle_settings_change_restarts_the_session_for_new_runs(stack):
     assert json.loads(stack.settings.env["REDTEAM_LLM_REQUEST_POLICY_JSON"])["max_requests"] == 70
 
 
+async def test_explicit_reauthentication_stops_idle_session_and_restarts_after_success(stack):
+    started = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def reauthenticate():
+        started.set()
+        await finish.wait()
+
+    stack.host.reauthenticator = reauthenticate
+    await become_ready(stack)
+    response = await post(stack.client, "/api/v1/settings/chatgpt/reauth")
+
+    assert response.status_code == 202
+    await asyncio.wait_for(started.wait(), 2)
+    assert stack.host.state == "authenticating"
+    assert stack.launcher.launches == 1
+
+    duplicate = await post(stack.client, "/api/v1/settings/chatgpt/reauth")
+    assert duplicate.status_code == 409
+    assert duplicate.json() == {"error": "authentication_in_progress"}
+    finish.set()
+    for _ in range(200):
+        if stack.host.state == "ready":
+            break
+        await asyncio.sleep(0.01)
+    assert stack.host.state == "ready"
+    assert stack.launcher.launches == 2
+
+
+async def test_reauthentication_failure_is_reported_without_exception_details(stack):
+    async def reauthenticate():
+        raise RuntimeError("secret-provider-detail")
+
+    stack.host.reauthenticator = reauthenticate
+    await become_ready(stack)
+    response = await post(stack.client, "/api/v1/settings/chatgpt/reauth")
+    assert response.status_code == 202
+    for _ in range(200):
+        if stack.host.state == "error":
+            break
+        await asyncio.sleep(0.01)
+    snapshot = (await stack.client.get("/api/v1/snapshot")).json()
+    assert snapshot["session"]["state"] == "error"
+    assert snapshot["session"]["error"] == "chatgpt_reauth_failed"
+    assert "secret-provider-detail" not in json.dumps(snapshot)
+
+
+async def test_reauthentication_is_unavailable_without_provider_adapter(stack):
+    await become_ready(stack)
+    response = await post(stack.client, "/api/v1/settings/chatgpt/reauth")
+    assert response.status_code == 409
+    assert response.json() == {"error": "reauth_unavailable"}
+
+
+async def test_reauthentication_preflight_does_not_stop_session_when_not_applicable(stack):
+    async def reauthenticate():
+        raise AssertionError("must not run")
+
+    stack.host.reauthenticator = reauthenticate
+    stack.host.reauthentication_available = lambda: False
+    await become_ready(stack)
+    controller = stack.host.frontend.controller
+    response = await post(stack.client, "/api/v1/settings/chatgpt/reauth")
+
+    assert response.status_code == 409
+    assert response.json() == {"error": "chatgpt_reauth_not_applicable"}
+    assert stack.host.state == "ready"
+    assert stack.host.frontend.controller is controller
+    assert stack.launcher.launches == 1
+
+
 async def test_invalid_settings_return_field_and_code_only(stack):
     await stack.host.start()
     response = await post(

@@ -114,6 +114,31 @@ SQL primary keys and indexed projections serve point/Run/status queries.
 Domain JSON is the original record, rather than a second Runtime snapshot.
 Point LLM request updates load only their referenced rows; accounting inventories
 are limited to that Run. Task lookups do not load Task/Path/Work inventories.
+Provider cooldown rows use a versioned Run-wide state machine. Retryable 429s
+move the Run through `cooldown`; after the configured consecutive threshold and
+the persisted deadline, one request ID atomically owns `half_open`. A success
+from that generation reopens the Run, another 429 starts a new cooldown, and an
+unknown dispatched recovery or a non-retryable/excessive delay becomes `held`.
+Success from an older concurrently dispatched generation cannot clear newer
+provider state. Legacy `{consecutive, until, held}` rows remain readable and are
+rewritten on their next state transition. Request rows and possibly-dispatched
+unknown usage are never refunded by cooldown recovery.
+Each new request row may also carry a code-owned `purpose`, `attempt_kind`,
+validated decision outcome and progress flag. Planning/atomization come from the
+trusted call stage; Worker external/local-read/settlement/text-only outcomes come
+from validated native bindings and registered local-tool metadata. Provider text
+and hidden reasoning are never parsed for classification. Invalid native
+arguments, unknown tool names, other binding rejection, protocol rejection and
+settlement remain distinct outcomes. Missing fields on old rows remain explicitly
+unclassified.
+
+Execution rows may additionally contain a bounded `selection` and `outcome`
+projection. `selection` comes from the provider descriptor's optional
+`execution_route` plus the Run-bound program environment; the descriptor value
+is display/planning metadata and never grants execution. `outcome` is derived
+from the preserved original and mapper evidence, so generic stdout cannot be
+reported as a canonical protocol receipt. Older rows omit both fields and stay
+`unknown`; readers must not fill them from the current machine's inventory.
 There are no TaskClaim, independent question, Path/Step or candidate scheduler
 tables. Legacy Task dependency/parent/priority fields are rejected on registration
 and omitted from central persisted Task JSON.
@@ -899,10 +924,15 @@ Tests may also register v2 probes directly through the existing central admissio
 Schema-2 profiles retain their original serialized policy and prompt fingerprints.
 
 The selected profile provides each Task's `probe_limits`: the default split
-profile currently allows four original action submissions and sixteen model
-request reservations, while the legacy profile uses four and eight. An omitted
-override inherits those limits. A proposal may tighten either limit,
-but cannot exceed the selected profile. Limits are immutable Task input, included
+profile allows four original action submissions and sixteen model request
+reservations; the legacy profile retains four and eight. Both selected profiles
+bind six format/semantic repairs and six consecutive provider failures per Task
+purpose. The provider threshold retains headroom for an initial failure plus the
+existing five transport retries; these sub-limits share the original Task and Run
+ledgers and never create another request pool. Historical Tasks whose optional
+circuit fields are absent retain their saved contract.
+A proposal may tighten limits but cannot exceed the selected profile; omitted
+repair/provider limits inherit the profile instead of disabling it. Limits are immutable Task input, included
 in its completion purpose hash, while the entire profile participates in the
 existing persisted selection fingerprint. No new queue, ledger or database is
 created: usage comes from `state_executions` and existing `llm_request` rows with
@@ -911,6 +941,17 @@ inherit the same Task charge and existing Run charge. Released undispatched mode
 reservations do not count. Slot return, owner transfer and checkpoint resume do
 not reset usage; continuing an original invocation does not submit another action.
 Run admission and its original time/action/model budgets still apply.
+
+The provider-failure circuit is derived from ordered request rows sharing a
+limit-independent semantic purpose key. Completion/resume binding still includes
+the immutable limits, but changing only those limits on a cloned Task cannot
+reset provider failures for the same objective, criteria, targets, principals,
+hypotheses and revisions. A validated model decision closes the consecutive
+failure sequence. The circuit is distinct from the Run-wide 429 cooldown: active
+Run cooldown is reported first, while an expired/recovered provider can continue
+other purposes. Opening the Task circuit preserves request rows, unknown usage,
+ToolResults and pending execution state and returns a structured Planner
+reconsideration condition.
 
 Claim atomically captures the candidate's admitted revision in the worker's SDK
 checkpoint. The authoritative candidate stays in the graph. The worker receives
@@ -1075,12 +1116,13 @@ must pass before resuming an existing Run; incompatible Runs are not migrated.
 
 ## Worker delivery version
 
-The default split schema-3 profile is now `native-probes` version 9, with
-`worker.md` prompt version 4 and `hypothesis-strategy.md` version 3 (combined
-candidate-v2 guidance and bounded original-feedback guidance). The retained single-stage
-profile is version 6
-and uses the same worker prompt version. Their Planner/atomizer responsibilities,
-probe limits and existing independent completion review are unchanged. Prompt
+The default split schema-3 profile is `native-probes` version 27, with
+`worker.md` prompt version 13, `hypothesis-strategy.md` version 15 and
+`probe-atomizer.md` version 8. The retained single-stage profile is version 20
+with planner prompt version 7 and the same worker prompt version. Planner/atomizer responsibilities
+and independent completion review remain separate. Default/legacy Task request limits
+remain 16/8, with explicit repair and consecutive-provider-failure subcaps of 6;
+these share the existing Task/Run ledger. Prompt
 content hashes and versioned read/settlement contributions change the existing
 selection fingerprints. Historical Runs/results stay readable; an incompatible
 checkpoint cannot execute under new bindings without the normal compatibility
@@ -1142,13 +1184,31 @@ The model proposes follow-up purposes or held, while code validates references,
 scope, revisions, original linkage, budgets and atomic registration. No natural
 language task classifier, semantic duplicate blocker or investigation DAG exists.
 
-Each new metered request may record its trusted instruction `stage` in the
-existing `llm_request` payload before dispatch, preserving owner/Task attribution.
+Each new metered request records its trusted instruction `stage` plus safe
+purpose/attempt/outcome fields in the existing `llm_request` payload before
+dispatch, preserving owner/Task attribution.
+Failed provider settlements additionally retain only the normalized
+`provider_status`, `provider_code`, `provider_retryable` and
+`provider_retry_after` fields from `LLMProviderFailure`. Each facade-backed request
+also retains a bounded, redacted rendering of the public system/user prompt and
+public text/JSON/tool-call response for operator inspection. Credentials,
+secret-shaped fields, provider bodies/headers, exception messages, private reasoning
+and continuation state are not copied. Historical rows without these additive
+content fields remain readable and visibly show that no body was retained; there is
+no backfill. An interrupted request with no provider outcome is not reclassified as
+a provider failure.
 `snapshot.by_stage` derives spent/reserved/known-token/unknown-usage/unknown-dispatch
 counts from those rows. Stage counts sum to the existing totals; undispatched
 release still refunds only the same reservation. Old/direct requests lacking a
 stage remain in `unknown`, without guessing from owner or method. No table,
 cost ledger or historical backfill is added.
+
+Run/stage/Task/owner projections count external-tool decisions, local reads,
+settlements, text-only holds, format/semantic repairs, transport retries and
+provider failures independently. External actions still come from canonical
+execution rows, not model tool-call claims. Task reports expose known tokens and
+unknown usage separately and publish `external_actions / model_requests` only
+when the denominator is nonzero; it is an efficiency ratio, not a success rate.
 
 Request rows also accept optional normalized `usage` counts for input, output,
 total, cache read and cache write. Run/stage/Task/owner snapshots expose a known

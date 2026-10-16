@@ -30,7 +30,7 @@ from redteam.orchestration.worker_session import (
     WorkerSession,
 )
 
-WORKER_CONVERSATION_VERSION = 2
+WORKER_CONVERSATION_VERSION = 3
 
 
 async def binding_context(deps, runtime) -> dict[str, Any]:

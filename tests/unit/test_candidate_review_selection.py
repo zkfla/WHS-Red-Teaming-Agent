@@ -19,9 +19,14 @@ from redteam.core.ids import EngagementId, EvidenceId, RunId
 from redteam.orchestration.central_state import receipt_failure
 from redteam.orchestration.coordination import content_hash
 from redteam.orchestration.hypothesis_planner import (
+    HypothesisDecision,
     HypothesisProposalError,
+    _split_plan_response_schema,
+    planner_candidate_wire_schema,
     validate_candidate_review_selections,
+    validate_candidate_status_presence,
 )
+from redteam.orchestration.probe_atomization import HypothesisPlanSelection
 
 TARGET = "host:unit.local"
 SECRET = "SECRET-REVIEW-MARKER-7f3a"
@@ -132,14 +137,8 @@ def test_bound_final_receipt_passes_for_each_verdict(status):
 
 
 @pytest.mark.parametrize("status", ["open", "inconclusive", "held"])
-def test_non_verdict_updates_do_not_consult_any_review(status):
+def test_nonverdict_update_without_review_evidence_remains_valid(status):
     cand = candidate(status=status)
-    # Even a task completion receipt cited on a non-verdict update is not a verdict to check.
-    validate_candidate_review_selections(
-        [HypothesisUpdate(hypothesis=cand, expected_revision=None,
-                          review_evidence_id=RECEIPT)],
-        {RECEIPT: task_receipt()},
-    )
     validate_candidate_review_selections(
         [HypothesisUpdate(hypothesis=cand, expected_revision=None)], {},
     )
@@ -162,3 +161,57 @@ def test_first_invalid_verdict_is_the_reported_index():
 def test_missing_review_id_on_a_verdict_is_rejected_by_the_update_contract_first():
     with pytest.raises(ValidationError):
         HypothesisUpdate(hypothesis=candidate(), expected_revision=1)
+
+
+@pytest.mark.parametrize("model,split", [
+    (HypothesisDecision, False),
+    (HypothesisPlanSelection, True),
+])
+def test_active_planner_wire_schema_requires_candidate_status(model, split):
+    schema = planner_candidate_wire_schema(model.model_json_schema())
+    if split:
+        schema = _split_plan_response_schema(schema)
+    ref = schema["$defs"]["HypothesisUpdate"]["properties"]["hypothesis"]["$ref"]
+    candidate_schema = schema["$defs"][ref.rsplit("/", 1)[-1]]
+
+    assert "status" in candidate_schema["required"]
+    assert "default" not in candidate_schema["properties"]["status"]
+    assert "confidence" not in candidate_schema["required"]
+
+
+def test_planner_rejects_omitted_status_before_domain_default_but_accepts_open():
+    hypothesis = candidate(status="open").model_dump(mode="json")
+    hypothesis.pop("status")
+    raw = {"updates": [{"hypothesis": hypothesis}], "reason": "Check a captured premise"}
+
+    # Both active decision models materialize the domain default unless the raw wire
+    # payload is checked first.
+    assert HypothesisDecision.model_validate(raw).updates[0].hypothesis.status == "open"
+    assert HypothesisPlanSelection.model_validate(raw).updates[0].hypothesis.status == "open"
+    with pytest.raises(HypothesisProposalError) as caught:
+        validate_candidate_status_presence(raw)
+    assert caught.value.code == "candidate_status_required"
+    assert caught.value.diagnostic.location == "$.updates[0].hypothesis.status"
+
+    hypothesis["status"] = "open"
+    validate_candidate_status_presence({"updates": [{"hypothesis": hypothesis}]})
+    assert CandidateHypothesis.model_validate(hypothesis).status == "open"
+
+
+@pytest.mark.parametrize("status", ["open", "inconclusive", "held"])
+def test_nonterminal_update_cannot_cite_a_review_receipt(status):
+    selected = HypothesisUpdate(
+        hypothesis=candidate(status=status), expected_revision=1, review_evidence_id=RECEIPT,
+    )
+
+    with pytest.raises(HypothesisProposalError) as caught:
+        validate_candidate_review_selections([selected], {RECEIPT: receipt(
+            candidate(status="confirmed"),
+        )})
+
+    diagnostic = caught.value.diagnostic
+    assert caught.value.code == "candidate_review_receipt_requires_terminal_status"
+    assert diagnostic.location == "$.updates[0].review_evidence_id"
+    assert diagnostic.retryable is True and diagnostic.cause_scope == "model_input"
+    rendered = json.dumps(diagnostic.model_dump(mode="json"))
+    assert SECRET not in rendered and RECEIPT not in rendered

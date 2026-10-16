@@ -69,6 +69,25 @@ class SplitDouble(FakeLLMClient):
             result = response(payload) if callable(response) else response
             if stdlib_inspect.isawaitable(result):
                 result = await result
+            if (
+                not payload.get("candidates")
+                and isinstance(result, dict)
+                and result.get("context_request") is None
+                and not result.get("updates")
+                and result.get("termination", "continue") == "continue"
+                and result.get("questions")
+            ):
+                result = {**result, "updates": [{
+                    "expected_revision": None,
+                    "hypothesis": {
+                        "contract_version": 2,
+                        "hypothesis_id": "initial-local",
+                        "description": "A target security premise remains untested",
+                        "target_node_ids": [TARGET],
+                        "reason": "Preserve the first scoped uncertainty for investigation",
+                        "status": "open",
+                    },
+                }]}
             return result
         if "tasks" in props:
             body = messages[-1]["content"].split("\n\nPrevious attempt failed")[0]
@@ -145,7 +164,7 @@ async def test_split_loop_update_only_makes_one_request(tmp_path):
     plan = {"updates": [{"expected_revision": None, "hypothesis": {
         "contract_version": 2, "hypothesis_id": "local",
         "description": "Access may be unguarded", "target_node_ids": [TARGET],
-        "reason": "Assess the preserved response"}}],
+        "reason": "Assess the preserved response", "status": "open"}}],
         "questions": [], "reason": "Record premise", "termination": "replan"}
     llm = SplitDouble([plan], [])
     async with probe_selection(tmp_path, llm=llm) as (session, llm, tools):
@@ -166,6 +185,72 @@ async def test_split_loop_new_candidate_forwarded_to_atomizer(tmp_path):
         assert candidate.revision == 1
         task = await session.deps.central_state.get_task(ids[0])
         assert task.hypothesis_revisions == {candidate.hypothesis_id: 1}
+
+
+async def test_split_loop_binds_unique_missing_verdict_reference_before_registration(tmp_path):
+    plan = _new_candidate_plan()
+    plan["questions"][0]["completion_criteria"] = [{
+        "kind": "hypothesis_confirmed", "description": "Confirm the premise",
+    }]
+
+    def atomize(payload):
+        (question,) = payload["questions"]
+        (candidate_id,) = question["hypothesis_revisions"]
+        criterion = question["completion_criteria"][0]
+        assert criterion["hypothesis_id"] == candidate_id
+        return {"tasks": [{
+            "task_key": "t1", "question_id": "q1",
+            "objective": "Probe the new premise", "title": "Verdict probe",
+            "role_id": "probe-worker", "target_node_ids": [TARGET],
+            "completion_criterion_ids": [
+                criterion_id(CompletionCriterion.model_validate(criterion)),
+            ],
+            "probe_limits": {"max_actions": 1, "max_model_requests": 4},
+        }]}
+
+    llm = SplitDouble([plan], [atomize])
+    async with probe_selection(tmp_path, llm=llm) as (session, llm, tools):
+        ids = await SpecialistPlanner(session.deps).advance(session.runtime)
+        assert len(ids) == 1
+        task = await session.deps.central_state.get_task(ids[0])
+        (candidate_id,) = task.hypothesis_revisions
+        assert task.completion_criteria[0].hypothesis_id == candidate_id
+        (candidate,) = await AttackGraphService(session.deps.graph_store).list_hypotheses()
+        assert candidate.hypothesis_id == candidate_id and candidate.status == "open"
+
+
+async def test_split_loop_ambiguous_missing_verdict_reference_commits_nothing(tmp_path):
+    plan = {
+        "updates": [
+            {"expected_revision": None, "hypothesis": {
+                "contract_version": 2, "hypothesis_id": "local-a",
+                "description": "First premise", "target_node_ids": [TARGET],
+                "reason": "Assess the first premise", "status": "open",
+            }},
+            {"expected_revision": None, "hypothesis": {
+                "contract_version": 2, "hypothesis_id": "local-b",
+                "description": "Second premise", "target_node_ids": [TARGET],
+                "reason": "Assess the second premise", "status": "open",
+            }},
+        ],
+        "questions": [{
+            "question_id": "q1", "objective": "Confirm a candidate",
+            "target_node_ids": [TARGET], "candidate_refs": ["local-a", "local-b"],
+            "completion_criteria": [{
+                "kind": "hypothesis_confirmed", "description": "Confirm the premise",
+            }],
+        }],
+        "reason": "The criterion has multiple linked candidates",
+        "termination": "continue",
+    }
+    # The second plan answer is a normal held repair after the field diagnostic.
+    llm = SplitDouble([plan], [])
+    async with probe_selection(tmp_path, llm=llm) as (session, llm, tools):
+        await SpecialistPlanner(session.deps).advance(session.runtime)
+        state = session.deps.central_state
+        assert len(llm.plan_inputs) == 2
+        assert await state.list_tasks() == []
+        assert await AttackGraphService(session.deps.graph_store).list_hypotheses() == []
 
 async def test_split_loop_updated_candidate_forwarded_to_atomizer(tmp_path):
     from tests.integration.test_hypothesis_planner import candidate as _cand
@@ -391,6 +476,7 @@ async def test_legacy_single_stage_storage_resume_compat(tmp_path):
     from tests.integration.test_central_completion import OriginalProtocolDouble
     from tests.integration.test_central_development import gateway
     from tests.integration.test_central_parallel import limits
+    from tests.integration.test_hypothesis_planner import candidate as _candidate
     from tests.integration.test_hypothesis_planner import probe as _probe
     original, configured = limits()
     original.metadata["success_criteria"] = ["Assess the original response"]
@@ -399,7 +485,7 @@ async def test_legacy_single_stage_storage_resume_compat(tmp_path):
     config = AppConfig(engagement=EngagementConfig.model_validate(
         original.model_dump(exclude={"engagement_id", "created_at"})))
     root = tmp_path / "run"
-    llm = FakeLLMClient(canned_structured={"tasks": [_probe()],
+    llm = FakeLLMClient(canned_structured={"updates": [_candidate()], "tasks": [_probe()],
                                           "reason": "No candidate yet"})
     tools = OriginalProtocolDouble(gateway())
     options = {"llm": llm, "tool_gateway": tools, "tool_catalog": tools.catalog}
@@ -457,11 +543,12 @@ def _profile_run_config(profile):
     return config, configured
 
 async def test_legacy_bound_run_accepts_same_profile_resume(tmp_path):
+    from tests.integration.test_hypothesis_planner import candidate as _candidate
     from tests.integration.test_hypothesis_planner import probe as _probe
     legacy = PROFILE.with_name("native-probes-legacy.yaml")
     config, configured = _profile_run_config(legacy)
     root = tmp_path / "run"
-    llm = FakeLLMClient(canned_structured={"tasks": [_probe()],
+    llm = FakeLLMClient(canned_structured={"updates": [_candidate()], "tasks": [_probe()],
                                           "reason": "No candidate yet"})
     tools = OriginalProtocolDouble(gateway())
     options = {"llm": llm, "tool_gateway": tools, "tool_catalog": tools.catalog}
@@ -478,12 +565,13 @@ async def test_legacy_bound_run_accepts_same_profile_resume(tmp_path):
         assert len(await session.deps.central_state.list_tasks()) == 1
 
 async def test_legacy_bound_run_refuses_split_profile_resume(tmp_path):
+    from tests.integration.test_hypothesis_planner import candidate as _candidate
     from tests.integration.test_hypothesis_planner import probe as _probe
     legacy = PROFILE.with_name("native-probes-legacy.yaml")
     config, legacy_configured = _profile_run_config(legacy)
     _, split_configured = _profile_run_config(PROFILE)
     root = tmp_path / "run"
-    llm = FakeLLMClient(canned_structured={"tasks": [_probe()],
+    llm = FakeLLMClient(canned_structured={"updates": [_candidate()], "tasks": [_probe()],
                                           "reason": "No candidate yet"})
     tools = OriginalProtocolDouble(gateway())
     options = {"llm": llm, "tool_gateway": tools, "tool_catalog": tools.catalog}
@@ -502,7 +590,7 @@ def _new_candidate_plan():
     return {"updates": [{"expected_revision": None, "hypothesis": {
         "contract_version": 2, "hypothesis_id": "local",
         "description": "Access may be unguarded", "target_node_ids": [TARGET],
-        "reason": "Assess the preserved response"}}],
+        "reason": "Assess the preserved response", "status": "open"}}],
         "questions": [{"question_id": "q1", "objective": "Probe the new premise",
          "target_node_ids": [TARGET],
          "completion_criteria": [{"kind": "observation", "description": "Inspect new"}],

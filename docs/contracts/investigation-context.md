@@ -262,8 +262,8 @@ uses bounded conflict/wait cards, not full contracts or an omissions-based gate.
 The existing split coverage, paired comparison, source/revision validation, empty
 and update-only skips and single atomic admission remain in place.
 
-Default profile version 18 (strategy 9 / atomizer 4 / worker 10) and single-stage
-compatibility version 15 (planner 5 / worker 10) bind the current prompts.
+Default profile version 21 (strategy 9 / atomizer 4 / worker 13) and single-stage
+compatibility version 18 (planner 5 / worker 13) bind the current prompts.
 The [10b request contract](planner-request.md) keeps independent Planner prefixes
 stable and samples current accounting for each lookup/repair attempt. Existing profile
 fingerprint/resume checks reject silent changes; no stored Run or checkpoint

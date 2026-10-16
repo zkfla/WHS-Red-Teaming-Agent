@@ -10,25 +10,34 @@ from tests.integration.test_central_development import PROFILE
 PROBES = PROFILE.with_name("native-probes.yaml")
 LEGACY = PROFILE.with_name("native-probes-legacy.yaml")
 
-# Golden constants for the version-19 single-stage v3 compatibility profile,
+# Golden constants for the version-20 single-stage v3 compatibility profile,
 # intentionally versioned for the shared worker's Korean methodology and contract instructions.
 # This does not assert compatibility with older prompt/profile versions;
 # integration tests separately require matching selection fingerprints on resume.
 # Runtime fingerprints hash raw prompt bytes, so both LF and CRLF prompt variants
 # are pinned while the YAML checksum is newline-canonicalized.
-LEGACY_YAML_LF_SHA256 = "5a236363de9286d378d52ae6a6457abb864274ee9dacabe6d64e4cd036133fcd"
-LEGACY_FINGERPRINT_CRLF = "7b79ebdc7ae3ed6ff068205dd2fc1f84e4dba8b5dc3d2606533ca98bc6432926"
-LEGACY_FINGERPRINT_LF = "8bf3596c26a761479ebb2c887a932db7ae932f02a7c6cac2e75b1389a38dd021"
+LEGACY_YAML_LF_SHA256 = "19cc9aca65cfb196b2813ee37660231117113e38c419833874d3bbbc47acd492"
+LEGACY_FINGERPRINT_LF = "0396dbbf27cad6476fd56b60802705a42a9467c2c01c0e1b8299e1f78bf362d5"
+LEGACY_FINGERPRINT_CRLF = "f4693e37c8aa5f5a6ecf36b0a49933195ad9fd8da93f0a39c8dc82595206af5b"
 
 
 def test_legacy_golden_fingerprint_and_bytes():
     canonical = LEGACY.read_bytes().replace(b"\r\n", b"\n")
     assert hashlib.sha256(canonical).hexdigest() == LEGACY_YAML_LF_SHA256
     loaded = load_specialist_profile(LEGACY)
-    assert loaded.profile.version == "19"
+    assert loaded.profile.version == "20"
     assert loaded.fingerprint in {LEGACY_FINGERPRINT_CRLF, LEGACY_FINGERPRINT_LF}
     assert loaded.run_policy().probe_atomization is False
     assert loaded.run_policy().fingerprint == loaded.fingerprint
+    assert loaded.fingerprint not in {
+        "18b04d45c2207efe133788f52f6c1baeec58e8ffd803b1d5b3216a89e3a275ab",
+        "50126322fedf6851f1a4791e6c816aab748d256317d889a5e0e3f9f3dadd2fa7",
+        "292fe25da9babd70c3e7704bc91f2843dbe0a6a69163cd27be37dc76efc30f17",
+        "b176b4317993b1483666b9dcfa330d0f413a2ca616435a931b21ca0af0046ffe",
+        "92dbea51ba10fd7a019a312a1cfd85dc9db4cba2bcef39dce77ebeb9c3524cf5",
+        "b0dfb2534e37b4418138dc0ab54ddd924a6f975b156c51526b58c909b224a2c5",
+        "20a1f2d00c8e315653e38c0b15aae1d8201c9f18f080ea22cbc4587a96ffb041",
+    }  # Historical selections must not silently resume with the new contract.
 
 
 def test_split_profile_fingerprint_roundtrip():

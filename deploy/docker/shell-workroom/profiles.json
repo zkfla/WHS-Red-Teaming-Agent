@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "profiles": {
+    "baseline": {
+      "package_input": "packages.txt",
+      "inventory_dependencies": false,
+      "description": "Minimal shell and common analysis baseline"
+    },
+    "kali-default": {
+      "package_input": "packages-kali-default.txt",
+      "inventory_dependencies": true,
+      "description": "Kali's standard default toolset; must be selected explicitly"
+    }
+  }
+}

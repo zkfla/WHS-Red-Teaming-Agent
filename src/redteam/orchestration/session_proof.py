@@ -38,6 +38,20 @@ def _cleaned(value: Any) -> str | None:
     return None
 
 
+def has_unmanaged_request_headers(arguments: Any) -> bool:
+    """Whether an original request supplied custom headers with unknown auth semantics.
+
+    The current request-header contract allowlists names but does not classify
+    credential headers. A nonempty custom-header mapping therefore cannot
+    support an anonymous claim, even when no registered session was used.
+    """
+    args = arguments if isinstance(arguments, dict) else {}
+    try:
+        return bool(args.get("request_headers"))
+    except Exception:
+        return True
+
+
 def collect_actual_sessions(metadata: Any, raw: Any) -> set[str]:
     """Return named actual-use receipts; absent/null receipts add no names.
 
@@ -169,6 +183,8 @@ def original_anonymous_receipt_matches(
         isinstance(args.get(key), str) and args[key].strip()
         for key in ("session_ref", "first_session_ref", "second_session_ref")
     ):
+        return False
+    if has_unmanaged_request_headers(args):
         return False
     return original_session_receipt_matches(
         metadata, raw, unit="request", expected_session_ref=None

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import io
 from collections import OrderedDict
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, Protocol, TextIO
 
@@ -121,10 +122,14 @@ class SessionHost:
         mirror: TextIO | None = None,
         catalog: EngagementCatalog | None = None,
         active_id: str | None = None,
+        reauthenticator: Callable[[], Awaitable[Any]] | None = None,
+        reauthentication_available: Callable[[], bool] | None = None,
     ) -> None:
         self.mirror = mirror
         self.catalog = catalog
         self.active_id = active_id
+        self.reauthenticator = reauthenticator
+        self.reauthentication_available = reauthentication_available
         self.central_path: Path | None = None  # where the running session keeps its state
         self.settings = settings
         self.launcher = launcher
@@ -137,6 +142,7 @@ class SessionHost:
         self.closing = asyncio.Event()
         self.frontend = self._new_frontend()
         self._task: asyncio.Task | None = None
+        self._reauth_task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
         self._client_inputs: OrderedDict[str, str] = OrderedDict()
 
@@ -239,6 +245,10 @@ class SessionHost:
 
     async def shutdown(self) -> None:
         self.closing.set()
+        auth_task = self._reauth_task
+        if auth_task is not None and not auth_task.done():
+            auth_task.cancel()
+            await asyncio.gather(auth_task, return_exceptions=True)
         async with self._lock:
             await self._stop_session()
             self.state = "closed"
@@ -252,8 +262,9 @@ class SessionHost:
         return controller
 
     def _ensure_idle(self) -> None:
-        if self.state == "starting":
-            raise Busy("session_starting")
+        if self.state in {"starting", "authenticating"}:
+            code = "session_starting" if self.state == "starting" else "authentication_in_progress"
+            raise Busy(code)
         controller = self.frontend.controller
         if self.state != "ready" or controller is None:
             return
@@ -312,6 +323,41 @@ class SessionHost:
             await self._stop_session()
             await self._launch()
             return result
+
+    async def begin_reauthentication(self) -> None:
+        """Start an explicit provider login without holding the HTTP request open."""
+        async with self._lock:
+            self._ensure_idle()
+            if self.reauthenticator is None:
+                raise Rejected("reauth_unavailable")
+            if (
+                self.reauthentication_available is not None
+                and not self.reauthentication_available()
+            ):
+                raise Rejected("chatgpt_reauth_not_applicable")
+            await self._stop_session()
+            self._set("authenticating")
+            task = asyncio.create_task(
+                self._complete_reauthentication(), name="web-provider-reauth"
+            )
+            self._reauth_task = task
+
+    async def _complete_reauthentication(self) -> None:
+        try:
+            assert self.reauthenticator is not None
+            await self.reauthenticator()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - expose only the stable provider failure code
+            async with self._lock:
+                if not self.closing.is_set():
+                    self._set("error", "chatgpt_reauth_failed")
+                self._reauth_task = None
+            return
+        async with self._lock:
+            self._reauth_task = None
+            if not self.closing.is_set():
+                await self._launch()
 
     async def save_engagement(
         self,

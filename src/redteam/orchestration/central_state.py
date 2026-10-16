@@ -25,6 +25,7 @@ from redteam.core.contracts.completion import (
     CompletionConditionConflict,
     completion_condition_conflicts,
     completion_contract_hash,
+    probe_failure_circuit_key,
 )
 from redteam.core.contracts.engagement import EngagementScope
 from redteam.core.contracts.events import EventEnvelope, EventType
@@ -59,6 +60,7 @@ from redteam.orchestration.llm_requests import (
     RequestAdmissionError,
     RequestChange,
     RunRequestLedger,
+    request_usage,
 )
 from redteam.orchestration.operator_intents.models import IntentRecord, IntentStatus
 from redteam.orchestration.operator_intents.store import check_intent_update, sanitize_intent_record
@@ -300,7 +302,7 @@ async def check_evidence(
 def execution_identity_hash(record: TaskExecution) -> str:
     excluded = {
         "state", "wait_reason", "job_ref", "result_evidence_id",
-        "resource_execution_pending", "resource_lease_until",
+        "resource_execution_pending", "resource_lease_until", "outcome",
     }
     if record.target_node_id is None:
         excluded.add("target_node_id")  # Preserve historical identity hashes.
@@ -706,13 +708,29 @@ class CentralTransaction:
             "SELECT count(*) FROM state_executions WHERE run_id=? AND task_id=?",
             (self.run_id, task_id),
         ).fetchone()[0]
-        requests = self.db.execute(
-            "SELECT count(*) FROM state_requests WHERE run_id=? AND kind='llm_request' "
+        request_rows = self.db.execute(
+            "SELECT payload FROM state_requests WHERE run_id=? AND kind='llm_request' "
             "AND json_extract(payload,'$.task_id')=? "
             "AND json_extract(payload,'$.state')!='released'", (self.run_id, task_id),
-        ).fetchone()[0]
-        return {"actions": actions, "model_requests": requests,
-                "limits": task.probe_limits.model_dump() if task.probe_limits else None}
+        ).fetchall()
+        rows = [json.loads(row[0]) for row in request_rows]
+        metrics = request_usage(rows)
+        return {
+            "actions": actions,
+            "model_requests": len(rows),
+            "known_tokens": metrics["known_tokens"],
+            "unknown_usage": metrics["unknown_usage"],
+            "external_tool_decisions": metrics["external_tool_decisions"],
+            "local_reads": metrics["local_reads"],
+            "repairs": metrics["repairs"],
+            "transport_retries": metrics["attempts"]["transport_retry"],
+            "provider_failures": metrics["provider_failures"],
+            "settlements": metrics["settlements"],
+            "text_only_held": metrics["text_only_held"],
+            "no_progress": metrics["no_progress"],
+            "request_outcomes": metrics["outcomes"],
+            "limits": task.probe_limits.model_dump() if task.probe_limits else None,
+        }
 
     def register_batch(
         self, request_id: str, tasks: Sequence[MissionTask], *,
@@ -760,6 +778,33 @@ class CentralTransaction:
         if any(self.get_task(identity) is None for identity in payload["task_ids"]):
             raise StateConflict("registration_original_task_missing")
         return payload
+
+    def candidate_finding_promotions(self) -> list[dict[str, Any]]:
+        """Safe Run-scoped projection; canonical Findings remain in the graph."""
+        self.binding()
+        return [json.loads(row[0]) for row in self.db.execute(
+            "SELECT payload FROM state_requests WHERE run_id=? "
+            "AND kind='candidate_finding_promotion' ORDER BY identity",
+            (self.run_id,),
+        )]
+
+    def _save_candidate_finding_promotion(self, payload: dict[str, Any]) -> None:
+        identity = f"{payload['candidate_id']}:{payload['candidate_revision']}"
+        serialized = json.dumps(payload, sort_keys=True)
+        previous = self.db.execute(
+            "SELECT payload FROM state_requests WHERE run_id=? "
+            "AND kind='candidate_finding_promotion' AND identity=?",
+            (self.run_id, identity),
+        ).fetchone()
+        if (
+            previous is not None
+            and json.dumps(json.loads(previous[0]), sort_keys=True) != serialized
+        ):
+            raise StateConflict("candidate_finding_projection_conflict")
+        self.db.execute(
+            "INSERT OR IGNORE INTO state_requests VALUES(?,'candidate_finding_promotion',?,?)",
+            (self.run_id, identity, serialized),
+        )
 
     def register_hypothesis_probes(
         self, request_id: str, request_hash: str, *, updates: Sequence[HypothesisUpdate],
@@ -813,8 +858,107 @@ class CentralTransaction:
                             trace_refs={"candidate_id": candidate.hypothesis_id, "reason": reason},
                         ),
                     ])
-            node = self.graph.save_hypothesis(update, now=datetime.now(timezone.utc))
-            revisions[candidate.hypothesis_id] = node.properties["facts"]["revision"]
+            now = datetime.now(timezone.utc)
+            node = self.graph.save_hypothesis(update, now=now)
+            committed = Hypothesis.model_validate(node.properties["facts"])
+            revisions[candidate.hypothesis_id] = committed.revision
+            if committed.status == "confirmed":
+                from redteam.attack_graph.predicates import Provenance, facts_of
+                from redteam.core.contracts.graph import Finding
+                from redteam.core.enums import GraphNodeType
+                from redteam.orchestration.findings import (
+                    FindingPromoter,
+                    candidate_promotion_input,
+                    claim_keys_from_findings,
+                )
+
+                review = inspected.get(update.review_evidence_id or "")
+                if review is None:
+                    raise StateConflict("candidate_review_original_missing")
+                promotion_input = candidate_promotion_input(
+                    update=update,
+                    committed=committed,
+                    receipt=review,
+                    originals=inspected,
+                    run_id=self.run_id,
+                    engagement_id=self.engagement_id,
+                )
+                projection: dict[str, Any] = {
+                    "contract_version": 1,
+                    "candidate_id": committed.hypothesis_id,
+                    "candidate_pre_verdict_revision": update.expected_revision,
+                    "candidate_revision": committed.revision,
+                    "review_receipt_id": str(review.evidence_id),
+                    "finding_id": None,
+                    "status": "refused",
+                    "reason": promotion_input.refused_reason,
+                }
+                if promotion_input.request is not None:
+                    findings = []
+                    for finding_node in self.graph.query(node_type=GraphNodeType.FINDING):
+                        try:
+                            findings.append(Finding.model_validate(facts_of(
+                                finding_node.properties
+                            )))
+                        except Exception:
+                            continue
+                    promoter = FindingPromoter()
+                    decision = promoter.promote(
+                        promotion_input.request,
+                        existing_claims=claim_keys_from_findings(findings),
+                    )
+                    if decision.finding is not None:
+                        self.graph.save_finding(
+                            decision.finding,
+                            hypothesis_id=committed.hypothesis_id,
+                            about=GraphNodeId(promotion_input.request.target_node_id),
+                            now=now,
+                            provenance=Provenance(
+                                source="planner:candidate-finding-v2",
+                                evidence_id=str(review.evidence_id),
+                                run_id=self.run_id,
+                            ),
+                        )
+                        self.queue(EventEnvelope(
+                            event_id=EventId("evt_" + content_hash([
+                                self.run_id,
+                                "candidate_finding_v2",
+                                decision.finding.finding_id,
+                            ])[:24]),
+                            event_type=EventType.FINDING_CREATED,
+                            run_id=RunId(self.run_id),
+                            engagement_id=EngagementId(self.engagement_id),
+                            source="orchestration.central_state",
+                            timestamp=now,
+                            correlation_id=promotion_input.request.action_id or self.run_id,
+                            payload={
+                                "finding_id": decision.finding.finding_id,
+                                "severity": decision.finding.severity,
+                                "evidence_ids": decision.finding.evidence_ids,
+                                "hypothesis_id": committed.hypothesis_id,
+                                "action_id": promotion_input.request.action_id,
+                            },
+                        ))
+                        projection.update({
+                            "finding_id": decision.finding.finding_id,
+                            "status": "promoted",
+                            "reason": "",
+                            "claim_key": decision.finding.metadata.get("claim_key"),
+                        })
+                    elif decision.refused_reason == "duplicate_finding":
+                        wanted = promoter.claim_key(promotion_input.request)
+                        existing = next((item for item in findings if wanted in {
+                            item.metadata.get("claim_key"), item.metadata.get("legacy_claim_key"),
+                        }), None)
+                        projection.update({
+                            "finding_id": existing.finding_id if existing else None,
+                            "status": "already_promoted" if existing else "refused",
+                            "reason": "" if existing else "duplicate_finding_unresolved",
+                            "claim_key": wanted,
+                        })
+                    else:
+                        projection["reason"] = decision.refused_reason
+                self._save_candidate_finding_promotion(projection)
         saved = self.register_batch(request_id, tasks, checked=checked) if tasks else []
         for envelope in notifications:
             self.queue(envelope)
@@ -1564,8 +1708,11 @@ class CentralTransaction:
                 raise StateConflict("approval_original_proposal_mismatch")
         self.check_execution_capacity(execution, max_calls=max_calls, per_target=per_target)
         self._resource_conflict(execution, now=now, comparison_keys=comparison_keys)
-        execution = execution.model_copy(update={"wait_reason": None,
-                                                "resource_lease_until": now + ttl})
+        execution = execution.model_copy(update={
+            "wait_reason": None,
+            "resource_lease_until": now + ttl,
+            "outcome": None,
+        })
         self.db.execute("UPDATE state_executions SET payload=? WHERE run_id=? "
                         "AND invocation_id=?", (execution.model_dump_json(), self.run_id,
                                                invocation_id))
@@ -1579,8 +1726,13 @@ class CentralTransaction:
         if execution is None or execution.state is not ExecutionState.PENDING:
             raise StateConflict("central_execution_cannot_be_replayed")
         task = self._owned(str(execution.task_id), owner, version)
-        execution = execution.model_copy(update={"wait_reason": "resource",
-                                                "resource_lease_until": 0})
+        from redteam.orchestration.execution_projection import waiting_outcome
+
+        execution = execution.model_copy(update={
+            "wait_reason": "resource",
+            "resource_lease_until": 0,
+            "outcome": waiting_outcome("resource"),
+        })
         self.db.execute("UPDATE state_executions SET payload=? WHERE run_id=? AND invocation_id=?",
                         (execution.model_dump_json(), self.run_id, invocation_id))
         self._refresh_execution_wait(task)
@@ -1990,6 +2142,9 @@ class CentralTransaction:
                 or approval.execution_fingerprint != execution.approval_fingerprint):
             raise StateConflict("approval_original_proposal_mismatch")
         execution.wait_reason = None
+        if (execution.outcome is not None
+                and execution.outcome.diagnostic_category == "approval_pending"):
+            execution.outcome = None
         self.db.execute("UPDATE state_executions SET payload=? "
                         "WHERE run_id=? AND invocation_id=?", (
             execution.model_dump_json(), self.run_id, invocation_id,
@@ -2089,7 +2244,9 @@ class _RequestTransaction:
         # task assignment/provider admission is closed independently.
         self.tx.admit(settlement=True)
 
-    def admit_probe_request(self, task_id: str, rows: Sequence[dict]) -> None:
+    def admit_probe_request(
+        self, task_id: str, rows: Sequence[dict], *, attempt_kind: str = "normal",
+    ) -> dict[str, str]:
         task = self.tx.get_task(task_id)
         if task is None or task.probe_limits is None:
             raise RequestAdmissionError("probe_request_task_unbound")
@@ -2098,6 +2255,49 @@ class _RequestTransaction:
         charged = sum(row.get("task_id") == task_id and row["state"] != "released" for row in rows)
         if charged >= task.probe_limits.max_model_requests:
             raise RequestAdmissionError("probe_model_request_limit_exhausted")
+        circuit_key = probe_failure_circuit_key(task)
+        related = sorted(
+            (
+                row for row in rows
+                if row.get("task_circuit_key") == circuit_key and row["state"] != "released"
+            ),
+            key=lambda row: row.get("request_sequence", 0),
+        )
+        repair_limit = task.probe_limits.max_repair_requests
+        if repair_limit is not None and attempt_kind in {
+            "format_repair", "semantic_repair",
+        }:
+            repairs = sum(
+                row.get("attempt_kind") in {"format_repair", "semantic_repair"}
+                for row in related
+            )
+            if repairs >= repair_limit:
+                raise RequestAdmissionError(
+                    "probe_repair_request_limit_exhausted",
+                    repair_condition=(
+                        "Return the preserved observations and let the Planner reconsider this "
+                        "purpose; do not create another Task with the same purpose to reset repair."
+                    ),
+                )
+        failure_limit = task.probe_limits.max_consecutive_provider_failures
+        if failure_limit is not None:
+            consecutive = 0
+            for row in reversed(related):
+                provider_outcome = row.get("provider_outcome")
+                if provider_outcome is not None and provider_outcome != "success":
+                    consecutive += 1
+                    continue
+                if row.get("decision_valid") is True:
+                    break
+            if consecutive >= failure_limit:
+                raise RequestAdmissionError(
+                    "probe_provider_failure_circuit_open",
+                    repair_condition=(
+                        "Preserve this Task's originals and reconsider the provider prerequisite "
+                        "or purpose. A new Task with the same purpose does not reset this circuit."
+                    ),
+                )
+        return {"circuit_key": circuit_key}
 
 
 class _RequestRecords(MutableMapping[tuple[str, str], Any]):
@@ -2131,8 +2331,9 @@ class _RequestRecords(MutableMapping[tuple[str, str], Any]):
             RunRequestLedger.checked_record(identity, payload)
             if payload["run_id"] != self.tx.run_id:
                 raise RequestAdmissionError("llm_request_record_invalid")
-        elif (kind not in {"llm_request_policy", "llm_provider_cooldown"}
-              or identity != self.tx.run_id):
+        elif kind == "llm_provider_cooldown" and identity == self.tx.run_id:
+            RunRequestLedger.checked_cooldown(payload)
+        elif kind != "llm_request_policy" or identity != self.tx.run_id:
             raise RequestAdmissionError("llm_request_record_invalid")
 
     def __setitem__(self, key: tuple[str, str], value: Any) -> None:
@@ -2363,6 +2564,9 @@ class CentralStateStore:
 
     async def list_executions(self, *, task_id: str | None = None) -> list[TaskExecution]:
         return await self.transaction(lambda tx: tx.list_executions(task_id=task_id), write=False)
+
+    async def candidate_finding_promotions(self) -> list[dict[str, Any]]:
+        return await self.transaction(lambda tx: tx.candidate_finding_promotions(), write=False)
 
     async def activation_inventory(self, *, instance_ids: set[str] | None = None) -> list[dict]:
         """Original proof rows for explicit quiescent recovery, not scheduling."""

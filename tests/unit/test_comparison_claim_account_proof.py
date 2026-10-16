@@ -413,6 +413,7 @@ async def test_posthoc_anonymous_claim_accepts_only_an_explicit_anonymous_unit(
     "absent",
     "wrong_comparison_leg",
     "named_request_null",
+    "unmanaged_request_headers",
     "failed",
     "mock",
     "derived_only",
@@ -438,6 +439,9 @@ async def test_posthoc_anonymous_claim_rejects_missing_or_untrusted_receipts(
     elif case == "named_request_null":
         raw["output"] = {"actual_session_ref": None}
         arguments = {"session_ref": "session-alice"}
+    elif case == "unmanaged_request_headers":
+        raw["output"] = {"actual_session_ref": None}
+        arguments = {"request_headers": {"x-api-key": "fixture-key"}}
     elif case in {"failed", "mock"}:
         raw["output"] = {"anonymous": {"actual_session_ref": None}}
         if case == "mock":

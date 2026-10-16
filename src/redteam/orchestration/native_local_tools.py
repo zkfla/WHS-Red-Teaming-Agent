@@ -48,7 +48,6 @@ from redteam.orchestration.investigation_context import (
     context_rule_diagnostic,
 )
 from redteam.orchestration.local_tools import (
-    RUNTIME_TOOL_CONTRIBUTION_VERSION,
     LocalToolContext,
     LocalToolDescriptor,
     LocalToolResult,
@@ -297,7 +296,7 @@ def evidence_read_descriptor() -> LocalToolDescriptor:
         ),
         input_schema=EvidenceReadRequest.model_json_schema(),
         contribution_id=EVIDENCE_READ_CONTRIBUTION_ID,
-        version="v4", initial_exposure=True,
+        version="v5", initial_exposure=True, decision_kind="local_read",
     )
 
 
@@ -314,7 +313,7 @@ def task_settle_descriptor() -> LocalToolDescriptor:
         ),
         input_schema=CompletionProposal.model_json_schema(),
         contribution_id=TASK_SETTLE_CONTRIBUTION_ID,
-        version="v3", initial_exposure=True,
+        version="v4", initial_exposure=True, decision_kind="settlement",
     )
 
 
@@ -330,7 +329,7 @@ def goal_settle_descriptor() -> LocalToolDescriptor:
         ),
         input_schema=CompletionProposal.model_json_schema(),
         contribution_id=GOAL_SETTLE_CONTRIBUTION_ID,
-        version=RUNTIME_TOOL_CONTRIBUTION_VERSION,
+        version="v2", decision_kind="settlement",
     )
 
 
@@ -350,7 +349,7 @@ def context_query_descriptor() -> LocalToolDescriptor:
         ),
         input_schema=ContextQuery.model_json_schema(),
         contribution_id=CONTEXT_QUERY_CONTRIBUTION_ID,
-        version="v1", initial_exposure=True,
+        version="v2", initial_exposure=True, decision_kind="local_read",
     )
 
 
@@ -360,7 +359,7 @@ def evidence_read_contribution() -> Contribution:
 
     return runtime_tool_contribution(
         contribution_id=EVIDENCE_READ_CONTRIBUTION_ID,
-        version="v4", factory=factory,
+        version="v5", factory=factory,
     )
 
 
@@ -370,7 +369,7 @@ def task_settle_contribution() -> Contribution:
 
     return runtime_tool_contribution(
         contribution_id=TASK_SETTLE_CONTRIBUTION_ID,
-        version="v3", factory=factory,
+        version="v4", factory=factory,
     )
 
 
@@ -380,7 +379,7 @@ def goal_settle_contribution() -> Contribution:
 
     return runtime_tool_contribution(
         contribution_id=GOAL_SETTLE_CONTRIBUTION_ID,
-        factory=factory,
+        version="v2", factory=factory,
     )
 
 
@@ -390,7 +389,7 @@ def context_query_contribution() -> Contribution:
 
     return runtime_tool_contribution(
         contribution_id=CONTEXT_QUERY_CONTRIBUTION_ID,
-        version="v1", factory=factory,
+        version="v2", factory=factory,
     )
 
 

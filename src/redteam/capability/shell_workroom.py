@@ -118,6 +118,7 @@ from typing import Any, Protocol
 
 from redteam.capability.shell_manifest import SHELL_SERVER_ID
 from redteam.capability.shell_policy import WORKROOM_KEY_PATTERN, ShellWorkroomPolicy
+from redteam.core.ports.program_discovery import ProgramStaticMetadata
 
 SHELL_MANAGED_LABEL = "io.whs-redteam.shell-workroom.managed=true"
 SHELL_CONTEXT_LABEL_KEY = "io.whs-redteam.shell-workroom.context"
@@ -144,6 +145,7 @@ _KILL_TIMEOUT_SECONDS = 15.0
 _RUN_ID_ENV = "WHS_RUN_ID"
 _WORKDIR_ENV = "WHS_WORKDIR"
 _LANG_ENV = "WHS_LANG"
+_EXECUTION_MODE_ENV = "WHS_EXECUTION_MODE"
 _TIMEOUT_ENV = "WHS_TIMEOUT_S"
 _GRACE_ENV = "WHS_GRACE_S"
 _RUN_UID_ENV = "WHS_RUN_UID"
@@ -154,6 +156,7 @@ _INVOCATION_ID_ENV = "WHS_INVOCATION_ID"
 _INPUT_DIGEST_ENV = "WHS_INPUT_DIGEST"
 _EXTRA_ENV_ENV = "WHS_EXTRA_ENV"
 _EXTRA_ENV_JSON_LIMIT = 4096
+_PROGRAM_ARGV_LIMIT_ENV = "WHS_ARGV_LIMIT"
 # Root-only supervisor state directory (0700 root): result and pgid files
 # live here, never in the model-writable workdir, so a script can neither
 # read nor forge them. Created at setup; adoption repairs it the same way.
@@ -199,8 +202,8 @@ _STREAM_CHUNK_BYTES = 8192
 # ONLY completion authority: the result file below is the exact signal the
 # host reads, so a fast parent exit never masks a live background child,
 # and no argv ever carries a NUL byte.
-_SUPERVISOR_VERSION = 2
-_SUPERVISOR_FILENAME = ".whs-supervisor-v2.py"
+_SUPERVISOR_VERSION = 4
+_SUPERVISOR_FILENAME = ".whs-supervisor-v4.py"
 _SUPERVISOR_SOURCE = '''"""Per-execution supervisor: exact completion signal plus measured teardown.
 Owns one interpreter child in its own session, enforces the deadline, and
 reaps the whole tree before reporting. The result file is the completion
@@ -216,6 +219,7 @@ Environment in (all via docker exec -e, never argv):
   WHS_MODEL_PATH bare-name PATH for the model child only
   WHS_MECH_PATH  system-only PATH used to resolve helper binaries
   WHS_LANG      bash or python3
+  WHS_EXECUTION_MODE script (default) or program
   WHS_TIMEOUT_S deadline seconds from spawn
   WHS_GRACE_S   escalation grace seconds
 Files out (under the root-only rundir, never the workdir):
@@ -538,6 +542,16 @@ def main():
     workdir = os.environ.get("WHS_WORKDIR", "/workroom")
     run_id = os.environ.get("WHS_RUN_ID", "")
     lang = os.environ.get("WHS_LANG", "bash")
+    execution_mode = os.environ.get("WHS_EXECUTION_MODE", "script")
+    raw_argv_limit = os.environ.get("WHS_ARGV_LIMIT")
+    try:
+        argv_limit = 4096 if raw_argv_limit is None else int(raw_argv_limit)
+    except ValueError:
+        return 127
+    if not 4096 <= argv_limit <= 65536:
+        return 127
+    if execution_mode != "program" and argv_limit != 4096:
+        return 127
     mech_path = os.environ.get("WHS_MECH_PATH", "/usr/local/bin:/usr/bin:/bin")
     model_path = os.environ.get("WHS_MODEL_PATH", "")
     rundir = os.environ.get("WHS_RUNDIR", "/run/whs-shell")
@@ -563,7 +577,8 @@ def main():
         grace = float(os.environ.get("WHS_GRACE_S", "2"))
     except ValueError:
         grace = 2.0
-    if not run_id or lang not in ("bash", "python3"):
+    if (not run_id or execution_mode not in ("script", "program")
+            or (execution_mode == "script" and lang not in ("bash", "python3"))):
         return 127
     if run_uid <= 0 or run_gid <= 0:
         return 127
@@ -584,15 +599,31 @@ def main():
         # Fail closed with no record: the host reads that as uncertainty.
         return 127
     try:
-        script = sys.stdin.buffer.read()
+        execution_input = sys.stdin.buffer.read()
     except Exception:
-        script = b""
-    python_bin = shutil.which("python3", path=mech_path)
-    bash_bin = shutil.which("bash", path=mech_path)
-    picked = python_bin if lang == "python3" else bash_bin
-    if picked is None:
-        return 127
-    argv = [picked, "-"] if lang == "python3" else [picked, "-s"]
+        execution_input = b""
+    if execution_mode == "program":
+        header, separator, child_input = execution_input.partition(b"\\n")
+        try:
+            envelope = json.loads(header.decode("utf-8"))
+            argv = envelope["argv"]
+        except (UnicodeDecodeError, ValueError, KeyError, TypeError):
+            return 127
+        if (not separator or not isinstance(envelope, dict)
+                or set(envelope) != {"argv"} or not isinstance(argv, list)
+                or not argv or len(argv) > 129
+                or not all(isinstance(item, str) and "\\x00" not in item
+                           and len(item.encode("utf-8")) <= argv_limit for item in argv)
+                or not os.path.isabs(argv[0])):
+            return 127
+    else:
+        child_input = execution_input
+        python_bin = shutil.which("python3", path=mech_path)
+        bash_bin = shutil.which("bash", path=mech_path)
+        picked = python_bin if lang == "python3" else bash_bin
+        if picked is None:
+            return 127
+        argv = [picked, "-"] if lang == "python3" else [picked, "-s"]
     child_env = dict(os.environ)
     if model_path:
         child_env["PATH"] = model_path
@@ -662,7 +693,7 @@ def main():
         pass
     def feed_stdin():
         try:
-            child.stdin.write(script)
+            child.stdin.write(child_input)
         except Exception:
             pass
         try:
@@ -842,10 +873,17 @@ class ShellWorkroomError(ValueError):
     never parse exception text.
     """
 
-    def __init__(self, message: str, *, uncertainty: bool = False) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        uncertainty: bool = False,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.reason_code = message
         self.uncertainty = uncertainty
+        self.metadata = dict(metadata or {})
 
 
 @dataclass(frozen=True)
@@ -903,8 +941,8 @@ class ExecutionAdmission:
     unrestricted, so the existing closed local-script path works unchanged.
     Implementations must not take manager locks or start work; both methods
     are read-only snapshots. TASK-007 owns job persistence/recovery and
-    must keep every execution path funneled through ``exec_script`` so this
-    single hook keeps covering them.
+    must keep every execution path funneled through ``exec_script`` or
+    ``exec_program`` so this single hook keeps covering them.
     """
 
     def check_exec_allowed(self, key: str, *, invocation_id: str | None = None) -> None:
@@ -951,6 +989,7 @@ class ProgramRecord:
     version: str | None
     owner_scope: str
     provenance: str | None
+    metadata: ProgramStaticMetadata | None = None
 
 
 def default_program_manifest_path() -> str:
@@ -1039,6 +1078,8 @@ def exec_argv(
     input_digest: str | None = None,
     spool_cap_bytes: int | None = None,
     extra_env_json: str | None = None,
+    execution_mode: str = "script",
+    _provider_argv_limit: int | None = None,
 ) -> tuple[str, ...]:
     """Pure ``docker exec`` argv. The script arrives on stdin, never in argv.
 
@@ -1055,6 +1096,15 @@ def exec_argv(
     (always present, equal to the job tag for jobs) names the supervisor
     state files. Script text never enters argv.
     """
+    if execution_mode not in ("script", "program"):
+        raise ShellWorkroomError("shell_invalid_arguments")
+    if _provider_argv_limit is not None and (
+        execution_mode != "program"
+        or isinstance(_provider_argv_limit, bool)
+        or not isinstance(_provider_argv_limit, int)
+        or not 4096 <= _provider_argv_limit <= 65536
+    ):
+        raise ShellWorkroomError("shell_invalid_arguments")
     if language == "bash":
         whs_lang = "bash"
     elif language == "python3":
@@ -1111,6 +1161,10 @@ def exec_argv(
         prefix += ("-e", _SPOOL_CAP_ENV + "=" + str(spool_cap_bytes))
     if extra_env_json is not None:
         prefix += ("-e", _EXTRA_ENV_ENV + "=" + extra_env_json)
+    provider_argv_limit = 4096 if _provider_argv_limit is None else _provider_argv_limit
+    prefix += ("-e", _PROGRAM_ARGV_LIMIT_ENV + "=" + str(provider_argv_limit))
+    if execution_mode == "program":
+        prefix += ("-e", _EXECUTION_MODE_ENV + "=program")
     supervisor = workdir.rstrip("/") + "/" + _SUPERVISOR_FILENAME
     return (
         *prefix,
@@ -1300,6 +1354,22 @@ class ShellWorkroomManager:
 
         local = [str(tool.tool_id) for tool in build_shell_descriptors(self.policy)
                  if tool.operations[0] in (RUN_OPERATION, JOB_START_OPERATION)]
+        inventory: dict[str, Any] = {"status": "manifest_unread"}
+        manifest_path = (
+            self._program_manifest_path or default_program_manifest_path()
+        )
+        try:
+            with open(manifest_path, encoding="utf-8") as handle:
+                manifest = json.load(handle)
+            inventory = {
+                "status": "manifest_declared",
+                "schema_version": manifest.get("inventory_schema_version", 1),
+                "profile": manifest.get("profile", "legacy"),
+                "package_input_sha256": manifest.get("package_input_sha256"),
+                "image_id": manifest.get("image_digest"),
+            }
+        except (OSError, ValueError, TypeError):
+            pass
         return ProgramExecutionEnvironment(
             source_id=self.source_id,
             routes=[ProgramExecutionRoute(
@@ -1310,6 +1380,7 @@ class ShellWorkroomManager:
                 },
             ), *self._admission_for().program_execution_routes()],
             unsupported_modes=["raw_socket", "network_admin", "external_ipv6"],
+            inventory=inventory,
         )
 
     def known_workrooms(self) -> tuple[str, ...]:
@@ -1948,14 +2019,35 @@ class ShellWorkroomManager:
         if count >= self._policy.max_workrooms:
             raise ShellWorkroomError("shell_too_many_workrooms")
 
-    def _truncate(self, data: bytes) -> tuple[str, bool]:
-        limit = self._policy.max_output_bytes
+    def _truncate(self, data: bytes, *, limit: int | None = None) -> tuple[str, bool]:
+        limit = self._policy.max_output_bytes if limit is None else limit
         text = data.decode("utf-8", errors="replace")
         encoded = text.encode("utf-8")
         if len(encoded) <= limit:
             return text, False
         cut = encoded[:limit].decode("utf-8", errors="ignore")
         return cut, True
+
+    @staticmethod
+    def _extra_env_json(extra_env: dict[str, str] | None) -> str | None:
+        if extra_env is None:
+            return None
+        if not isinstance(extra_env, dict) or not extra_env:
+            raise ShellWorkroomError("shell_invalid_arguments")
+        for env_key, env_value in extra_env.items():
+            if not isinstance(env_key, str) or not isinstance(env_value, str):
+                raise ShellWorkroomError("shell_invalid_arguments")
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", env_key):
+                raise ShellWorkroomError("shell_invalid_arguments")
+            if len(env_value.encode("utf-8")) > 4096:
+                raise ShellWorkroomError("shell_invalid_arguments")
+        try:
+            encoded = json.dumps(extra_env, sort_keys=True)
+        except (TypeError, ValueError) as exc:
+            raise ShellWorkroomError("shell_invalid_arguments") from exc
+        if len(encoded.encode("utf-8")) > _EXTRA_ENV_JSON_LIMIT:
+            raise ShellWorkroomError("shell_invalid_arguments")
+        return encoded
 
     async def exec_script(
         self,
@@ -2027,23 +2119,142 @@ class ShellWorkroomManager:
             raise ShellWorkroomError("shell_invalid_arguments")
         if retain_record is not True and retain_record is not False:
             raise ShellWorkroomError("shell_invalid_arguments")
-        extra_env_json: str | None = None
-        if extra_env is not None:
-            if not isinstance(extra_env, dict) or not extra_env:
-                raise ShellWorkroomError("shell_invalid_arguments")
-            for env_key, env_value in extra_env.items():
-                if not isinstance(env_key, str) or not isinstance(env_value, str):
-                    raise ShellWorkroomError("shell_invalid_arguments")
-                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", env_key):
-                    raise ShellWorkroomError("shell_invalid_arguments")
-                if len(env_value.encode("utf-8")) > 4096:
-                    raise ShellWorkroomError("shell_invalid_arguments")
-            try:
-                extra_env_json = json.dumps(extra_env, sort_keys=True)
-            except (TypeError, ValueError) as exc:
-                raise ShellWorkroomError("shell_invalid_arguments") from exc
-            if len(extra_env_json.encode("utf-8")) > _EXTRA_ENV_JSON_LIMIT:
-                raise ShellWorkroomError("shell_invalid_arguments")
+        extra_env_json = self._extra_env_json(extra_env)
+        return await self._exec_supervised(
+            key=key,
+            language=language,
+            execution_input=script_bytes,
+            execution_mode="script",
+            timeout=timeout,
+            exec_tag=exec_tag,
+            invocation_id=invocation_id,
+            input_digest=input_digest,
+            retain_record=retain_record,
+            extra_env_json=extra_env_json,
+        )
+
+    async def exec_program(
+        self,
+        key: str,
+        executable: str,
+        argv: list[str],
+        stdin: str = "",
+        timeout_seconds: float | None = None,
+        exec_tag: str | None = None,
+        *,
+        invocation_id: str | None = None,
+        input_digest: str | None = None,
+        retain_record: bool = True,
+        extra_env: dict[str, str] | None = None,
+        _provider_input_limit: int | None = None,
+        _provider_output_limit: int | None = None,
+        _provider_argv_limit: int | None = None,
+    ) -> ExecResult:
+        """Execute one discovered absolute path without a shell parser.
+
+        The private provider limits are for registered protocol adapters that
+        transport a bounded binary response in an internal JSON envelope.
+        Model-facing shell calls never set them and retain the workroom policy
+        limits.  They do not change timeout, admission, cancellation or the
+        protected supervisor record.
+        """
+        check_workroom_key(key)
+        try:
+            self._admission_for().check_exec_allowed(key, invocation_id=invocation_id)
+        except ShellWorkroomError:
+            raise
+        except ValueError as exc:
+            raise ShellWorkroomError(str(exc) or "window_busy") from exc
+        if (not isinstance(executable, str) or not executable.startswith("/")
+                or "\x00" in executable or len(executable.encode("utf-8")) > 4096):
+            raise ShellWorkroomError("shell_program_invalid")
+        argv_limit = 4096
+        if _provider_argv_limit is not None:
+            if (isinstance(_provider_argv_limit, bool)
+                    or not isinstance(_provider_argv_limit, int)
+                    or not 4096 <= _provider_argv_limit <= 65536):
+                raise ShellWorkroomError("shell_program_invalid")
+            argv_limit = _provider_argv_limit
+        if (not isinstance(argv, list) or len(argv) > 128
+                or any(not isinstance(item, str) or "\x00" in item
+                       or len(item.encode("utf-8")) > argv_limit for item in argv)):
+            raise ShellWorkroomError("shell_program_invalid")
+        if not isinstance(stdin, str):
+            raise ShellWorkroomError("shell_program_invalid")
+        stdin_bytes = stdin.encode("utf-8")
+        input_limit = self._policy.max_script_bytes
+        if _provider_input_limit is not None:
+            if not 1 <= _provider_input_limit <= 2 * 1024 * 1024:
+                raise ShellWorkroomError("shell_program_invalid")
+            input_limit = _provider_input_limit
+        if len(stdin_bytes) > input_limit:
+            raise ShellWorkroomError("shell_program_stdin_too_large")
+        try:
+            header = json.dumps(
+                {"argv": [executable, *argv]}, ensure_ascii=False, separators=(",", ":")
+            ).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise ShellWorkroomError("shell_program_invalid") from exc
+        header_limit = 256 * 1024 if _provider_argv_limit is not None else (
+            self._policy.max_script_bytes
+        )
+        if len(header) > header_limit:
+            raise ShellWorkroomError("shell_program_argv_too_large")
+        timeout = self._policy.default_timeout_seconds if timeout_seconds is None else float(
+            timeout_seconds
+        )
+        if (not math.isfinite(timeout) or timeout <= 0
+                or timeout > self._policy.max_timeout_seconds):
+            raise ShellWorkroomError("shell_timeout_out_of_range")
+        if exec_tag is not None and not _JOB_TAG.fullmatch(exec_tag):
+            raise ShellWorkroomError("shell_unknown_job")
+        if invocation_id is not None and (
+            not isinstance(invocation_id, str) or not _JOB_TAG.fullmatch(invocation_id)
+        ):
+            raise ShellWorkroomError("shell_invalid_arguments")
+        if input_digest is not None and (
+            not isinstance(input_digest, str) or len(input_digest) != 64
+            or any(c not in "0123456789abcdef" for c in input_digest)
+        ):
+            raise ShellWorkroomError("shell_invalid_arguments")
+        if retain_record is not True and retain_record is not False:
+            raise ShellWorkroomError("shell_invalid_arguments")
+        if _provider_output_limit is not None and not (
+            self._policy.max_output_bytes <= _provider_output_limit <= 2 * 1024 * 1024
+        ):
+            raise ShellWorkroomError("shell_program_invalid")
+        return await self._exec_supervised(
+            key=key,
+            language="bash",
+            execution_input=header + b"\n" + stdin_bytes,
+            execution_mode="program",
+            timeout=timeout,
+            exec_tag=exec_tag,
+            invocation_id=invocation_id,
+            input_digest=input_digest,
+            retain_record=retain_record,
+            extra_env_json=self._extra_env_json(extra_env),
+            output_limit=_provider_output_limit,
+            _provider_argv_limit=_provider_argv_limit,
+        )
+
+    async def _exec_supervised(
+        self,
+        *,
+        key: str,
+        language: str,
+        execution_input: bytes,
+        execution_mode: str,
+        timeout: float,
+        exec_tag: str | None,
+        invocation_id: str | None,
+        input_digest: str | None,
+        retain_record: bool,
+        extra_env_json: str | None,
+        output_limit: int | None = None,
+        _provider_argv_limit: int | None = None,
+    ) -> ExecResult:
+        stream_limit = output_limit or self._policy.max_output_bytes
         if exec_tag is not None:
             run_id = exec_tag
         elif invocation_id is not None:
@@ -2064,16 +2275,18 @@ class ShellWorkroomManager:
             run_gid=int(gid_text),
             invocation_id=invocation_id,
             input_digest=input_digest,
-            spool_cap_bytes=self._policy.max_output_bytes,
+            spool_cap_bytes=stream_limit,
             extra_env_json=extra_env_json,
+            execution_mode=execution_mode,
+            _provider_argv_limit=_provider_argv_limit,
         )
         started = time.monotonic()
         try:
             code, raw_out, raw_err, outer_timeout, collected_cut = await self._run_docker(
                 argv,
-                script_bytes,
+                execution_input,
                 timeout + self._policy.exec_grace_seconds + _HOST_OUTER_MARGIN_SECONDS,
-                self._policy.max_output_bytes,
+                stream_limit,
             )
         except asyncio.CancelledError:
             try:
@@ -2113,8 +2326,8 @@ class ShellWorkroomManager:
             timed_out = await self._classify_exit(
                 container, run_id, code, retain_record=retain_record
             )
-        stdout, out_cut = self._truncate(raw_out)
-        stderr, err_cut = self._truncate(raw_err)
+        stdout, out_cut = self._truncate(raw_out, limit=stream_limit)
+        stderr, err_cut = self._truncate(raw_err, limit=stream_limit)
         return ExecResult(
             exit_code=None if timed_out else code,
             stdout=stdout,
@@ -2622,6 +2835,35 @@ class ShellWorkroomManager:
         except Exception:
             pass
 
+    async def discard_provider_record(self, key: str, tag: str) -> bool:
+        """Best-effort deletion of an internal protocol envelope and seal.
+
+        Ordinary shell executions retain sealed spools for recovery.  A
+        registered protocol adapter consumes its envelope synchronously and
+        must not leave response bodies in that recovery channel.  This method
+        is intentionally absent from model-facing tool contracts.
+        """
+        try:
+            check_workroom_key(key)
+            if not isinstance(tag, str) or not _JOB_TAG.fullmatch(tag):
+                return False
+            name = self._known.get(key) or container_name_for(key)
+            result_path, pgid_path = self._result_paths(tag)
+            out_path, err_path, meta_path = self._spool_paths(tag)
+            code, _out, _err, timed_out, truncated = await self._run_docker(
+                (
+                    "exec", "--user", "0", "-e", "PATH=" + _MECHANISM_PATH,
+                    "-i", name, "/bin/rm", "-f", result_path, pgid_path,
+                    out_path, err_path, meta_path,
+                ),
+                None,
+                _KILL_TIMEOUT_SECONDS,
+                None,
+            )
+            return code == 0 and not timed_out and not truncated
+        except Exception:
+            return False
+
     async def kill_tagged_exec(self, key: str, tag: str) -> CancelReport:
         """Signal the supervisor owning this tag, then verify. Never raises.
 
@@ -2807,6 +3049,7 @@ class ShellWorkroomManager:
                 manifest = json.load(handle)
             programs = manifest["programs"]
             manifest_digest = manifest["image_digest"]
+            manifest_schema = manifest.get("inventory_schema_version", 1)
         except (OSError, ValueError, KeyError, TypeError) as exc:
             raise ShellWorkroomError("shell_manifest_unreadable") from exc
         resolved = await self._resolve_image_id(self._policy.image)
@@ -2820,6 +3063,14 @@ class ShellWorkroomManager:
                 version = program.get("version")
                 origin = program.get("origin")
                 for entry in program.get("executables", []):
+                    metadata = None
+                    if manifest_schema == 2:
+                        metadata_fields = entry.get("metadata") or {}
+                        metadata = ProgramStaticMetadata.model_validate({
+                            **metadata_fields,
+                            "path_status": entry.get("path_status"),
+                            "resolved_path": entry.get("resolved_path"),
+                        })
                     records.append(
                         ProgramRecord(
                             name=entry["command"],
@@ -2827,9 +3078,10 @@ class ShellWorkroomManager:
                             version=version,
                             owner_scope="image",
                             provenance=origin,
+                            metadata=metadata,
                         )
                     )
-        except (AttributeError, TypeError, KeyError) as exc:
+        except (AttributeError, TypeError, KeyError, ValueError) as exc:
             raise ShellWorkroomError("shell_manifest_unreadable") from exc
         return records
 
@@ -2974,6 +3226,16 @@ class ShellWorkroomManager:
                     version=table.get(command),
                     owner_scope="instance",
                     provenance="workroom:" + bindir,
+                    metadata=ProgramStaticMetadata(
+                        purposes=["local", "target"],
+                        path_status="instance",
+                        resolved_path=path if bindir == local_bin else None,
+                        execution_characteristics={
+                            "output": "bounded_by_shell_policy",
+                            "timeout": "bounded_by_shell_policy",
+                            "concurrency": "bounded_by_shell_policy",
+                        },
+                    ),
                 )
             )
         return records

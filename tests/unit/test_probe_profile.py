@@ -30,9 +30,12 @@ def test_probe_profile_uses_one_common_executor_and_split_atomizer():
     executors = [role for role in loaded.profile.roles if role.definition.schedulable]
 
     assert len(executors) == 1
-    assert loaded.run_policy().probe_limits == ProbeLimits(max_actions=4, max_model_requests=16)
+    assert loaded.run_policy().probe_limits == ProbeLimits(
+        max_actions=4, max_model_requests=16, max_repair_requests=6,
+        max_consecutive_provider_failures=6,
+    )
 
-    assert loaded.profile.version == "26"
+    assert loaded.profile.version == "27"
     atomizer_id = loaded.profile.stages.get("task_atomization")
     assert atomizer_id == "probe-atomizer"
     assert atomizer_id != loaded.profile.stages["hypothesis_planning"]
@@ -60,7 +63,11 @@ def test_probe_profile_uses_one_common_executor_and_split_atomizer():
 
 def test_legacy_single_stage_profile_has_no_atomizer():
     loaded = load_specialist_profile(LEGACY)
-    assert loaded.profile.version == "19"
+    assert loaded.profile.version == "20"
+    assert loaded.run_policy().probe_limits == ProbeLimits(
+        max_actions=4, max_model_requests=8, max_repair_requests=6,
+        max_consecutive_provider_failures=6,
+    )
     assert "task_atomization" not in loaded.profile.stages
     assert loaded.run_policy().probe_atomization is False
     assert "probe_atomization" not in loaded.run_policy().model_dump()

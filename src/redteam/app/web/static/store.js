@@ -107,6 +107,7 @@ function diagnosticView(value) {
   if (!value || typeof value !== "object") return null;
   const text = (item) => (typeof item === "string" ? item : null);
   const count = (item) => (typeof item === "number" && Number.isInteger(item) && item >= 0 ? item : null);
+  const number = (item) => (typeof item === "number" && Number.isFinite(item) && item >= 0 ? item : null);
   const view = {
     label: text(value.label),
     code: text(value.code),
@@ -117,6 +118,10 @@ function diagnosticView(value) {
     rule: text(value.rule),
     cause_code: text(value.cause_code),
     provider_status: count(value.provider_status),
+    provider_code: text(value.provider_code),
+    retryable: typeof value.retryable === "boolean" ? value.retryable : null,
+    retry_after: number(value.retry_after),
+    repair_condition: text(value.repair_condition),
     error_type: text(value.error_type),
   };
   return Object.values(view).some((item) => item !== null) ? view : null;

@@ -16,7 +16,11 @@ from redteam.core.contracts.tool import ToolResult
 from redteam.core.ids import EvidenceId
 from redteam.core.ports.evidence_store import EvidenceStore
 from redteam.orchestration.evidence_access import raw_from_metadata
-from redteam.orchestration.session_proof import original_session_receipt_matches
+from redteam.orchestration.session_proof import (
+    has_unmanaged_request_headers,
+    original_anonymous_receipt_matches,
+    original_session_receipt_matches,
+)
 
 
 class AuthSession(BaseModel):
@@ -120,6 +124,74 @@ def _safe_response_metadata(output: dict[str, Any]) -> dict[str, Any]:
     return metadata
 
 
+def _canonical_receipt_observation(
+    arguments: dict[str, Any], result: ToolResult, output: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Validate the provider-owned v1 receipt before deriving observations.
+
+    Legacy web-http results have no ``http_receipt`` and keep their existing
+    compatibility path.  Once the field is present it is authoritative: an
+    incomplete or contradictory receipt is rejected rather than borrowing
+    request echoes from the result.
+    """
+    receipt = output.get("http_receipt")
+    if receipt is None:
+        return {}
+    if not isinstance(receipt, dict) or receipt.get("version") != 1 or (
+        receipt.get("provider") != "kali-http-v1"
+    ):
+        return None
+    request = receipt.get("request")
+    response = receipt.get("response")
+    if not isinstance(request, dict) or not isinstance(response, dict):
+        return None
+    binding = request.get("binding")
+    status = response.get("status")
+    session_ref = arguments.get("session_ref")
+    expected_scope = "session" if session_ref is not None else "anonymous"
+    if (
+        not isinstance(binding, str) or len(binding) != 64
+        or any(char not in "0123456789abcdef" for char in binding)
+        or response.get("request_binding") != binding
+        or request.get("invocation_id") != str(result.invocation_id)
+        or request.get("action_id") != str(result.action_id)
+        or not isinstance(request.get("input_digest"), str)
+        or len(request["input_digest"]) != 64
+        or any(char not in "0123456789abcdef" for char in request["input_digest"])
+        or response.get("response_received") is not True
+        or status != output.get("status_code")
+        or request.get("method") != arguments.get("method", "GET")
+        or request.get("path") != arguments.get("path")
+        or request.get("target_ref") != arguments.get("target_ref")
+        or request.get("session_ref") != session_ref
+        or request.get("principal_scope") != expected_scope
+        or "actual_session_ref" not in output
+        or output.get("actual_session_ref") != session_ref
+    ):
+        return None
+    body = response.get("body")
+    if (
+        not isinstance(body, dict)
+        or body.get("sha256") != output.get("body_sha256")
+        or body.get("size_bytes") != output.get("body_bytes")
+        or type(body.get("truncated")) is not bool
+        or body.get("retention") not in {"digest_only", "artifact"}
+    ):
+        return None
+    return {
+        "receipt_version": 1,
+        "request_binding": binding,
+        "principal_scope": expected_scope,
+        "principal_ref": request.get("principal_ref"),
+        "response_received": True,
+        "failure_phase": response.get("failure_phase"),
+        "peer": response.get("peer"),
+        "transport": response.get("transport"),
+        "body_artifact_ref": body.get("artifact_ref"),
+        "body_retention": body.get("retention"),
+    }
+
+
 def http_observation(arguments: dict[str, Any], result: ToolResult) -> dict[str, Any] | None:
     """Project HTTP data for its registered mapper or explicit auth assessment.
 
@@ -146,6 +218,9 @@ def http_observation(arguments: dict[str, Any], result: ToolResult) -> dict[str,
         or (session_ref is not None and not isinstance(session_ref, str))
     ):
         return None
+    receipt_observation = _canonical_receipt_observation(arguments, result, output)
+    if receipt_observation is None:
+        return None
     digest = output.get("body_sha256")
     return {
         "kind": "http_response",
@@ -162,6 +237,7 @@ def http_observation(arguments: dict[str, Any], result: ToolResult) -> dict[str,
         "body_sha256": digest if isinstance(digest, str) else None,
         **({"actual_session_ref": output["actual_session_ref"]}
            if "actual_session_ref" in output else {}),
+        **receipt_observation,
         **_safe_response_metadata(output),
     }
 
@@ -202,6 +278,7 @@ BaselineMismatchReason = Literal[
     "baseline_method_mismatch",
     "baseline_path_mismatch",
     "baseline_target_ref_mismatch",
+    "baseline_request_headers_ambiguous",
     "baseline_actual_session_receipt_mismatch",
     "request_actual_session_receipt_mismatch",
 ]
@@ -275,8 +352,16 @@ def _baseline_mismatch_reason(
         return "baseline_path_mismatch"
     if previous.get("target_ref") != proposal.arguments.get("target_ref"):
         return "baseline_target_ref_mismatch"
-    if not original_session_receipt_matches(
-        baseline.metadata, baseline_raw, unit="request", expected_session_ref=None,
+    baseline_proposal = baseline.metadata.get("proposal")
+    baseline_arguments = (
+        baseline_proposal.get("arguments")
+        if isinstance(baseline_proposal, dict)
+        else None
+    )
+    if has_unmanaged_request_headers(baseline_arguments):
+        return "baseline_request_headers_ambiguous"
+    if not original_anonymous_receipt_matches(
+        baseline.metadata, baseline_raw, baseline_arguments,
     ):
         return "baseline_actual_session_receipt_mismatch"
     if not current_receipt_matches:

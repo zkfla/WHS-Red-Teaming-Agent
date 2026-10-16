@@ -456,6 +456,8 @@ def _prepare_records(plan: _Import, records: dict) -> None:
                     RunRequestLedger.checked_record(identity, value)
                 elif identity != run.run_id:
                     raise ValueError("request_identity")
+                elif kind == "llm_provider_cooldown":
+                    RunRequestLedger.checked_cooldown(value)
                 plan.mark(
                     "task",
                     "orchestration_records",

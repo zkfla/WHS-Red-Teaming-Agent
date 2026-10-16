@@ -25,6 +25,9 @@ function inputEntry(entry) {
         h("p", { class: "detail-text", text: entry.diagnostic.label }),
         entry.diagnostic.rule ? h("p", { class: "note mono", text: `규칙 ${entry.diagnostic.rule} · 위치 ${entry.diagnostic.location || "-"}` }) : null,
         entry.diagnostic.provider_status != null ? h("p", { class: "note mono", text: `제공자 상태 ${entry.diagnostic.provider_status}` }) : null,
+        entry.diagnostic.provider_code ? h("p", { class: "note mono", text: `제공자 코드 ${entry.diagnostic.provider_code}` }) : null,
+        entry.diagnostic.retry_after != null ? h("p", { class: "note mono", text: `재시도 대기 ${entry.diagnostic.retry_after}초` }) : null,
+        entry.diagnostic.repair_condition ? h("p", { class: "note", text: entry.diagnostic.repair_condition }) : null,
       ) : null));
   }
   const decision = entry.decision;

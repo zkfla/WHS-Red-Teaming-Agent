@@ -66,6 +66,9 @@ async def test_rejected_local_references_survive_correction_before_atomic_commit
 
         llm.observer = committed_counts
         rejected = _plan([TARGET, extra])
+        # The split planner schema requires the candidate's current status even
+        # though the shared helper also serves older single-stage fixtures.
+        rejected["updates"][0]["hypothesis"]["status"] = "open"
         rejected["updates"][0]["hypothesis"]["hypothesis_id"] = "proposal-local-candidate-73"
         rejected["questions"][0]["candidate_refs"] = ["proposal-local-candidate-73"]
         # Atomizer helper expects q1, so vary the candidate's proposal-local key only.

@@ -1670,10 +1670,23 @@ async def append_posthoc_claim_receipt(
         if _posthoc_source_gap(source, raw_from_metadata(source.metadata)) is not None:
             return None
         origin_pairs.add((str(source.action_id), str(source.invocation_id)))
+        source_meta = source.metadata if isinstance(source.metadata, dict) else {}
+        stored_proposal = source_meta.get("proposal")
+        stored_proposal = stored_proposal if isinstance(stored_proposal, dict) else {}
         source_origins.append({
             "evidence_id": str(source.evidence_id),
             "action_id": str(source.action_id),
             "invocation_id": str(source.invocation_id),
+            "target_node_id": str(source_meta.get("target_node_id") or ""),
+            "capability": str(
+                source_meta.get("capability") or stored_proposal.get("capability") or ""
+            ),
+            "operation": str(
+                source_meta.get("operation") or stored_proposal.get("operation") or ""
+            ),
+            "agent_id": str(
+                source_meta.get("agent_id") or stored_proposal.get("agent_id") or ""
+            ),
         })
     if (clean_action, clean_invocation) not in origin_pairs:
         return None
@@ -1711,6 +1724,7 @@ async def append_posthoc_claim_receipt(
         else str(assessment.verdict)
     )
     payload: dict[str, Any] = {
+        "review_contract_version": 2,
         "record_kind": "review_receipt",
         "public": True,
         "admission": "final",
@@ -1723,9 +1737,15 @@ async def append_posthoc_claim_receipt(
         "outcome": outcome,
         "reason": str(getattr(assessment, "reason", "") or "")[:500],
         "claim_supported": getattr(assessment, "claim_supported", None),
+        "assessment_kind": "security_check",
+        "security_violation": (
+            verdict == Verdict.VIOLATION.value
+            and outcome == "success"
+            and getattr(assessment, "claim_supported", None) is True
+        ),
         "claim": statement,
         "claim_identity": content_hash({
-            "statement": " ".join(str(claim.get("statement", "")).split()),
+            "statement": " ".join(statement.split()),
             "target_node_id": target_node_id,
             "principal_refs": sorted(claimed_principals),
         }),

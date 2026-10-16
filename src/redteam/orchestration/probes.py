@@ -196,6 +196,19 @@ async def context_for_probe(deps, runtime, context):
         lambda tx: tx.probe_usage(str(task.task_id)), write=False,
     )
     limit = task.probe_limits.max_actions
+    profile_limits = getattr(
+        getattr(deps, "specialist_policy", None), "probe_limits", None,
+    )
+    repair_limits = [
+        value for value in (
+            task.probe_limits.max_repair_requests,
+            getattr(profile_limits, "max_repair_requests", None),
+        )
+        if value is not None
+    ]
+    repair_limit = min(repair_limits) if repair_limits else None
+    if repair_limit is not None:
+        repair_limit = min(repair_limit, task.probe_limits.max_model_requests)
     filtered["probe"] = {
         "candidates": runtime.probe_hypotheses,
         "original_evidence_ids": [str(record.evidence_id) for record in originals],
@@ -206,6 +219,16 @@ async def context_for_probe(deps, runtime, context):
             "used": usage["actions"],
             "remaining": max(limit - usage["actions"], 0),
             "budget_available": usage["actions"] < limit,
+        },
+        "remaining": {
+            "actions": max(task.probe_limits.max_actions - usage["actions"], 0),
+            "model_requests": max(
+                task.probe_limits.max_model_requests - usage["model_requests"], 0,
+            ),
+            "repairs": (
+                max(repair_limit - usage["repairs"], 0)
+                if repair_limit is not None else None
+            ),
         },
         "purpose": task.objective,
         "return_conditions": [item.model_dump(mode="json") for item in task.completion_criteria],

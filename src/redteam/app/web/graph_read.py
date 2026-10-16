@@ -49,6 +49,8 @@ def _collect(tx: CentralTransaction) -> GraphRaw:
         "SELECT payload FROM state_outbox WHERE run_id=? ORDER BY sequence DESC LIMIT ?",
         (run, EVENT_WINDOW),
     ).fetchall()
+    finding_facts = [facts_of(node.properties)
+                     for node in tx.graph.query(node_type=GraphNodeType.FINDING)]
     return GraphRaw(
         run_id=run,
         mission=tx.get_mission(mission_id),
@@ -66,6 +68,9 @@ def _collect(tx: CentralTransaction) -> GraphRaw:
             "SELECT COUNT(*) FROM state_evidence_refs WHERE run_id=?", (run,),
         ).fetchone()[0],
         event_counts={name: count for name, count in counts if name},
+        finding_count=len(finding_facts),
+        verified_finding_count=sum(item.get("verified") is True for item in finding_facts),
+        candidate_finding_promotions=_request_rows(tx, "candidate_finding_promotion"),
         events=[json.loads(row[0]) for row in events],
         budget_remaining=tx.policy_budget_remaining(),
     )

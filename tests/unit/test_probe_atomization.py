@@ -10,16 +10,18 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
-from redteam.core.contracts.completion import criterion_id
+from redteam.core.contracts.completion import CompletionCriterion, criterion_id
 from redteam.core.contracts.specialists import ProbeLimits
 from redteam.orchestration.probe_atomization import (
     AtomizationProposalError,
     AtomizedProbeSelection,
     AtomizedProbeTask,
     HypothesisPlanDraft,
+    HypothesisPlanSelection,
     PlannedInvestigationQuestion,
     TaskAtomizationDraft,
     bind_plan,
+    bind_plan_selection,
     needs_atomization,
     resolve_atomized_tasks,
     validate_atomized_tasks,
@@ -312,6 +314,31 @@ def test_validate_rejects_unknown_role_and_over_limit():
                                 max_tasks=MAX_TASKS)
 
 
+@pytest.mark.parametrize("field", [
+    "max_repair_requests", "max_consecutive_provider_failures",
+])
+def test_validate_rejects_task_request_sub_limits_above_profile(field):
+    questions, versions = _two_question_setup()
+    profile_limits = ProbeLimits(
+        max_actions=4, max_model_requests=16, max_repair_requests=6,
+        max_consecutive_provider_failures=6,
+    )
+    explicit = ProbeLimits(
+        max_actions=4, max_model_requests=8, max_repair_requests=6,
+        max_consecutive_provider_failures=6,
+    ).model_copy(update={field: 7})
+    first = _task("t1", qid="q1", targets=("n1",), criteria=[_criterion("Inspect n1")])
+    first = first.model_copy(update={"probe_limits": explicit})
+    second = _task("t2", qid="q2", targets=("n2",), criteria=[_criterion("Inspect n2")])
+
+    with pytest.raises(AtomizationProposalError, match="probe_limits_exceed_profile"):
+        validate_atomized_tasks(
+            [first, second], questions=questions, issued={}, versions=versions,
+            targets=TARGETS, principals=PRINCIPALS, roles=ROLES,
+            limits=profile_limits, snapshot=_snap(), max_tasks=MAX_TASKS,
+        )
+
+
 def test_atomization_draft_requires_question_binding():
     with pytest.raises(ValidationError):
         TaskAtomizationDraft.model_validate({"tasks": [{
@@ -341,6 +368,133 @@ def _validate_resolved(selections, questions):
         issued={}, versions={}, targets=TARGETS, principals=PRINCIPALS, roles=ROLES,
         limits=LIMITS, snapshot=_snap(), max_tasks=MAX_TASKS,
     )
+
+
+def _selection_with_missing_hypothesis_reference(candidate_refs, *, updates=()):
+    return HypothesisPlanSelection.model_validate({
+        "updates": list(updates),
+        "questions": [{
+            "question_id": "q1", "objective": "Investigate q1", "target_node_ids": ["n1"],
+            "completion_criteria": [{
+                "kind": "hypothesis_confirmed", "description": "Confirm the candidate",
+            }],
+            "candidate_refs": list(candidate_refs),
+        }],
+        "reason": "Bind the candidate-specific condition", "termination": "continue",
+    })
+
+
+def test_unique_candidate_binds_missing_verdict_reference_before_atomizer_identity():
+    selection = _selection_with_missing_hypothesis_reference(
+        ["local"], updates=[_update("local")],
+    )
+    _, updates, questions, versions = bind_plan_selection(
+        selection, _snap(), issued={}, targets=TARGETS, principals=PRINCIPALS,
+        max_tasks=MAX_TASKS,
+    )
+    candidate_id = updates[0].hypothesis.hypothesis_id
+    (question,) = questions
+    criterion = question.completion_criteria[0]
+    assert criterion.kind == "hypothesis_confirmed"
+    assert criterion.hypothesis_id == candidate_id
+    assert versions == {candidate_id: 1}
+    assert updates[0].hypothesis.status == "open"
+
+    atomized = resolve_atomized_tasks([_selection(question)], questions=questions)
+    (task,) = validate_atomized_tasks(
+        atomized, questions=questions, issued={}, versions=versions,
+        targets=TARGETS, principals=PRINCIPALS, roles=ROLES, limits=LIMITS,
+        snapshot=_snap(), max_tasks=MAX_TASKS,
+    )
+    assert task.completion_criteria[0].hypothesis_id == candidate_id
+    assert task.hypothesis_revisions == {candidate_id: 1}
+    assert criterion_id(task.completion_criteria[0]) == criterion_id(criterion)
+
+
+@pytest.mark.parametrize("candidate_count", [0, 2])
+def test_missing_verdict_reference_requires_repair_when_candidate_is_not_unique(candidate_count):
+    local_ids = [f"local-{index}" for index in range(candidate_count)]
+    updates = [_update(identity) for identity in local_ids]
+    selection = _selection_with_missing_hypothesis_reference(local_ids, updates=updates)
+    with pytest.raises(AtomizationProposalError) as rejected:
+        bind_plan_selection(
+            selection, _snap(), issued={}, targets=TARGETS, principals=PRINCIPALS,
+            max_tasks=MAX_TASKS,
+        )
+    diagnostic = rejected.value.diagnostic
+    assert diagnostic.code == "plan_question_criterion_hypothesis_reference_required"
+    assert diagnostic.location == "$.questions[0].completion_criteria[0].hypothesis_id"
+    assert diagnostic.retryable is True
+    assert diagnostic.cause_scope == "model_input"
+    assert diagnostic.owner == "orchestration.probe_atomization"
+
+
+def test_initial_candidate_gate_only_applies_to_validated_continuing_investigation():
+    selection = HypothesisPlanSelection.model_validate({
+        "updates": [],
+        "questions": [{
+            "question_id": "q1", "objective": "Inspect the response",
+            "target_node_ids": ["n1"], "candidate_refs": [],
+            "completion_criteria": [_criterion()],
+        }],
+        "reason": "A target-specific investigation is proposed",
+        "termination": "continue",
+    })
+    with pytest.raises(AtomizationProposalError, match="candidate_inventory_empty"):
+        bind_plan_selection(
+            selection, _snap(), issued={}, targets={"n1"}, principals=PRINCIPALS,
+            max_tasks=MAX_TASKS, require_initial_candidate=True,
+        )
+
+    held = HypothesisPlanSelection.model_validate({
+        "updates": [], "questions": [], "reason": "Await an external prerequisite",
+        "termination": "held", "resume_conditions": ["The target becomes available"],
+    })
+    _, updates, questions, _ = bind_plan_selection(
+        held, _snap(), issued={}, targets={"n1"}, principals=PRINCIPALS,
+        max_tasks=MAX_TASKS, require_initial_candidate=True,
+    )
+    assert updates is None and questions == []
+
+
+def test_initial_candidate_gate_does_not_mask_invalid_question_scope():
+    selection = HypothesisPlanSelection.model_validate({
+        "updates": [],
+        "questions": [{
+            "question_id": "q1", "objective": "Inspect an uncaptured response",
+            "target_node_ids": ["outside"], "candidate_refs": [],
+            "completion_criteria": [_criterion()],
+        }],
+        "reason": "A target-specific investigation is proposed",
+        "termination": "continue",
+    })
+    with pytest.raises(AtomizationProposalError, match="plan_question_subject_not_registered"):
+        bind_plan_selection(
+            selection, _snap(), issued={}, targets={"n1"}, principals=PRINCIPALS,
+            max_tasks=MAX_TASKS, require_initial_candidate=True,
+        )
+
+
+def test_explicit_verdict_reference_outside_question_candidates_still_rejected():
+    selection = _selection_with_missing_hypothesis_reference(
+        ["local"], updates=[_update("local")],
+    )
+    question = selection.questions[0].model_copy(update={
+        "completion_criteria": [CompletionCriterion(
+            kind="hypothesis_confirmed", description="Confirm the candidate",
+            hypothesis_id="unlinked",
+        )],
+    })
+    selection = selection.model_copy(update={"questions": [question]})
+    with pytest.raises(AtomizationProposalError) as rejected:
+        bind_plan_selection(
+            selection, _snap(), issued={}, targets=TARGETS, principals=PRINCIPALS,
+            max_tasks=MAX_TASKS,
+        )
+    diagnostic = rejected.value.diagnostic
+    assert diagnostic.code == "plan_question_criterion_outside_purpose"
+    assert diagnostic.location == "$.questions[0].completion_criteria[0].hypothesis_id"
+    assert diagnostic.retryable is True
 
 
 def test_reference_output_excludes_rewritten_conditions_and_restores_whole_original():

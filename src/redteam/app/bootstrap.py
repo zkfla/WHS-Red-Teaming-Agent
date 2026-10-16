@@ -362,15 +362,18 @@ async def build_application(
     if config.planning_provider is not None:
         extension_assembly.resolve("planning", config.planning_provider)
 
-    from redteam.app.mcp_deployment import synchronize_deployment
+    from redteam.app.mcp_deployment import synchronize_deployment, verified_deployment
 
-    config = config.model_copy(
-        update={
-            "engagement": synchronize_deployment(
-                config.engagement, config.capability.mcp_servers, env=environment
-            )
-        }
+    verified_mcp_deployment = verified_deployment(
+        config.engagement, config.capability.mcp_servers, env=environment
     )
+    config = config.model_copy(update={"engagement": (
+        verified_mcp_deployment.engagement
+        if verified_mcp_deployment is not None
+        else synchronize_deployment(
+            config.engagement, config.capability.mcp_servers, env=environment
+        )
+    )})
     library = (
         load_reference_library(config.capability.methodology)
         if config.capability.methodology is not None
@@ -490,7 +493,41 @@ async def build_application(
             raise ValueError("direct target provider must be assembled before gateway discovery")
         if not any(adapter is shell.adapter for adapter in builtin_adapters):
             raise ValueError("direct target provider must use the registered shell adapter")
-        configure_direct_target(shell, engagement.scope, provider_config)
+        _extension, direct_executor, _descriptors = configure_direct_target(
+            shell, engagement.scope, provider_config
+        )
+        # A fully verified local deployment may replace only the web-http
+        # transport with the canonical in-process provider.  Discovery keeps
+        # the same server id / ToolIds / operations, while execution moves
+        # into the selected Kali workroom.  Manual and remote deployments are
+        # left unchanged because they do not establish this binding.
+        if (
+            verified_mcp_deployment is not None
+            and "web-http" in verified_mcp_deployment.spec.roles
+        ):
+            from redteam.capability.kali_http import BuiltinKaliHttpAdapter
+            from redteam.capability.server_roles import role_spec
+
+            http_adapter = BuiltinKaliHttpAdapter(
+                shell.adapter.program_source,
+                direct_executor,
+                provider_config,
+                verified_mcp_deployment.spec.server_policy(),
+            )
+            builtin_adapters = [*builtin_adapters, http_adapter]
+            role = role_spec("web-http")
+            assert role is not None
+            builtin_concurrency = {
+                **dict(builtin_concurrency or {}), "web-http": role.max_concurrency,
+            }
+            builtin_output_limits = {
+                **dict(builtin_output_limits or {}), "web-http": role.max_output_bytes,
+            }
+            config = config.model_copy(update={"capability": config.capability.model_copy(
+                update={"mcp_servers": [
+                    item for item in config.capability.mcp_servers if item != "web-http"
+                ]}
+            )})
     resolved_attack_graph = attack_graph or (build_central_graph(central_state))
     resolved_llm = llm or build_llm_client(config.llm)
     llm_connection_fingerprint = getattr(resolved_llm, "connection_fingerprint", None)

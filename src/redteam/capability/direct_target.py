@@ -19,7 +19,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -33,6 +33,7 @@ from redteam.capability.shell_manifest import (
     SHELL_LANGUAGES,
     SHELL_NAMESPACE,
     SHELL_SERVER_ID,
+    program_input_property,
 )
 from redteam.capability.shell_policy import WORKROOM_KEY_PATTERN, ShellWorkroomPolicy
 from redteam.capability.shell_preparation import (
@@ -517,10 +518,31 @@ class DirectTargetExecutionPolicy:
                 return "direct_target_pin_denied"
         return None
 
-    async def execute(self, invocation: ToolInvocation, parsed: Any, delegate) -> MCPCallResult:
-        if not isinstance(parsed, dict) or not parsed.get("language") or not parsed.get("script"):
-            return self._failure("direct_target_script_missing")
-        refused = self._validate(invocation)
+    async def execute_route(
+        self,
+        invocation: ToolInvocation,
+        *,
+        target_ref: str,
+        port: int,
+        delegate,
+    ) -> MCPCallResult:
+        """Run a provider-owned operation in the same direct-target window.
+
+        ``target_ref``/``port`` are a provider projection from an already
+        verified protocol profile, not model input.  The original invocation
+        identity, approval subject and arguments remain unchanged; only the
+        route selector consumed by this policy is replaced for validation.
+        This lets protocol adapters reuse the exact attach/detach boundary
+        without teaching this generic policy protocol or tool names.
+        """
+        route_invocation = invocation.model_copy(update={
+            "arguments": {
+                **dict(invocation.arguments),
+                "target_ref": target_ref,
+                "port": port,
+            }
+        })
+        refused = self._validate(route_invocation)
         if refused:
             return self._failure(refused)
         context = invocation.execution_context
@@ -568,6 +590,21 @@ class DirectTargetExecutionPolicy:
         metadata["network_enforcement"] = "none"
         return replace(result, metadata=metadata)
 
+    async def execute(self, invocation: ToolInvocation, parsed: Any, delegate) -> MCPCallResult:
+        if not isinstance(parsed, dict):
+            return self._failure("direct_target_script_missing")
+        has_script = bool(parsed.get("language") and parsed.get("script"))
+        has_program = isinstance(parsed.get("program"), dict)
+        if has_script == has_program:
+            return self._failure("direct_target_script_missing")
+        args = invocation.arguments
+        return await self.execute_route(
+            invocation,
+            target_ref=cast(str, args.get("target_ref")),
+            port=cast(int, args.get("port")),
+            delegate=delegate,
+        )
+
 
 def _descriptor(policy: ShellWorkroomPolicy, network: DirectTargetConfig) -> ToolDescriptor:
     descriptor = ToolDescriptor(
@@ -593,6 +630,7 @@ def _descriptor(policy: ShellWorkroomPolicy, network: DirectTargetConfig) -> Too
                     "type": "string", "minLength": 1,
                     "maxLength": policy.max_script_bytes,
                 },
+                "program": program_input_property(policy),
                 "timeout_seconds": {
                     "type": "number", "exclusiveMinimum": 0,
                     "maximum": policy.max_timeout_seconds,
@@ -605,7 +643,13 @@ def _descriptor(policy: ShellWorkroomPolicy, network: DirectTargetConfig) -> Too
                     "enum": sorted({p for values in network.target_ports.values() for p in values}),
                 },
             },
-            "required": ["language", "script", "target_ref", "port"],
+            "required": ["target_ref", "port"],
+            "oneOf": [
+                {"required": ["language", "script"], "not": {"required": ["program"]}},
+                {"required": ["program"], "not": {"anyOf": [
+                    {"required": ["language"]}, {"required": ["script"]},
+                ]}},
+            ],
             "additionalProperties": False,
         },
         output_schema=dict(RUN_OUTPUT_SCHEMA),

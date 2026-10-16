@@ -11,6 +11,7 @@ from redteam.attack_graph.hypotheses import HypothesisConflict
 from redteam.attack_graph.service import AttackGraphService
 from redteam.core.contracts.graph import Hypothesis
 from redteam.core.contracts.mission import InvestigationResult, MissionTask
+from redteam.core.contracts.specialists import ProbeLimits
 from redteam.core.enums import GraphNodeType
 from redteam.evidence.stores.filesystem import FilesystemEvidenceStore
 from redteam.orchestration.agents.base import AgentSpec
@@ -285,3 +286,119 @@ async def test_followup_cas_detects_new_result_with_the_same_id(tmp_path):
             "followup", source_task_id=str(claimed.task_id), source_result_id=partial.result_id,
         )], task_read={str(claimed.task_id): content_hash(source)})
     assert len(await state.list_tasks()) == 1
+
+
+async def test_direct_registration_binds_unique_missing_verdict_reference(tmp_path):
+    deps, service = await setup(tmp_path)
+    await admit(deps, service, "seed", updates=[candidate()], tasks=[])
+
+    submitted = [probe(
+        "unique-verdict", revision=1, completion_criteria=[{
+            "kind": "hypothesis_confirmed", "description": "Confirm the candidate",
+        }],
+    )]
+    proposal = HypothesisProbeProposal.model_validate({"updates": [], "tasks": submitted})
+    graph_read = {
+        identity: content_hash(await service.get_node(identity))
+        for identity in ("host:a", "hypothesis:candidate-a")
+    }
+    registration = {
+        "proposal_id": "unique-verdict", "proposal": proposal,
+        "expected_revision": 1, "expected_binding_hash": BINDING,
+        "graph_read": graph_read, "known_targets": {"host:a"},
+        "known_principals": set(), "max_tasks": 4,
+    }
+    receipt = await register_probe_tasks(deps, **registration)
+    # Binding works on an owned clone, so retries with the exact same input object
+    # and with a newly reconstructed raw proposal retain the original request hash.
+    assert proposal.tasks[0].completion_criteria[0].hypothesis_id is None
+    assert await register_probe_tasks(deps, **registration) == receipt
+    assert await admit(deps, service, "unique-verdict", tasks=submitted) == receipt
+    task = await deps.central_state.get_task(receipt["task_ids"][0])
+    assert task.completion_criteria[0].hypothesis_id == "candidate-a"
+    assert task.related_hypothesis_ids == ["candidate-a"]
+    candidate_row = await service.get_hypothesis("candidate-a")
+    assert candidate_row.status == "open" and candidate_row.revision == 1
+
+
+async def test_direct_registration_rejects_ambiguous_missing_verdict_before_writes(tmp_path):
+    deps, service = await setup(tmp_path)
+    await admit(deps, service, "seed-two", updates=[candidate("candidate-a"),
+                                                     candidate("candidate-b")], tasks=[])
+    before_candidates = await service.list_hypotheses()
+
+    with pytest.raises(SpecialistProposalError) as rejected:
+        await admit(deps, service, "ambiguous-verdict", tasks=[probe(
+            "ambiguous-verdict", revision=1,
+            hypothesis_revisions={"candidate-a": 1, "candidate-b": 1},
+            completion_criteria=[{
+                "kind": "hypothesis_confirmed", "description": "Confirm one candidate",
+            }],
+        )])
+
+    diagnostic = rejected.value.diagnostic
+    assert diagnostic.code == "specialist_criterion_hypothesis_reference_required"
+    assert diagnostic.location == "$.tasks[0].completion_criteria[0].hypothesis_id"
+    assert diagnostic.retryable is True and diagnostic.cause_scope == "model_input"
+    assert diagnostic.owner == "orchestration.specialist_tasks"
+    assert await deps.central_state.list_tasks() == []
+    after_candidates = await service.list_hypotheses()
+    assert [(row.hypothesis_id, row.revision, row.status) for row in after_candidates] == [
+        (row.hypothesis_id, row.revision, row.status) for row in before_candidates
+    ]
+
+
+async def test_direct_registration_rejects_explicit_unlinked_verdict_reference(tmp_path):
+    deps, service = await setup(tmp_path)
+    await admit(deps, service, "seed-two", updates=[candidate("candidate-a"),
+                                                     candidate("candidate-b")], tasks=[])
+    before_candidates = await service.list_hypotheses()
+
+    with pytest.raises(SpecialistProposalError) as rejected:
+        await admit(deps, service, "outside-verdict", tasks=[probe(
+            "outside-verdict", revision=1, hypothesis_revisions={"candidate-a": 1},
+            completion_criteria=[{
+                "kind": "hypothesis_confirmed", "description": "Confirm candidate B",
+                "hypothesis_id": "candidate-b",
+            }],
+        )])
+
+    diagnostic = rejected.value.diagnostic
+    assert diagnostic.code == "specialist_criterion_hypothesis_outside_subjects"
+    assert diagnostic.location == "$.tasks[0].completion_criteria[0].hypothesis_id"
+    assert diagnostic.retryable is True and diagnostic.cause_scope == "model_input"
+    assert diagnostic.owner == "orchestration.specialist_tasks"
+    assert await deps.central_state.list_tasks() == []
+    after_candidates = await service.list_hypotheses()
+    assert [(row.hypothesis_id, row.revision, row.status) for row in after_candidates] == [
+        (row.hypothesis_id, row.revision, row.status) for row in before_candidates
+    ]
+
+
+async def test_direct_registration_inherits_and_clamps_profile_sub_limits(tmp_path):
+    deps, service = await setup(tmp_path)
+    deps.specialist_policy = SimpleNamespace(probe_limits=ProbeLimits(
+        max_actions=4, max_model_requests=8, max_repair_requests=6,
+        max_consecutive_provider_failures=6,
+    ))
+    await admit(deps, service, "seed", updates=[candidate()], tasks=[])
+
+    receipt = await admit(deps, service, "clamped-limits", tasks=[probe(
+        "clamped-limits", revision=1,
+        probe_limits={"max_actions": 2, "max_model_requests": 3},
+    )])
+    task = await deps.central_state.get_task(receipt["task_ids"][0])
+    assert task.probe_limits == ProbeLimits(
+        max_actions=2, max_model_requests=3, max_repair_requests=3,
+        max_consecutive_provider_failures=3,
+    )
+
+    before_tasks = await deps.central_state.list_tasks()
+    with pytest.raises(StateConflict, match="probe_override_exceeds_profile_limits"):
+        await admit(deps, service, "overridden-sub-limit", tasks=[probe(
+            "overridden-sub-limit", revision=1,
+            probe_limits={
+                "max_actions": 4, "max_model_requests": 8, "max_repair_requests": 7,
+            },
+        )])
+    assert await deps.central_state.list_tasks() == before_tasks

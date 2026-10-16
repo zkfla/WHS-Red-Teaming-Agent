@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, defaultdict
 from collections.abc import Collection, Iterable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, Field
 
 from redteam.attack_graph.service import AttackGraphService
 from redteam.core.contracts.completion import completion_conditions, completion_contract_hash
+from redteam.core.contracts.evidence import EvidenceRecord
+from redteam.core.contracts.execution import ExecutionState, TaskExecution
 from redteam.core.contracts.mission import MissionPlan, MissionTask
 from redteam.core.enums import AgentPhase, MissionStatus, TaskStatus
 from redteam.core.ids import ApprovalId, EvidenceId, FindingId, MissionId, RunId, TaskId
@@ -262,6 +264,25 @@ class EvidenceReadProjection(BaseModel):
     delegation_id: str | None = None
 
 
+class ApprovalWaitProjection(BaseModel):
+    """Current receipt-backed view of one historical approval wait.
+
+    ``settled`` means only that the exact original invocation later reached a
+    receipt-validated terminal state. It does not settle the Task or erase the
+    immutable diagnostic that recorded the earlier wait.
+    """
+
+    invocation_id: str = Field(max_length=200)
+    action_id: str | None = Field(default=None, max_length=200)
+    recorded_state: str = Field(default="pending", max_length=60)
+    recorded_wait_reason: str = Field(default="approval", max_length=60)
+    current_state: str | None = Field(default=None, max_length=60)
+    current_wait_reason: str | None = Field(default=None, max_length=60)
+    result_evidence_id: str | None = Field(default=None, max_length=200)
+    receipt_validated: bool = False
+    resolution: Literal["pending", "settled", "unresolved"] = "unresolved"
+
+
 class UnresolvedGapProjection(BaseModel):
     code: str = "unknown"
     description: str = ""
@@ -270,6 +291,8 @@ class UnresolvedGapProjection(BaseModel):
     evidence_refs: list[str] = Field(default_factory=list)
     required_conditions: list[str] = Field(default_factory=list)
     next_suggestions: list[str] = Field(default_factory=list)
+    approval_wait_resolution: Literal["pending", "settled", "unresolved"] | None = None
+    historical_approval_waits: list[ApprovalWaitProjection] = Field(default_factory=list)
 
 
 class InvestigationUnresolvedProjection(BaseModel):
@@ -284,6 +307,7 @@ class InvestigationUnresolvedProjection(BaseModel):
     reason: str = ""
     source_evidence_ids: list[str] = Field(default_factory=list)
     gaps: list[UnresolvedGapProjection] = Field(default_factory=list)
+    historical_approval_waits: list[ApprovalWaitProjection] = Field(default_factory=list)
     claim_supported: bool = False
     diagnostic: DecisionDiagnostic | None = None
 
@@ -314,29 +338,244 @@ def _project_evidence_reads(runtime: Any) -> list[EvidenceReadProjection]:
     return projected
 
 
-def _project_unresolved_details(evidence: Any) -> list[InvestigationUnresolvedProjection]:
-    ordered: list[Any] = []
-    for item in evidence or []:
+def _execution_wait_index(executions: Iterable[Any]) -> dict[tuple[str, str], list[Any]]:
+    indexed: dict[tuple[str, str], list[Any]] = defaultdict(list)
+    for item in executions:
+        run_id = _safe_id_token(getattr(item, "run_id", None))
+        invocation_id = _safe_id_token(getattr(item, "invocation_id", None))
+        if run_id is not None and invocation_id is not None:
+            indexed[(run_id, invocation_id)].append(item)
+    return indexed
+
+
+def _execution_wait_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(getattr(value, "value", value)).strip()
+    return text[:60] or None
+
+
+def _approval_wait_note(waits: list[ApprovalWaitProjection]) -> str:
+    if not waits:
+        return ""
+    statuses = ", ".join(
+        f"{wait.invocation_id}={wait.resolution}" for wait in waits[:10]
+    )
+    return (
+        f" [Projection: recorded approval wait status: {statuses}; "
+        "the source outcome and history remain unchanged.]"
+    )
+
+
+def _combined_approval_wait_resolution(
+    waits: list[ApprovalWaitProjection],
+) -> Literal["pending", "settled", "unresolved"]:
+    if not waits:
+        return "unresolved"
+    if all(wait.resolution == "settled" for wait in waits):
+        return "settled"
+    if any(wait.resolution == "pending" for wait in waits):
+        return "pending"
+    return "unresolved"
+
+
+def _project_approval_wait(
+    trace: Any,
+    *,
+    item: EvidenceRecord,
+    task_id: str | None,
+    run_id: str,
+    engagement_id: str,
+    executions: dict[tuple[str, str], list[Any]],
+    evidence_by_id: dict[str, list[EvidenceRecord]],
+) -> ApprovalWaitProjection | None:
+    if (not isinstance(trace, dict)
+            or _execution_wait_text(trace.get("state")) != ExecutionState.PENDING.value
+            or _execution_wait_text(trace.get("wait_reason")) != "approval"):
+        return None
+    invocation_id = _safe_id_token(trace.get("invocation_id"))
+    if invocation_id is None:
+        return None
+    raw_action_id = trace.get("action_id")
+    trace_action_id = _safe_id_token(raw_action_id)
+    if raw_action_id not in (None, "") and trace_action_id is None:
+        return None
+    # A pending approval trace with a result receipt is internally inconsistent;
+    # keep it unresolved instead of reconciling a possibly different attempt.
+    if trace.get("result_evidence_id") not in (None, ""):
+        return ApprovalWaitProjection(invocation_id=invocation_id)
+
+    base = ApprovalWaitProjection(invocation_id=invocation_id)
+    if (task_id is None or str(item.run_id) != run_id
+            or str(item.engagement_id) != engagement_id):
+        return base
+    candidates = [
+        execution for execution in executions.get((run_id, invocation_id), [])
+        if str(getattr(execution, "run_id", "")) == run_id
+        and str(getattr(execution, "engagement_id", "")) == engagement_id
+        and str(getattr(execution, "task_id", "")) == task_id
+        and (trace_action_id is None
+             or str(getattr(execution, "action_id", "")) == trace_action_id)
+    ]
+    if len(candidates) != 1:
+        return base
+
+    execution = candidates[0]
+    action_id = _safe_id_token(getattr(execution, "action_id", None))
+    current_state = _execution_wait_text(getattr(execution, "state", None))
+    current_wait_reason = _execution_wait_text(getattr(execution, "wait_reason", None))
+    result_evidence_id = _safe_id_token(getattr(execution, "result_evidence_id", None))
+    base = ApprovalWaitProjection(
+        invocation_id=invocation_id,
+        action_id=action_id,
+        current_state=current_state,
+        current_wait_reason=current_wait_reason,
+        result_evidence_id=result_evidence_id,
+    )
+    if (current_state == ExecutionState.PENDING.value
+            and current_wait_reason == "approval"
+            and result_evidence_id is None):
+        return base.model_copy(update={"resolution": "pending"})
+
+    terminal_states = {
+        ExecutionState.SUCCEEDED.value,
+        ExecutionState.FAILED.value,
+        ExecutionState.CANCELLED.value,
+    }
+    if (current_state not in terminal_states or current_wait_reason is not None
+            or getattr(execution, "resource_execution_pending", False)
+            or result_evidence_id is None):
+        return base
+
+    receipts = evidence_by_id.get(result_evidence_id, [])
+    if len(receipts) != 1:
+        return base
+    receipt = receipts[0]
+    if (str(receipt.run_id) != run_id
+            or str(receipt.engagement_id) != engagement_id
+            or str(receipt.evidence_id) != result_evidence_id
+            or str(receipt.invocation_id) != invocation_id
+            or str(receipt.action_id) != action_id):
+        return base
+
+    try:
+        # This canonical validator binds the immutable receipt to the exact
+        # action, invocation, tool, task, input digest and result state.
+        from redteam.orchestration.central_state import check_execution_receipt
+        from redteam.orchestration.coordination import StateConflict
+
+        if not isinstance(execution, TaskExecution):
+            return base
+        check_execution_receipt(execution, receipt, result=True)
+    except (StateConflict, ValueError, TypeError, KeyError, AttributeError):
+        return base
+    return base.model_copy(update={"receipt_validated": True, "resolution": "settled"})
+
+
+def _project_unresolved_details(
+    evidence: Any,
+    *,
+    executions: Iterable[Any] = (),
+    run_id: str | None = None,
+    engagement_id: str | None = None,
+) -> list[InvestigationUnresolvedProjection]:
+    all_evidence = list(evidence or [])
+    evidence_by_id: dict[str, list[EvidenceRecord]] = defaultdict(list)
+    for item in all_evidence:
+        identity = _safe_id_token(getattr(item, "evidence_id", None))
+        if identity is not None and isinstance(item, EvidenceRecord):
+            evidence_by_id[identity].append(item)
+    execution_index = _execution_wait_index(executions)
+
+    ordered: list[EvidenceRecord] = []
+    for item in all_evidence:
         metadata = getattr(item, "metadata", None)
         if not isinstance(metadata, dict):
             continue
         if metadata.get("record_kind") != "investigation_unresolved":
             continue
-        ordered.append(item)
+        if isinstance(item, EvidenceRecord):
+            ordered.append(item)
     ordered = ordered[:_UNRESOLVED_DETAIL_LIMIT]
+
+    # Resolve direct trace rows and model gaps only through explicit
+    # source-evidence links to same-Task immutable probe-yield records.
+    referenced_ids: set[str] = {str(item.evidence_id) for item in ordered}
+    for item in ordered:
+        metadata = item.metadata if isinstance(item.metadata, dict) else {}
+        referenced_ids.update(_safe_id_list(metadata.get("source_evidence_ids", [])))
+        raw_gaps = metadata.get("gaps")
+        if isinstance(raw_gaps, (list, tuple)):
+            for gap in raw_gaps:
+                if isinstance(gap, dict):
+                    referenced_ids.update(_safe_id_list(
+                        gap.get("evidence_ids", gap.get("evidence_refs", []))
+                    ))
+    wait_sources: dict[str, tuple[str | None, list[ApprovalWaitProjection]]] = {}
+    for identity in referenced_ids:
+        records = evidence_by_id.get(identity, [])
+        if len(records) != 1:
+            continue
+        record = records[0]
+        metadata = record.metadata if isinstance(record.metadata, dict) else {}
+        if metadata.get("record_kind") != "investigation_unresolved":
+            continue
+        task_id = _safe_id_token(metadata.get("task_id"))
+        diagnostic = metadata.get("diagnostic")
+        traces = diagnostic.get("trace", []) if isinstance(diagnostic, dict) else []
+        waits: list[ApprovalWaitProjection] = []
+        if isinstance(traces, (list, tuple)):
+            for trace in traces:
+                projected_wait = _project_approval_wait(
+                    trace,
+                    item=record,
+                    task_id=task_id,
+                    run_id=run_id or "",
+                    engagement_id=engagement_id or "",
+                    executions=execution_index,
+                    evidence_by_id=evidence_by_id,
+                )
+                if projected_wait is not None:
+                    waits.append(projected_wait)
+        wait_sources[identity] = (task_id, waits)
+
     projected: list[InvestigationUnresolvedProjection] = []
     for item in ordered:
         metadata = item.metadata if isinstance(item.metadata, dict) else {}
+        task_id = _safe_id_token(metadata.get("task_id"))
+        identity = str(item.evidence_id)
+        direct_waits = wait_sources.get(identity, (None, []))[1]
         gaps: list[UnresolvedGapProjection] = []
         raw_gaps = metadata.get("gaps")
         if isinstance(raw_gaps, (list, tuple)):
             for gap in list(raw_gaps)[:10]:
                 if not isinstance(gap, dict):
                     continue
+                linked_waits: list[ApprovalWaitProjection] = []
+                if gap.get("code") == "approval_pending":
+                    linked_ids = set(_safe_id_list(metadata.get("source_evidence_ids", [])))
+                    linked_ids.update(_safe_id_list(
+                        gap.get("evidence_ids", gap.get("evidence_refs", []))
+                    ))
+                    linked_waits = [
+                        wait
+                        for linked_id in linked_ids
+                        for source_task, source_waits in [wait_sources.get(linked_id, (None, []))]
+                        if source_task == task_id
+                        for wait in source_waits
+                    ]
+                wait_resolution = None
+                if linked_waits:
+                    wait_resolution = _combined_approval_wait_resolution(linked_waits)
+                description = safe_feedback(str(gap.get("description", "")), 500)
+                if linked_waits:
+                    description = safe_feedback(
+                        description + _approval_wait_note(linked_waits), 800,
+                    )
                 gaps.append(
                     UnresolvedGapProjection(
                         code=safe_feedback(str(gap.get("code", "unknown")), 100) or "unknown",
-                        description=safe_feedback(str(gap.get("description", "")), 500),
+                        description=description,
                         unresolved_questions=_safe_text_list(
                             gap.get("unresolved_questions", gap.get("questions", [])),
                         ),
@@ -352,9 +591,14 @@ def _project_unresolved_details(evidence: Any) -> list[InvestigationUnresolvedPr
                         next_suggestions=_safe_text_list(
                             gap.get("next_suggestions", gap.get("suggestions", []))
                         ),
+                        approval_wait_resolution=wait_resolution,
+                        historical_approval_waits=linked_waits,
                     )
                 )
         reported = safe_feedback(str(metadata.get("reported_by", "unknown")), 60)
+        reason = safe_feedback(str(metadata.get("reason", "")), 500)
+        if direct_waits:
+            reason = safe_feedback(reason + _approval_wait_note(direct_waits), 800)
         projected.append(
             InvestigationUnresolvedProjection(
                 evidence_id=str(getattr(item, "evidence_id", ""))[:200],
@@ -368,9 +612,10 @@ def _project_unresolved_details(evidence: Any) -> list[InvestigationUnresolvedPr
                 else None,
                 path_step_id=_safe_id_token(metadata.get("path_step_id")),
                 outcome=safe_feedback(str(metadata.get("outcome", "unknown")), 60) or "unknown",
-                reason=safe_feedback(str(metadata.get("reason", "")), 500),
+                reason=reason,
                 source_evidence_ids=_safe_id_list(metadata.get("source_evidence_ids", [])),
                 gaps=gaps,
+                historical_approval_waits=direct_waits,
                 claim_supported=False,
                 diagnostic=(
                     DecisionDiagnostic.model_validate(metadata["diagnostic"])
@@ -433,6 +678,7 @@ class TerminalReportProjection(BaseModel):
     work_status_counts: dict[str, int] = Field(default_factory=dict)
     findings: list[FindingProjection] = Field(default_factory=list)
     candidates: list[CandidateProjection] = Field(default_factory=list)
+    candidate_finding_promotions: list[dict[str, Any]] = Field(default_factory=list)
     evidence_ids: list[EvidenceId] = Field(default_factory=list)
     integrity_blockers: list[str] = Field(default_factory=list)
     unresolved_hypotheses: list[str] = Field(default_factory=list)
@@ -457,6 +703,7 @@ class TerminalReportProjection(BaseModel):
     model_tokens_used: int = Field(default=0, ge=0)
     model_usage_unknown: int = Field(default=0, ge=0)
     llm_request_accounting: dict[str, Any] | None = None
+    task_request_effectiveness: list[dict[str, Any]] = Field(default_factory=list)
     unresolved_evidence_ids: list[str] = Field(default_factory=list)
     evidence_reads: list[EvidenceReadProjection] = Field(default_factory=list)
     unresolved_details: list[InvestigationUnresolvedProjection] = Field(default_factory=list)
@@ -608,7 +855,12 @@ class ReportingAgent:
         runtime_records = project_runtime_records(
             evidence, run_id=runtime.run_id, engagement_id=runtime.engagement_id,
         )
-        unresolved_details = _project_unresolved_details(evidence)
+        unresolved_details = _project_unresolved_details(
+            evidence,
+            executions=work if central_state is not None else (),
+            run_id=str(runtime.run_id),
+            engagement_id=str(runtime.engagement_id),
+        )
         if unresolved_refs:
             ref_order = {identity: index for index, identity in enumerate(unresolved_refs)}
             unresolved_details = sorted(
@@ -617,8 +869,12 @@ class ReportingAgent:
             )
         evidence_read_projections = _project_evidence_reads(runtime)
         request_accounting = None
+        candidate_finding_promotions: list[dict[str, Any]] = []
         if central_state is not None:
             request_accounting = await central_state.request_ledger().snapshot(str(runtime.run_id))
+            read_promotions = getattr(central_state, "candidate_finding_promotions", None)
+            if callable(read_promotions):
+                candidate_finding_promotions = await read_promotions()
         elif runtime.llm_request_policy is not None and coordinator is not None:
             from redteam.orchestration.llm_requests import RunRequestLedger
 
@@ -690,6 +946,7 @@ class ReportingAgent:
                 source_hypothesis_ids=list(item.source_hypothesis_ids),
                 probe_task_ids=sorted(candidate_tasks.get(item.hypothesis_id, [])),
             ) for item in hypotheses],
+            candidate_finding_promotions=candidate_finding_promotions,
             evidence_ids=[item.evidence_id for item in evidence],
             integrity_blockers=integrity.blocking,
             unresolved_hypotheses=unresolved,
@@ -729,6 +986,32 @@ class ReportingAgent:
             plan = await central_state.get_mission(runtime.mission_id)
             report.investigations = [task.model_dump(mode="json") for task in tasks]
             report.executions = [item.model_dump(mode="json") for item in work]
+            by_task = request_accounting.get("by_task", {})
+            for task in tasks:
+                task_id = str(task.task_id)
+                usage = by_task.get(task_id, {})
+                requests = _safe_nonneg_int(usage.get("spent", 0))
+                external_actions = sum(str(item.task_id) == task_id for item in work)
+                report.task_request_effectiveness.append({
+                    "task_id": task_id,
+                    "model_requests": requests,
+                    "known_tokens": _safe_nonneg_int(usage.get("known_tokens", 0)),
+                    "unknown_usage": _safe_nonneg_int(usage.get("unknown_usage", 0)),
+                    "external_actions": external_actions,
+                    "local_reads": _safe_nonneg_int(usage.get("local_reads", 0)),
+                    "repairs": _safe_nonneg_int(usage.get("repairs", 0)),
+                    "transport_retries": _safe_nonneg_int(
+                        (usage.get("attempts") or {}).get("transport_retry", 0)
+                    ),
+                    "provider_failures": _safe_nonneg_int(
+                        usage.get("provider_failures", 0)
+                    ),
+                    "settlements": _safe_nonneg_int(usage.get("settlements", 0)),
+                    "text_only_held": _safe_nonneg_int(usage.get("text_only_held", 0)),
+                    "external_actions_per_model_request": (
+                        external_actions / requests if requests else None
+                    ),
+                })
             report.criterion_evidence = [item.model_dump(mode="json")
                                          for item in plan.criterion_results]
             required_open = {(task_id, q.question_id) for task_id, q in required_questions(tasks)}

@@ -10,6 +10,7 @@ from redteam.core.contracts.evidence import EvidenceRecord
 from redteam.core.contracts.network import WINDOW_EGRESS_RECORD_KIND, WINDOW_EGRESS_SOURCE_ID
 from redteam.core.convert import digest_payload
 from redteam.core.enums import EvidenceSourceType
+from redteam.core.ports.program_discovery import ProgramStaticMetadata
 from redteam.orchestration.analysis import claim_target_is_grounded
 from redteam.orchestration.evidence_access import EvidenceReader, project_original_records
 from redteam.orchestration.tool_discovery import (
@@ -72,6 +73,28 @@ async def test_large_inventory_is_searchable_without_filling_passive_context():
     assert described.ok and described.payload["executable"] == "/usr/bin/p0499"
     assert described.payload["execution_environment"]["status"] == "unknown"
     assert not (await program_describe_handler({"name": "not-installed"}, _ctx(deps))).ok
+
+
+async def test_installed_privileged_mode_is_not_reported_as_generally_supported():
+    row = _row("tcpdump")
+    row.metadata = ProgramStaticMetadata(
+        purposes=["local", "privileged"],
+        network_families=["ipv4", "ipv6"],
+        network_protocols=["packet_capture"],
+        required_capabilities=["CAP_NET_RAW"],
+        unsupported_modes=["live_capture"],
+        unprivileged_alternatives=["read an existing capture (-r)"],
+        path_status="effective",
+        resolved_path="/usr/bin/tcpdump",
+    )
+    described = await program_describe_handler(
+        {"name": "tcpdump"}, _ctx(_deps(shell_programs=StubPrograms(image=[row])))
+    )
+    metadata = described.payload["program_metadata"]
+    assert metadata["required_capabilities"] == ["CAP_NET_RAW"]
+    assert metadata["unsupported_modes"] == ["live_capture"]
+    assert "read an existing capture" in metadata["unprivileged_alternatives"][0]
+    assert not described.payload["execution_environment"]["execution_permission_granted"]
 
 
 def companion_for(record):

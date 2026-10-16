@@ -33,6 +33,7 @@ from redteam.orchestration.worker_session import WorkerSession
 from tests.integration.test_central_completion import OriginalProtocolDouble
 from tests.integration.test_central_development import call, gateway, inspect, turn
 from tests.integration.test_central_parallel import limits
+from tests.integration.test_hypothesis_planner import candidate as hypothesis_candidate
 from tests.integration.test_hypothesis_planner import probe
 from tests.integration.test_investigation_context_baseline import _compare_requests
 from tests.integration.test_native_schema_delivery import SchemaSensitiveProbe, provider
@@ -72,16 +73,24 @@ async def saved_session(session, runtime):
 async def test_independent_planner_worker_bash_source_and_new_task_session(tmp_path):
     first = probe("A")
     first["probe_limits"] = {"max_actions": 3, "max_model_requests": 8}
+    candidate_id = "initial-premise"
+    first["hypothesis_revisions"] = {candidate_id: 1}
 
     def followup(payload):
         source, = payload["investigations"]
-        child = probe("B", source=source)
+        candidate, = payload["candidates"]
+        child = probe(
+            "B", candidate=candidate["hypothesis_id"], revision=candidate["revision"],
+            source=source,
+        )
         child["probe_limits"] = first["probe_limits"]
         return {"tasks": [child], "reason": "Assess an explicit follow-up source"}
 
     class Cycle(RequestDouble):
         def __init__(self):
-            super().__init__([{"tasks": [first], "reason": "Inspect a synthetic uncertainty"},
+            super().__init__([{"updates": [hypothesis_candidate(candidate_id)],
+                               "tasks": [first],
+                               "reason": "Inspect a synthetic uncertainty"},
                               followup])
             self.worker_requests = {}
 
@@ -177,7 +186,7 @@ async def test_actual_input_boundary_archives_displays_or_holds_opaque_state(
 
     model = BoundedConversation(executions=3, reads=1, opaque=opaque)
     async with shell_session(tmp_path, model) as (session, manager):
-        task_id = await register(session, "bounded", actions=4, requests=16)
+        task_id = await register(session, "bounded", actions=4, requests=8)
         outcome, = await drive(session)
         assert outcome.kind == "completed", outcome.error
         saved = await saved_session(session, outcome.runtime)
@@ -219,7 +228,7 @@ async def test_actual_input_boundary_archives_displays_or_holds_opaque_state(
 async def test_changed_owned_purpose_gets_explicit_generation_and_keeps_original_budget(tmp_path):
     model = ConversationModel(executions=3, reads=1, opaque=False)
     async with shell_session(tmp_path, model) as (session, manager):
-        identity = await register(session, "purpose", actions=4, requests=16)
+        identity = await register(session, "purpose", actions=4, requests=8)
 
         async def change_purpose():
             state = session.deps.central_state
@@ -350,7 +359,7 @@ async def test_crash_after_original_before_display_restores_without_reexecution(
 
     monkeypatch.setattr(react, "_result_messages", interrupt)
     async with shell_session(tmp_path, model) as (session, manager):
-        identity = await register(session, "crash", actions=4, requests=16)
+        identity = await register(session, "crash", actions=4, requests=8)
         outcome, = await drive(session)
         assert outcome.kind == "failed" and failed
         before = await saved_session(session, outcome.runtime)
@@ -502,7 +511,7 @@ async def test_crash_after_preentry_failure_restores_rejection_before_corrected_
 async def test_unknown_local_submission_stays_pending_without_replay(tmp_path, monkeypatch):
     model = ConversationModel(executions=3, reads=1)
     async with shell_session(tmp_path, model) as (session, manager):
-        await register(session, "local-unknown", actions=4, requests=16)
+        await register(session, "local-unknown", actions=4, requests=8)
         original = session.deps.local_tools.call
         submissions = []
 
@@ -603,6 +612,10 @@ async def test_original_job_or_unknown_survives_process_reopen_without_new_submi
         saved = await saved_session(session, outcome.runtime)
         assert saved.status == "waiting"
         execution, = await session.deps.central_state.list_executions()
+        if wait == "unknown":
+            assert execution.outcome.diagnostic_category == "execution_unknown"
+            assert execution.outcome.result_kind == "unknown"
+            assert "Do not submit" in execution.outcome.resume_condition
         run_id, engagement_id = session.runtime.run_id, session.runtime.engagement_id
     async with open_central_run(
         config, directory=root, settings=settings, resume=True,
@@ -624,6 +637,136 @@ async def test_original_job_or_unknown_survives_process_reopen_without_new_submi
             assert len(jobs.submissions) == 1 and not tools.inner.invocations
         else:
             assert len(tools.inner.invocations) == 1
-            assert (await session.deps.central_state.get_execution(
+            reopened = await session.deps.central_state.get_execution(
                 str(execution.invocation_id),
-            )).state is ExecutionState.UNKNOWN
+            )
+            assert reopened.state is ExecutionState.UNKNOWN
+            assert reopened.outcome == execution.outcome
+
+
+@pytest.mark.parametrize(
+    "repeat_reads,crash,legacy_receipt",
+    [
+        (True, True, False),
+        (False, True, False),
+        (True, True, True),
+        (True, False, False),
+        (False, False, False),
+    ],
+)
+async def test_local_read_progress_survives_checkpoint_recovery_without_replay(
+    tmp_path, monkeypatch, repeat_reads, crash, legacy_receipt,
+):
+    model = ConversationModel(executions=1, reads=2, repeat_reads=repeat_reads)
+    original = react._result_messages
+    interrupted = False
+
+    async def interrupt_after_progress(messages, **kwargs):
+        nonlocal interrupted
+        if crash and not interrupted and any(
+            message.get("tool_call_id") == "read-3" for message in messages
+        ):
+            interrupted = True
+            usage = await kwargs["deps"].central_state.transaction(
+                lambda tx: tx.probe_usage(
+                    str(kwargs["runtime"].active_task_id),
+                ),
+                write=False,
+            )
+            assert usage["no_progress"] == (1 if repeat_reads else 0)
+            raise RuntimeError(
+                "synthetic crash after ledger progress, before transcript checkpoint"
+            )
+        return await original(messages, **kwargs)
+
+    monkeypatch.setattr(react, "_result_messages", interrupt_after_progress)
+    async with shell_session(tmp_path, model) as (session, manager):
+        if legacy_receipt:
+            append = session.deps.evidence_store.append
+
+            async def append_legacy_receipt(record):
+                if (record.metadata.get("record_kind") == "runtime_tool_result"
+                        and record.metadata.get("tool_id") == "evidence.read"
+                        and record.metadata.get("model_tool_call_id") == "read-3"):
+                    metadata = dict(record.metadata)
+                    metadata.pop("made_progress", None)
+                    record = record.model_copy(update={
+                        "metadata": metadata, "digest": content_hash(metadata),
+                    })
+                await append(record)
+
+            monkeypatch.setattr(
+                session.deps.evidence_store, "append", append_legacy_receipt,
+            )
+        identity = await register(
+            session, f"local-read-{repeat_reads}-{crash}-{legacy_receipt}",
+        )
+        outcome, = await drive(session)
+        before = None
+        if crash:
+            assert outcome.kind == "failed" and interrupted
+            runner = session.driver.runner_for(outcome.runtime)
+            before = await saved_session(session, outcome.runtime)
+            checkpoint = await runner._latest_snapshot()
+            pending, = [
+                call for call in checkpoint.values["native_calls"]
+                if call.call_id == "read-3"
+            ]
+            assert not pending.completed and pending.made_progress is None
+            reads = [
+                record for record in await session.deps.evidence_store.list_for_run(
+                    outcome.runtime.run_id,
+                )
+                if record.metadata.get("record_kind") == "runtime_tool_result"
+                and record.metadata.get("tool_id") == "evidence.read"
+                and record.metadata.get("model_tool_call_id") == "read-3"
+            ]
+            receipt, = reads
+            if legacy_receipt:
+                assert "made_progress" not in receipt.metadata
+            else:
+                assert receipt.metadata["made_progress"] is (not repeat_reads)
+            assert receipt.digest == content_hash(receipt.metadata)
+            recovered, proof = await session.recover(outcome.runtime.instance_id)
+            assert proof.ready, proof.errors
+            returned = await session.driver.runner_for(recovered).resume_recovered(recovered)
+        else:
+            assert outcome.kind == "completed", outcome.error
+            returned = outcome.runtime
+
+        after = await saved_session(session, returned)
+        assert after.status == "closed"
+        if before is not None:
+            assert after.conversation()[:len(before.messages)] == before.conversation()
+        assert len(manager.executions) == 1
+        assert len(model.envelopes) == 4
+        usage = await session.deps.central_state.transaction(
+            lambda tx: tx.probe_usage(identity), write=False,
+        )
+        assert usage["actions"] == 1
+        assert usage["model_requests"] == 4
+        assert usage["local_reads"] == 2
+        assert usage["settlements"] == 1
+        assert usage["no_progress"] == (1 if repeat_reads else 0)
+        read_receipts = [
+            record for record in await session.deps.evidence_store.list_for_run(
+                returned.run_id,
+            )
+            if record.metadata.get("record_kind") == "runtime_tool_result"
+            and record.metadata.get("tool_id") == "evidence.read"
+        ]
+        assert {record.metadata["model_tool_call_id"] for record in read_receipts} == {
+            "read-2", "read-3",
+        }
+        assert len(read_receipts) == 2
+        displayed_reads = [
+            message for message in after.conversation()
+            if message.get("role") == "tool"
+            and message.get("tool_call_id") in {"read-2", "read-3"}
+        ]
+        assert len(displayed_reads) == 2
+        recovered, proof = await session.recover(returned.instance_id)
+        assert proof.ready, proof.errors
+        resumed = await session.driver.runner_for(recovered).resume_recovered(recovered)
+        assert len(model.envelopes) == 4 and len(manager.executions) == 1
+        assert (await saved_session(session, resumed)).conversation() == after.conversation()

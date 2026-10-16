@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -98,6 +99,115 @@ class SpecialistProposalError(ValueError):
         super().__init__(code)
 
 
+class CriterionHypothesisReferenceError(ValueError):
+    """A verdict criterion cannot be bound to exactly one linked candidate."""
+
+    def __init__(self, condition_index: int, reason: Literal["missing", "outside"],
+                 candidate_count: int) -> None:
+        self.condition_index = condition_index
+        self.reason = reason
+        self.candidate_count = candidate_count
+        super().__init__("criterion_hypothesis_reference_invalid")
+
+
+_HYPOTHESIS_VERDICT_CRITERIA = frozenset({"hypothesis_confirmed", "hypothesis_refuted"})
+
+
+def bind_hypothesis_criterion_references(
+    criteria: list[CompletionCriterion], candidate_ids: Iterable[str],
+) -> list[CompletionCriterion]:
+    """Bind a missing verdict reference only when one candidate is explicitly linked.
+
+    Candidate IDs are the question/task's canonical links, not a global graph
+    inventory. Explicit references of every criterion kind must remain inside
+    that linked set.
+    """
+    candidates = sorted({str(identity) for identity in candidate_ids})
+    bound: list[CompletionCriterion] = []
+    for index, criterion in enumerate(criteria):
+        reference = criterion.hypothesis_id
+        if reference is None:
+            if criterion.kind in _HYPOTHESIS_VERDICT_CRITERIA:
+                if len(candidates) != 1:
+                    raise CriterionHypothesisReferenceError(index, "missing", len(candidates))
+                bound.append(criterion.model_copy(update={"hypothesis_id": candidates[0]}))
+            else:
+                bound.append(criterion)
+            continue
+        if reference not in candidates:
+            raise CriterionHypothesisReferenceError(index, "outside", len(candidates))
+        bound.append(criterion)
+    return bound
+
+
+def _criterion_reference_diagnostic(
+    task_index: int, error: CriterionHypothesisReferenceError,
+) -> DecisionDiagnostic:
+    location = (
+        f"$.tasks[{task_index}].completion_criteria"
+        f"[{error.condition_index}].hypothesis_id"
+    )
+    if error.reason == "outside":
+        code = "specialist_criterion_hypothesis_outside_subjects"
+        summary = (
+            "A completion criterion hypothesis_id must name a candidate already linked to "
+            "this task. Correct the field at the location named in the diagnostic."
+        )
+        repair = (
+            "Use a candidate already present in this task's hypothesis_revisions; do not "
+            "invent or broaden candidate references."
+        )
+    else:
+        code = "specialist_criterion_hypothesis_reference_required"
+        if error.candidate_count == 1:
+            summary = (
+                "A hypothesis verdict criterion needs its uniquely linked candidate reference. "
+                "Correct the field at the location named in the diagnostic."
+            )
+            repair = (
+                "Set hypothesis_id to the single candidate already present in this task's "
+                "hypothesis_revisions. This binds the condition only; it does not confirm or "
+                "refute the candidate."
+            )
+        elif error.candidate_count == 0:
+            summary = (
+                "A hypothesis verdict criterion has no linked candidate. Add the intended "
+                "candidate to this task's purpose and identify it at the location named in "
+                "the diagnostic."
+            )
+            repair = (
+                "Link the intended candidate in hypothesis_revisions and set hypothesis_id "
+                "to that candidate. This grants no candidate verdict."
+            )
+        else:
+            summary = (
+                "A hypothesis verdict criterion has multiple linked candidates. Specify the "
+                "intended candidate at the location named in the diagnostic."
+            )
+            repair = (
+                "Set hypothesis_id to the intended candidate already present in this task's "
+                "hypothesis_revisions; do not infer among multiple candidates."
+            )
+    return DecisionDiagnostic(
+        code=code, stage="hypothesis_planning", kind="validation", location=location,
+        summary=summary, retryable=True, cause_scope="model_input",
+        owner="orchestration.specialist_tasks", repair_condition=repair,
+        validation_issues=[{"rule": code, "location": location}],
+    )
+
+
+def normalize_probe_task_criteria(tasks: list[ProbeTaskProposal]) -> None:
+    """Normalize/reject probe criteria before registration identity is hashed."""
+    for task_index, task in enumerate(tasks):
+        try:
+            task.completion_criteria = bind_hypothesis_criterion_references(
+                task.completion_criteria, task.hypothesis_revisions,
+            )
+        except CriterionHypothesisReferenceError as error:
+            diagnostic = _criterion_reference_diagnostic(task_index, error)
+            raise SpecialistProposalError(diagnostic.code, diagnostic=diagnostic) from error
+
+
 
 
 def validate_strategy_questions(
@@ -117,6 +227,16 @@ def _validate_subjects(
 ) -> None:
     for item_index, raw_item in enumerate(items):
         item = cast(InvestigationQuestion | AtomicTaskProposal | ProbeTaskProposal, raw_item)
+        if isinstance(item, ProbeTaskProposal):
+            try:
+                item.completion_criteria = bind_hypothesis_criterion_references(
+                    item.completion_criteria, item.hypothesis_revisions,
+                )
+            except CriterionHypothesisReferenceError as error:
+                diagnostic = _criterion_reference_diagnostic(item_index, error)
+                raise SpecialistProposalError(
+                    diagnostic.code, diagnostic=diagnostic,
+                ) from error
         if not item.objective.strip() or any(not ref.strip() for ref in item.target_node_ids):
             raise SpecialistProposalError("specialist_blank_subject")
         if isinstance(item, AtomicTaskProposal) and not item.title.strip():
@@ -523,16 +643,22 @@ async def register_probe_tasks(
     from redteam.orchestration.diagnostics import DecisionDiagnostic
     from redteam.orchestration.evidence_validity import capture_validity
 
-    proposal = HypothesisProbeProposal.model_validate(proposal.model_dump())
     state = deps.central_state
     if not proposal_id.strip() or max_tasks < 1 or len(proposal.tasks) > max_tasks:
         raise StateConflict("probe_registration_identity_or_count_invalid")
+    # This hash identifies the submitted request for replay compatibility.
+    # Criterion IDs and stored Task purpose hashes use the bound criteria below;
+    # an existing raw-input registration with a missing ref still replays.
     request_hash = content_hash(proposal)
     previous = await state.transaction(
         lambda tx: tx.probe_registration(proposal_id, request_hash), write=False,
     )
     if previous is not None:
         return previous
+    # Never canonicalize the caller's object: a retry with that same instance
+    # must still hash to the original submitted request.
+    proposal = HypothesisProbeProposal.model_validate(proposal.model_dump())
+    normalize_probe_task_criteria(proposal.tasks)
     known_hypotheses = {
         item.hypothesis.hypothesis_id for item in proposal.updates
     } | {identity for task in proposal.tasks for identity in task.hypothesis_revisions}
@@ -636,14 +762,55 @@ async def register_probe_tasks(
         if policy_limits is not None and item.probe_limits is not None and (
             item.probe_limits.max_actions > policy_limits.max_actions
             or item.probe_limits.max_model_requests > policy_limits.max_model_requests
+            or (
+                item.probe_limits.max_repair_requests is not None
+                and policy_limits.max_repair_requests is not None
+                and item.probe_limits.max_repair_requests > policy_limits.max_repair_requests
+            )
+            or (
+                item.probe_limits.max_consecutive_provider_failures is not None
+                and policy_limits.max_consecutive_provider_failures is not None
+                and item.probe_limits.max_consecutive_provider_failures
+                > policy_limits.max_consecutive_provider_failures
+            )
         ):
             raise StateConflict("probe_override_exceeds_profile_limits")
+
+    def effective_limits(item: ProbeTaskProposal):
+        selected = item.probe_limits or policy_limits
+        if selected is None:
+            return None
+        if item.probe_limits is not None and policy_limits is not None:
+            selected = selected.model_copy(update={
+                "max_repair_requests": (
+                    item.probe_limits.max_repair_requests
+                    if item.probe_limits.max_repair_requests is not None
+                    else policy_limits.max_repair_requests
+                ),
+                "max_consecutive_provider_failures": (
+                    item.probe_limits.max_consecutive_provider_failures
+                    if item.probe_limits.max_consecutive_provider_failures is not None
+                    else policy_limits.max_consecutive_provider_failures
+                ),
+            })
+        total = selected.max_model_requests
+
+        def clamp(value: int | None) -> int | None:
+            return min(value, total) if value is not None else None
+
+        return selected.model_copy(update={
+            "max_repair_requests": clamp(selected.max_repair_requests),
+            "max_consecutive_provider_failures": clamp(
+                selected.max_consecutive_provider_failures
+            ),
+        })
+
     tasks = [MissionTask(
         task_id=TaskId("task_" + content_hash([state.run_id, proposal_id, item.task_key])),
         mission_id=mission.mission_id, title=item.title, objective=item.objective,
         assigned_agent=AgentId(item.role_id), status=TaskStatus.READY,
         investigation_contract_version=2, completion_contract_version=2,
-        probe_limits=item.probe_limits or policy_limits,
+        probe_limits=effective_limits(item),
         completion_criteria=item.completion_criteria, principal_refs=item.principal_refs,
         required=item.required,
         goal_required_hypothesis_ids=[HypothesisId(ref)

@@ -69,7 +69,7 @@
       <div class="graph-workspace">
         <div class="graph-toolbar">
           <div><h2>조사 흐름</h2><p class="note">노드를 선택하면 연결 경로와 상세 정보를 볼 수 있습니다.</p></div>
-          <label class="graph-search"><span data-icon="target"></span><span class="sr-only">그래프 노드 검색</span><input id="graph-search" type="search" placeholder="작업·워커 검색" autocomplete="off"><span id="graph-search-count" aria-live="polite"></span></label>
+          <label class="graph-search"><span data-icon="target"></span><span class="sr-only">그래프 노드 검색</span><input id="graph-search" type="search" placeholder="작업·워커·LLM 검색" autocomplete="off"><span id="graph-search-count" aria-live="polite"></span></label>
         </div>
         <div class="graph-canvas" id="graph-canvas" tabindex="0" aria-label="조사 흐름 캔버스. 방향키로 이동할 수 있습니다.">
           <div id="graph-surface" class="graph-surface">
@@ -81,7 +81,7 @@
           <div id="graph-empty" class="graph-empty" hidden></div>
         </div>
         <div class="graph-footer">
-          <div class="graph-legend"><span><i class="legend-line"></i>작업 연결</span><span><i class="legend-line stored"></i>결과 저장</span><span><i class="legend-line wakes"></i>다음 판단</span></div>
+          <div class="graph-legend"><span><i class="legend-line"></i>작업 연결</span><span><i class="legend-line model-exchange"></i>LLM 요청 ↔ 응답</span><span><i class="legend-line stored"></i>결과 저장</span><span><i class="legend-line wakes"></i>다음 판단</span></div>
           <div class="graph-zoom" aria-label="그래프 확대 축소">
             <button type="button" id="graph-zoom-out" aria-label="그래프 축소">−</button><output id="graph-zoom-level" aria-live="polite">100%</output><button type="button" id="graph-zoom-in" aria-label="그래프 확대">+</button><button type="button" id="graph-fit">전체 맞춤</button>
           </div>
@@ -161,6 +161,10 @@
       <input id="s-key" name="api_key" type="password" autocomplete="off" spellcheck="false">
     </label>
     <label class="check"><input id="s-persist" type="checkbox"> API 키를 .env에 저장</label>
+    <div>
+      <button type="button" id="s-reauth" class="ghost" hidden>ChatGPT 재로그인</button>
+      <p class="note" id="s-reauth-note" hidden></p>
+    </div>
     <label>에이전트 프로필
       <select id="s-profile" name="profile_id"></select>
     </label>

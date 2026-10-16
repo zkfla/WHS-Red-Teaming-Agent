@@ -278,6 +278,7 @@ def mcp_server_ids_from_environment(
 
 SHELL_POLICY_ENV_VAR = "REDTEAM_SHELL_POLICY_PATH"
 SHELL_AUTO_SETUP_ENV_VAR = "REDTEAM_SHELL_AUTO_SETUP"
+SHELL_IMAGE_PROFILE_ENV_VAR = "REDTEAM_SHELL_IMAGE_PROFILE"
 
 
 def automatic_shell_setup_from_environment(
@@ -294,6 +295,27 @@ def automatic_shell_setup_from_environment(
     except ValidationError:
         raise MCPConfigurationError(
             "REDTEAM_SHELL_AUTO_SETUP must be true or false"
+        ) from None
+
+
+def shell_image_profile_from_environment(
+    *, source: Mapping[str, str] | None = None
+) -> str:
+    """Explicit managed image profile selection; baseline stays the default."""
+    from redteam.capability.shell_image import resolve_asset_dir
+    from redteam.capability.shell_profiles import (
+        DEFAULT_SHELL_IMAGE_PROFILE,
+        resolve_shell_image_profile,
+    )
+    from redteam.core.environment import env_snapshot
+
+    raw = env_snapshot(source).get(SHELL_IMAGE_PROFILE_ENV_VAR)
+    selected = DEFAULT_SHELL_IMAGE_PROFILE if raw is None else raw.strip()
+    try:
+        return resolve_shell_image_profile(resolve_asset_dir(), selected).name
+    except ValueError:
+        raise MCPConfigurationError(
+            "REDTEAM_SHELL_IMAGE_PROFILE must name a packaged Kali image profile"
         ) from None
 
 

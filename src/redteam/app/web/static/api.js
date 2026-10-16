@@ -41,6 +41,7 @@ export const api = {
     call("POST", `/approvals/${encodeURIComponent(approvalId)}/${decision}`, { run_id: runId }),
   control: (action) => call("POST", `/run/${action}`, {}),
   saveSettings: (values) => call("PUT", "/settings", values),
+  reauthenticateChatGPT: () => call("POST", "/settings/chatgpt/reauth", {}),
   engagements: () => call("GET", "/engagements"),
   engagement: (id) => call("GET", id ? `/engagement?id=${encodeURIComponent(id)}` : "/engagement"),
   previewEngagement: (id, draft) => call("POST", "/engagement/preview", { id, draft }),

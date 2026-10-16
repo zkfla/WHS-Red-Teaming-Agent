@@ -49,6 +49,11 @@ def original_planning_inputs(deps):
     }).model_dump(mode="json")
     if inputs["schema_version"] == 4 and deps.specialist_policy.probe_limits is None:
         inputs["schema_version"] = 2
+        # This key is part of current central execution identity, but schema-2
+        # source Runs predate Worker conversations.  The zero-entry adapter
+        # compares the exact frozen source identity before rebinding the current
+        # schema-4 identity, so do not project a new field into that old hash.
+        inputs.pop("worker_conversation_version", None)
     return inputs
 
 

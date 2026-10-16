@@ -100,12 +100,69 @@ class HypothesisProposalError(ValueError):
         super().__init__(code)
 
 
+def planner_candidate_wire_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Require an explicit status only on the active Planner's candidate wire copy.
+
+    ``CandidateHypothesis`` retains its domain default for historical readers and other
+    callers. The model-facing contract must distinguish an explicit ``open`` judgment
+    from an omitted field before Pydantic materializes defaults.
+    """
+    result = deepcopy(schema)
+    candidate = result.get("$defs", {}).get("CandidateHypothesis")
+    if not isinstance(candidate, dict):
+        raise ValueError("planner_candidate_schema_missing")
+    required = list(candidate.get("required", []))
+    candidate["required"] = list(dict.fromkeys([*required, "status"]))
+    candidate.get("properties", {}).get("status", {}).pop("default", None)
+    return result
+
+
+def validate_candidate_status_presence(raw: Any) -> None:
+    """Reject omitted candidate statuses before Pydantic can default them to ``open``."""
+    if not isinstance(raw, dict) or not isinstance(raw.get("updates"), list):
+        return
+    for index, update in enumerate(raw["updates"]):
+        if not isinstance(update, dict):
+            continue
+        hypothesis = update.get("hypothesis")
+        if not isinstance(hypothesis, dict) or "status" in hypothesis:
+            continue
+        code = "candidate_status_required"
+        location = f"$.updates[{index}].hypothesis.status"
+        raise HypothesisProposalError(code, diagnostic=DecisionDiagnostic(
+            code=code, stage="hypothesis_planning", kind="validation",
+            location=location, retryable=True, cause_scope="model_input",
+            owner="orchestration.hypothesis_planner",
+            summary="Every candidate update must state its status explicitly. Candidate prose "
+                    "does not supply a missing status.",
+            repair_condition="Include status on this update. Use open to leave the candidate "
+                             "unconfirmed; confirmed or rejected requires a matching final "
+                             "public review receipt and supporting original evidence.",
+            validation_issues=[{"rule": code, "location": location}],
+        ))
+
+
 def validate_candidate_review_selections(
     updates: Sequence[HypothesisUpdate], records: Mapping[str, EvidenceRecord],
 ) -> None:
     """Repair invalid receipt selection before admission; final proof stays authoritative."""
     for index, update in enumerate(updates):
         if update.hypothesis.status not in {"confirmed", "rejected"}:
+            if update.review_evidence_id is not None:
+                code = "candidate_review_receipt_requires_terminal_status"
+                location = f"$.updates[{index}].review_evidence_id"
+                raise HypothesisProposalError(code, diagnostic=DecisionDiagnostic(
+                    code=code, stage="hypothesis_planning", kind="validation",
+                    location=location, retryable=True, cause_scope="model_input",
+                    owner="orchestration.hypothesis_planner",
+                    summary="A review_evidence_id is consumed only with a confirmed or rejected "
+                            "candidate update; it cannot change a nonterminal candidate.",
+                    repair_condition="If the candidate remains open, held, or inconclusive, omit "
+                                     "review_evidence_id. Propose confirmed or rejected only "
+                                     "when preserved originals support that verdict and the "
+                                     "receipt matches the current candidate revision and purpose.",
+                    validation_issues=[{"rule": code, "location": location}],
+                ))
             continue
         failure = receipt_failure(
             update, update.hypothesis, records.get(update.review_evidence_id or ""),
@@ -129,6 +186,13 @@ def validate_candidate_review_selections(
 # Code-owned repair guidance keyed by proposal error code: (contract field, guidance).
 # Fields name the judgment contract only; they never carry model-supplied refs or values.
 _REPAIR_GUIDANCE: dict[str, tuple[str, str]] = {
+    "candidate_inventory_empty_requires_new_candidate": (
+        "$.updates",
+        "The candidate inventory is empty. When continuing with a proposed investigation on a "
+        "captured target, add a tentative candidate with explicit untested premises and a "
+        "nonterminal status. Do not invent a candidate for a truthful held or exhausted judgment, "
+        "or when no useful target-bound investigation can be proposed.",
+    ),
     "continue_requires_proposed_or_existing_work": (
         "$.termination",
         "Continue is valid only with proposed tasks/questions or referenced existing work "
@@ -375,7 +439,10 @@ def capture_snapshot(tx):
     )
 
 
-def bind_decision(decision, snapshot, *, issued, targets, principals, roles, max_tasks, limits):
+def bind_decision(
+    decision, snapshot, *, issued, targets, principals, roles, max_tasks, limits,
+    require_initial_candidate=False,
+):
     """Resolve local references and validate purpose inputs without mutating originals."""
     tasks = []
     names = [update.hypothesis.hypothesis_id for update in decision.updates]
@@ -431,6 +498,17 @@ def bind_decision(decision, snapshot, *, issued, targets, principals, roles, max
         if draft.probe_limits is not None and (
             draft.probe_limits.max_actions > limits.max_actions
             or draft.probe_limits.max_model_requests > limits.max_model_requests
+            or (
+                draft.probe_limits.max_repair_requests is not None
+                and limits.max_repair_requests is not None
+                and draft.probe_limits.max_repair_requests > limits.max_repair_requests
+            )
+            or (
+                draft.probe_limits.max_consecutive_provider_failures is not None
+                and limits.max_consecutive_provider_failures is not None
+                and draft.probe_limits.max_consecutive_provider_failures
+                > limits.max_consecutive_provider_failures
+            )
         ):
             raise HypothesisProposalError("probe_limits_exceed_profile")
         tasks.append(draft.model_copy(update={
@@ -460,6 +538,15 @@ def bind_decision(decision, snapshot, *, issued, targets, principals, roles, max
     proposal = HypothesisProbeProposal(updates=updates, tasks=tasks)
     validate_probe_subjects(proposal, known_targets=targets, known_principals=principals,
                             known_hypotheses=versions.keys())
+    if (
+        require_initial_candidate
+        and not snapshot.candidates
+        and not updates
+        and decision.termination == "continue"
+        and bool(proposal.tasks)
+        and bool(targets)
+    ):
+        raise HypothesisProposalError("candidate_inventory_empty_requires_new_candidate")
     return proposal
 
 
@@ -590,6 +677,7 @@ async def advance_hypotheses(planner, runtime, schema):
         )
 
     def bind(raw):
+        validate_candidate_status_presence(raw)
         decision = HypothesisDecision.model_validate(raw)
         if lookup_only(decision):
             return decision, None, ({}, {})
@@ -597,7 +685,7 @@ async def advance_hypotheses(planner, runtime, schema):
         proposal = bind_decision(
             decision, snapshot, issued=issued, targets=targets, principals=principals,
             roles=roles, max_tasks=planner.policy.max_tasks_per_strategy,
-            limits=planner.policy.probe_limits,
+            limits=planner.policy.probe_limits, require_initial_candidate=True,
         )
         validate_candidate_review_selections(
             proposal.updates if proposal is not None else [], pass_context.records,
@@ -621,13 +709,15 @@ async def advance_hypotheses(planner, runtime, schema):
                     "held for an external prerequisite, exhausted when no useful work remains, "
                     "or goal_achieved only as a completion proposal."
                 )),
-                schema=HypothesisDecision.model_json_schema(),
+                schema=planner_candidate_wire_schema(HypothesisDecision.model_json_schema()),
             )) from exc
 
     with llm_request_scope(str(runtime.run_id), "hypothesis_planning"):
         raw = await _ask_with_context(planner, pass_context, engine,
             stage="hypothesis_planning", payload=payload, budget=budget,
-            response_schema=schema(HypothesisDecision.model_json_schema()),
+            response_schema=planner_candidate_wire_schema(
+                schema(HypothesisDecision.model_json_schema())
+            ),
             validate_response=validate, before_call=engine.guard_reasoning,
             system=_SINGLE_PLAN_SYSTEM,
         )
@@ -688,7 +778,7 @@ async def _finalize_hypothesis_pass(deps, snapshot, budget, *, identity, proposa
     return identities
 
 
-PLANNER_REQUEST_CONTRACT_VERSION = 1
+PLANNER_REQUEST_CONTRACT_VERSION = 4
 
 
 FEEDBACK_SYSTEM = (
@@ -728,6 +818,9 @@ FEEDBACK_SYSTEM = (
     "metadata.hypothesis_outcome(없으면 metadata.outcome)이 success 또는 refuted이고 "
     "metadata.verdict가 unknown이 아닌지 확인하세요. "
     "metadata.verdict만으로 후보 판정을 추론하지 마세요. "
+    "각 candidate update에는 hypothesis.status를 명시하세요. 생략한 상태를 description이나 "
+    "reason에서 추론하지 않습니다. review_evidence_id는 confirmed/rejected update에만 넣고, "
+    "open/held/inconclusive를 유지하면 생략하세요. "
     "receipt는 자동 승격 지시가 아닙니다. "
     "보존된 원본과 지지·반대 근거를 평가해 결론이 뒷받침될 때만 "
     "후보 status를 confirmed 또는 rejected로 갱신하세요. 그때 updates에 해당 candidate를 명시하고, "
@@ -742,7 +835,11 @@ FEEDBACK_SYSTEM = (
     "unbound는 재사용 바인딩이 없다는 뜻이며, 유효성이나 거짓을 뜻하지 않습니다. 정보가 부족하면 "
     "범위를 정한 추가 관측으로 어떤 보안 불확실성을 줄일 수 있는지 "
     "설명하세요. "
-    "candidate가 없는 후속 작업도 허용됩니다. 더 많은 작업을 제안하기 전에 이전 질문, source "
+    "이미 candidate inventory가 있다면 새 후보 update 없이 후속 작업을 제안할 수 있습니다. 다만 "
+    "inventory가 비어 있고 캡처된 target에서 계속 조사할 question/task를 제안한다면 "
+    "명시적 전제와 nonterminal status를 가진 tentative candidate를 함께 제안하세요. "
+    "held/exhausted로 타당하게 멈추거나 유용한 대상 한정 작업이 없다면 후보를 만들지 마세요. "
+    "더 많은 작업을 제안하기 전에 이전 질문, source "
     "results, 변경된 전제, 새로 이용 가능한 관측 및 남은 "
     "예산을 읽으세요. "
     "진단에는 cause_scope, owner 및 repair_condition을 사용하세요. source correction이 필요한 "
@@ -781,8 +878,11 @@ _SINGLE_PLAN_SYSTEM = FEEDBACK_SYSTEM + (
     "사용합니다. 실제 사용한 reviewed_task_ids/reviewed_hypothesis_ids를 지정하세요. "
     "출처를 이어받는 후속 작업에서는 캡처된 Task/result 쌍을 참조하고 question을 새로 만들지 "
     "마세요. 관측과 Task outcome은 candidate 판정이 아닙니다. 최종 판정에는 정확한 candidate "
-    "revision/purpose에 대한 독립 public review receipt가 필요합니다. 처음에 candidates가 없다면 "
-    "유용하고 범위가 명확한 관측을 제안하거나 이유를 들어 보류하세요. 같은 evidence로 또 다른 "
+    "revision/purpose에 대한 독립 public review receipt가 필요합니다. candidates가 비어 있고 "
+    "캡처된 target에서 실제 조사를 계속할 task를 제안한다면 "
+    "새 tentative candidate도 함께 제안하세요. "
+    "held/exhausted로 정직하게 멈추거나 유용한 대상 한정 작업이 없으면 후보를 만들지 마세요. "
+    "같은 evidence로 또 다른 "
     "유용한 probe를 할 수 있습니다. tool-call 순서를 지시하거나 subjects를 만들어내거나 진행 중인 "
     "작업을 덮어쓰지 마세요. held/exhausted 판단에는 재검토 조건을 설명해야 합니다. 목표 성공은 "
     "별도 completion gate를 거쳐야 합니다."
@@ -815,8 +915,9 @@ _SPLIT_PLAN_SYSTEM = FEEDBACK_SYSTEM + (
     "코드가 해당 Task의 result를 복사하며 명시적 null은 파생값이 아닙니다. 관측과 Task outcome은 "
     "candidate 판정이 아닙니다. "
     "최종 판정에는 정확한 candidate revision/purpose에 대한 독립적인 public review receipt가 "
-    "필요합니다. 처음에 candidates가 "
-    "없다면 유용한 범위 지정 관측을 제안하거나 근거를 들어 보류하세요. "
+    "필요합니다. candidates가 비어 있고 캡처된 target에서 조사를 계속할 question을 제안한다면 "
+    "새 tentative candidate를 함께 제안하세요. "
+    "정직하게 held/exhausted를 선택하거나 유용한 대상 한정 question이 없으면 후보를 만들지 마세요. "
     "같은 evidence가 또 다른 유용한 probe를 뒷받침할 수 있습니다. tool-call 순서를 지시하거나 "
     "subjects를 만들어내거나 진행 중인 작업을 덮어쓰지 "
     "마세요. "
@@ -1046,6 +1147,7 @@ async def _advance_split(planner, runtime, schema, snapshot, engine, budget, pay
         )
 
     def bind_stage_one(raw):
+        validate_candidate_status_presence(raw)
         selection = HypothesisPlanSelection.model_validate(raw)
         if lookup_only(selection):
             return selection, None, [], {}
@@ -1053,7 +1155,7 @@ async def _advance_split(planner, runtime, schema, snapshot, engine, budget, pay
         bound = bind_plan_selection(
             selection, snapshot, issued=issued, targets=targets, principals=principals,
             max_tasks=planner.policy.max_tasks_per_strategy,
-            existing_work_validator=validate_existing_work,
+            existing_work_validator=validate_existing_work, require_initial_candidate=True,
         )
         validate_candidate_review_selections(bound[1] or [], pass_context.records)
         return bound
@@ -1072,14 +1174,16 @@ async def _advance_split(planner, runtime, schema, snapshot, engine, budget, pay
                     "purpose only, never worker tasks. Empty judgments need a termination reason "
                     "and resume_conditions.",
                 ),
-                schema=HypothesisPlanSelection.model_json_schema(),
+                schema=_split_plan_response_schema(planner_candidate_wire_schema(
+                    HypothesisPlanSelection.model_json_schema()
+                )),
             )) from exc
 
     with llm_request_scope(str(runtime.run_id), "hypothesis_planning"):
         plan_raw = await _ask_with_context(planner, pass_context, engine,
             stage="hypothesis_planning", payload=payload, budget=budget,
             response_schema=_split_plan_response_schema(
-                schema(HypothesisPlanSelection.model_json_schema())
+                planner_candidate_wire_schema(schema(HypothesisPlanSelection.model_json_schema()))
             ),
             validate_response=validate_plan, before_call=engine.guard_reasoning,
             system=_SPLIT_PLAN_SYSTEM,
@@ -1150,7 +1254,7 @@ async def _advance_split(planner, runtime, schema, snapshot, engine, budget, pay
         proposal = bind_decision(
             decision, snapshot, issued=issued, targets=targets, principals=principals,
             roles=roles, max_tasks=planner.policy.max_tasks_per_strategy,
-            limits=planner.policy.probe_limits,
+            limits=planner.policy.probe_limits, require_initial_candidate=True,
         )
         coverage = {
             question.question_id: [task.task_key for task in parsed.tasks

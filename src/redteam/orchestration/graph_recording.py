@@ -67,7 +67,11 @@ from redteam.orchestration.analysis import (
 from redteam.orchestration.coordination import content_hash
 from redteam.orchestration.diagnostics import DecisionDiagnostic, diagnostic_for_exception
 from redteam.orchestration.evidence_access import raw_from_metadata
-from redteam.orchestration.findings import FindingPromoter, PromotionRequest
+from redteam.orchestration.findings import (
+    FindingPromoter,
+    PromotionRequest,
+    claim_keys_from_findings,
+)
 from redteam.orchestration.local_tools import (
     LocalToolContext,
     LocalToolDescriptor,
@@ -982,10 +986,7 @@ class GraphRecordingHandler:
         existing_claims: set[str] = set()
         if recording.findings and service is not None:
             try:
-                for item in await service.list_findings():
-                    key = (getattr(item, "metadata", None) or {}).get("claim_key")
-                    if key:
-                        existing_claims.add(str(key))
+                existing_claims = claim_keys_from_findings(await service.list_findings())
             except Exception:
                 existing_claims = set()
         for finding_draft in recording.findings:
@@ -1361,12 +1362,7 @@ class GraphRecordingHandler:
                 "reason": "graph write failed",
             }
         record_ids.append(str(node.id))
-        try:
-            _claim_key = (promotion.finding.metadata or {}).get("claim_key")
-        except Exception:
-            _claim_key = None
-        if _claim_key:
-            existing_claims.add(str(_claim_key))
+        existing_claims.update(claim_keys_from_findings([promotion.finding]))
         return {
             **base,
             "hypothesis_id": hypothesis_id,

@@ -107,6 +107,17 @@ def _diagnostic_view(diagnostic: Any) -> dict[str, Any] | None:
     attempts = dump.get("attempts")
     if not isinstance(attempts, int) or isinstance(attempts, bool) or attempts < 0:
         attempts = 0
+    retry_after = dump.get("retry_after")
+    if retry_after is None:
+        retry_after = cause.get("retry_after")
+    if (not isinstance(retry_after, (int, float)) or isinstance(retry_after, bool)
+            or retry_after < 0):
+        retry_after = None
+    retryable = dump.get("retryable")
+    if cause and dump.get("last_cause") is not None:
+        retryable = cause.get("retryable", retryable)
+    if not isinstance(retryable, bool):
+        retryable = False
     view: dict[str, Any] = {
         "code": _scalar(dump.get("code")),
         "stage": _scalar(dump.get("stage")),
@@ -116,6 +127,14 @@ def _diagnostic_view(diagnostic: Any) -> dict[str, Any] | None:
         "rule": first_rule(issues) or first_rule(cause_issues),
         "cause_code": cause_code,
         "provider_status": status,
+        "provider_code": _scalar(
+            dump.get("provider_code") or cause.get("provider_code")
+        ),
+        "retryable": retryable,
+        "retry_after": retry_after,
+        "repair_condition": _scalar(
+            dump.get("repair_condition") or cause.get("repair_condition")
+        ),
         "label": safe_text(
             conversation_failure_label(diagnostic, fallback="unknown"),
             limit=_DIAGNOSTIC_TEXT_LIMIT * 2,

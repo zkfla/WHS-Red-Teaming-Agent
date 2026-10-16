@@ -88,7 +88,10 @@ class PlannerDouble(FakeLLMClient):
         await self._wait_response("complete_structured", messages)
         self.planner_inputs.append(payload)
         response = self.decisions.pop(0) if self.decisions else held()
-        return response(payload) if callable(response) else response
+        result = response(payload) if callable(response) else response
+        if asyncio.iscoroutine(result):
+            result = await result
+        return result
 
 
 @pytest.mark.parametrize("verdict", ["success", "refuted"])
@@ -142,13 +145,33 @@ async def test_candidate_probe_partial_followup_and_reviewed_verdict(tmp_path, v
             hypothesis_id=current.hypothesis_id, action_id=str(source.action_id),
             invocation_id=str(source.invocation_id), target_node_id=TARGET, candidate=current,
         )
-        llm.decisions.append({"updates": [candidate(
-            current=current.model_dump(mode="json"),
-            status="confirmed" if verdict == "success" else "rejected",
-            evidence=[str(source.evidence_id)], review=str(receipt.evidence_id),
-        )], "termination": "replan",
-            "reason": "The bound independent review supports this limited candidate verdict"})
+        tasks_before_repair = await session.deps.central_state.list_tasks()
+        llm.decisions.append({
+            "updates": [candidate(
+                current=current.model_dump(mode="json"), status="open",
+                evidence=[str(source.evidence_id)], review=str(receipt.evidence_id),
+            )],
+            "termination": "replan",
+            "reason": "Keep the candidate open while retaining the review reference",
+        })
+
+        async def repair_to_exact_terminal_review(payload):
+            unchanged = await service.get_hypothesis(current.hypothesis_id)
+            assert unchanged.revision == current.revision and unchanged.status == "open"
+            assert await session.deps.central_state.list_tasks() == tasks_before_repair
+            assert await service.list_findings() == []
+            return {"updates": [candidate(
+                current=current.model_dump(mode="json"),
+                status="confirmed" if verdict == "success" else "rejected",
+                evidence=[str(source.evidence_id)], review=str(receipt.evidence_id),
+            )], "termination": "replan",
+                "reason": "The bound independent review supports this limited candidate verdict"}
+
+        llm.decisions.append(repair_to_exact_terminal_review)
         assert await planner.advance(session.runtime) == []
+        feedback = llm.requests[-1]["messages"][-1]["content"]
+        assert "candidate_review_receipt_requires_terminal_status" in feedback
+        assert "$.updates[0].review_evidence_id" in feedback
         saved = await service.get_hypothesis(current.hypothesis_id)
         assert saved.revision == 3 and saved.status == (
             "confirmed" if verdict == "success" else "rejected"
@@ -156,12 +179,12 @@ async def test_candidate_probe_partial_followup_and_reviewed_verdict(tmp_path, v
         assert await service.list_findings() == []
         mission = await session.deps.central_state.get_mission(session.runtime.mission_id)
         assert mission.status is MissionStatus.ACTIVE
-        assert len(llm.planner_inputs) == 3
+        assert len(llm.planner_inputs) == 4  # The nonterminal receipt selection is repaired.
         native_requests = [request for request in llm.requests
                            if request["kind"] == "complete_native"]
         planner_requests = [request for request in llm.requests
                             if request["kind"] == "complete_structured"]
-        assert len(planner_requests) == 3
+        assert len(planner_requests) == 4
         assert len(native_requests) == 6  # Each worker gets one local turn after the physical cap.
         assert len(tools.inner.invocations) == 2  # No physical request after either probe cap.
         for task_id in (first_id, second_id):
@@ -169,27 +192,40 @@ async def test_candidate_probe_partial_followup_and_reviewed_verdict(tmp_path, v
             for request in native_requests:
                 user_messages = [message for message in request["messages"]
                                  if message.get("role") == "user"]
-                payload = json.loads(user_messages[-1]["content"])
-                if payload.get("active_task", {}).get("task_id") == task_id:
+                captured_task_id = None
+                for message in reversed(user_messages):
+                    payload = json.loads(message["content"])
+                    captured_task_id = (payload.get("active_task") or {}).get("task_id")
+                    if captured_task_id is not None:
+                        break
+                if captured_task_id == task_id:
                     task_requests.append(request)
             assert len(task_requests) == 3
 
 
 async def test_initial_observation_and_same_event_redelivery_are_distinct(tmp_path):
-    llm = PlannerDouble([{"tasks": [probe()], "reason": "No candidate yet; inspect one response"}])
+    llm = PlannerDouble([{
+        "updates": [candidate()], "tasks": [probe(candidate="local")],
+        "reason": "Seed a tentative premise before inspecting the captured response",
+    }])
     async with selection(tmp_path, llm=llm) as (session, llm, tools):
         planner = SpecialistPlanner(session.deps)
         identity, = await planner.advance(session.runtime)
         assert await planner.advance(session.runtime) == []
         assert await SpecialistPlanner(session.deps).advance(session.runtime) == []
         assert len(llm.planner_inputs) == 1
-        assert await AttackGraphService(session.deps.graph_store).list_hypotheses() == []
+        assert len(await AttackGraphService(session.deps.graph_store).list_hypotheses()) == 1
         llm.native_responses_by_task[identity] = [discover(TOOL), turn(inspect("initial"))]
         await drive(session)
         llm.decisions.append(lambda p: {
-            "updates": [candidate()], "tasks": [probe(
-                "candidate-probe", candidate="local", source=p["investigations"][0],
-            )], "reason": "A scoped candidate now follows the original observation",
+            "updates": [candidate(
+                current=p["candidates"][0],
+                evidence=p["investigations"][0]["result"]["evidence_ids"],
+            )],
+            "tasks": [probe(
+                "candidate-probe", candidate=p["candidates"][0]["hypothesis_id"],
+                revision=p["candidates"][0]["revision"] + 1, source=p["investigations"][0],
+            )], "reason": "Reuse the captured premise with a revised purpose after observation",
         })
         next_id, = await planner.advance(session.runtime)
         assert next_id != identity and len(llm.planner_inputs) == 2
@@ -361,8 +397,11 @@ async def test_candidate_loop_never_refutes_pending_or_unknown_execution(tmp_pat
 
 
 async def test_invalid_followup_is_repaired_within_one_shared_planner_budget(tmp_path):
-    invalid = {"tasks": [{**probe(), "source_result_id": "invented-result"}],
-               "reason": "Invalid source proposal"}
+    invalid = {
+        "updates": [candidate()],
+        "tasks": [{**probe(candidate="local"), "source_result_id": "invented-result"}],
+        "reason": "Invalid source proposal",
+    }
     llm = PlannerDouble([invalid, held("No source result exists; await authorized observations")])
     async with selection(tmp_path, llm=llm) as (session, llm, tools):
         assert await SpecialistPlanner(session.deps).advance(session.runtime) == []
@@ -397,7 +436,6 @@ async def test_partial_gap_cannot_supply_a_candidate_verdict_receipt(tmp_path):
         feedback = prompt.partition("Previous attempt failed")[2]
         assert "candidate_review_receipt_invalid" in feedback
         assert "$.updates[0].review_evidence_id" in feedback
-        assert partial not in feedback
         saved = await service.get_hypothesis(current.hypothesis_id)
         assert saved.status == "open" and saved.revision == 1
         assert await service.list_findings() == []

@@ -89,23 +89,38 @@ call/result 참조만으로도 초과하면 `native_input_limit_exceeded`로 명
 매 턴 전체 DB나 shared budget snapshot을 다시 보내지 않는다. 기존 승인/실행 결과는
 해당 tool result로 전달한다. 무관한 형제 변화가 세션을 새로 만들지 않는다.
 
+초기 `probe` 입력에는 현재 Task의 action/model/repair 잔량이 한 번 포함되고, 이후에는
+실제 경계 변화만 `worker_updates`로 추가된다. 동일한 local-read tool과 인자에서 결과가
+바뀌지 않으면 기존 frozen payload를 재사용하고 해당 model decision의 progress를 false로
+기록한다. 다른 offset/query 또는 달라진 context 결과는 새 조회다. 이 최적화는 조회 권한,
+원본 receipt, 다음 모델 요청이나 Task 총 request 차감을 생략하지 않는다.
+
 웹 `graph_model`은 원래 request row에서 Planner/Task/Worker별 input/output/cache read/write의
 확인된 합계와 미보고 요청 수를 계산하고 `graph_detail.js`가 표시한다. CLI status/report는
 기존 report projection의 같은 usage를 표시한다. UI는 대화 문자열을 파싱하거나 세션을
 저장하지 않는다. 과거 상세 usage/total이 없는 row는 unknown이다. 보고된 0과 unknown은
 구별하며 cache read/write를 빼서 admission을 완화하지 않는다. 실제 요금은 미측정이다.
 
+중앙 execution row에는 provider descriptor와 program environment에서 캡처한 `selection`
+(route/readiness/reason/program)과 원본 결과 처리 뒤의 `outcome`(generic stdout, canonical
+protocol receipt, provider failure, UNKNOWN 및 구조화된 재개 조건)을 선택적으로 보존한다.
+Planner와 Worker는 기존 execution history를 통해 같은 값을 읽고, web/status/report도 이
+원장을 그대로 투영한다. 과거 row에 필드가 없으면 unknown으로 표시하며 오늘의 inventory로
+보충하지 않는다. approval/resource 대기와 route/privilege/scope/timeout/program 부재/응답
+부재/detach UNKNOWN은 서로 다른 코드와 재개 조건이며 후보 반증이 아니다.
+
 ## 호환과 한계
 
-기본 profile 19 / 단일 판단 호환 profile 16 / worker prompt 11,
-`worker_conversation_version=2` / session version 2를 사용한다. Worker 코드 계약은 custom 및
-이전 profile에도 binding되며, probe Planner는 `planner_request_contract_version=1`을 유지한다.
+기본 profile 27 / 단일 판단 호환 profile 20 / worker prompt 13,
+`worker_conversation_version=3` / session version 2를 사용한다. Worker 코드 계약은 custom 및
+이전 profile에도 binding되며, probe Planner는 `planner_request_contract_version=4`를 사용한다.
 구 session version 1·native history만 있는 checkpoint·맞지 않는 prompt/provider는 새 모델/
 도구 실행 전에 거절한다. 기존 read/report/원본은 유지하고 자동 migration/backfill하지 않는다.
 
-Worker는 현재 선택·가용한 Kali Bash와 실행 경로가 지원하는 조사에서는 Bash를 우선한다.
-필수 경로·프로그램·권한·기능이 없으면 다른 선택 도구를 사용하며, 우선순위를 채우기 위한
-무의미한 Bash 호출은 하지 않는다. 문맥·증거 조회와 기록·작업 반환은 기존 helper를 사용한다.
+Worker는 현재 선택·가용한 도구와 실행 경로 중 목적에 가장 적합한 수단을 적극 사용한다.
+Kali Bash를 포함해 특정 도구의 호출 횟수나 고정 순서를 성공 조건으로 삼지 않는다.
+필수 경로·프로그램·권한·기능의 제약을 확인하고, 문맥·증거 조회와 기록·작업 반환에는
+기존 helper를 사용한다. 역할 프롬프트는 로컬 개선본을 유지한다.
 
 별도 atomizer, Planner snapshot 생성의 DB 읽기, 일부 관련 증거 유효성 조회의 Run record
 읽기는 남아 있다. 새로운 Docker SDK/Kali MCP·네트워크 도달성·Bash target binding 문제나
@@ -128,6 +143,7 @@ Worker는 현재 선택·가용한 Kali Bash와 실행 경로가 지원하는 �
 | Bash/추가 읽기/반환 commit 뒤 crash | 원래 결과 복구; 3실행/5모델 유지; result pairing 1회 |
 | 모델 응답 뒤 assistant checkpoint 전 crash | 같은 준비 입력으로 재개; 유실 응답 포함 3요청 차감, 실행 1회 |
 | Planner → A → 독립 Planner → B | 판단 2회+Worker 8회=10요청; source만 전달, 세션 분리 |
+| 1d split 통합 Run | Planner 2 + atomizer 1 + Worker 5 + review 2 = 10요청; 외부 실행 1, local read 1, settlement 1, total token known 40 / unknown 6; input/output/cache는 10회 모두 미보고 |
 
 5턴 기준 누적 application JSON은 약 5.3% 작아졌다. 지침 버전도 함께 갱신된 같은 scripted
 행동 비교이며 실제 token/요금 비교가 아니다. 긴 대화에서는 append-only 전송량이 늘 수

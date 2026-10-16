@@ -236,6 +236,12 @@ fills in what is otherwise unset.
 Investigation startup enables automatic Kali preparation by default.
 `REDTEAM_SHELL_AUTO_SETUP=false` preserves manual setup. An explicit
 `REDTEAM_SHELL_POLICY_PATH` takes precedence over the managed default.
+The managed image profile is `baseline` unless
+`REDTEAM_SHELL_IMAGE_PROFILE=kali-default` is selected explicitly. The latter
+uses the repository-owned Kali standard metapackage input; it is never a
+fallback and cannot be combined with an explicit shell policy. Profile
+selection changes build/preparation identity, not Control permission or target
+scope. No profile installs packages during an investigation run.
 Preparation starts installed Docker Desktop on Windows when needed, waits
 for a Linux engine, builds/reuses an immutable image, and generates its
 matching program manifest. Missing Docker produces installation guidance.
@@ -364,6 +370,15 @@ Providers without the optional seam report unknown metadata; no target
 readiness is inferred from inventory or registration. Eligible catalog IDs
 filter route IDs for the current role.
 
+Program inventory uses five distinct meanings. `installed` means the immutable
+image probe observed a package-owned executable. `route configured` describes
+provider setup only. `mode supported` accounts for declared network/capability
+requirements and can remain false even for an installed program. `execution
+admitted` is a per-invocation Control/provider decision. `execution observed`
+requires an actual result/evidence record. None is inferred from an earlier
+state. Manifest PATH status and static requirements are metadata, not health,
+reachability, permission, or successful execution.
+
 Worker context, Planner/atomizer payload, `agent.readiness` and `program.describe`
 share this projection. Passive context contains at most eight program samples
 and prioritizes callable/reference cards within its existing 100-card ceiling.
@@ -375,10 +390,10 @@ Already-supplied execution schemas need no discovery round. No per-program
 wrappers, title-based tool switch, extra registry or model approval polling is
 introduced; the native input bound and shared model-request ledger remain.
 
-`native-probes` is version 19 (worker prompt 11, strategy prompt 9, atomizer prompt 4).
-The explicit single-stage compatibility profile is version 16 (planner prompt 5,
-shared worker prompt 11). The code contracts additionally bind
-`planner_request_contract_version=1` and `worker_conversation_version=2`, including
+`native-probes` is version 22 (worker prompt 14, strategy prompt 9, atomizer prompt 4).
+The explicit single-stage compatibility profile is version 19 (planner prompt 5,
+shared worker prompt 14). The code contracts additionally bind
+`planner_request_contract_version=4` and `worker_conversation_version=3`, including
 for custom profiles. Worker checkpoints use session version 2; see
 [Worker lifecycle](worker-conversation.md) and
 [Planner request and resume semantics](planner-request.md).

@@ -14,6 +14,10 @@ class LLMRequestPolicy(BaseModel):
     mode: Literal["bounded", "unlimited_requests"]
     max_requests: int | None = Field(default=None, strict=True, gt=0)
     max_concurrent_requests: int = Field(default=1, strict=True, gt=0)
+    # After this many consecutive retryable 429s, an expired cooldown admits
+    # one transactionally claimed recovery request. It is not a permanent Run
+    # ban. Non-retryable or excessive Retry-After responses still require
+    # operator review/new Run admission.
     max_consecutive_rate_limits: int = Field(default=3, strict=True, gt=0)
     rate_limit_base_seconds: float = Field(default=1.0, gt=0, allow_inf_nan=False)
     max_rate_limit_wait_seconds: float = Field(default=30.0, gt=0, allow_inf_nan=False)

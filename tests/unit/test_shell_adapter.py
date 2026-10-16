@@ -35,11 +35,13 @@ from redteam.capability.shell_manifest import (
 )
 from redteam.capability.shell_policy import WORKROOM_KEY_PATTERN, ShellWorkroomPolicy
 from redteam.capability.shell_workroom import (
+    _SUPERVISOR_SOURCE,
     SHELL_CONTEXT_LABEL_KEY,
     SHELL_MANAGED_LABEL,
     CancelReport,
     ExecResult,
     ExecutionAdmission,
+    ProgramRecord,
     ShellWorkroomError,
     check_workroom_key,
     container_name_for,
@@ -55,6 +57,7 @@ from redteam.core.contracts.tool import (
 )
 from redteam.core.enums import RiskLevel, ToolHealthStatus
 from redteam.core.ids import ActionId, AgentInstanceId, EngagementId, InvocationId, RunId, ToolId
+from redteam.core.ports.program_discovery import ProgramStaticMetadata
 from redteam.core.tool_binding import SELECTED_TOOL
 
 
@@ -158,6 +161,26 @@ def test_descriptors_match_pinned_manifest():
     }
 
 
+def test_run_schema_accepts_exact_program_contract_and_rejects_mixed_script_input():
+    run = _descriptor_map(build_shell_descriptors())[RUN_TOOL_NAME]
+    validator = Draft202012Validator(run.input_schema)
+    program = {
+        "program": {
+            "name": "curl",
+            "executable": "/usr/bin/curl",
+            "owner_scope": "image",
+            "argv": ["--version"],
+            "stdin": "",
+        },
+        "timeout_seconds": 5,
+    }
+    assert list(validator.iter_errors(program)) == []
+    mixed = {**program, "language": "bash", "script": "true"}
+    assert list(validator.iter_errors(mixed))
+    job_start = _descriptor_map(build_shell_descriptors())[JOB_START_TOOL_NAME]
+    assert "program" not in job_start.input_schema["properties"]
+
+
 def test_risk_and_binding_posture():
     by_name = _descriptor_map(build_shell_descriptors())
     # TASK-008 (FR-007): starting shell work is bounded execution (MEDIUM), so
@@ -218,7 +241,7 @@ def test_exec_argv_carries_no_script_text():
     assert argv[1:3] == ("--user", "0")
     assert "-i" in argv
     assert argv[argv.index("-i") + 1] == "whs-shell-abc123"
-    assert argv[-4:] == ("python3", "-I", "-u", "/workroom/.whs-supervisor-v2.py")
+    assert argv[-4:] == ("python3", "-I", "-u", "/workroom/.whs-supervisor-v4.py")
     assert "WHS_RUN_ID=abc123def4567890" in argv
     assert "WHS_LANG=bash" in argv
     assert "WHS_TIMEOUT_S=10.0" in argv
@@ -249,7 +272,69 @@ def test_exec_argv_carries_no_script_text():
     with pytest.raises(ShellWorkroomError):
         exec_argv("whs-shell-abc123", "bash", 10.0, 2.0,
                     run_id="abc123def4567890", workdir="/workroom",
-                    run_uid=0, run_gid=65532)
+        run_uid=0, run_gid=65532)
+
+
+def test_program_exec_argv_selects_supervisor_mode_without_exposing_program_arguments():
+    argv = exec_argv(
+        "whs-shell-abc123", "bash", 10.0, 2.0,
+        run_id="abc123def4567890", workdir="/workroom",
+        run_uid=65532, run_gid=65532, execution_mode="program",
+    )
+    assert "WHS_EXECUTION_MODE=program" in argv
+    rendered = " ".join(argv)
+    assert "/usr/bin/curl" not in rendered
+    assert "--data=secret" not in rendered
+
+
+def test_program_capable_supervisor_source_is_valid_python_without_nul_bytes():
+    assert "\x00" not in _SUPERVISOR_SOURCE
+    compile(_SUPERVISOR_SOURCE, "<shell-supervisor>", "exec")
+
+
+async def test_exec_program_transports_exact_argv_and_stdin_to_common_supervisor(monkeypatch):
+    from redteam.capability.shell_workroom import ShellWorkroomManager
+
+    manager = ShellWorkroomManager(_policy())
+    captured = {}
+
+    async def ensure(key):
+        assert key == "run1.inst1"
+        return "whs-shell-test"
+
+    async def run_docker(argv, stdin_bytes, timeout_seconds, output_limit):
+        captured.update(
+            argv=argv,
+            stdin_bytes=stdin_bytes,
+            timeout_seconds=timeout_seconds,
+            output_limit=output_limit,
+        )
+        return 9, b"out", b"err", False, True
+
+    async def classify(*args, **kwargs):
+        return False
+
+    monkeypatch.setattr(manager, "ensure_workroom", ensure)
+    monkeypatch.setattr(manager, "_run_docker", run_docker)
+    monkeypatch.setattr(manager, "_classify_exit", classify)
+
+    result = await manager.exec_program(
+        "run1.inst1",
+        "/usr/bin/printf",
+        ["%s", "hello world"],
+        "stdin-data",
+        4.0,
+        invocation_id="inv-1",
+    )
+
+    header, stdin = captured["stdin_bytes"].split(b"\n", 1)
+    assert json.loads(header) == {"argv": ["/usr/bin/printf", "%s", "hello world"]}
+    assert stdin == b"stdin-data"
+    assert "WHS_EXECUTION_MODE=program" in captured["argv"]
+    assert result.exit_code == 9
+    assert result.stdout == "out"
+    assert result.stderr == "err"
+    assert result.truncated is True
 
 
 def test_workroom_key_helpers():
@@ -1048,6 +1133,141 @@ def _shell_invocation(arguments, *, run="run1", instance="inst1", context_run=No
     )
 
 
+class _ProgramWorkroom(_FakeWorkroom):
+    def __init__(self, metadata=None):
+        super().__init__()
+        self.program_calls = []
+        self._metadata = metadata or ProgramStaticMetadata(
+            purposes=["local", "target"],
+            path_status="effective",
+            resolved_path="/usr/bin/printf",
+        )
+
+    async def list_image_programs(self):
+        return [ProgramRecord(
+            name="printf",
+            executable="/usr/bin/printf",
+            version="1",
+            owner_scope="image",
+            provenance="test",
+            metadata=self._metadata,
+        )]
+
+    async def exec_program(
+        self, key, executable, argv, stdin="", timeout_seconds=None, exec_tag=None, **kwargs
+    ):
+        self.program_calls.append((key, executable, argv, stdin, timeout_seconds, exec_tag))
+        return ExecResult(
+            exit_code=7,
+            stdout="program-output",
+            stderr="program-error",
+            timed_out=False,
+            truncated=True,
+            duration_ms=3,
+            workroom_key=key,
+            container_name="fake-container",
+        )
+
+
+async def test_contextual_structured_program_binds_discovery_argv_stdin_and_evidence():
+    workroom = _ProgramWorkroom()
+    adapter = BuiltinShellAdapter(_policy(), workroom=workroom)
+    invocation = _shell_invocation({
+        "workroom_key": "run1.inst1",
+        "program": {
+            "name": "printf",
+            "executable": "/usr/bin/printf",
+            "owner_scope": "image",
+            "argv": ["%s", "hello"],
+            "stdin": "input",
+        },
+        "timeout_seconds": 4.0,
+    })
+
+    result = await adapter.invoke_contextual(invocation)
+
+    assert result.success is True
+    assert workroom.program_calls == [
+        ("run1.inst1", "/usr/bin/printf", ["%s", "hello"], "input", 4.0, "inv-t3")
+    ]
+    assert result.output["exit_code"] == 7
+    assert result.output["stderr"] == "program-error"
+    assert result.output["truncated"] is True
+    assert result.output["execution_kind"] == "program"
+    assert result.output["program_argv"] == ["/usr/bin/printf", "%s", "hello"]
+    assert result.metadata["route_purpose"] == "local"
+
+
+async def test_structured_program_rejects_wrong_discovery_identity_before_execution():
+    workroom = _ProgramWorkroom()
+    adapter = BuiltinShellAdapter(_policy(), workroom=workroom)
+    invocation = _shell_invocation({
+        "workroom_key": "run1.inst1",
+        "program": {
+            "name": "printf",
+            "executable": "/usr/local/bin/printf",
+            "owner_scope": "image",
+            "argv": [],
+        },
+    })
+
+    result = await adapter.invoke_contextual(invocation)
+
+    assert result.success is False
+    assert result.error.code == "shell_program_not_discovered"
+    assert workroom.program_calls == []
+
+
+async def test_structured_program_refuses_required_privilege_without_operator_profile():
+    workroom = _ProgramWorkroom(ProgramStaticMetadata(
+        purposes=["local", "privileged"],
+        required_capabilities=["CAP_NET_RAW"],
+        unsupported_modes=["syn_scan"],
+        unprivileged_alternatives=["connect_scan"],
+        path_status="effective",
+        resolved_path="/usr/bin/printf",
+    ))
+    adapter = BuiltinShellAdapter(_policy(), workroom=workroom)
+    invocation = _shell_invocation({
+        "workroom_key": "run1.inst1",
+        "program": {
+            "name": "printf",
+            "executable": "/usr/bin/printf",
+            "owner_scope": "image",
+            "argv": [],
+        },
+    })
+
+    result = await adapter.invoke_contextual(invocation)
+
+    assert result.success is False
+    assert result.error.code == "shell_program_privilege_unsupported"
+    assert result.metadata["unprivileged_alternatives"] == ["connect_scan"]
+    assert workroom.program_calls == []
+
+
+def test_structured_program_recovery_reference_binds_changed_argv():
+    adapter = BuiltinShellAdapter(_policy(), workroom=_ProgramWorkroom())
+    base = {
+        "workroom_key": "run1.inst1",
+        "program": {
+            "name": "printf",
+            "executable": "/usr/bin/printf",
+            "owner_scope": "image",
+            "argv": ["one"],
+        },
+    }
+    first = adapter.prepare_reference(_shell_invocation(base))
+    changed = dict(base)
+    changed["program"] = {**base["program"], "argv": ["two"]}
+    second = adapter.prepare_reference(_shell_invocation(changed))
+
+    assert first is not None and second is not None
+    assert first.input_digest != second.input_digest
+    assert first.provider_handle["program_sha256"] != second.provider_handle["program_sha256"]
+    assert first.provider_handle["execution_kind"] == "program"
+
+
 def test_binder_protocol_and_prefix():
     adapter = BuiltinShellAdapter(_policy(), workroom=_FakeWorkroom())
     assert isinstance(adapter, InvocationContextBinder)
@@ -1336,7 +1556,7 @@ async def test_supervisor_provisioned_on_create_and_adopt():
     assert await manager.ensure_workroom(key) == name
     tees = [c for c in fake.calls if "tee" in c or "/usr/bin/tee" in c]
     assert tees
-    assert any(".whs-supervisor-v2.py" in a for c in tees for a in c)
+    assert any(".whs-supervisor-v4.py" in a for c in tees for a in c)
     assert any("--user" in c and c[c.index("--user") + 1] == "0" for c in tees)
     sources = [p.stdin.written for p in fake.processes if p.stdin.written]
     assert any(b"_enable_subreaper" in blob for blob in sources)

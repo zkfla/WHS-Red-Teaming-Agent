@@ -93,7 +93,34 @@ async def run(args: argparse.Namespace) -> int:
         for name, counts in accounting.get("usage", {}).items():
             print(f"  {name}: reported sum={counts['known']}; "
                   f"unreported requests={counts['unknown']}")
+        cooldown = accounting.get("provider_cooldown")
+        if cooldown is not None:
+            print("Provider cooldown: "
+                  f"state={cooldown.get('state', 'unknown')}; "
+                  f"consecutive={cooldown.get('consecutive', 0)}; "
+                  f"retry_at={cooldown.get('until', 0)}")
+            failure = cooldown.get("last_failure") or {}
+            if failure:
+                print("  Last provider outcome: "
+                      f"kind={failure.get('kind', 'unknown')}; "
+                      f"status={failure.get('provider_status')}; "
+                      f"code={failure.get('provider_code', 'unknown')}; "
+                      f"retryable={failure.get('retryable')}; "
+                      f"retry_after={failure.get('retry_after')}")
         print("Actual provider cost: unmeasured")
+        for task in getattr(report, "task_request_effectiveness", []) or []:
+            ratio = task.get("external_actions_per_model_request")
+            ratio_text = "unknown" if ratio is None else f"{ratio:.3f}"
+            print(
+                f"  Task {task.get('task_id')}: model={task.get('model_requests', 0)}; "
+                f"tokens={task.get('known_tokens', 0)} known/"
+                f"{task.get('unknown_usage', 0)} unknown; "
+                f"external={task.get('external_actions', 0)}; "
+                f"local_reads={task.get('local_reads', 0)}; repairs={task.get('repairs', 0)}; "
+                f"transport_retries={task.get('transport_retries', 0)}; "
+                f"provider_failures={task.get('provider_failures', 0)}; "
+                f"settlements={task.get('settlements', 0)}; external/model={ratio_text}"
+            )
     if report.work_status_counts:
         print("Work items by status:")
         for status, count in report.work_status_counts.items():
@@ -101,16 +128,33 @@ async def run(args: argparse.Namespace) -> int:
     if report.effective_limits:
         print(f"Applied limits: {report.effective_limits}")
     for execution in report.executions:
-        if execution.get("wait_reason") or execution["state"] == "unknown":
-            print(f"  {execution['task_id']} / {execution['invocation_id']}: "
-                  f"{execution['state']}, wait={execution.get('wait_reason')}, "
-                  f"approval={execution.get('approval_ref')}, job={execution.get('job_ref')}")
+        selection = execution.get("selection") or {}
+        outcome = execution.get("outcome") or {}
+        if selection or outcome or execution.get("wait_reason") or execution["state"] == "unknown":
+            program = outcome.get("executed_program") or selection.get("selected_program")
+            print(
+                f"  {execution['task_id']} / {execution['invocation_id']}: "
+                f"state={execution['state']}; route={selection.get('route') or 'unknown'} "
+                f"({selection.get('route_status', 'unknown')}); "
+                f"program={program or 'unknown'}; "
+                f"result={outcome.get('result_kind') or 'unknown'}; "
+                f"diagnostic={outcome.get('diagnostic_category') or 'none'}; "
+                f"wait={execution.get('wait_reason') or 'none'}"
+            )
+            if outcome.get("resume_condition"):
+                print(f"    Resume condition: {outcome['resume_condition']}")
     print(f"Evidence recorded: {report.evidence_count}")
     if report.candidates:
         candidate_counts: dict[str, int] = {}
         for candidate in report.candidates:
             candidate_counts[candidate.status] = candidate_counts.get(candidate.status, 0) + 1
         print(f"Candidates: {dict(sorted(candidate_counts.items()))}")
+    if report.candidate_finding_promotions:
+        promotion_counts: dict[str, int] = {}
+        for item in report.candidate_finding_promotions:
+            status = str(item.get("status") or "unknown")
+            promotion_counts[status] = promotion_counts.get(status, 0) + 1
+        print(f"Candidate finding promotion: {dict(sorted(promotion_counts.items()))}")
     print(f"Findings: {report.finding_count}")
     if report.pending_approval_id:
         approvals = ApprovalService(FilesystemApprovalStore(args.approval_dir))

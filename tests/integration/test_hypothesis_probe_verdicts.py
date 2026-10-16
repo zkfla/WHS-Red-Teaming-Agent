@@ -72,6 +72,13 @@ async def test_bound_final_verdict_and_stale_purpose_receipt(tmp_path, outcome):
         saved = await service.get_hypothesis("candidate-a")
         assert saved.status == values["status"] and saved.revision == 2
         assert await service.list_findings() == []
+        promotions = await state.candidate_finding_promotions()
+        if outcome == "success":
+            assert len(promotions) == 1
+            assert promotions[0]["status"] == "refused"
+            assert promotions[0]["reason"] == "review_did_not_confirm_security_violation"
+        else:
+            assert promotions == []
         await commit("reopen", {"hypothesis": {**saved.model_dump(), "status": "open"},
                                 "expected_revision": 2})
         with pytest.raises(StateConflict, match="verdict_receipt_unbound"):

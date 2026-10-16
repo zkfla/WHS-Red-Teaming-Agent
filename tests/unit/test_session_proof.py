@@ -9,6 +9,7 @@ from redteam.orchestration.session_proof import (
     collect_actual_accounts,
     collect_actual_sessions,
     has_anonymous_receipt,
+    original_anonymous_receipt_matches,
 )
 
 
@@ -24,6 +25,28 @@ def test_explicit_original_null_is_anonymous_without_a_named_account():
     assert has_anonymous_receipt({}, raw)
     assert not collect_actual_sessions({}, raw)
     assert not collect_actual_accounts({}, raw)
+
+
+def test_top_level_null_is_anonymous_with_empty_custom_headers():
+    raw = {"success": True, "output": {"actual_session_ref": None}}
+    assert original_anonymous_receipt_matches({}, raw, {"request_headers": {}})
+
+
+def test_custom_headers_make_top_level_anonymous_use_unproven():
+    raw = {"success": True, "output": {"actual_session_ref": None}}
+    assert not original_anonymous_receipt_matches(
+        {}, raw, {"request_headers": {"x-api-key": "fixture-key"}}
+    )
+
+
+def test_nested_anonymous_receipt_remains_bound_to_its_own_unit():
+    raw = {"success": True, "output": {
+        "anonymous": {"actual_session_ref": None},
+        "authenticated": {"actual_session_ref": "s-alice"},
+    }}
+    assert original_anonymous_receipt_matches(
+        {}, raw, {"request_headers": {"x-api-key": "fixture-key"}}
+    )
 
 
 @pytest.mark.parametrize("metadata,raw_metadata,success", [

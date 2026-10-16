@@ -10,9 +10,14 @@ import pytest
 
 from redteam.app.web.graph_read import read_graph
 from redteam.attack_graph.hypotheses import prepare_hypothesis_update
-from redteam.core.contracts.execution import ExecutionState
+from redteam.core.contracts.execution import (
+    ExecutionOutcomeProjection,
+    ExecutionSelectionProjection,
+    ExecutionState,
+)
 from redteam.core.contracts.graph import CandidateHypothesis, HypothesisUpdate
 from redteam.core.contracts.llm_policy import LLMRequestPolicy
+from redteam.core.ports.llm import LLMProviderFailure
 from redteam.core.tool_binding import execution_fingerprint
 from redteam.evidence.stores.filesystem import FilesystemEvidenceStore
 from tests.unit.test_central_state import RUN, execution, original, owner, world
@@ -155,6 +160,16 @@ async def test_two_workers_one_running_a_tool_and_one_waiting_for_approval_with_
         proposal_evidence_id=proposal_b[0].record.evidence_id, resource_keys=["session-b"],
         wait_reason="approval", approval_ref="approval-b",
         approval_fingerprint=execution_fingerprint("tool-any", None, {}),
+        selection=ExecutionSelectionProjection(
+            route="target", route_status="target_ready",
+            route_reason_code="target_route_configured", selected_program="curl",
+            program_executable="/usr/bin/curl",
+        ),
+        outcome=ExecutionOutcomeProjection(
+            result_kind="not_executed", diagnostic_category="approval_pending",
+            diagnostic_code="approval_pending", cause_scope="policy_wait",
+            resume_condition="Approve the original fingerprint.",
+        ),
     )
     await state.transaction(lambda tx: tx.record_execution(
         waiting, owner="worker-b", checked=proposal_b, now=100))
@@ -166,6 +181,14 @@ async def test_two_workers_one_running_a_tool_and_one_waiting_for_approval_with_
     assert (a["phase"], a["current_tool"], a["slot_released"]) == ("tool", "tool-any", False)
     assert (b["phase"], b["slot_released"]) == ("waiting_approval", True)
     assert b["wait"] == {"reason": "approval", "approval_ref": "approval-b"}
+    projected, = b["executions"]
+    assert projected["route"] == "target" and projected["route_status"] == "target_ready"
+    assert projected["selected_program"] == "curl"
+    assert projected["result_kind"] == "not_executed"
+    assert projected["diagnostic_category"] == "approval_pending"
+    assert projected["resume_condition"] == "Approve the original fingerprint."
+    assert next(item for item in view["executions"]
+                if item["invocation_id"] == "invocation-b") == projected
     tasks = {t["task_id"]: t for t in view["tasks"]}
     assert tasks["task-a"]["worker"] == "instance-a"
     assert tasks["task-b"]["worker"] is None  # slot returned, task still held by its execution
@@ -179,10 +202,53 @@ async def test_model_phase_and_unknown_outcome_are_never_shown_as_success(tmp_pa
     state, ledger = await bound(tmp_path)
     evidence = FilesystemEvidenceStore(tmp_path / "evidence")
     await owner(state)
-    request = await ledger.reserve(RUN, owner="worker-a", kind="complete_native")
+    request = await ledger.reserve(
+        RUN, owner="worker-a", kind="complete_native", stage="native_action",
+        purpose="worker_decision",
+    )
     await ledger.dispatch(RUN, request)
-    assert by_instance(await graph(state), "instance-a")["phase"] == "model"
-    await ledger.settle(RUN, request, total_tokens=5)
+    during = await graph(state)
+    assert by_instance(during, "instance-a")["phase"] == "model"
+    assert during["llm"]["waiting"] == 1
+    assert during["llm"]["exchanges"][0]["response_state"] == "waiting"
+    assert {"from": "worker:instance-a", "to": "llm", "kind": "model_exchange"} in (
+        during["edges"]
+    )
+    await ledger.settle_provider_outcome(RUN, request, total_tokens=5)
+    await ledger.classify_decision(
+        RUN, request, purpose="worker_external_tool_decision", outcome="accepted",
+        valid=True, made_progress=True,
+    )
+    exchange = (await graph(state))["llm"]["exchanges"][0]
+    assert exchange == {
+        "request_id": request,
+        "sequence": 1,
+        "actor": "worker:instance-a",
+        "owner": "worker-a",
+        "task_id": None,
+        "stage": "native_action",
+        "kind": "complete_native",
+        "purpose": "worker_external_tool_decision",
+        "attempt_kind": "normal",
+        "request_state": "settled",
+        "response_state": "received",
+        "provider_outcome": "success",
+        "provider_status": None,
+        "provider_code": None,
+        "provider_retryable": None,
+        "provider_retry_after": None,
+        "decision_outcome": "accepted",
+        "decision_valid": True,
+        "made_progress": True,
+        "request_content": None,
+        "request_truncated": None,
+        "response_content": None,
+        "response_truncated": None,
+        "tokens": {
+            "input": None, "output": None, "cache_read": None,
+            "cache_write": None, "total": 5,
+        },
+    }
 
     proposal = await original(evidence, "proposal-a")
     intent = execution(proposal_evidence_id=proposal[0].record.evidence_id)
@@ -196,6 +262,57 @@ async def test_model_phase_and_unknown_outcome_are_never_shown_as_success(tmp_pa
     assert worker["phase"] == "outcome_unknown"
     assert worker["tool_states"] == {"unknown": 1}
     assert worker["model_requests"] == 1
+
+
+async def test_provider_failure_details_and_interrupted_requests_are_distinct(tmp_path):
+    state, ledger = await bound(tmp_path)
+    await owner(state)
+    failed = await ledger.reserve(
+        RUN, owner="worker-a", kind="complete_native", stage="native_action",
+        purpose="worker_decision",
+    )
+    await ledger.dispatch(RUN, failed)
+    await ledger.settle_provider_outcome(
+        RUN,
+        failed,
+        failure=LLMProviderFailure(
+            kind="server",
+            http_status=503,
+            provider_code="service_unavailable",
+            retryable=True,
+            retry_after=1.5,
+        ),
+    )
+    interrupted = await ledger.reserve(
+        RUN, owner="worker-a", kind="complete_native", stage="native_action",
+        purpose="worker_decision", attempt_kind="transport_retry",
+    )
+    await ledger.dispatch(RUN, interrupted)
+    assert await ledger.settle_interrupted_dispatch(RUN, interrupted) is True
+
+    view = await graph(state)
+    exchanges = {item["request_id"]: item for item in view["llm"]["exchanges"]}
+    assert view["llm"]["failure_breakdown"] == {"server": 1}
+    assert view["llm"]["failures"] == 1
+    assert view["llm"]["unknown"] == 1
+    assert exchanges[failed]["response_state"] == "failed"
+    assert {
+        key: exchanges[failed][key]
+        for key in (
+            "provider_outcome", "provider_status", "provider_code",
+            "provider_retryable", "provider_retry_after",
+        )
+    } == {
+        "provider_outcome": "server",
+        "provider_status": 503,
+        "provider_code": "service_unavailable",
+        "provider_retryable": True,
+        "provider_retry_after": 1.5,
+    }
+    assert exchanges[interrupted]["response_state"] == "unknown"
+    assert exchanges[interrupted]["provider_outcome"] is None
+    assert exchanges[interrupted]["provider_status"] is None
+    assert exchanges[interrupted]["provider_retryable"] is None
 
 
 async def test_read_is_read_only_and_never_creates_or_changes_a_database(tmp_path):
@@ -218,8 +335,26 @@ async def test_read_is_read_only_and_never_creates_or_changes_a_database(tmp_pat
 
 
 async def test_secret_material_never_appears_in_the_projection(tmp_path):
-    state, _ = await bound(tmp_path)
+    state, ledger = await bound(tmp_path)
     await owner(state)
+    request_id = await ledger.reserve(
+        RUN, owner="worker-a", kind="complete_native",
+    )
+
+    def inject_private_bodies(tx):
+        row = tx.db.execute(
+            "SELECT payload FROM state_requests WHERE run_id=? AND kind='llm_request' "
+            "AND identity=?", (RUN, request_id),
+        ).fetchone()
+        payload = json.loads(row[0])
+        payload.update(prompt="api_key=sk-prompt-secret-123456",
+                       response="api_key=sk-response-secret-123456")
+        tx.db.execute(
+            "UPDATE state_requests SET payload=? WHERE run_id=? AND kind='llm_request' "
+            "AND identity=?", (json.dumps(payload), RUN, request_id),
+        )
+
+    await state.transaction(inject_private_bodies)
     await state.transaction(lambda tx: tx.db.execute(
         "INSERT INTO state_requests VALUES(?,'planner_termination',?,?)",
         (RUN, RUN, json.dumps({"termination": "held",
@@ -227,6 +362,43 @@ async def test_secret_material_never_appears_in_the_projection(tmp_path):
     ))
     text = json.dumps(await graph(state))
     assert "sk-test-secret-value-123456" not in text
+    assert "sk-prompt-secret-123456" not in text
+    assert "sk-response-secret-123456" not in text
+
+
+async def test_redacted_public_prompt_and_response_appear_in_the_projection(tmp_path):
+    state, ledger = await bound(tmp_path)
+    await owner(state)
+    request_id = await ledger.reserve(
+        RUN,
+        owner="worker-a",
+        kind="complete_native",
+        request_payload={
+            "system": "Inspect the captured response",
+            "messages": [{
+                "role": "user",
+                "content": "authorization: Bearer secret-token-value",
+            }],
+        },
+    )
+    await ledger.dispatch(RUN, request_id)
+    await ledger.settle_provider_outcome(
+        RUN,
+        request_id,
+        response_payload={
+            "text": "A public observation is available",
+            "password": "response-secret-value",
+        },
+    )
+
+    exchange = (await graph(state))["llm"]["exchanges"][0]
+    assert "Inspect the captured response" in exchange["request_content"]
+    assert "A public observation is available" in exchange["response_content"]
+    assert exchange["request_truncated"] is False
+    assert exchange["response_truncated"] is False
+    serialized = json.dumps(exchange)
+    assert "secret-token-value" not in serialized
+    assert "response-secret-value" not in serialized
 
 
 @pytest.mark.parametrize("bad", ["../x", "a b", "x" * 200])

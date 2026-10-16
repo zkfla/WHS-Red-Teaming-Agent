@@ -125,3 +125,11 @@ def test_anonymous_completion_receipt_must_belong_to_anonymous_or_request_unit()
         "success": True,
         "output": {"actual_session_ref": None},
     }, {})
+    assert _completion_has_anonymous_receipt({}, {
+        "success": True,
+        "output": {"actual_session_ref": None},
+    }, {"request_headers": {}})
+    assert not _completion_has_anonymous_receipt({}, {
+        "success": True,
+        "output": {"actual_session_ref": None},
+    }, {"request_headers": {"x-api-key": "fixture-key"}})

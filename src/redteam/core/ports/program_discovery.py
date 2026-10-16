@@ -57,6 +57,30 @@ class ProgramExecutionEnvironment(BaseModel):
     unsupported_modes: list[str] = Field(default_factory=list)
     target_execution_verified: Literal[False] = False
     execution_permission_granted: Literal[False] = False
+    inventory: dict = Field(default_factory=dict)
+
+
+def _default_program_purposes() -> list[
+    Literal["local", "target", "install", "privileged"]
+]:
+    return ["local"]
+
+
+class ProgramStaticMetadata(BaseModel):
+    """Image-observed facts and declared constraints, never an execution grant."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    purposes: list[Literal["local", "target", "install", "privileged"]] = Field(
+        default_factory=_default_program_purposes
+    )
+    network_families: list[str] = Field(default_factory=list)
+    network_protocols: list[str] = Field(default_factory=list)
+    required_capabilities: list[str] = Field(default_factory=list)
+    unsupported_modes: list[str] = Field(default_factory=list)
+    unprivileged_alternatives: list[str] = Field(default_factory=list)
+    path_status: Literal["effective", "shadowed", "off_path", "instance"]
+    resolved_path: str | None = None
+    execution_characteristics: dict[str, str] = Field(default_factory=dict)
 
 
 class ProgramExecutionDiscovery(Protocol):
@@ -130,6 +154,9 @@ class ProgramRecord(Protocol):
 
     @property
     def provenance(self) -> str | None: ...
+
+    @property
+    def metadata(self) -> ProgramStaticMetadata | None: ...
 
 
 class ShellProgramDiscovery(Protocol):

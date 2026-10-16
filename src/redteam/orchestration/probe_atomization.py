@@ -41,9 +41,11 @@ from redteam.core.ids import new_id
 from redteam.orchestration.diagnostics import DecisionDiagnostic, safe_feedback
 from redteam.orchestration.planner_context import PlannerContextRequest
 from redteam.orchestration.specialist_tasks import (
+    CriterionHypothesisReferenceError,
     HypothesisProbeProposal,
     ProbeTaskProposal,
     SpecialistProposalError,
+    bind_hypothesis_criterion_references,
     validate_probe_subjects,
 )
 
@@ -127,6 +129,20 @@ _PURPOSE_SUMMARY = (
     "needs that relation, list the captured or proposed candidate there. "
     "Do not invent refs or remove required purpose; correct the location named in the diagnostic."
 )
+
+
+def _missing_hypothesis_criterion_summary(candidate_count: int) -> str:
+    if candidate_count == 0:
+        return (
+            "A hypothesis confirmation/refutation criterion needs a linked candidate. If it "
+            "is new, declare it in updates; then list its local ID in candidate_refs and set "
+            "hypothesis_id at the location named in the diagnostic."
+        )
+    return (
+        "A hypothesis confirmation/refutation criterion needs one intended candidate. Set "
+        "hypothesis_id to a candidate already in this question's candidate_refs at the "
+        "location named in the diagnostic."
+    )
 
 
 _SUBJECT_SUMMARY = (
@@ -450,6 +466,26 @@ def post_update_candidates(
     return views
 
 
+def _require_initial_candidate_for_proposed_investigation(
+    *, enabled: bool, snapshot: PlanningSnapshot,
+    updates: list[HypothesisUpdate], draft: HypothesisPlanDraft,
+    questions: list[PlannedInvestigationQuestion], targets: set[str],
+) -> None:
+    """Require an initial premise only for a validated, continuing investigation."""
+    has_captured_question_target = any(
+        target in targets for question in questions for target in question.target_node_ids
+    )
+    if (
+        enabled
+        and not snapshot.candidates
+        and not updates
+        and draft.termination == "continue"
+        and questions
+        and has_captured_question_target
+    ):
+        raise AtomizationProposalError("candidate_inventory_empty_requires_new_candidate")
+
+
 def bind_plan(
     draft: HypothesisPlanDraft,
     snapshot: PlanningSnapshot,
@@ -459,6 +495,7 @@ def bind_plan(
     principals: set[str],
     max_tasks: int,
     existing_work_validator: Callable[[list[str], dict[str, int]], set[str]] | None = None,
+    require_initial_candidate: bool = False,
 ) -> tuple[list[HypothesisUpdate] | None, list[PlannedInvestigationQuestion], dict[str, int]]:
     """Resolve local references for stage-1 updates+questions without mutating originals.
 
@@ -476,9 +513,14 @@ def bind_plan(
         draft.questions, snapshot, issued=issued, targets=targets, principals=principals,
         versions=versions, candidate_views=post_update_candidates(snapshot, updates),
     )
-    return _finish_plan_judgment(
+    result = _finish_plan_judgment(
         draft, updates, questions, versions, snapshot, existing_work_validator,
     )
+    _require_initial_candidate_for_proposed_investigation(
+        enabled=require_initial_candidate, snapshot=snapshot, updates=updates,
+        draft=draft, questions=questions, targets=targets,
+    )
+    return result
 
 
 def _bind_plan_questions(
@@ -535,8 +577,34 @@ def _bind_plan_questions(
                 location=f"$.questions[{question_index}].source_question_id",
                 summary=followup_summary,
             )
+        canonical_criteria = [item.model_copy(update={
+            "hypothesis_id": (
+                issued.get(item.hypothesis_id, item.hypothesis_id)
+                if item.hypothesis_id is not None else None),
+        }) for item in question.completion_criteria]
+        try:
+            resolved_criteria = bind_hypothesis_criterion_references(
+                canonical_criteria, revisions.keys(),
+            )
+        except CriterionHypothesisReferenceError as error:
+            location = (
+                f"$.questions[{question_index}].completion_criteria"
+                f"[{error.condition_index}].hypothesis_id"
+            )
+            if error.reason == "outside":
+                raise _plan_rejection(
+                    "plan_question_criterion_outside_purpose",
+                    location=location,
+                    summary=_PURPOSE_SUMMARY.format(field=relation_field),
+                ) from error
+            raise _plan_rejection(
+                "plan_question_criterion_hypothesis_reference_required",
+                location=location,
+                summary=_missing_hypothesis_criterion_summary(error.candidate_count),
+            ) from error
+
         seen_criteria = set()
-        for condition_index, item in enumerate(question.completion_criteria):
+        for condition_index, item in enumerate(resolved_criteria):
             identity = criterion_id(item)
             if identity in seen_criteria:
                 raise _plan_rejection(
@@ -545,7 +613,7 @@ def _bind_plan_questions(
                     summary=_DUPLICATE_SUMMARY,
                 )
             seen_criteria.add(identity)
-        for condition_index, condition in enumerate(question.completion_criteria):
+        for condition_index, condition in enumerate(resolved_criteria):
             if not condition.is_known() or not condition.description.strip():
                 raise _condition_rejection(
                     question_index=question_index, condition_index=condition_index,
@@ -558,21 +626,6 @@ def _bind_plan_questions(
                               f".completion_criteria[{condition_index}].principal_refs"),
                     summary=_PRINCIPAL_SUMMARY,
                 )
-            hypothesis_ref = condition.hypothesis_id or ""
-            if hypothesis_ref and issued.get(
-                hypothesis_ref, hypothesis_ref
-            ) not in revisions:
-                raise _plan_rejection(
-                    "plan_question_criterion_outside_purpose",
-                    location=(f"$.questions[{question_index}]"
-                              f".completion_criteria[{condition_index}].hypothesis_id"),
-                    summary=_PURPOSE_SUMMARY.format(field=relation_field),
-                )
-        resolved_criteria = [condition.model_copy(update={
-            "hypothesis_id": (
-                issued.get(condition.hypothesis_id, condition.hypothesis_id)
-                if condition.hypothesis_id is not None else None),
-        }) for condition in question.completion_criteria]
         conflicts = completion_condition_conflicts(resolved_criteria)
         if conflicts:
             raise AtomizationProposalError(
@@ -677,6 +730,7 @@ def bind_plan_selection(
     principals: set[str],
     max_tasks: int,
     existing_work_validator: Callable[[list[str], dict[str, int]], set[str]] | None = None,
+    require_initial_candidate: bool = False,
 ) -> tuple[HypothesisPlanDraft, list[HypothesisUpdate] | None,
            list[PlannedInvestigationQuestion], dict[str, int]]:
     """Wire-to-canonical stage-1 binding: (canonical draft, updates_or_None, questions, versions).
@@ -706,6 +760,10 @@ def bind_plan_selection(
     )
     finished_updates, questions, versions = _finish_plan_judgment(
         draft, updates, questions, versions, snapshot, existing_work_validator,
+    )
+    _require_initial_candidate_for_proposed_investigation(
+        enabled=require_initial_candidate, snapshot=snapshot, updates=updates,
+        draft=draft, questions=questions, targets=targets,
     )
     return draft, finished_updates, questions, versions
 
@@ -835,6 +893,17 @@ def validate_atomized_tasks(
             if child.probe_limits is not None and limits is not None and (
                 child.probe_limits.max_actions > limits.max_actions
                 or child.probe_limits.max_model_requests > limits.max_model_requests
+                or (
+                    child.probe_limits.max_repair_requests is not None
+                    and limits.max_repair_requests is not None
+                    and child.probe_limits.max_repair_requests > limits.max_repair_requests
+                )
+                or (
+                    child.probe_limits.max_consecutive_provider_failures is not None
+                    and limits.max_consecutive_provider_failures is not None
+                    and child.probe_limits.max_consecutive_provider_failures
+                    > limits.max_consecutive_provider_failures
+                )
             ):
                 raise reject("probe_limits_exceed_profile", "probe_limits",
                              repair="Use limits within the supplied profile.")

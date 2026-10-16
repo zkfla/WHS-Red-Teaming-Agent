@@ -63,3 +63,36 @@ def test_manifest_uses_installed_image_and_only_fetches_index_when_enabled(
     assert manifest["origin_unresolved"] == (["bind9-dnsutils==fixture-version"] if offline else [])
     assert manifest["programs"][0]["origin"] == (None if offline else "kali-rolling/main")
     assert manifest["programs"][0]["executables"][0]["command"] == "dig"
+    assert "generated_at" not in manifest
+
+    # The same immutable-image observations produce byte-identical JSON.
+    calls.clear()
+    second = tmp_path / "programs-second.json"
+    argv[argv.index(str(output))] = str(second)
+    monkeypatch.setattr("sys.argv", argv)
+    assert generator.main() == 0
+    assert second.read_bytes() == output.read_bytes()
+    assert calls == expected
+
+
+def test_path_shadowing_and_duplicate_identity_are_explicit():
+    script = (Path(__file__).resolve().parents[2]
+              / "deploy/docker/shell-workroom/generate-manifest.py")
+    spec = importlib.util.spec_from_file_location("shell_manifest_path_fixture", script)
+    assert spec is not None and spec.loader is not None
+    generator = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(generator)
+    rows = [{"executables": [
+        {"command": "tool", "path": "/usr/bin/tool",
+         "resolved_path": "/usr/local/bin/tool"},
+        {"command": "local", "path": "/usr/bin/local",
+         "resolved_path": "/usr/bin/local"},
+        {"command": "off", "path": "/opt/off", "resolved_path": None},
+    ]}]
+    annotated = generator._annotate_path_status(rows)
+    assert [row["path_status"] for row in annotated[0]["executables"]] == [
+        "shadowed", "effective", "off_path",
+    ]
+    annotated[0]["executables"].append(dict(annotated[0]["executables"][0]))
+    with pytest.raises(RuntimeError, match="duplicate executable"):
+        generator._annotate_path_status(annotated)

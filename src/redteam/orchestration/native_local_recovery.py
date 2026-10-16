@@ -54,6 +54,23 @@ async def prior_result(deps, runtime, call, binding):
     return None
 
 
+def recorded_progress(record):
+    """Restore the exact tri-state request disposition from a hashed local receipt.
+
+    Receipts written before this field existed remain unknown; recovery must not
+    turn that missing history into a positive progress classification.
+    """
+    if "made_progress" not in record.metadata:
+        return None
+    value = record.metadata["made_progress"]
+    if value is not None and type(value) is not bool:
+        raise DecisionRuleError(
+            "The local tool receipt has an invalid progress disposition.",
+            code="worker_session_local_receipt_invalid",
+        )
+    return value
+
+
 async def record_submission(deps, runtime, call, binding):
     if binding is None:
         return

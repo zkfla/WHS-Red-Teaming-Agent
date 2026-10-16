@@ -23,6 +23,7 @@ from redteam.core.contracts.tool import EXECUTION_STARTED_METADATA_KEY
 from redteam.core.enums import EvidenceSourceType
 from redteam.core.ids import ActionId, EvidenceId, ToolId, new_id
 from redteam.core.ports.llm import NativeCompletion
+from redteam.core.request_scope import RequestPurpose
 from redteam.orchestration.agents.base import PlanStep
 from redteam.orchestration.candidates.compiler import CandidateCompiler
 from redteam.orchestration.candidates.models import CandidateDraft
@@ -429,8 +430,16 @@ async def model_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             role_id=role_id,
         )
         if response.protocol_error:
+            await engine.client.classify_last_request(
+                budget, purpose="worker_decision", outcome="protocol_rejected",
+                valid=False, made_progress=False,
+            )
             raise ValueError("native provider protocol: " + response.protocol_error)
         if len({call.call_id for call in response.tool_calls}) != len(response.tool_calls):
+            await engine.client.classify_last_request(
+                budget, purpose="worker_decision", outcome="protocol_rejected",
+                valid=False, made_progress=False,
+            )
             raise ValueError("native provider repeated a call ID in one response")
         calls = []
         for requested in response.tool_calls:
@@ -440,10 +449,12 @@ async def model_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 tool_id=bindings.get(requested.name, ""),
                 arguments=requested.arguments,
                 argument_error=requested.argument_error,
+                decision_request_id=budget.last_request_id,
             )
             if call.argument_error or not call.tool_id:
                 call.feedback = {"ok": False, "error": call.argument_error or "unknown tool"}
                 call.completed = True
+                call.made_progress = False
             elif deps.local_tools.get(call.tool_id) is None:
                 try:
                     await _bind_call(call, deps=deps, runtime=runtime, context=context)
@@ -453,7 +464,41 @@ async def model_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                         "error": diagnostic_for_exception(exc, stage="native_binding").feedback(),
                     }
                     call.completed = True
+                    call.made_progress = False
             calls.append(call)
+        valid_calls = [call for call in calls if not call.completed or call.dispatch is not None]
+        for call in valid_calls:
+            call.decision_valid = True
+        if calls:
+            purpose: RequestPurpose = "worker_decision"
+            if any(call.dispatch is not None for call in valid_calls):
+                purpose = "worker_external_tool_decision"
+            else:
+                descriptors = [
+                    deps.local_tools.descriptor(call.tool_id) for call in valid_calls
+                ]
+                if any(
+                    descriptor is not None and descriptor.decision_kind == "settlement"
+                    for descriptor in descriptors
+                ):
+                    purpose = "worker_settlement"
+                elif descriptors and all(
+                    descriptor is not None and descriptor.decision_kind == "local_read"
+                    for descriptor in descriptors
+                ):
+                    purpose = "worker_local_read_decision"
+            outcome = "accepted"
+            if not valid_calls:
+                if any(call.argument_error for call in calls):
+                    outcome = "invalid_tool_arguments"
+                elif any(not call.tool_id for call in calls):
+                    outcome = "unknown_tool"
+                else:
+                    outcome = "invalid_tool_call"
+            await engine.client.classify_last_request(
+                budget, purpose=purpose, outcome=outcome,
+                valid=bool(valid_calls), made_progress=False if not valid_calls else None,
+            )
         # Only normalized, masked public messages are retained. Raw results
         # belong to EvidenceStore; provider reasoning is never retained.
         # The bounded public assistant text is preserved (masked), never
@@ -484,6 +529,10 @@ async def model_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             # investigation, never an implicit success. Terminate cleanly
             # instead of nudging the model until the step/stall ceiling.
             runtime.termination_reason = TerminationReason.INVESTIGATION_HELD
+            await engine.client.classify_last_request(
+                budget, purpose="worker_text_only_held", outcome="text_only_held",
+                valid=True, made_progress=False,
+            )
         # Echo the opaque provider continuation onto the checkpointed assistant
         # message only. Never merged into content or tool_calls; empty stays
         # absent for backward compatibility. No redaction here.
@@ -540,6 +589,9 @@ async def _local_call(call: NativeCallState, state: GraphState, *, deps: Runtime
         return
     if previous is not None:
         call.feedback, call.evidence_ids = previous.metadata["result"], [str(previous.evidence_id)]
+        from redteam.orchestration.native_local_recovery import recorded_progress
+
+        call.made_progress = recorded_progress(previous)
         call.arguments, call.completed = None, True
         state["native_outcome"] = (call.feedback.get("runtime_outcome")
                                    or state.get("native_outcome"))
@@ -566,6 +618,32 @@ async def _local_call(call: NativeCallState, state: GraphState, *, deps: Runtime
             ),
         )
         call.feedback = _safe(asdict(result))
+        descriptor = deps.local_tools.descriptor(call.tool_id)
+        if descriptor is not None and descriptor.decision_kind == "local_read":
+            records = await deps.evidence_store.list_for_run(runtime.run_id)
+            previous = [
+                record for record in records
+                if record.metadata.get("record_kind") == "runtime_tool_result"
+                and record.metadata.get("mission_task_id") == str(runtime.active_task_id)
+                and record.metadata.get("tool_id") == call.tool_id
+                and isinstance(record.metadata.get("call_binding"), dict)
+                and record.metadata["call_binding"].get("arguments_hash")
+                == (binding or {}).get("arguments_hash")
+            ]
+            unchanged = next(
+                (record for record in reversed(previous)
+                 if record.metadata.get("result") == call.feedback),
+                None,
+            )
+            if unchanged is not None:
+                # Deliver the earlier frozen display byte-for-byte. The new
+                # call/result pairing remains explicit, but it is not progress.
+                call.feedback = copy.deepcopy(unchanged.metadata["result"])
+                call.made_progress = False
+            else:
+                call.made_progress = True
+        else:
+            call.made_progress = True
         if result.last_event_id is not None:
             state["last_event_id"] = result.last_event_id
         if result.ok:
@@ -600,6 +678,7 @@ async def _local_call(call: NativeCallState, state: GraphState, *, deps: Runtime
             "mission_id": str(runtime.mission_id) if runtime.mission_id else None,
             "mission_task_id": str(runtime.active_task_id) if runtime.active_task_id else None,
             "result": call.feedback,
+            "made_progress": call.made_progress,
         }
     )
     # Preserve opaque call IDs and their binding; neither contains public text.
@@ -659,8 +738,11 @@ async def tools_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             if previous is None and boundary:
                 call.feedback = {"ok": False, "executed": False, "reason_code": boundary}
                 call.completed = True
+                call.made_progress = False
                 continue
             state = await run_call(call, state, deps)
+            if call.completed:
+                call.made_progress = True
     for call in calls:
         if call.completed:
             call.arguments, call.dispatch = None, None
@@ -671,7 +753,11 @@ async def restore_completed_calls(state, *, deps):
     """Read verified canonical outcomes after a checkpoint lag; never submit."""
     from redteam.orchestration.central_completion import unsafe
     from redteam.orchestration.execution_journal import preserved_result
-    from redteam.orchestration.native_local_recovery import call_binding, prior_result
+    from redteam.orchestration.native_local_recovery import (
+        call_binding,
+        prior_result,
+        recorded_progress,
+    )
 
     runtime = state["runtime"]
     for call in state.get("native_calls", []):
@@ -685,6 +771,7 @@ async def restore_completed_calls(state, *, deps):
             if prior is not None:
                 call.feedback = prior.metadata["result"]
                 call.evidence_ids = [str(prior.evidence_id)]
+                call.made_progress = recorded_progress(prior)
                 call.completed, call.arguments = True, None
                 state["native_outcome"] = (call.feedback.get("runtime_outcome")
                                            or state.get("native_outcome"))
@@ -724,6 +811,7 @@ async def restore_completed_calls(state, *, deps):
                     })
                 call.evidence_ids = ([str(prior.result_evidence_id)]
                                      if prior.result_evidence_id else [])
+                call.made_progress = True
                 call.completed, call.arguments, call.dispatch = True, None, None
     return state
 
@@ -731,6 +819,22 @@ async def restore_completed_calls(state, *, deps):
 async def append_completed_results(state, *, deps):
     calls = state.get("native_calls", [])
     if calls and all(call.completed for call in calls):
+        valid_calls = [call for call in calls if call.decision_valid]
+        request_ids = {
+            call.decision_request_id for call in valid_calls if call.decision_request_id
+        }
+        if len(request_ids) == 1:
+            request_id = request_ids.pop()
+            dispositions = [call.made_progress for call in valid_calls]
+            progress = (
+                True if any(value is True for value in dispositions) else
+                False if dispositions and all(value is False for value in dispositions) else
+                None
+            )
+            if progress is not None:
+                await deps.central_state.request_ledger().mark_progress(
+                    str(state["runtime"].run_id), request_id, made_progress=progress,
+                )
         new_results = [
             *({"role": "tool", "tool_call_id": call.call_id,
                "content": json.dumps({**call.feedback, "evidence_ids": call.evidence_ids})}

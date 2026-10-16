@@ -19,6 +19,10 @@ def _cause() -> DecisionDiagnostic:
         attempts=2,
         summary="provider throttled the request",
         provider_status=429,
+        provider_code="rate_limit",
+        retryable=True,
+        retry_after=2.5,
+        repair_condition="Wait for the provider cooldown and retry this Run.",
         location="$.responses[0]",
         validation_issues=[{"rule": "schema_required_field", "location": "$.mode"}],
     )
@@ -63,6 +67,9 @@ def test_view_flattens_nested_cause_to_shallow_scalars() -> None:
     assert view["rule"] == "schema_required_field"
     assert view["location"] == "$.responses[0]"
     assert view["provider_status"] == 429
+    assert view["provider_code"] == "rate_limit"
+    assert view["retryable"] is True and view["retry_after"] == 2.5
+    assert "provider cooldown" in view["repair_condition"]
     assert view["cause_code"] == "provider_rate_limited"
     assert "provider_rate_limited" in view["label"]
     assert "status 429" in view["label"]
@@ -103,6 +110,8 @@ def test_tail_carries_flattened_cause_fields() -> None:
     assert projected["rule"] == "schema_required_field"
     assert projected["location"] == "$.responses[0]"
     assert projected["provider_status"] == 429
+    assert projected["provider_code"] == "rate_limit"
+    assert projected["retryable"] is True and projected["retry_after"] == 2.5
     assert projected["cause_code"] == "provider_rate_limited"
     assert projected["code"] == "conversation_failed"
     assert projected["attempts"] == 3

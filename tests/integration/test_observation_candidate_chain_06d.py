@@ -11,6 +11,7 @@ import pytest
 
 from redteam.attack_graph.hypotheses import hypothesis_purpose
 from redteam.attack_graph.service import AttackGraphService
+from redteam.attack_graph.stores.central import GraphTransaction
 from redteam.core.enums import MissionStatus, TaskStatus
 from redteam.core.ids import EngagementId, EvidenceId, RunId
 from redteam.llm.fake import FakeLLMClient
@@ -157,6 +158,7 @@ async def test_observation_review_receipt_then_planner_judgment_admits_only_exac
         assert receipt.metadata["candidate_purpose_hash"] == content_hash(
             hypothesis_purpose(current))
         assert receipt.metadata["hypothesis_outcome"] == outcome
+        assert await service.list_findings() == []
 
         if outcome == "unknown":
             # UNKNOWN never admits a verdict: the Planner holds and a confirmation is rejected.
@@ -202,7 +204,26 @@ async def test_observation_review_receipt_then_planner_judgment_admits_only_exac
         assert meta["hypothesis_outcome"] == outcome
         saved = await service.get_hypothesis(current.hypothesis_id)
         assert saved.revision == 2 and saved.status == status
-        assert await service.list_findings() == []
+        findings = await service.list_findings()
+        promotions = await session.deps.central_state.candidate_finding_promotions()
+        if outcome == "success":
+            assert len(findings) == 1
+            finding = findings[0]
+            assert finding.verified is True
+            assert set(finding.evidence_ids) == {
+                str(source.evidence_id), str(receipt.evidence_id),
+            }
+            assert finding.metadata["hypothesis_id"] == current.hypothesis_id
+            assert finding.metadata["review_receipt_id"] == str(receipt.evidence_id)
+            assert finding.metadata["candidate_pre_verdict_revision"] == 1
+            assert finding.metadata["candidate_revision"] == 2
+            assert finding.metadata["target"] == TARGET
+            assert len(promotions) == 1
+            assert promotions[0]["status"] == "promoted"
+            assert promotions[0]["finding_id"] == finding.finding_id
+        else:
+            assert findings == []
+            assert promotions == []
         mission = await session.deps.central_state.get_mission(session.runtime.mission_id)
         assert mission.status is MissionStatus.ACTIVE
         # A receipt bound to revision 1 cannot admit a judgment against revision 2.
@@ -218,6 +239,71 @@ async def test_observation_review_receipt_then_planner_judgment_admits_only_exac
 async def _receipts(session):
     records = await session.deps.evidence_store.list_for_run(session.runtime.run_id)
     return [item for item in records if item.metadata.get("record_kind") == "review_receipt"]
+
+
+async def test_exact_confirmation_replay_keeps_one_v2_finding(tmp_path):
+    opening = {"updates": [candidate()], "tasks": [probe(candidate="local")],
+               "reason": "Observe the candidate's smallest uncertainty"}
+    async with selection(tmp_path, llm=ChainLLM([opening])) as (session, llm, tools):
+        service = AttackGraphService(session.deps.graph_store)
+        current, source = await _observe_candidate(session, llm)
+        verifier = StructuredLLMAnalysisVerifier(
+            MeaningLLM([_meaning("success")]), session.deps.evidence_store, service,
+        )
+        receipt = await _receipt(session, await _graph_record(
+            session, verifier, candidate_id=current.hypothesis_id, source=source,
+        ))
+        judged = candidate(
+            current=current.model_dump(mode="json"), status="confirmed",
+            evidence=[str(source.evidence_id)], review=str(receipt.evidence_id),
+        )
+
+        first = await _commit(session, "exact-confirm", judged)
+        replay = await _commit(session, "exact-confirm", judged)
+
+        assert replay == first
+        assert (await service.get_hypothesis(current.hypothesis_id)).revision == 2
+        assert len(await service.list_findings()) == 1
+        assert len(await session.deps.central_state.candidate_finding_promotions()) == 1
+
+
+@pytest.mark.parametrize("after_finding_write", [False, True])
+async def test_v2_finding_failure_rolls_back_candidate_and_retry_converges(
+    tmp_path, monkeypatch, after_finding_write,
+):
+    opening = {"updates": [candidate()], "tasks": [probe(candidate="local")],
+               "reason": "Observe the candidate's smallest uncertainty"}
+    async with selection(tmp_path, llm=ChainLLM([opening])) as (session, llm, tools):
+        service = AttackGraphService(session.deps.graph_store)
+        current, source = await _observe_candidate(session, llm)
+        verifier = StructuredLLMAnalysisVerifier(
+            MeaningLLM([_meaning("success")]), session.deps.evidence_store, service,
+        )
+        receipt = await _receipt(session, await _graph_record(
+            session, verifier, candidate_id=current.hypothesis_id, source=source,
+        ))
+        judged = candidate(
+            current=current.model_dump(mode="json"), status="confirmed",
+            evidence=[str(source.evidence_id)], review=str(receipt.evidence_id),
+        )
+        original = GraphTransaction.save_finding
+
+        def fail(self, *args, **kwargs):
+            if after_finding_write:
+                original(self, *args, **kwargs)
+            raise RuntimeError("simulated candidate/finding transaction crash")
+
+        monkeypatch.setattr(GraphTransaction, "save_finding", fail)
+        with pytest.raises(RuntimeError, match="simulated"):
+            await _commit(session, "atomic-confirm", judged)
+        assert (await service.get_hypothesis(current.hypothesis_id)).revision == 1
+        assert await service.list_findings() == []
+        assert await session.deps.central_state.candidate_finding_promotions() == []
+
+        monkeypatch.setattr(GraphTransaction, "save_finding", original)
+        await _commit(session, "atomic-confirm", judged)
+        assert (await service.get_hypothesis(current.hypothesis_id)).revision == 2
+        assert len(await service.list_findings()) == 1
 
 
 @pytest.mark.parametrize("shape", ["new_proposal", "other_candidate"])

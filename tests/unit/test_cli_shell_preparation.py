@@ -16,6 +16,7 @@ from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
 from redteam.capability.settings import (
     MCPConfigurationError,
     automatic_shell_setup_from_environment,
+    shell_image_profile_from_environment,
 )
 from redteam.capability.shell_policy import ShellWorkroomPolicy
 from redteam.capability.shell_runtime import prepare_shell_runtime
@@ -97,6 +98,18 @@ def test_auto_setup_defaults_enabled_and_invalid_values_are_bounded():
             }
         )
     assert "secret-invalid-value" not in str(caught.value)
+
+
+def test_managed_image_profile_is_explicit_and_bounded():
+    assert shell_image_profile_from_environment(source={}) == "baseline"
+    assert shell_image_profile_from_environment(
+        source={"REDTEAM_SHELL_IMAGE_PROFILE": "kali-default"}
+    ) == "kali-default"
+    with pytest.raises(MCPConfigurationError) as caught:
+        shell_image_profile_from_environment(
+            source={"REDTEAM_SHELL_IMAGE_PROFILE": "secret-unknown-profile"}
+        )
+    assert "secret-unknown-profile" not in str(caught.value)
 
 
 async def test_prepared_manifest_reaches_no_argument_program_discovery(monkeypatch, tmp_path):

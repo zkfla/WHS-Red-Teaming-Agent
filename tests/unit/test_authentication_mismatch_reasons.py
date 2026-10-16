@@ -116,6 +116,11 @@ CASES: list[Any] = [
         id="baseline_receipt_wrong_session",
     ),
     pytest.param(
+        "baseline_request_headers_ambiguous",
+        {"baseline_args": {"request_headers": {"X-Api-Key": "fixture-key"}}},
+        id="baseline_custom_headers",
+    ),
+    pytest.param(
         "request_actual_session_receipt_mismatch",
         {"current_output": {"status_code": 200}},
         id="current_receipt_missing",
@@ -167,6 +172,7 @@ async def _assess(case: dict[str, Any], *, status: int | None = 200) -> Authenti
             "baseline_output", {"status_code": 401, "actual_session_ref": None}
         ),
     }
+    baseline_meta["proposal"] = {"arguments": case.get("baseline_args", {})}
     baseline = _record(
         "ev-base",
         metadata=baseline_meta,
@@ -269,6 +275,10 @@ async def test_the_first_failed_condition_is_the_reported_reason() -> None:
     [
         pytest.param({"args": {"session_ref": "sk-live-SECRET-VALUE-123"}}, id="session"),
         pytest.param({"observation": {"path": "/sk-live-SECRET-VALUE-123"}}, id="path"),
+        pytest.param(
+            {"baseline_args": {"request_headers": {"X-Api-Key": "sk-live-SECRET-VALUE-123"}}},
+            id="custom-header",
+        ),
     ],
 )
 async def test_provided_values_are_never_echoed_in_the_assessment(case: dict[str, Any]) -> None:

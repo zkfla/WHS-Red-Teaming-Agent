@@ -168,6 +168,74 @@ def test_continue_accepts_new_tasks_or_questions():
     assert updates == [] and len(questions) == 1
 
 
+def test_empty_inventory_requires_candidate_only_for_captured_continuing_investigation():
+    snapshot = _snapshot()
+    legacy = HypothesisDecision(
+        reason="No candidate was proposed", termination="held",
+        resume_conditions=["A captured target observation becomes available"],
+    )
+    assert bind_decision(
+        legacy, snapshot, issued={}, targets={TARGET}, principals=set(), roles={ROLE},
+        max_tasks=4, limits=ProbeLimits(), require_initial_candidate=True,
+    ) is None
+
+    split = _plan_draft(
+        reason="No candidate was proposed", termination="held",
+        resume_conditions=["A captured target observation becomes available"],
+    )
+    updates, questions, _ = bind_plan(
+        split, snapshot, issued={}, targets={TARGET}, principals=set(), max_tasks=4,
+        existing_work_validator=_witness_validator(snapshot), require_initial_candidate=True,
+    )
+    assert updates is None and questions == []
+
+    task = ProbeTaskProposal.model_validate({
+        "task_key": "probe-initial", "title": "Observe response", "objective": "Inspect response",
+        "role_id": ROLE, "target_node_ids": [TARGET],
+        "completion_criteria": [{"kind": "observation", "description": "Inspect response"}],
+    })
+    with pytest.raises(HypothesisProposalError) as legacy_error:
+        bind_decision(
+            HypothesisDecision(tasks=[task], reason="Continue the captured investigation"),
+            snapshot, issued={}, targets={TARGET}, principals=set(), roles={ROLE},
+            max_tasks=4, limits=ProbeLimits(), require_initial_candidate=True,
+        )
+    assert legacy_error.value.code == "candidate_inventory_empty_requires_new_candidate"
+
+    question = PlannedInvestigationQuestion.model_validate({
+        "question_id": "q-initial", "objective": "Inspect the response",
+        "target_node_ids": [TARGET],
+        "completion_criteria": [{"kind": "observation", "description": "Inspect response"}],
+    })
+    with pytest.raises(AtomizationProposalError) as split_error:
+        bind_plan(
+            _plan_draft(questions=[question.model_dump(mode="json")]), snapshot,
+            issued={}, targets={TARGET}, principals=set(), max_tasks=4,
+            existing_work_validator=_witness_validator(snapshot), require_initial_candidate=True,
+        )
+    assert split_error.value.code == "candidate_inventory_empty_requires_new_candidate"
+
+    new_candidate = _candidate("proposal-local")
+    update = HypothesisUpdate(hypothesis=new_candidate, expected_revision=None)
+    task = task.model_copy(update={
+        "hypothesis_revisions": {"proposal-local": 1},
+    })
+    accepted = bind_decision(
+        HypothesisDecision(
+            updates=[update], tasks=[task], reason="Continue the captured investigation",
+        ),
+        snapshot,
+        issued={},
+        targets={TARGET},
+        principals=set(),
+        roles={ROLE},
+        max_tasks=4,
+        limits=ProbeLimits(),
+        require_initial_candidate=True,
+    )
+    assert accepted is not None and len(accepted.updates) == 1
+
+
 @pytest.mark.parametrize("status,owner", [
     (TaskStatus.READY, None),
     (TaskStatus.RUNNING, "run-a:instance:worker-a"),
@@ -330,6 +398,13 @@ def test_replan_related_reads_stay_candidate_local_and_diagnostic_names_disposit
 
 class _FakeRuntime:
     run_id = "run-a"
+    engagement_id = "engagement-a"
+    mission_id = "mission-a"
+    current_goal = None
+    started_at = NOW
+    component_binding = None
+    llm_request_policy = None
+    remaining_budget = None
 
     def model_copy(self, *, deep=False, update=None):
         return SimpleNamespace(**(update or {}))

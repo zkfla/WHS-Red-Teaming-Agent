@@ -91,6 +91,36 @@ async def test_candidate_projection_is_not_a_finding_or_mission_verdict() -> Non
     assert "separate from Task completion" in markdown
 
 
+async def test_markdown_projects_safe_provider_cooldown_state() -> None:
+    from redteam.app.cli.commands.report import _render_markdown
+
+    projection = await ReportingAgent().project(
+        RuntimeState(
+            run_id=RunId("run"), engagement_id=EngagementId("eng"),
+            phase=AgentPhase.FAILED, termination_reason="planning_error",
+        ),
+        graph=AttackGraphService(InMemoryAttackGraphStore()),
+        evidence_store=FakeEvidenceStore(), work_store=InMemoryWorkStore(),
+    )
+    projection.llm_request_accounting = {
+        "policy": {"mode": "bounded", "max_requests": 10},
+        "spent": 1, "reserved": 0, "known_tokens": 0, "unknown_usage": 1,
+        "by_stage": {}, "usage": {},
+        "provider_cooldown": {
+            "version": 2, "state": "cooldown", "generation": 1,
+            "consecutive": 1, "until": 123.0, "recovery_request_id": None,
+            "last_failure": {
+                "kind": "rate_limited", "provider_status": 429,
+                "provider_code": "rate_limit", "retryable": True, "retry_after": 2.5,
+            },
+        },
+    }
+
+    markdown = _render_markdown(projection)
+    assert "Provider cooldown: state=cooldown; consecutive=1; retry_at=123.0" in markdown
+    assert "kind=rate_limited; status=429; code=rate_limit" in markdown
+
+
 async def test_reporting_preserves_operational_diagnostic_in_json_and_markdown() -> None:
     from redteam.app.cli.commands.report import _render_markdown
     from redteam.orchestration.diagnostics import operational_exception_diagnostic
@@ -307,3 +337,251 @@ async def test_recovered_planning_failure_history_remains_in_persisted_report(tm
     ]
     text = _render_markdown(restored)
     assert "rate_limit" in text and "429" in text and "2.5" in text
+
+
+async def _settled_execution_fixture():
+    from redteam.core.contracts.action import ActionProposal
+    from redteam.core.contracts.completion import completion_contract_hash
+    from redteam.core.contracts.execution import ExecutionState, TaskExecution
+    from redteam.core.contracts.mission import MissionTask
+    from redteam.core.contracts.tool import ToolInvocation, ToolResult
+    from redteam.core.convert import execution_input_digest
+    from redteam.core.tool_binding import execution_fingerprint
+    from redteam.orchestration.agents.base import PlanStep
+    from redteam.orchestration.execution_journal import append_execution_receipt
+
+    now = datetime.now(timezone.utc)
+    task = MissionTask(
+        task_id="task", mission_id="mission", title="Check one response",
+        objective="Inspect the authorized response", assigned_agent="web",
+        created_at=now, updated_at=now, provenance={"source": "test"},
+    )
+    arguments = {"query": "fixture"}
+    proposal = ActionProposal(
+        action_id="action", run_id="run", engagement_id="eng", agent_id="web",
+        instance_id="instance", binding_mode="selected_tool", tool_id="tool-any",
+        target=None, arguments=arguments, reason="Synthetic unit-test proposal",
+        created_at=now,
+    )
+    invocation = ToolInvocation(
+        invocation_id="invocation", action_id="action", run_id="run",
+        tool_id="tool-any", binding_mode="selected_tool", arguments=arguments,
+        execution_context={
+            "engagement_id": "eng", "run_id": "run", "agent_id": "web",
+            "instance_id": "instance",
+        },
+        created_at=now,
+    )
+    step = PlanStep(
+        step_id="step", tool_id="tool-any", binding_mode="selected_tool",
+        execution_origin_version=1, mission_task_id="task",
+        task_purpose_hash=completion_contract_hash(task),
+        model_tool_call_id="call", reason="Synthetic unit-test step",
+    )
+    result = ToolResult(
+        invocation_id="invocation", action_id="action", tool_id="tool-any",
+        success=True, output={"fixture": True}, started_at=now, finished_at=now,
+    )
+    store = FakeEvidenceStore()
+    receipt = await append_execution_receipt(
+        store, invocation=invocation, proposal=proposal, step=step,
+        work_id=None, result=result,
+    )
+    execution = TaskExecution(
+        engagement_id="eng", run_id="run", task_id="task", instance_id="instance",
+        ownership_version=1, action_id="action", invocation_id="invocation",
+        model_tool_call_id="call", tool_id="tool-any",
+        input_digest=execution_input_digest(invocation),
+        proposal_evidence_id="proposal-evidence", approval_ref="approval",
+        approval_fingerprint=execution_fingerprint("tool-any", None, arguments),
+        state=ExecutionState.SUCCEEDED, result_evidence_id=receipt.evidence_id,
+    )
+    return execution, receipt
+
+
+def _approval_wait_evidence(
+    *, evidence_id="probe-yield", task_id="task", invocation_id="invocation",
+    action_id=None,
+):
+    return EvidenceRecord(
+        evidence_id=evidence_id, run_id="run", engagement_id="eng",
+        source_type=EvidenceSourceType.SYSTEM,
+        source_id="orchestration.investigation_result", content_type="application/json",
+        digest="d" * 64, created_at=datetime.now(timezone.utc),
+        metadata={
+            "record_kind": "investigation_unresolved", "task_id": task_id,
+            "reported_by": "system", "outcome": "blocked",
+            "reason": "Probe returned preserved observations: approval_pending",
+            "diagnostic": {
+                "code": "probe_yield", "stage": "probe_return", "kind": "validation",
+                "summary": "Approval was pending at yield",
+                "cause_scope": "policy_wait", "retryable": False,
+                "trace": [{
+                    "invocation_id": invocation_id, "state": "pending",
+                    "wait_reason": "approval", "result_evidence_id": None,
+                    **({"action_id": action_id} if action_id is not None else {}),
+                }],
+            },
+            "gaps": [{"code": "unknown", "description": "Historical wait"}],
+        },
+    )
+
+
+async def test_reporting_marks_only_receipt_validated_historical_approval_waits_settled():
+    from redteam.orchestration.reporting import _project_unresolved_details
+
+    execution, receipt = await _settled_execution_fixture()
+    probe_wait = _approval_wait_evidence()
+    observation = EvidenceRecord(
+        evidence_id="mapped-observation", run_id="run", engagement_id="eng",
+        source_type=EvidenceSourceType.TOOL, source_id="test.http_request",
+        action_id="action", invocation_id="invocation", content_type="application/json",
+        digest="e" * 64, created_at=datetime.now(timezone.utc),
+        metadata={"http_observation": {"status_code": 404}, "mapping_status": "mapped"},
+    )
+    final_result = EvidenceRecord(
+        evidence_id="final-blocked", run_id="run", engagement_id="eng",
+        source_type=EvidenceSourceType.SYSTEM,
+        source_id="orchestration.investigation_result", content_type="application/json",
+        digest="f" * 64, created_at=datetime.now(timezone.utc),
+        metadata={
+            "record_kind": "investigation_unresolved", "task_id": "task",
+            "reported_by": "model", "outcome": "blocked",
+            "reason": "The source remains unavailable for inspection.",
+            "source_evidence_ids": [str(probe_wait.evidence_id), str(observation.evidence_id)],
+            "gaps": [
+                {
+                    "code": "approval_pending", "description": "Original approval was pending",
+                    "evidence_ids": [str(probe_wait.evidence_id)],
+                },
+                {
+                    "code": "insufficient_evidence", "description": "404 supplied no script source",
+                },
+            ],
+        },
+    )
+
+    details = _project_unresolved_details(
+        [receipt, observation, probe_wait, final_result], executions=[execution],
+        run_id="run", engagement_id="eng",
+    )
+    by_id = {item.evidence_id: item for item in details}
+    projected_wait = by_id["probe-yield"]
+    assert projected_wait.outcome == "blocked"
+    assert projected_wait.diagnostic.trace[0]["state"] == "pending"
+    assert projected_wait.diagnostic.trace[0]["wait_reason"] == "approval"
+    resolution = projected_wait.historical_approval_waits[0]
+    assert resolution.resolution == "settled" and resolution.receipt_validated
+    assert resolution.result_evidence_id == str(receipt.evidence_id)
+    assert resolution.action_id == "action" and resolution.current_state == "succeeded"
+
+    projected_result = by_id["final-blocked"]
+    assert projected_result.outcome == "blocked"
+    approval_gap, evidence_gap = projected_result.gaps
+    assert approval_gap.code == "approval_pending"
+    assert approval_gap.approval_wait_resolution == "settled"
+    assert approval_gap.historical_approval_waits[0].invocation_id == "invocation"
+    assert evidence_gap.code == "insufficient_evidence"
+    assert evidence_gap.description == "404 supplied no script source"
+    assert evidence_gap.approval_wait_resolution is None
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    [
+        ("pending", "pending"),
+        ("unknown", "unresolved"),
+        ("missing_execution", "unresolved"),
+        ("missing_receipt", "unresolved"),
+        ("mismatched_receipt_action", "unresolved"),
+        ("mismatched_trace_action", "unresolved"),
+        ("invalid_receipt_digest", "unresolved"),
+        ("mismatched_task", "unresolved"),
+        ("mismatched_run", "unresolved"),
+        ("duplicate_execution", "unresolved"),
+        ("pending_with_receipt", "unresolved"),
+    ],
+)
+async def test_reporting_keeps_unverified_approval_waits_unresolved(case, expected):
+    from redteam.core.contracts.execution import ExecutionState
+    from redteam.orchestration.reporting import _project_unresolved_details
+
+    execution, receipt = await _settled_execution_fixture()
+    inventory = [receipt]
+    executions = [execution]
+    wait_evidence = _approval_wait_evidence()
+    if case == "pending":
+        execution = execution.model_copy(update={
+            "state": ExecutionState.PENDING, "wait_reason": "approval",
+            "result_evidence_id": None,
+        })
+    elif case == "unknown":
+        execution = execution.model_copy(update={
+            "state": ExecutionState.UNKNOWN, "wait_reason": None,
+            "result_evidence_id": None,
+        })
+    elif case == "missing_receipt":
+        execution = execution.model_copy(update={"result_evidence_id": "missing-receipt"})
+    elif case == "mismatched_receipt_action":
+        inventory = [receipt.model_copy(update={"action_id": "other-action"})]
+    elif case == "mismatched_trace_action":
+        wait_evidence = _approval_wait_evidence(action_id="other-action")
+    elif case == "invalid_receipt_digest":
+        inventory = [receipt.model_copy(update={"digest": "0" * 64})]
+    elif case == "mismatched_task":
+        execution = execution.model_copy(update={"task_id": "other-task"})
+    elif case == "mismatched_run":
+        execution = execution.model_copy(update={"run_id": "other-run"})
+    elif case == "duplicate_execution":
+        duplicate = execution.model_copy(update={"state": ExecutionState.UNKNOWN})
+        executions = [execution, duplicate]
+    elif case == "pending_with_receipt":
+        execution = execution.model_copy(update={
+            "state": ExecutionState.PENDING, "wait_reason": "approval",
+        })
+    if case == "missing_execution":
+        executions = []
+    elif case != "duplicate_execution":
+        executions = [execution]
+    detail = _project_unresolved_details(
+        [*inventory, wait_evidence], executions=executions,
+        run_id="run", engagement_id="eng",
+    )[0]
+    resolution = detail.historical_approval_waits[0]
+    assert resolution.resolution == expected
+    assert resolution.receipt_validated is (expected == "settled")
+
+
+async def test_reporting_preserves_a_sibling_approval_wait_while_projecting_original_settled():
+    from redteam.core.contracts.execution import ExecutionState
+    from redteam.orchestration.reporting import _project_unresolved_details
+
+    execution, receipt = await _settled_execution_fixture()
+    active_sibling = execution.model_copy(update={
+        "action_id": "sibling-action", "invocation_id": "sibling-invocation",
+        "state": ExecutionState.PENDING, "wait_reason": "approval",
+        "result_evidence_id": None,
+    })
+    historical = _approval_wait_evidence()
+    history_metadata = dict(historical.metadata)
+    diagnostic = dict(history_metadata["diagnostic"])
+    diagnostic["trace"] = [
+        *diagnostic["trace"],
+        {
+            "invocation_id": "sibling-invocation", "state": "pending",
+            "wait_reason": "approval", "result_evidence_id": None,
+        },
+    ]
+    history_metadata["diagnostic"] = diagnostic
+    historical = historical.model_copy(update={"metadata": history_metadata})
+
+    detail = _project_unresolved_details(
+        [receipt, historical], executions=[execution, active_sibling],
+        run_id="run", engagement_id="eng",
+    )[0]
+    assert [wait.resolution for wait in detail.historical_approval_waits] == [
+        "settled", "pending",
+    ]
+    assert detail.historical_approval_waits[0].invocation_id == "invocation"
+    assert detail.historical_approval_waits[1].invocation_id == "sibling-invocation"
+    assert detail.outcome == "blocked"
