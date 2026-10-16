@@ -115,6 +115,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
+from weakref import WeakValueDictionary
 
 from redteam.capability.shell_manifest import SHELL_SERVER_ID
 from redteam.capability.shell_policy import WORKROOM_KEY_PATTERN, ShellWorkroomPolicy
@@ -1317,7 +1318,10 @@ class ShellWorkroomManager:
         self._process_factory = process_factory
         self._program_manifest_path = program_manifest_path
         self._known: dict[str, str] = {}
-        self._ensure_lock = asyncio.Lock()
+        # Existing rooms are independent resources. Keep same-key adoption and
+        # setup serialized; the cross-process creation lock below still owns
+        # shared max_workrooms accounting. Weak values avoid retaining old keys.
+        self._ensure_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
         self._admission: ExecutionAdmission | None = None
         self._bound_endpoint: EndpointSnapshot | None = None
 
@@ -1835,7 +1839,8 @@ class ShellWorkroomManager:
         cannot overshoot a cap it can no longer see in memory.
         """
         check_workroom_key(key)
-        async with self._ensure_lock:
+        ensure_lock = self._ensure_locks.setdefault(key, asyncio.Lock())
+        async with ensure_lock:
             known = self._known.get(key)
             if known is not None:
                 exists, running = await self._inspect_state(known)

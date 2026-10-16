@@ -1133,6 +1133,103 @@ def _shell_invocation(arguments, *, run="run1", instance="inst1", context_run=No
     )
 
 
+def _shell_start_invocation(invocation_id: str, script: str = "sleep 30"):
+    return ToolInvocation(
+        invocation_id=InvocationId(invocation_id),
+        action_id=ActionId("action-start-test"),
+        run_id=RunId("run1"),
+        tool_id=ToolId("analysis.shell_job_start"),
+        binding_mode=SELECTED_TOOL,
+        arguments={"workroom_key": "run1.inst1", "language": "bash", "script": script},
+        execution_context=ExecutionContext(
+            engagement_id=EngagementId("eng-start-test"),
+            run_id=RunId("run1"),
+            instance_id=AgentInstanceId("inst1"),
+        ),
+        created_at=datetime.now(timezone.utc),
+    )
+
+
+class _ContextStartWorkroom(_FakeWorkroom):
+    def __init__(
+        self,
+        *,
+        slow_scripts=(),
+        uncertain_scripts=(),
+        fail_manifest=False,
+        trace_present=True,
+        block_ensure=False,
+        block_manifest=False,
+        block_first_outcome=False,
+        kill_verified=True,
+    ):
+        super().__init__(
+            slow_scripts=slow_scripts,
+            uncertain_scripts=uncertain_scripts,
+            kill_verified=kill_verified,
+        )
+        self.fail_manifest = fail_manifest
+        self.trace_present = trace_present
+        self.block_ensure = block_ensure
+        self.block_manifest = block_manifest
+        self.block_first_outcome = block_first_outcome
+        self.ensure_calls = 0
+        self.manifest_calls = 0
+        self.manifests = {}
+        self.probe_calls = 0
+        self.ensure_entered = asyncio.Event()
+        self.two_ensures_entered = asyncio.Event()
+        self.release_ensure = asyncio.Event()
+        if not block_ensure:
+            self.release_ensure.set()
+        self.manifest_written = asyncio.Event()
+        self.release_manifest = asyncio.Event()
+        if not block_manifest:
+            self.release_manifest.set()
+        self.probe_entered = asyncio.Event()
+        self.release_probe = asyncio.Event()
+        if not block_first_outcome:
+            self.release_probe.set()
+
+    async def ensure_workroom(self, key):
+        self.ensure_calls += 1
+        self.ensure_entered.set()
+        if self.ensure_calls >= 2:
+            self.two_ensures_entered.set()
+        if self.block_ensure:
+            await self.release_ensure.wait()
+        return "fake-container"
+
+    async def write_job_manifest(self, key, job_id, manifest):
+        self.manifest_calls += 1
+        if self.fail_manifest:
+            raise ShellWorkroomError("shell_job_manifest_unwritable")
+        self.manifests[job_id] = dict(manifest)
+        self.manifest_written.set()
+        if self.block_manifest:
+            await self.release_manifest.wait()
+
+    async def read_job_manifest(self, key, job_id):
+        found = self.manifests.get(job_id)
+        return dict(found) if isinstance(found, dict) else None
+
+    async def supervisor_trace_present(self, key, supervisor_id):
+        return self.trace_present
+
+    async def spool_record(self, key, supervisor_id):
+        return None
+
+    async def read_cancel_mark(self, key, supervisor_id):
+        return None
+
+    async def supervisor_outcome(self, key, selector):
+        self.probe_calls += 1
+        if self.block_first_outcome and self.probe_calls == 1:
+            self.probe_entered.set()
+            await self.release_probe.wait()
+        return self.settle_outcome, self.settle_alive
+
+
 class _ProgramWorkroom(_FakeWorkroom):
     def __init__(self, metadata=None):
         super().__init__()
@@ -1167,6 +1264,206 @@ class _ProgramWorkroom(_FakeWorkroom):
             workroom_key=key,
             container_name="fake-container",
         )
+
+
+async def test_contextual_start_reserves_capacity_before_independent_ensure_calls():
+    workroom = _ContextStartWorkroom(block_ensure=True, slow_scripts={"sleep 30"})
+    adapter = BuiltinShellAdapter(_policy(max_jobs=2), workroom=workroom)
+    first = asyncio.create_task(
+        adapter.invoke_contextual(_shell_start_invocation("inv-start-first"))
+    )
+    await asyncio.wait_for(workroom.ensure_entered.wait(), 1.0)
+    second = asyncio.create_task(
+        adapter.invoke_contextual(_shell_start_invocation("inv-start-second"))
+    )
+
+    await asyncio.wait_for(workroom.two_ensures_entered.wait(), 1.0)
+    assert adapter._active_count() == 2
+    assert workroom.ensure_calls == 2
+    workroom.release_ensure.set()
+    results = await asyncio.gather(first, second)
+    assert all(result.success for result in results)
+    assert len({result.output["job_id"] for result in results}) == 2
+    await adapter.aclose()
+
+
+async def test_contextual_duplicate_waits_for_reservation_and_max_jobs_counts_it():
+    workroom = _ContextStartWorkroom(block_ensure=True, slow_scripts={"sleep 30"})
+    adapter = BuiltinShellAdapter(_policy(max_jobs=1), workroom=workroom)
+    same = _shell_start_invocation("inv-start-duplicate")
+    first = asyncio.create_task(adapter.invoke_contextual(same))
+    await asyncio.wait_for(workroom.ensure_entered.wait(), 1.0)
+    duplicate = asyncio.create_task(adapter.invoke_contextual(same))
+    await asyncio.sleep(0)
+
+    limited = await adapter.invoke_contextual(_shell_start_invocation("inv-start-full"))
+    assert limited.success is False
+    assert limited.error.code == "shell_job_limit"
+    assert adapter._active_count() == 1
+    assert workroom.ensure_calls == 1
+
+    workroom.release_ensure.set()
+    first_result, duplicate_result = await asyncio.gather(first, duplicate)
+    assert first_result.success is True
+    assert duplicate_result.success is True
+    assert duplicate_result.output["job_id"] == first_result.output["job_id"]
+    assert workroom.ensure_calls == 1
+    assert workroom.manifest_calls == 1
+    await asyncio.sleep(0)
+    assert sum(
+        1 for call in workroom.calls
+        if len(call) == 4 and call[2] == "sleep 30"
+    ) == 1
+    await adapter.aclose()
+
+
+async def test_slow_unknown_probe_does_not_block_submit_when_a_slot_opens():
+    workroom = _ContextStartWorkroom(
+        slow_scripts={"sleep 30"},
+        uncertain_scripts={"boom"},
+        block_first_outcome=True,
+    )
+    adapter = BuiltinShellAdapter(_policy(max_jobs=2), workroom=workroom)
+    by_name = _descriptor_map(build_shell_descriptors())
+    unknown = await adapter.invoke(
+        by_name[JOB_START_TOOL_NAME],
+        {"workroom_key": "run1.inst1", "language": "bash", "script": "boom"},
+    )
+    unknown_job = adapter._jobs[unknown.output["job_id"]]
+    await asyncio.wait_for(asyncio.shield(unknown_job.task), 1.0)
+    assert unknown_job.status == "uncertain"
+    unknown_job.created_at -= 3600.0
+
+    running = await adapter.invoke(
+        by_name[JOB_START_TOOL_NAME],
+        {"workroom_key": "run1.inst1", "language": "bash", "script": "sleep 30"},
+    )
+    slow_probe = asyncio.create_task(
+        adapter.invoke_contextual(_shell_start_invocation("inv-start-slow-probe"))
+    )
+    await asyncio.wait_for(workroom.probe_entered.wait(), 1.0)
+
+    cancelled = await adapter.invoke(
+        by_name[JOB_CANCEL_TOOL_NAME],
+        {"workroom_key": "run1.inst1", "job_id": running.output["job_id"]},
+    )
+    assert cancelled.success is True
+    independent = await asyncio.wait_for(
+        adapter.invoke_contextual(_shell_start_invocation("inv-start-spare-slot")),
+        1.0,
+    )
+    assert independent.success is True
+    assert workroom.probe_calls == 1
+    assert slow_probe.done() is False
+
+    workroom.release_probe.set()
+    limited = await slow_probe
+    assert limited.success is False
+    assert limited.error.code == "shell_job_limit"
+    assert adapter._jobs[unknown.output["job_id"]].status == "uncertain"
+    await adapter.aclose()
+
+
+async def test_contextual_manifest_failure_releases_only_before_spawn(monkeypatch):
+    workroom = _ContextStartWorkroom(
+        fail_manifest=True,
+        trace_present=False,
+        slow_scripts={"sleep 30"},
+    )
+    adapter = BuiltinShellAdapter(_policy(max_jobs=1), workroom=workroom)
+    invocation = _shell_start_invocation("inv-start-manifest-fail")
+    failed = await adapter.invoke_contextual(invocation)
+    assert failed.success is False
+    assert failed.error.code == "shell_job_manifest_unwritable"
+    assert adapter._active_count() == 0
+    assert adapter._jobs == {}
+
+    async def no_trace(_key, _supervisor_id, *, timeout_seconds=15.0):
+        return False
+
+    monkeypatch.setattr(adapter, "_await_spawn_verified", no_trace)
+    workroom.fail_manifest = False
+    started = await adapter.invoke_contextual(invocation)
+    assert started.success is False
+    assert started.error.code == "shell_submit_unverified"
+    assert started.metadata[EXECUTION_UNCERTAIN_METADATA_KEY] is True
+    assert adapter._active_count() == 1
+    duplicate = await adapter.invoke_contextual(invocation)
+    assert duplicate.error.code == "shell_submit_unverified"
+    assert workroom.ensure_calls == 2
+    assert workroom.manifest_calls == 2
+    limited = await adapter.invoke_contextual(_shell_start_invocation("inv-start-after-unknown"))
+    assert limited.error.code == "shell_job_limit"
+    assert adapter._active_count() == 1
+    await adapter.aclose()
+
+
+@pytest.mark.parametrize("stage", ["ensure", "manifest"])
+async def test_contextual_cancel_during_pre_spawn_keeps_unknown_reservation(
+    stage, monkeypatch
+):
+    workroom = _ContextStartWorkroom(
+        block_ensure=stage == "ensure",
+        block_manifest=stage == "manifest",
+        trace_present=False,
+        slow_scripts={"sleep 30"},
+    )
+    adapter = BuiltinShellAdapter(_policy(max_jobs=1), workroom=workroom)
+    invocation = _shell_start_invocation("inv-start-cancel-" + stage)
+    reference = adapter.prepare_reference(invocation)
+    assert reference is not None
+    job_id = reference.provider_handle["job_id"]
+    start = asyncio.create_task(adapter.invoke_contextual(invocation))
+
+    if stage == "ensure":
+        await asyncio.wait_for(workroom.ensure_entered.wait(), 1.0)
+    else:
+        await asyncio.wait_for(workroom.manifest_written.wait(), 1.0)
+        await adapter._lock.acquire()
+        workroom.release_manifest.set()
+        await asyncio.sleep(0)
+        assert start.done() is False
+    start.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await start
+    if stage == "manifest":
+        adapter._lock.release()
+
+    reserved = adapter._jobs[job_id]
+    assert reserved.status == "uncertain"
+    assert reserved.uncertain is True
+    assert reserved.task is None
+    assert adapter._active_count() == 1
+    assert (job_id in workroom.manifests) is (stage == "manifest")
+
+    async def no_trace(_key, _supervisor_id, *, timeout_seconds=15.0):
+        return False
+
+    monkeypatch.setattr(adapter, "_await_spawn_verified", no_trace)
+    duplicate = await adapter.invoke_contextual(invocation)
+    assert duplicate.error.code == "shell_submit_unverified"
+    assert workroom.ensure_calls == 1
+    assert workroom.manifest_calls == (1 if stage == "manifest" else 0)
+    assert adapter._active_count() == 1
+
+    if stage == "manifest":
+        fresh = BuiltinShellAdapter(_policy(max_jobs=1), workroom=workroom)
+        status = await fresh.invoke(
+            _descriptor_map(build_shell_descriptors())[JOB_STATUS_TOOL_NAME],
+            {"workroom_key": "run1.inst1", "job_id": job_id},
+        )
+        assert status.success is True
+        assert status.output["status"] == "running"
+        assert fresh._active_count() == 1
+        await fresh.aclose()
+    cancelled = await adapter.invoke(
+        _descriptor_map(build_shell_descriptors())[JOB_CANCEL_TOOL_NAME],
+        {"workroom_key": "run1.inst1", "job_id": job_id},
+    )
+    assert cancelled.success is True
+    assert cancelled.output["status"] == "cancelled"
+    assert adapter._active_count() == 0
+    await adapter.aclose()
 
 
 async def test_contextual_structured_program_binds_discovery_argv_stdin_and_evidence():

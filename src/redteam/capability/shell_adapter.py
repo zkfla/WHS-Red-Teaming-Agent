@@ -101,7 +101,7 @@ _TERMINAL_STATUSES = ("completed", "failed", "cancelled")
 # Executions holding an active budget: running, cancel-requested but
 # teardown-unverified, and supervisor-loss uncertain. Only
 # verified-terminal records free the slot; TTL/deadlines never do.
-_ACTIVE_STATUSES = ("running", "cleanup-unknown", "uncertain")
+_ACTIVE_STATUSES = ("starting", "running", "cleanup-unknown", "uncertain")
 # Settle margin past the supervisor deadline before a cleanup-unknown job
 # is eligible for a deadline-confirmed lookup.
 _SETTLE_MARGIN_SECONDS = 10.0
@@ -203,6 +203,10 @@ class _ShellJob:
     created_at: float = 0.0
     status: str = "running"
     task: asyncio.Task | None = None
+    # Contextual submit reservation. The Future is resolved once preparation
+    # hands off to the worker, fails before spawn, or becomes uncertain.
+    # Keeping it on the job avoids a second process-wide reservation table.
+    start_ready: asyncio.Future[bool] | None = None
     result: dict[str, Any] | None = None
     error: str | None = None
     updated_at: float = 0.0
@@ -981,72 +985,114 @@ class BuiltinShellAdapter(ContextualInvocationAdapter, ExecutionRecoveryProvider
         if parsed.workroom_key != workroom_key:
             raise ShellWorkroomError("shell_workroom_key_mismatch")
         digest = self.script_digest(parsed.language, parsed.script)
-        async with self._lock:
-            await self._sweep_locked()
-            effective_timeout = (
-                self._policy.default_timeout_seconds
-                if parsed.timeout_seconds is None
-                else float(parsed.timeout_seconds)
-            )
-            now = time.monotonic()
-            job_id = self._deterministic_job_id(str(invocation.invocation_id), input_digest)
-            existing = self._jobs.get(job_id)
-            if existing is not None and existing.workroom_key == workroom_key:
-                # Idempotent resubmit of the same invocation: active jobs
-                # re-acknowledge without spawning again. A terminal
-                # duplicate is refused outright; the ACK schema admits
-                # only a running acknowledgement.
-                if existing.status in _TERMINAL_STATUSES:
-                    raise ShellWorkroomError("shell_duplicate_job")
-                if not await self._await_spawn_verified(workroom_key, supervisor_id):
-                    return self._unverified_submit(
-                        tool, started, workroom_key, digest, supervisor_id
+        effective_timeout = (
+            self._policy.default_timeout_seconds
+            if parsed.timeout_seconds is None
+            else float(parsed.timeout_seconds)
+        )
+        job_id = self._deterministic_job_id(str(invocation.invocation_id), input_digest)
+        loop = asyncio.get_running_loop()
+        existing = None
+        start_ready = None
+        job = None
+        for attempt in range(2):
+            async with self._lock:
+                self._expire_terminal_locked(time.monotonic())
+                self._evict_terminal_pressure()
+                existing = self._jobs.get(job_id)
+                if existing is not None:
+                    if existing.workroom_key != workroom_key:
+                        raise ShellWorkroomError("shell_duplicate_job")
+                    # Idempotent resubmit waits for current preparation,
+                    # then checks the same supervisor trace as before.
+                    if existing.status in _TERMINAL_STATUSES:
+                        raise ShellWorkroomError("shell_duplicate_job")
+                    start_ready = (
+                        existing.start_ready if existing.status == "starting" else None
                     )
-                return MCPCallResult(
-                    success=True,
-                    started_at=started,
-                    finished_at=datetime.now(timezone.utc),
-                    output={"job_id": job_id, "status": "running",
-                            "workroom_key": workroom_key},
-                    error=None,
-                    metadata={
-                        "tool_name": tool.tool_name,
-                        "workroom_key": workroom_key,
-                        "script_sha256": digest,
-                        "supervisor_id": supervisor_id,
-                        EXECUTION_STARTED_METADATA_KEY: True,
-                    },
-                )
-            if existing is not None:
+                    break
+                if self._active_count() < self._policy.max_jobs:
+                    now = time.monotonic()
+                    start_ready = loop.create_future()
+                    job = _ShellJob(
+                        workroom_key=workroom_key,
+                        language=parsed.language,
+                        script=parsed.script,
+                        script_sha256=digest,
+                        timeout_seconds=effective_timeout,
+                        created_at=now,
+                        updated_at=now,
+                        status="starting",
+                        start_ready=start_ready,
+                        supervisor_id=supervisor_id,
+                        invocation_id=str(invocation.invocation_id),
+                        input_digest=input_digest,
+                    )
+                    self._jobs[job_id] = job
+                    break
+                pending = [
+                    (candidate_id, candidate, candidate.status, candidate.updated_at)
+                    for candidate_id, candidate in self._jobs.items()
+                    if candidate.status in ("cleanup-unknown", "uncertain")
+                ]
+            if attempt == 0 and pending:
+                await self._settle_unknown(pending, time.monotonic())
+                continue
+            raise ShellWorkroomError("shell_job_limit")
+
+        if job is None:
+            if start_ready is not None and not await asyncio.shield(start_ready):
                 raise ShellWorkroomError("shell_duplicate_job")
-            if self._active_count() >= self._policy.max_jobs:
-                raise ShellWorkroomError("shell_job_limit")
-            manifest = {
-                "job_id": job_id,
-                "supervisor_id": supervisor_id,
-                "workroom_key": workroom_key,
-                "invocation_id": str(invocation.invocation_id),
-                "input_digest": input_digest,
-                "script_sha256": digest,
-                "tool": self._tool_name_for(invocation.tool_id),
-                "language": parsed.language,
-                "timeout_seconds": effective_timeout,
-                "created_epoch": time.time(),
-                "holder": {
-                    "run_id": str(invocation.run_id),
-                    "instance_id": str(invocation.execution_context.instance_id),
-                    "action_id": str(invocation.action_id),
-                },
-                "route": {
-                    "tool": self._tool_name_for(invocation.tool_id),
-                    "operation": invocation.operation,
+            async with self._lock:
+                if (
+                    existing is None
+                    or self._jobs.get(job_id) is not existing
+                    or existing.status in _TERMINAL_STATUSES
+                ):
+                    raise ShellWorkroomError("shell_duplicate_job")
+            if not await self._await_spawn_verified(workroom_key, supervisor_id):
+                return self._unverified_submit(tool, started, workroom_key, digest, supervisor_id)
+            return MCPCallResult(
+                success=True,
+                started_at=started,
+                finished_at=datetime.now(timezone.utc),
+                output={"job_id": job_id, "status": "running", "workroom_key": workroom_key},
+                error=None,
+                metadata={
+                    "tool_name": tool.tool_name,
                     "workroom_key": workroom_key,
+                    "script_sha256": digest,
+                    "supervisor_id": supervisor_id,
+                    EXECUTION_STARTED_METADATA_KEY: True,
                 },
-            }
+            )
+
+        manifest = {
+            "job_id": job_id,
+            "supervisor_id": supervisor_id,
+            "workroom_key": workroom_key,
+            "invocation_id": str(invocation.invocation_id),
+            "input_digest": input_digest,
+            "script_sha256": digest,
+            "tool": self._tool_name_for(invocation.tool_id),
+            "language": parsed.language,
+            "timeout_seconds": effective_timeout,
+            "created_epoch": time.time(),
+            "holder": {
+                "run_id": str(invocation.run_id),
+                "instance_id": str(invocation.execution_context.instance_id),
+                "action_id": str(invocation.action_id),
+            },
+            "route": {
+                "tool": self._tool_name_for(invocation.tool_id),
+                "operation": invocation.operation,
+                "workroom_key": workroom_key,
+            },
+        }
+        try:
             if retained_window is not None:
                 # Pre-spawn retained-window cargo: the window owner is
-                # durable before the job exists. Strictly validated;
-                # a malformed record refuses the submit outright.
+                # durable before the job exists. Strictly validated.
                 if not isinstance(retained_window, dict):
                     raise ShellWorkroomError("shell_invalid_arguments")
                 try:
@@ -1057,24 +1103,36 @@ class BuiltinShellAdapter(ContextualInvocationAdapter, ExecutionRecoveryProvider
                     raise ShellWorkroomError("shell_invalid_arguments")
                 manifest["retained_window"] = json.loads(cargo.decode("utf-8"))
                 manifest["window_annotated"] = True
+            job.retained_window = isinstance(manifest.get("retained_window"), dict)
+            job.manifest = manifest
             await self._workroom.ensure_workroom(workroom_key)
             await self._workroom.write_job_manifest(workroom_key, job_id, manifest)
-            job = _ShellJob(
-                workroom_key=workroom_key,
-                language=parsed.language,
-                script=parsed.script,
-                script_sha256=digest,
-                timeout_seconds=effective_timeout,
-                created_at=now,
-                updated_at=now,
-                supervisor_id=supervisor_id,
-                invocation_id=str(invocation.invocation_id),
-                input_digest=input_digest,
-                retained_window=isinstance(manifest.get("retained_window"), dict),
-                manifest=manifest,
-            )
-            job.task = asyncio.create_task(self._run_job(job_id))
-            self._jobs[job_id] = job
+            async with self._lock:
+                if self._jobs.get(job_id) is not job or job.status != "starting":
+                    raise ShellWorkroomError("shell_duplicate_job")
+                job.retained_window = isinstance(manifest.get("retained_window"), dict)
+                job.manifest = manifest
+                job.status = "running"
+                job.task = asyncio.create_task(self._run_job(job_id))
+                if job.start_ready is not None and not job.start_ready.done():
+                    job.start_ready.set_result(True)
+        except asyncio.CancelledError:
+            # The remote ensure/manifest operation may have completed even
+            # though its host waiter was cancelled. Keep this reservation
+            # active and make retries probe the existing supervisor only.
+            if self._jobs.get(job_id) is job and job.task is None:
+                job.status = "uncertain"
+                job.error = "shell_submit_unverified"
+                job.uncertain = True
+                job.updated_at = time.monotonic()
+                if job.start_ready is not None and not job.start_ready.done():
+                    job.start_ready.set_result(True)
+            raise
+        except BaseException:
+            # A completed preparation error occurred before the worker was
+            # launched, so removing this exact reservation is verified.
+            self._release_start_reservation(job_id, job)
+            raise
         if not await self._await_spawn_verified(workroom_key, supervisor_id):
             return self._unverified_submit(tool, started, workroom_key, digest, supervisor_id)
         return MCPCallResult(
@@ -1091,6 +1149,27 @@ class BuiltinShellAdapter(ContextualInvocationAdapter, ExecutionRecoveryProvider
                 EXECUTION_STARTED_METADATA_KEY: True,
             },
         )
+
+    def _release_start_reservation(self, job_id: str, job: _ShellJob) -> None:
+        # Called synchronously after a definite pre-spawn error; no task can
+        # interleave between the identity check and deletion.
+        if self._jobs.get(job_id) is job and job.task is None:
+            self._jobs.pop(job_id, None)
+        if job.start_ready is not None and not job.start_ready.done():
+            job.start_ready.set_result(False)
+
+    async def _wait_for_start(self, job_id: str, job: _ShellJob) -> _ShellJob | None:
+        """Wait for a local contextual reservation without exposing it as running."""
+        ready = job.start_ready
+        if job.status != "starting" or ready is None:
+            return job
+        if not await asyncio.shield(ready):
+            return None
+        async with self._lock:
+            current = self._jobs.get(job_id)
+            if current is not job:
+                return None
+            return current
 
     def prepare_reference(self, invocation: ToolInvocation) -> ExecutionReference | None:
         # Pure derivation from the same bound, validated invocation the
@@ -1456,84 +1535,88 @@ class BuiltinShellAdapter(ContextualInvocationAdapter, ExecutionRecoveryProvider
         )
 
     def _active_count(self) -> int:
-        """Jobs holding an active budget: running plus cleanup-unknown."""
+        """Jobs and in-flight reservations holding an active budget."""
         return sum(1 for job in self._jobs.values() if job.status in _ACTIVE_STATUSES)
 
     def _evict_terminal_pressure(self) -> None:
         """Drop oldest terminal records past the max_jobs scale. Defensive."""
         terminal = sorted(
-            (job.updated_at, job_id)
-            for job_id, job in self._jobs.items()
+            (job.updated_at, index, job_id)
+            for index, (job_id, job) in enumerate(self._jobs.items())
             if job.status in _TERMINAL_STATUSES
         )
         while terminal and sum(
             1 for job in self._jobs.values() if job.status in _TERMINAL_STATUSES
         ) > self._policy.max_jobs:
-            _updated_at, evict_id = terminal.pop(0)
+            _updated_at, _insertion_order, evict_id = terminal.pop(0)
             self._jobs.pop(evict_id, None)
 
-    async def _sweep_locked(self) -> None:
-        """Drop expired terminal jobs, settle cleanup-unknown, bound scale.
-
-        A verified cancel frees its active slot immediately and its record
-        sits in terminal like any completed job. A cleanup-unknown job
-        holds its slot until a deadline-confirmed supervisor lookup
-        settles it; TTL alone never releases a possibly-live budget.
-        """
-        now = time.monotonic()
+    def _expire_terminal_locked(self, now: float) -> None:
         ttl = self._policy.completed_job_ttl_seconds
         for job_id, job in list(self._jobs.items()):
             if job.status in _TERMINAL_STATUSES and now - job.updated_at >= ttl:
                 self._jobs.pop(job_id, None)
-        await self._settle_unknown_locked(now)
-        self._evict_terminal_pressure()
 
-    async def _settle_unknown_locked(self, now: float) -> None:
-        """Settle teardown-unverified or uncertain jobs on verified evidence only.
+    async def _settle_unknown(
+        self,
+        pending: list[tuple[str, _ShellJob, str, float]],
+        now: float,
+    ) -> None:
+        """Probe unknown jobs outside the lock and apply only current evidence."""
+        decisions = []
+        for job_id, job, status, updated_at in pending:
+            decision = await self._probe_unknown(job, job_id, now)
+            if decision is not None:
+                decisions.append((job_id, job, status, updated_at, decision))
 
-        Only a supervisor-VERIFIED terminal outcome or an authoritative
-        container state (gone, or present-but-stopped) ends uncertainty;
-        a missing outcome with a running or unreadable container holds the
-        slot indefinitely. TTL and deadlines alone never free a
-        possibly-live budget.
-        """
-        for job_id, job in list(self._jobs.items()):
-            if job.status not in ("cleanup-unknown", "uncertain"):
-                continue
-            supervisor_tag = job.supervisor_id or job_id
-            outcome, _alive = await self._workroom.supervisor_outcome(
-                job.workroom_key, supervisor_tag
-            )
-            if outcome is not None:
-                record = await self._workroom.supervisor_record(
-                    job.workroom_key, supervisor_tag
-                )
+        # Provider I/O above can take an arbitrary amount of time. Apply
+        # only while the exact object and its observed state still match.
+        async with self._lock:
+            for job_id, job, status, updated_at, decision in decisions:
                 if (
-                    record is not None
-                    and record.get("outcome") == outcome
-                    and ShellWorkroomManager.record_trusted(record)
+                    self._jobs.get(job_id) is not job
+                    or job.status != status
+                    or job.updated_at != updated_at
                 ):
-                    self._apply_verified_outcome(job, outcome)
                     continue
-                # A distrusted outcome file (forged, unprotected, or with
-                # survivors) falls through to container-state evidence;
-                # a live writer means the slot stays held.
-            if not self._settle_eligible(now, job):
-                continue
-            state = await self._workroom.workroom_container_state(job.workroom_key)
-            if state == "gone":
-                job.status = "cancelled"
-                job.result = None
-                job.error = "shell_container_torn_down"
-                job.uncertain = False
-                job.updated_at = time.monotonic()
-            elif state == "stopped":
-                job.status = "cancelled"
-                job.result = None
-                job.error = "shell_container_stopped"
-                job.uncertain = False
-                job.updated_at = time.monotonic()
-            # running or unknown: hold the slot.
+                kind, value = decision
+                if kind == "outcome":
+                    self._apply_verified_outcome(job, value)
+                else:
+                    job.status = "cancelled"
+                    job.result = None
+                    job.error = value
+                    job.uncertain = False
+                    job.updated_at = time.monotonic()
+            self._expire_terminal_locked(time.monotonic())
+            self._evict_terminal_pressure()
+
+    async def _probe_unknown(
+        self, job: _ShellJob, job_id: str, now: float
+    ) -> tuple[str, str] | None:
+        """Read settlement evidence outside ``_lock``; return a proposed transition."""
+        supervisor_tag = job.supervisor_id or job_id
+        outcome, _alive = await self._workroom.supervisor_outcome(
+            job.workroom_key, supervisor_tag
+        )
+        if outcome is not None:
+            record = await self._workroom.supervisor_record(job.workroom_key, supervisor_tag)
+            if (
+                record is not None
+                and record.get("outcome") == outcome
+                and ShellWorkroomManager.record_trusted(record)
+            ):
+                return "outcome", outcome
+            # A distrusted outcome file falls through to authoritative
+            # container-state evidence; a live or unknown container holds.
+        if not self._settle_eligible(now, job):
+            return None
+        state = await self._workroom.workroom_container_state(job.workroom_key)
+        if state == "gone":
+            return "container", "shell_container_torn_down"
+        if state == "stopped":
+            return "container", "shell_container_stopped"
+        return None
 
     def _settle_eligible(self, now: float, job: _ShellJob) -> bool:
         """Deadline past which a missing outcome may consult container state."""
@@ -1578,34 +1661,42 @@ class BuiltinShellAdapter(ContextualInvocationAdapter, ExecutionRecoveryProvider
     ) -> MCPCallResult:
         parsed = self._parse_script(arguments)
         digest = self.script_digest(parsed.language, parsed.script)
-        async with self._lock:
-            # max_jobs caps ACTIVE executions: running plus
-            # teardown-unverified cancels. Verified-terminal records sit
-            # under the same scale with oldest-first eviction on pressure.
-            await self._sweep_locked()
-            if self._active_count() >= self._policy.max_jobs:
-                raise ShellWorkroomError("shell_job_limit")
-            job_id = _JOB_ID_PREFIX + uuid.uuid4().hex[:16]
-            while job_id in self._jobs:
-                job_id = _JOB_ID_PREFIX + uuid.uuid4().hex[:16]
-            effective_timeout = (
-                self._policy.default_timeout_seconds
-                if parsed.timeout_seconds is None
-                else float(parsed.timeout_seconds)
-            )
-            now = time.monotonic()
-            job = _ShellJob(
-                workroom_key=parsed.workroom_key,
-                language=parsed.language,
-                script=parsed.script,
-                script_sha256=digest,
-                timeout_seconds=effective_timeout,
-                created_at=now,
-                updated_at=now,
-            )
-            job.supervisor_id = job_id
-            job.task = asyncio.create_task(self._run_job(job_id))
-            self._jobs[job_id] = job
+        effective_timeout = (
+            self._policy.default_timeout_seconds
+            if parsed.timeout_seconds is None
+            else float(parsed.timeout_seconds)
+        )
+        job_id = _JOB_ID_PREFIX + uuid.uuid4().hex[:16]
+        for attempt in range(2):
+            async with self._lock:
+                now = time.monotonic()
+                self._expire_terminal_locked(now)
+                self._evict_terminal_pressure()
+                if self._active_count() < self._policy.max_jobs:
+                    while job_id in self._jobs:
+                        job_id = _JOB_ID_PREFIX + uuid.uuid4().hex[:16]
+                    job = _ShellJob(
+                        workroom_key=parsed.workroom_key,
+                        language=parsed.language,
+                        script=parsed.script,
+                        script_sha256=digest,
+                        timeout_seconds=effective_timeout,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                    job.supervisor_id = job_id
+                    job.task = asyncio.create_task(self._run_job(job_id))
+                    self._jobs[job_id] = job
+                    break
+                pending = [
+                    (candidate_id, candidate, candidate.status, candidate.updated_at)
+                    for candidate_id, candidate in self._jobs.items()
+                    if candidate.status in ("cleanup-unknown", "uncertain")
+                ]
+            if attempt == 0 and pending:
+                await self._settle_unknown(pending, time.monotonic())
+                continue
+            raise ShellWorkroomError("shell_job_limit")
         return MCPCallResult(
             success=True,
             started_at=started,
@@ -1637,6 +1728,7 @@ class BuiltinShellAdapter(ContextualInvocationAdapter, ExecutionRecoveryProvider
             )
             job.result = result.to_output_dict(job.script_sha256)
             job.status = "completed"
+            job.updated_at = time.monotonic()
             self._evict_terminal_pressure()
         except asyncio.CancelledError:
             # The host docker-exec child is already reaped by the workroom;
@@ -1661,6 +1753,7 @@ class BuiltinShellAdapter(ContextualInvocationAdapter, ExecutionRecoveryProvider
                 job.error = "shell_cancel_unverified"
             else:
                 await self._write_cancel_mark_for(job)
+                job.updated_at = time.monotonic()
                 self._evict_terminal_pressure()
             raise
         except ShellWorkroomError as exc:
@@ -1675,10 +1768,12 @@ class BuiltinShellAdapter(ContextualInvocationAdapter, ExecutionRecoveryProvider
             else:
                 job.status = "failed"
                 job.error = str(exc)
+                job.updated_at = time.monotonic()
                 self._evict_terminal_pressure()
         except Exception:
             job.status = "failed"
             job.error = "shell_job_failed"
+            job.updated_at = time.monotonic()
             self._evict_terminal_pressure()
         finally:
             if job.status in _TERMINAL_STATUSES and not job.uncertain:
@@ -1693,6 +1788,9 @@ class BuiltinShellAdapter(ContextualInvocationAdapter, ExecutionRecoveryProvider
         job = self._lookup(parsed)
         if job is None:
             job = await self._restore_from_manifest(parsed)
+        if job is None:
+            return self._failure(tool, started, "shell_unknown_job", "unknown shell job")
+        job = await self._wait_for_start(parsed.job_id, job)
         if job is None:
             return self._failure(tool, started, "shell_unknown_job", "unknown shell job")
         metadata: dict[str, Any] = {
@@ -1726,6 +1824,9 @@ class BuiltinShellAdapter(ContextualInvocationAdapter, ExecutionRecoveryProvider
         job = self._lookup(parsed)
         if job is None:
             job = await self._restore_from_manifest(parsed)
+        if job is None:
+            return self._failure(tool, started, "shell_unknown_job", "unknown shell job")
+        job = await self._wait_for_start(parsed.job_id, job)
         if job is None:
             return self._failure(tool, started, "shell_unknown_job", "unknown shell job")
         was_active = job.status in _ACTIVE_STATUSES
@@ -1788,7 +1889,7 @@ class BuiltinShellAdapter(ContextualInvocationAdapter, ExecutionRecoveryProvider
         job stays cleanup-unknown instead of hanging the cancel call.
         """
         job = self._jobs.get(job_id)
-        if job is None or job.status not in ("running", "cleanup-unknown"):
+        if job is None or job.status not in ("running", "cleanup-unknown", "uncertain"):
             return
         try:
             report = await asyncio.wait_for(
