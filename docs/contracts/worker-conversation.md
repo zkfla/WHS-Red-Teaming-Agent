@@ -113,7 +113,7 @@ Planner와 Worker는 기존 execution history를 통해 같은 값을 읽고, we
 
 기본 profile 27 / 단일 판단 호환 profile 20 / worker prompt 13,
 `worker_conversation_version=4` / session version 2를 사용한다. Worker 코드 계약은 custom 및
-이전 profile에도 binding되며, probe Planner는 `planner_request_contract_version=4`를 사용한다.
+이전 profile에도 binding되며, probe Planner는 `planner_request_contract_version=5`를 사용한다.
 새 `task.publish_result` 입력은 버전을 생략하면 v2로 처리하고 probe 문맥도 v2 기본값을
 안내한다. 저장된 과거 결과의 v1 기본값·직렬화는 유지하며 명시적 v1 입력도 지원한다.
 도구 계약과 conversation binding이 달라진 기존 session은 새 모델/도구 호출 전에 거절한다.

@@ -43,7 +43,7 @@ def test_code_owned_request_contract_changes_planning_binding_for_custom_prompts
     deps = SimpleNamespace(specialist_policy=loaded.run_policy(), engagement=None,
                            component_binding=None)
     selected = specialist_planning_inputs(deps)
-    assert selected["planner_request_contract_version"] == 4
+    assert selected["planner_request_contract_version"] == 5
     historical = {key: value for key, value in selected.items()
                   if key != "planner_request_contract_version"}
     assert content_hash(selected) != content_hash(historical)

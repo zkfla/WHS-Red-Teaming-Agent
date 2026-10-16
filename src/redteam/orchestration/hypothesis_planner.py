@@ -778,7 +778,7 @@ async def _finalize_hypothesis_pass(deps, snapshot, budget, *, identity, proposa
     return identities
 
 
-PLANNER_REQUEST_CONTRACT_VERSION = 4
+PLANNER_REQUEST_CONTRACT_VERSION = 5
 
 
 FEEDBACK_SYSTEM = (

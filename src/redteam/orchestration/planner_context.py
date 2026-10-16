@@ -9,6 +9,7 @@ from pydantic_core import PydanticCustomError
 
 from redteam.attack_graph.hypotheses import hypothesis_purpose
 from redteam.core.contracts.mission import redact_secret_material
+from redteam.core.enums import EvidenceSourceType
 from redteam.orchestration.coordination import content_hash
 from redteam.orchestration.diagnostics import (
     DecisionDiagnostic,
@@ -17,6 +18,7 @@ from redteam.orchestration.diagnostics import (
 )
 from redteam.orchestration.evidence_access import (
     EvidenceReader,
+    locate_raw,
     project_original_records,
     project_runtime_records,
 )
@@ -335,6 +337,14 @@ class PlannerPassContext:
         receipts = self._receipts({item["hypothesis_id"] for item in fields["candidates"]})
         fields["review_receipts"] = receipts
         shown.update(item["evidence_id"] for item in receipts)
+        fields["candidate_review_support"], fields["candidate_review_support_omitted_count"] = (
+            self._candidate_review_support(
+                fields["candidates"], receipts,
+                visible_task_ids={item["task_id"] for item in fields["investigations"]},
+                visible_original_ids={item["evidence_id"]
+                                     for item in fields["original_observations"]["records"]},
+            )
+        )
         fields["evidence_index"] = sorted(shown)
         fields["evidence_summary"] = {"total": len(self.records), "shown": len(shown),
                                       "omitted_count": len(self.records) - len(shown)}
@@ -361,6 +371,135 @@ class PlannerPassContext:
             *item.get("supporting_evidence_ids", []), *item.get("refuting_evidence_ids", [])))
         return refs
 
+    def _candidate_review_support(self, displayed_candidates, receipts, *, visible_task_ids,
+                                  visible_original_ids):
+        """Join omitted current-revision review inputs without turning summaries into reads.
+
+        This projection is navigation DATA only. It neither creates a review request nor
+        admits evidence, and its identities do not enter the Planner's consumed-read set.
+        """
+        task_limit, original_limit, context_limit = 4, 8, 8192
+        tasks = self.canonical.tasks
+        candidates = self.canonical.candidates
+        receipts_by_candidate: dict[str, list[str]] = {}
+        for item in receipts:
+            identity = item["metadata"].get("hypothesis_id")
+            if identity:
+                receipts_by_candidate.setdefault(identity, []).append(item["evidence_id"])
+
+        result = []
+        remaining = context_limit
+        omitted_candidates = 0
+        for displayed in displayed_candidates:
+            identity = displayed["hypothesis_id"]
+            candidate = candidates.get(identity)
+            if (candidate is None or candidate.revision != displayed.get("revision")
+                    or candidate.status not in {"open", "held", "inconclusive"}):
+                continue
+            linked = sorted(
+                (task for task in tasks.values()
+                 if task.hypothesis_revisions.get(identity) == candidate.revision),
+                key=lambda task: (str(task.updated_at), str(task.task_id)), reverse=True,
+            )
+            if not linked:
+                continue
+
+            linked_views: list[dict[str, Any]] = []
+            captured_originals: set[str] = set()
+            for task in linked[:task_limit]:
+                source = tasks.get(str(task.source_task_id)) if task.source_task_id else None
+                source_result_id = (str(source.result.result_id)
+                                    if source is not None and source.result is not None else None)
+                source_status = (
+                    "none" if not task.source_task_id else
+                    "cycle" if str(task.source_task_id) == str(task.task_id) else
+                    "missing_task" if source is None else
+                    "missing_result" if source_result_id is None else
+                    "matched" if source_result_id == str(task.source_result_id or "") else
+                    "result_mismatch"
+                )
+                source_link = None if not task.source_task_id else {
+                    "task_id": str(task.source_task_id),
+                    "expected_result_id": task.source_result_id,
+                    "result_id": source_result_id,
+                    "link_status": source_status,
+                }
+                linked_source = source if source_status == "matched" else None
+                chain_tasks = [task, *([linked_source] if linked_source is not None else [])]
+                refs: list[str] = []
+                for linked_task in chain_tasks:
+                    refs.extend(str(ref) for ref in linked_task.evidence_ids)
+                    if linked_task.result is not None:
+                        refs.extend(str(ref) for ref in linked_task.result.evidence_ids)
+                refs = list(dict.fromkeys(refs))
+                captured_original_ids: list[str] = []
+                for ref in refs:
+                    record = self.records.get(ref)
+                    if (record is not None and locate_raw(
+                            record, self.reader.snapshot.run_id,
+                            self.reader.snapshot.engagement_id)[0] == "ok"
+                            and record.source_type == EvidenceSourceType.TOOL):
+                        captured_original_ids.append(ref)
+                captured_originals.update(captured_original_ids)
+                result_record = task.result
+                linked_views.append({
+                    "task_id": str(task.task_id),
+                    "candidate_revision": candidate.revision,
+                    "task_revision": task.hypothesis_revisions.get(identity),
+                    "task_status": getattr(task.status, "value", task.status),
+                    "result_id": str(result_record.result_id) if result_record else None,
+                    "outcome": result_record.outcome if result_record else None,
+                    "source_task_id": (str(task.source_task_id)
+                                       if task.source_task_id else None),
+                    "source_result_id": task.source_result_id,
+                    "source_link": source_link,
+                    "source_chain_truncated": bool(
+                        linked_source is not None and linked_source.source_task_id),
+                    "omitted_source_chain_minimum_count": int(bool(
+                        linked_source is not None and linked_source.source_task_id)),
+                    "captured_original_ids": captured_original_ids[:original_limit],
+                    "captured_original_count": len(captured_original_ids),
+                    "omitted_captured_original_count": max(
+                        0, len(captured_original_ids) - original_limit),
+                })
+
+            # Emit only when the ordinary bounded Task/original views omit a linked item.
+            has_omitted_context = any(
+                item["task_id"] not in visible_task_ids
+                or item["omitted_source_chain_minimum_count"] > 0
+                or (item["source_link"] is not None
+                    and item["source_link"]["link_status"] == "matched"
+                    and item["source_link"]["task_id"] not in visible_task_ids)
+                or any(ref not in visible_original_ids for ref in item["captured_original_ids"])
+                for item in linked_views
+            ) or len(linked) > len(linked_views)
+            if not has_omitted_context:
+                continue
+
+            card = {
+                "candidate_id": identity,
+                "candidate_revision": candidate.revision,
+                "candidate_purpose_hash": content_hash(hypothesis_purpose(candidate)),
+                "current_public_receipt_ids": receipts_by_candidate.get(identity, []),
+                "linked_tasks": linked_views,
+                "linked_task_count": len(linked),
+                "omitted_linked_task_count": max(0, len(linked) - len(linked_views)),
+                "captured_original_count_examined_linked_tasks": len(captured_originals),
+                "captured_original_count_scope": "Only linked_tasks listed above; additional "
+                                                  "same-revision Tasks may be omitted.",
+                "note": "Navigation DATA only. Task outcomes and original references do not "
+                        "prove candidate purpose, evidence validity, or a candidate verdict. "
+                        "A summary identity is not a full read; use context_request before "
+                        "citing an unpresented Task as reviewed.",
+            }
+            size = context_bytes(card)
+            if size > remaining:
+                omitted_candidates += 1
+                continue
+            result.append(card)
+            remaining -= size
+        return result, omitted_candidates
+
     def _receipts(self, identities):
         candidates = self.canonical.candidates
         matching = []
@@ -378,7 +517,7 @@ class PlannerPassContext:
                 continue
             matching.append(record)
         # Only the public contract is included; unrelated/private metadata is never dumped.
-        result = []
+        result: list[dict[str, Any]] = []
         for record in sorted(matching, key=lambda record: record.created_at, reverse=True)[:4]:
             meta = public_receipt_metadata(record.metadata)
             item = {"evidence_id": str(record.evidence_id), "metadata": meta}

@@ -49,6 +49,17 @@ without completing the Task or releasing unresolved executions. Direct follow-up
 may cite source Task/result without inventing a result question; when a question
 is supplied, it must still exist on the original source result.
 
+The Planner may receive an ephemeral `candidate_review_support` projection when its ordinary bounded
+Task/original views omit current-revision context. It joins only displayed current candidates to Tasks
+whose `hypothesis_revisions` match that candidate revision, and follows at most one
+`source_task_id`/`source_result_id` link when the saved source result ID matches exactly. It lists only
+captured same-Run original evidence IDs and public review receipt IDs already admitted by the existing
+revision/purpose filter. This is navigation DATA, not a review request, evidence read, proof of
+validity, or candidate verdict. Summary IDs do not enter the Planner's consumed-read set; a Task must
+still appear as a full card or an explicit lookup result before the Planner can cite it as reviewed.
+The projection is bounded and reports omitted linked Tasks and source-chain truncation explicitly;
+none of it is persisted as a second review state.
+
 The v2 admission/result contracts are the default new-Run path. Reading v1
 records does not reinterpret their original Run as a v2 candidate Run.
 

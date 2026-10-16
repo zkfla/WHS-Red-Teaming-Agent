@@ -20,6 +20,13 @@ scope/ROE도 이 변경 자료에 남긴다. Run 간 또는 정책 변경 후 �
 이전 assistant 답변·추론·user 대화를 덧붙이지 않는다. 필요한 과거 의미는 기존
 canonical 결과·후보·공개 review receipt·원본 증거에서 읽는다.
 
+`candidate_review_support`는 표시된 현재 후보와 같은 개정의 Task/result, 결속된 source
+result, 보존 원본 참조를 연결하는 제한된 탐색 자료다. Task outcome은 후보 verdict가 아니며
+참조 카드도 원본 본문·최종 검토·proof를 대신하지 않는다. 필요한 원본을 읽고 현재 후보의
+독립 검토를 요청할지, 추가 관측이 필요한지, 검토 경로가 없는지 판단한다. 코드는 이를
+자동으로 실행하거나 후보 판정을 만들지 않는다. 카드에 없는 관계는 부재의 증거가 아니며
+생략 개수와 기존 lookup을 사용한다. 요약으로만 표시된 Task는 full-read로 승격되지 않는다.
+
 `StructuredDecisionClient.ask`의 선택적 `request_context`는 호출자가 소유한 읽기 전용
 관측 자료 공급자다. actual attempt마다 user DATA의 복사본에만 병합하며 lookup과 repair에도
 같은 system/schema를 유지한다. Planner는 기존 ledger의 최신 Run/stage 사용량과
@@ -73,7 +80,7 @@ HTTP JSON 필드 순서는 모델이 해석하는 prompt 순서와 같은 개념
 10b 도입 당시 profile은 16/13이었다. 현재 `native-probes`는 profile 27 / strategy prompt 15,
 single-stage 호환 profile은 20 / planner prompt 7이다. Worker prompt는 13이며 atomizer는 8이다.
 기존 prompt SHA와 profile fingerprint가 달라지며, `specialist_planning_inputs`에도
-`planner_request_contract_version=4`를 포함한다. 활성 Planner의 candidate update는 상태를
+`planner_request_contract_version=5`를 포함한다. 활성 Planner의 candidate update는 상태를
 명시하고, review 참조는 terminal 판정에서만 소비한다. 따라서 prompt bytes가 그대로인 custom
 profile도 기존 코드 계약의 Run으로 조용히 재개되지 않는다. 기존 planning binding 검사에서
 다른 입력으로 거부하고 새 Run을 사용한다. 과거 DB/보고서/checkpoint를 수정하거나 backfill하지 않는다.
