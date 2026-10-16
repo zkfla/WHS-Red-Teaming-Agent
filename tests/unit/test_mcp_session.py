@@ -7,9 +7,11 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from mcp.types import CallToolResult
 
 from redteam.capability import bootstrap
 from redteam.capability.adapters.mcp.transport import StreamableHTTPMCPTransport
+from redteam.core.contracts.tool import PROVIDER_RESULT_EXECUTION_UNCERTAIN
 
 
 def fake_connection(events: list[str]) -> Any:
@@ -73,6 +75,32 @@ async def test_session_closes_on_owner_cancellation(monkeypatch: pytest.MonkeyPa
     with pytest.raises(asyncio.CancelledError):
         await task
     assert events == ["open", "close"]
+
+
+async def test_transport_preserves_result_meta_separately_from_structured_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_result = CallToolResult(
+        content=[],
+        is_error=True,
+        structured_content={"diagnostic": {"execution_uncertain": False}},
+        meta={PROVIDER_RESULT_EXECUTION_UNCERTAIN: True},
+    )
+
+    async def call_tool(*args: Any, **kwargs: Any) -> CallToolResult:
+        return raw_result
+
+    @asynccontextmanager
+    async def connect() -> AsyncIterator[Any]:
+        yield SimpleNamespace(call_tool=call_tool)
+
+    transport = StreamableHTTPMCPTransport("http://mcp.test/mcp")
+    monkeypatch.setattr(transport, "_connect_client", connect)
+    async with transport.session():
+        result = await transport.call_tool("probe", {})
+
+    assert result.output == {"diagnostic": {"execution_uncertain": False}}
+    assert result.metadata == {PROVIDER_RESULT_EXECUTION_UNCERTAIN: True}
 
 
 async def test_partial_bootstrap_failure_closes_prior_sessions(

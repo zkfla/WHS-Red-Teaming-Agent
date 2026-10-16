@@ -16,12 +16,14 @@ from redteam.capability.adapters.mcp.transport import (
     StreamableHTTPMCPTransport,
 )
 from redteam.core.contracts.tool import (
+    EXECUTION_UNCERTAIN_METADATA_KEY,
     PROVIDER_METADATA_AVAILABILITY_IMPACT,
     PROVIDER_METADATA_COMMAND_FIELDS,
     PROVIDER_METADATA_REQUIRES_TARGET,
     PROVIDER_METADATA_RESOURCE_BINDINGS,
     PROVIDER_METADATA_RESOURCE_EFFECTS,
     PROVIDER_METADATA_TARGET_BINDING,
+    PROVIDER_RESULT_EXECUTION_UNCERTAIN,
     ToolDescriptor,
     ToolError,
     ToolResourceBinding,
@@ -111,18 +113,25 @@ class MCPServerAdapter:
                 message=_safe_error_message(result.output),
                 retryable=False,
             )
+        provider_metadata = {
+            "mcp_server_id": self.server_id, "mcp_tool_name": tool.tool_name,
+            **({"resource_effects": [effect.model_dump(mode="json")
+                                      for effect in tool.resource_effects]}
+               if tool.resource_effects is not None else {}),
+        }
+        if isinstance(result.metadata, Mapping):
+            # Execution state comes only from the MCP result metadata channel,
+            # never from output DATA such as a diagnostic object.
+            uncertain = result.metadata.get(PROVIDER_RESULT_EXECUTION_UNCERTAIN)
+            if isinstance(uncertain, bool):
+                provider_metadata[EXECUTION_UNCERTAIN_METADATA_KEY] = uncertain
         return MCPCallResult(
             success=not result.is_error,
             output=result.output,
             error=error,
             started_at=started_at,
             finished_at=finished_at,
-            metadata={
-                "mcp_server_id": self.server_id, "mcp_tool_name": tool.tool_name,
-                **({"resource_effects": [effect.model_dump(mode="json")
-                                          for effect in tool.resource_effects]}
-                   if tool.resource_effects is not None else {}),
-            },
+            metadata=provider_metadata,
         )
 
     async def health_check(self) -> ToolHealthStatus:

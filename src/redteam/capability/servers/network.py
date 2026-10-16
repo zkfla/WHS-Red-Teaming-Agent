@@ -25,6 +25,7 @@ from mcp.types import CallToolResult, TextContent
 from redteam.capability.servers.config import ServerPolicy, TargetProfile
 from redteam.capability.servers.session_state import cookie_header
 from redteam.core.contracts.mission import redact_secret_material
+from redteam.core.contracts.tool import PROVIDER_RESULT_EXECUTION_UNCERTAIN
 from redteam.core.redaction import SECRET_KEY_PARTS, redact_sensitive_text
 
 
@@ -93,17 +94,35 @@ class ToolInputError(ToolError, ValueError):
 
 
 class TargetRequestError(ToolInputError):
-    """Safe target-transport diagnosis; never the raw exception or request."""
+    """Safe target-request diagnosis; never the raw exception or request."""
 
-    def __init__(self, code: str, phase: str, repair: str):
+    def __init__(
+        self,
+        code: str,
+        phase: str,
+        repair: str,
+        *,
+        http_request_attempted: bool,
+        execution_uncertain: bool,
+        message: str | None = None,
+    ):
         self.diagnostic = {
             "code": code, "cause_scope": "target_prerequisite",
             "owner": "capability.servers.network",
             "phase": phase, "repair_condition": repair,
-            "message": "target HTTP request failed",
-            "response_received": False if phase in {"connect", "tls"} else None,
+            "message": message or "target HTTP request failed",
+            # This describes the HTTP request boundary only. DNS lookup or a
+            # TLS connection may already have used the network when it is false.
+            "http_request_attempted": http_request_attempted,
+            "execution_uncertain": execution_uncertain,
+            "response_received": False
+            if phase in {"connect", "tls", "pool", "preflight"} else None,
         }
-        super().__init__(f"target HTTP request failed ({code}): {repair}")
+        super().__init__(message or f"target HTTP request failed ({code}): {repair}")
+
+    def include_completed_http_request(self) -> None:
+        """Include an earlier successful request in a multi-request tool call."""
+        self.diagnostic["http_request_attempted"] = True
 
 
 def target_network_tool(function):
@@ -114,6 +133,7 @@ def target_network_tool(function):
             return await function(*args, **kwargs)
         except TargetRequestError as exc:
             return CallToolResult(
+                meta={PROVIDER_RESULT_EXECUTION_UNCERTAIN: exc.diagnostic["execution_uncertain"]},
                 is_error=True,
                 content=[TextContent(type="text", text=str(exc))],
                 structured_content={"diagnostic": exc.diagnostic},
@@ -121,9 +141,23 @@ def target_network_tool(function):
     return wrapped
 
 
+def target_request_rejected(exc: ToolInputError) -> TargetRequestError:
+    """Record a provider-owned preflight rejection without claiming no provider entry."""
+    return TargetRequestError(
+        "target_http_request_rejected",
+        "preflight",
+        "Correct the request arguments or approved target configuration before retrying.",
+        http_request_attempted=False,
+        execution_uncertain=False,
+        message=str(exc),
+    )
+
+
 def _target_request_error(exc: BaseException) -> TargetRequestError:
     if isinstance(exc, httpx.ConnectTimeout):
         code, phase = "target_http_connect_timeout", "connect"
+    elif isinstance(exc, httpx.PoolTimeout):
+        code, phase = "target_http_pool_timeout", "pool"
     elif isinstance(exc, httpx.ConnectError):
         code, phase = "target_http_connect_failed", "connect"
     elif isinstance(exc, (httpx.TimeoutException, TimeoutError)):
@@ -148,12 +182,22 @@ def _target_request_error(exc: BaseException) -> TargetRequestError:
         "may require the prepared container-network execution route. Another tool in the "
         "same host process does not repair that route."
         if phase == "connect" else
+        "Check local request capacity and the registered execution route before retrying. "
+        "The target HTTP request was not sent."
+        if phase == "pool" else
         "Check the target TLS certificate and configured hostname; retain certificate verification."
         if phase == "tls" else
         "Check the target response and the registered execution route before another request. "
         "A missing response does not establish whether the request had effects."
     )
-    return TargetRequestError(code, phase, repair)
+    attempted = phase == "request_or_response"
+    return TargetRequestError(
+        code,
+        phase,
+        repair,
+        http_request_attempted=attempted,
+        execution_uncertain=attempted,
+    )
 
 
 @dataclass(frozen=True)
@@ -316,42 +360,23 @@ async def request(
     request_headers: dict[str, str] | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> CapturedResponse:
-    profile = policy.targets.get(target_ref)
-    if profile is None:
-        raise ToolInputError("unknown target_ref")
-    validate_path(profile, path)
-    allowed_methods = profile.allowed_path_methods.get(path, profile.allowed_methods)
-    if method not in allowed_methods:
-        raise ToolInputError("HTTP method is not enabled for this target")
-    if json_body is not None and form_body is not None:
-        raise ToolInputError("select one request body format")
-    if (json_body is not None or form_body is not None) and (
-        method in {"GET", "HEAD", "OPTIONS"} or not profile.request_body_enabled
-    ):
-        raise ToolInputError("body is not allowed for read requests")
-    content = None if json_body is None else json.dumps(json_body).encode()
-    if form_body is not None:
-        from urllib.parse import urlencode
-        content = urlencode(form_body).encode()
-    if content is not None and len(content) > 65536:
-        raise ToolInputError("request body exceeds limit")
-    query = query or {}
-    request_headers = request_headers or {}
-    if len(query) > 20 or any(
-        not profile.allows_query_key(path, key)
-        or len(value) > 1024 or any(ord(c) < 32 for c in value)
-        for key, value in query.items()
-    ):
-        raise ToolInputError("query outside configured allowlist or size limit")
-    headers = {key.lower(): value for key, value in request_headers.items()}
-    if len(headers) != len(request_headers) or len(headers) > 20 or any(
-        not profile.allows_request_header(key) or len(value) > 1024
-        or any(ord(c) < 32 or ord(c) > 126 for c in value)
-        for key, value in headers.items()
-    ):
-        raise ToolInputError("request headers outside configured allowlist or size limit")
-    headers.update(session_header(policy, target_ref, session_ref, path))
-    target = await resolve_target(policy, target_ref)
+    try:
+        profile, content, query, headers, target = await _prepare_request(
+            policy,
+            target_ref,
+            path,
+            method=method,
+            session_ref=session_ref,
+            json_body=json_body,
+            form_body=form_body,
+            query=query,
+            request_headers=request_headers,
+        )
+    except TargetRequestError:
+        raise
+    except ToolInputError as exc:
+        raise target_request_rejected(exc) from exc
+
     host = f"[{target.host}]" if ":" in target.host else target.host
     headers.update({"Host": f"{host}:{target.port}", "Accept-Encoding": "identity"})
     if content is not None:
@@ -398,3 +423,55 @@ async def request(
                     )
     except (httpx.HTTPError, OSError, asyncio.TimeoutError, TimeoutError) as exc:
         raise _target_request_error(exc) from exc
+
+
+async def _prepare_request(
+    policy: ServerPolicy,
+    target_ref: str,
+    path: str,
+    *,
+    method: str,
+    session_ref: str | None,
+    json_body: dict[str, Any] | None,
+    form_body: dict[str, str] | None,
+    query: dict[str, str] | None,
+    request_headers: dict[str, str] | None,
+) -> tuple[TargetProfile, bytes | None, dict[str, str], dict[str, str], ResolvedTarget]:
+    """Validate and resolve the request before entering HTTPX's request path."""
+    profile = policy.targets.get(target_ref)
+    if profile is None:
+        raise ToolInputError("unknown target_ref")
+    validate_path(profile, path)
+    allowed_methods = profile.allowed_path_methods.get(path, profile.allowed_methods)
+    if method not in allowed_methods:
+        raise ToolInputError("HTTP method is not enabled for this target")
+    if json_body is not None and form_body is not None:
+        raise ToolInputError("select one request body format")
+    if (json_body is not None or form_body is not None) and (
+        method in {"GET", "HEAD", "OPTIONS"} or not profile.request_body_enabled
+    ):
+        raise ToolInputError("body is not allowed for read requests")
+    content = None if json_body is None else json.dumps(json_body).encode()
+    if form_body is not None:
+        from urllib.parse import urlencode
+        content = urlencode(form_body).encode()
+    if content is not None and len(content) > 65536:
+        raise ToolInputError("request body exceeds limit")
+    query = query or {}
+    request_headers = request_headers or {}
+    if len(query) > 20 or any(
+        not profile.allows_query_key(path, key)
+        or len(value) > 1024 or any(ord(c) < 32 for c in value)
+        for key, value in query.items()
+    ):
+        raise ToolInputError("query outside configured allowlist or size limit")
+    headers = {key.lower(): value for key, value in request_headers.items()}
+    if len(headers) != len(request_headers) or len(headers) > 20 or any(
+        not profile.allows_request_header(key) or len(value) > 1024
+        or any(ord(c) < 32 or ord(c) > 126 for c in value)
+        for key, value in headers.items()
+    ):
+        raise ToolInputError("request headers outside configured allowlist or size limit")
+    headers.update(session_header(policy, target_ref, session_ref, path))
+    target = await resolve_target(policy, target_ref)
+    return profile, content, query, headers, target

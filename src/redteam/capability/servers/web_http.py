@@ -11,10 +11,12 @@ from pydantic import Field
 from redteam.capability.servers.config import ServerPolicy
 from redteam.capability.servers.inspection import security_observations
 from redteam.capability.servers.network import (
+    TargetRequestError,
     ToolInputError,
     request,
     session_header,
     target_network_tool,
+    target_request_rejected,
 )
 from redteam.core.contracts.tool import (
     PROVIDER_METADATA_REQUIRES_TARGET,
@@ -135,13 +137,22 @@ def create_server(policy: ServerPolicy) -> MCPServer:
             or second.target_ref != target_ref
             or first.principal_ref == second.principal_ref
         ):
-            raise ToolInputError("two distinct principals bound to this target are required")
+            raise target_request_rejected(ToolInputError(
+                "two distinct principals bound to this target are required"
+            ))
         # Preflight both registrations/credentials before either network request.
-        session_header(policy, target_ref, first_session_ref, path)
-        session_header(policy, target_ref, second_session_ref, path)
+        try:
+            session_header(policy, target_ref, first_session_ref, path)
+            session_header(policy, target_ref, second_session_ref, path)
+        except ToolInputError as exc:
+            raise target_request_rejected(exc) from exc
         async with execution_lock:
             a = await request(policy, target_ref, path, session_ref=first_session_ref)
-            b = await request(policy, target_ref, path, session_ref=second_session_ref)
+            try:
+                b = await request(policy, target_ref, path, session_ref=second_session_ref)
+            except TargetRequestError as exc:
+                exc.include_completed_http_request()
+                raise
         return {
             "target_ref": target_ref,
             "first": {"principal_ref": first.principal_ref, **a.summary(
@@ -192,11 +203,20 @@ def create_server(policy: ServerPolicy) -> MCPServer:
         """
         # Validate the named credential before either request, including the anonymous one.
         if session_ref not in policy.sessions:
-            raise ToolInputError("registered session_ref is required")
-        session_header(policy, target_ref, session_ref, path)
+            raise target_request_rejected(ToolInputError("registered session_ref is required"))
+        try:
+            session_header(policy, target_ref, session_ref, path)
+        except ToolInputError as exc:
+            raise target_request_rejected(exc) from exc
         async with execution_lock:
             anonymous = await request(policy, target_ref, path)
-            authenticated = await request(policy, target_ref, path, session_ref=session_ref)
+            try:
+                authenticated = await request(
+                    policy, target_ref, path, session_ref=session_ref,
+                )
+            except TargetRequestError as exc:
+                exc.include_completed_http_request()
+                raise
         return {
             "target_ref": target_ref,
             "anonymous": anonymous.summary(

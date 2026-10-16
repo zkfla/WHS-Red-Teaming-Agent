@@ -25,7 +25,12 @@ from redteam.capability.adapters.mcp.transport import (
 from redteam.capability.adapters.mcp.web_api import WebAPIMCPAdapter
 from redteam.capability.gateway import MCPToolGateway
 from redteam.capability.registry import MCPToolRegistry, ToolRegistrationConflictError
-from redteam.core.contracts.tool import ExecutionContext, ToolDescriptor, ToolInvocation
+from redteam.core.contracts.tool import (
+    PROVIDER_RESULT_EXECUTION_UNCERTAIN,
+    ExecutionContext,
+    ToolDescriptor,
+    ToolInvocation,
+)
 from redteam.core.enums import ToolHealthStatus
 from redteam.core.ids import ActionId, EngagementId, InvocationId, RunId, ToolId
 
@@ -279,21 +284,82 @@ async def test_mobile_and_analysis_adapters_have_independent_namespaces(
     assert tools[0].capability_tags == expected_tags
 
 
-async def test_adapter_retains_structured_network_diagnostic_in_error_message():
+async def test_adapter_retains_diagnostic_data_without_promoting_execution_state():
     transport = FakeTransport(
         tools=[RemoteTool(name="request", description="", input_schema={})],
         result=RemoteCallResult(is_error=True, output={"diagnostic": {
-            "code": "target_http_connect_timeout", "message": "target HTTP request failed",
-            "repair_condition": "Use the prepared container-network route.",
+            "code": "target_http_response_timeout", "message": "target HTTP request failed",
+            "repair_condition": "Reconcile the original invocation before retrying.",
+            "http_request_attempted": True,
+            "execution_uncertain": True,
         }}),
     )
     adapter = WebAPIMCPAdapter(server_id="web-server", transport=transport)
     tool = (await adapter.discover_tools())[0]
     result = await adapter.invoke(tool, {})
     assert not result.success and result.error is not None
-    assert "target_http_connect_timeout" in result.error.message
-    assert "container-network route" in result.error.message
+    assert "target_http_response_timeout" in result.error.message
+    assert "Reconcile the original invocation" in result.error.message
     assert result.output == transport.result.output
+    assert "http_request_attempted" not in result.metadata
+    assert "execution_uncertain" not in result.metadata
+
+
+async def test_adapter_promotes_uncertainty_only_from_provider_result_metadata():
+    transport = FakeTransport(
+        tools=[RemoteTool(name="request", description="", input_schema={})],
+        result=RemoteCallResult(
+            is_error=True,
+            output={"diagnostic": {"execution_uncertain": False}},
+            metadata={PROVIDER_RESULT_EXECUTION_UNCERTAIN: True},
+        ),
+    )
+    adapter = WebAPIMCPAdapter(server_id="web-server", transport=transport)
+
+    result = await adapter.invoke((await adapter.discover_tools())[0], {})
+
+    assert result.metadata["execution_uncertain"] is True
+    assert result.output == {"diagnostic": {"execution_uncertain": False}}
+
+
+async def test_gateway_preserves_provider_uncertainty_separately_from_adapter_entry():
+    diagnostic = {
+        "code": "target_http_response_timeout",
+        "message": "target HTTP request failed",
+        "owner": "capability.servers.network",
+        "phase": "request_or_response",
+        "http_request_attempted": True,
+        "execution_uncertain": True,
+    }
+    backend = FakeTransport(
+        tools=[RemoteTool(name="request", description="", input_schema={})],
+        result=RemoteCallResult(
+            is_error=True,
+            output={"diagnostic": diagnostic},
+            metadata={PROVIDER_RESULT_EXECUTION_UNCERTAIN: True},
+        ),
+    )
+    adapter = WebAPIMCPAdapter(server_id="web-server", transport=backend)
+    tools = await adapter.discover_tools()
+    registry = MCPToolRegistry()
+    registry.replace_server_tools(adapter.server_id, tools)
+    tool_id = tools[0].tool_id
+    gateway = MCPToolGateway(
+        registry,
+        {adapter.server_id: adapter},
+        {str(tool_id): ("http_request",)},
+    )
+
+    result = await gateway.invoke(
+        _invocation(tool_id=tool_id, operation="http_request")
+    )
+
+    assert not result.success
+    # Gateway entry and target HTTP request entry have different meanings.
+    assert result.metadata["execution_started"] is True
+    assert result.metadata["execution_uncertain"] is True
+    assert "http_request_attempted" not in result.metadata
+    assert result.output["diagnostic"]["http_request_attempted"] is True
 
 
 async def test_adapter_normalizes_remote_tool_error() -> None:

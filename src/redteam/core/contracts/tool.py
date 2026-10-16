@@ -91,6 +91,10 @@ PROVIDER_METADATA_AVAILABILITY_IMPACT = "redteam.availability_impact"
 PROVIDER_METADATA_RESOURCE_BINDINGS = "redteam.resource_bindings"
 PROVIDER_METADATA_RESOURCE_EFFECTS = "redteam.resource_effects"
 
+# Provider result metadata travels through MCP CallToolResult.meta, separately
+# from structured_content that may contain untrusted DATA.
+PROVIDER_RESULT_EXECUTION_UNCERTAIN = "redteam.execution_uncertain"
+
 
 def model_input_schema(schema: dict[str, Any]) -> dict[str, Any]:
     """Expose caller inputs, excluding top-level JSON Schema readOnly fields.

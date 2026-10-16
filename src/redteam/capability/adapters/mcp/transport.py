@@ -46,6 +46,8 @@ def remote_tool_metadata(tool: Any) -> dict[str, Any]:
 class RemoteCallResult:
     is_error: bool
     output: dict[str, Any] | str | None
+    # MCP CallToolResult.meta is preserved separately from structured output DATA.
+    metadata: Mapping[str, Any] | None = None
 
 
 class MCPTransport(Protocol):
@@ -163,7 +165,12 @@ class _SDKMCPTransport:
         else:
             output = None
 
-        return RemoteCallResult(is_error=bool(result.is_error), output=output)
+        result_meta = getattr(result, "meta", None)
+        return RemoteCallResult(
+            is_error=bool(result.is_error),
+            output=output,
+            metadata=dict(result_meta) if isinstance(result_meta, Mapping) else None,
+        )
 
     async def health_check(self) -> bool:
         try:

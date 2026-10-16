@@ -35,6 +35,8 @@ async def test_network_failure_preserves_safe_stage_and_no_retry(
     diagnostic = captured.value.diagnostic
     assert diagnostic["code"] == code and diagnostic["phase"] == phase
     assert diagnostic["response_received"] is (False if phase == "connect" else None)
+    assert diagnostic["http_request_attempted"] is (phase == "request_or_response")
+    assert diagnostic["execution_uncertain"] is (phase == "request_or_response")
     assert diagnostic["repair_condition"]
     assert "secret" not in str(captured.value) and len(calls) == 1
 
@@ -108,6 +110,30 @@ async def test_dns_answers_outside_scope_are_rejected_before_connection(
 async def test_unapproved_paths_denied(policy: ServerPolicy, path: str) -> None:
     with pytest.raises(ToolInputError, match="path outside"):
         await request(policy, "bank", path)
+
+
+async def test_preflight_rejection_proves_no_http_request_attempt(policy: ServerPolicy) -> None:
+    from redteam.capability.servers.network import TargetRequestError
+
+    called = False
+
+    def fail_if_called(_req):
+        nonlocal called
+        called = True
+        raise AssertionError("preflight rejection reached HTTP transport")
+
+    with pytest.raises(TargetRequestError, match="path outside") as captured:
+        await request(
+            policy,
+            "bank",
+            "/outside-scope",
+            transport=httpx.MockTransport(fail_if_called),
+        )
+
+    assert not called
+    assert captured.value.diagnostic["http_request_attempted"] is False
+    assert captured.value.diagnostic["execution_uncertain"] is False
+    assert captured.value.diagnostic["phase"] == "preflight"
 
 
 async def test_write_method_disabled_by_default(policy: ServerPolicy) -> None:
