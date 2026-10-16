@@ -114,9 +114,9 @@ class PosthocClaimVerifier(Protocol):
 
 
 _CLAIM_SYSTEM = (
-    "Judge the new claim against the preserved raw excerpts. Confirm only "
-    "what the excerpts show for that claim; a bare success proves nothing. "
-    "Reply with JSON only."
+    "보존된 원문 발췌를 근거로 새 주장을 판단하세요. 발췌가 해당 주장에 대해 "
+    "보여 주는 내용만 확인하세요. 성공했다는 말만으로는 아무것도 입증되지 않습니다. "
+    "JSON만 응답하세요."
 )
 
 
@@ -177,10 +177,9 @@ class DeterministicAnalysisVerifier:
 
 
 _ANALYSIS_SYSTEM = (
-    "Judge the tested hypothesis claim against the tool output and the "
-    "pre-recorded expectation. Confirm only what the output shows for "
-    "that claim; expectation alone is never enough and a bare success "
-    "proves nothing. Reply with JSON only."
+    "검증 대상 가설 주장을 도구 출력 및 사전 기록된 기대와 대조해 판단하세요. "
+    "출력이 해당 주장에 대해 보여 주는 내용만 확인하세요. 기대만으로는 결코 충분하지 "
+    "않으며, 성공했다는 말만으로는 아무것도 입증되지 않습니다. JSON만 응답하세요."
 )
 
 
@@ -944,8 +943,8 @@ class StructuredLLMAnalysisVerifier:
                 response_schema["properties"]["hypothesis_outcome"] = {
                     "type": "string", "enum": ["success", "refuted", "unknown"],
                     "description": (
-                        "Whether evidence supports, refutes, "
-                        "or does not resolve the cited hypothesis."
+                        "인용한 가설을 증거가 지지하는지, 반증하는지, "
+                        "또는 아직 판단할 수 없는지 구분합니다."
                     ),
                 }
                 response_schema["required"].append("hypothesis_outcome")
@@ -954,10 +953,10 @@ class StructuredLLMAnalysisVerifier:
                 payload={"claim": claim, "excerpts": excerpts},
                 response_schema=response_schema,
                 system=_CLAIM_SYSTEM + (
-                    " When reference_hypothesis is given, independently judge its meaning "
-                    "from these same sources. A paraphrase may support it; an unrelated "
-                    "claim or a narrower negative result does not resolve it. Return "
-                    "hypothesis_outcome separately from the new claim outcome."
+                    " reference_hypothesis가 주어지면 동일한 출처를 바탕으로 그 의미도 "
+                    "독립적으로 판단하세요. 바꾸어 표현한 내용도 이를 뒷받침할 수 있지만, "
+                    "관련 없는 주장이나 더 좁은 범위의 부정적 결과로는 이를 판단할 수 "
+                    "없습니다. hypothesis_outcome은 새 주장의 outcome과 별도로 반환하세요."
                 ),
                 budget=budget,
                 before_call=before_call,

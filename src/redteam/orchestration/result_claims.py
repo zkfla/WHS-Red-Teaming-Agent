@@ -89,12 +89,11 @@ def check_result_edge_proof(tx, proof):
 
 
 RESULT_REVIEW_INSTRUCTION = (
-    " Describe actual results as claims tied to their exact source evidence. "
-    "Use semantic for general investigation or synthesis, poc for a vulnerability "
-    "success claim, and hypothesis_confirmed/hypothesis_refuted for those conclusions. "
-    "Include the actual target, account and hypothesis references required by the "
-    "original purpose. Accepting a result requires at least one supported claim. "
-    "Provisional plan steps are methods; never require all of them to finish."
+    " 실제 결과는 정확한 원본 증거에 연결된 주장으로 기술하세요. 일반 조사나 종합에는 "
+    "semantic을, 취약점 성공 주장에는 poc를, 해당 결론에는 "
+    "hypothesis_confirmed/hypothesis_refuted를 사용하세요. 원래 목적에서 요구하는 실제 "
+    "대상, 계정 및 가설 참조를 포함하세요. 결과를 수용하려면 뒷받침되는 주장이 하나 이상 "
+    "필요합니다. 잠정 계획 단계는 수행 방법이므로, 모든 단계를 끝내도록 요구하지 마세요."
 )
 
 

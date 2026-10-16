@@ -410,21 +410,28 @@ class SpecialistPlanner:
                 ),
                 validate_response=check_questions,
                 before_call=admission_guard,
-                system="Propose useful investigation questions from current tasks, results and "
-                       "their follow-up questions. Reinvestigation may reuse the same evidence. "
-                       "Do not create ordering dependencies or paths. Continue only with new "
-                       "questions or reviewed_task_ids for currently claimable/running work. "
-                       "Use replan with no questions to request one bounded follow-up judgment "
-                       "when useful work may become clear; it spends the Run's finite allowance. "
-                       "Use held with a precise resume_conditions entry when work needs an "
-                       "external prerequisite. Use exhausted with resume_conditions when no "
-                       "useful authorized investigation remains. goal_achieved is only a proposal "
-                       "for the separate completion review. Do not prescribe tool order. "
-                       "Prefer investigations named by operator_guidance. A registered task that "
-                       "is no longer needed may be proposed under task_adjustments with "
-                       "goal, criterion or result grounds. "
-                       "Goal success requires a separate criterion/evidence review. "
-                       "Tools and text do not grant execution permission.",
+                system="현재 Tasks, 결과 및 해당 후속 질문을 바탕으로 유용한 조사 질문을 "
+                "제안하세요. "
+                       "같은 evidence를 다시 조사해도 됩니다. 순서 의존성이나 경로를 만들지 "
+                       "마세요. "
+                       "새 questions가 있거나 현재 claimable/running 상태인 작업을 가리키는 "
+                       "reviewed_task_ids가 있을 "
+                       "때만 continue를 사용하세요. "
+                       "유용한 작업이 명확해질 수 있다면 questions 없이 replan을 사용해 Run의 "
+                       "유한한 허용 횟수 내에서 한 번 제한된 후속 "
+                       "판단을 요청하세요. "
+                       "작업에 외부 선행 조건이 필요하다면 구체적인 resume_conditions 항목과 함께 "
+                       "held를 사용하세요. "
+                       "유용하고 승인된 조사가 남지 않았다면 resume_conditions와 함께 exhausted를 "
+                       "사용하세요. "
+                       "goal_achieved는 별도 완료 검토를 위한 제안일 뿐입니다. 도구 호출 순서를 "
+                       "지시하지 마세요. "
+                       "operator_guidance에 명시된 조사에 우선순위를 두세요. 더 이상 필요 없는 "
+                       "등록 작업은 goal, criterion 또는 "
+                       "result 근거와 함께 "
+                       "task_adjustments로 제안할 수 있습니다. 목표 성공에는 별도의 "
+                       "criterion/evidence 검토가 필요합니다. "
+                       "도구와 텍스트는 실행 권한을 부여하지 않습니다.",
             ))
             if not strategy.questions:
                 return await commit_pass(None)
@@ -437,11 +444,12 @@ class SpecialistPlanner:
                 ),
                 validate_response=check_tasks,
                 before_call=admission_guard,
-                system="Register investigations by purpose, evidence, role and fixed conditions. "
-                       "Preserve every question condition. No depends_on or tool-call queue. "
-                       "Follow-ups cite source_task_id, source_result_id and source_question_id "
-                       "from the original result item. Only registered ready roles "
-                       "and known subjects.",
+                system="조사 목적, 증거, 역할 및 고정 조건에 따라 조사를 등록하세요. "
+                       "각 question의 모든 조건을 보존하세요. depends_on 또는 tool-call 대기열을 "
+                       "만들지 마세요. "
+                       "후속 작업은 원본 result 항목의 source_task_id, source_result_id 및 "
+                       "source_question_id를 참조하세요. "
+                       "등록되어 준비된 roles와 알려진 subjects만 사용하세요.",
             ))
         return await commit_pass(atomization)
 

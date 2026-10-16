@@ -90,8 +90,8 @@ def _native_chat_completion_format(response_schema: dict[str, Any]) -> dict[str,
 def _schema_json_system(system: str | None, response_schema: dict[str, Any]) -> str:
     """Trusted schema instruction for providers that do not enforce the schema natively."""
     instruction = (
-        "Respond with a single JSON object only -- no prose, no "
-        "markdown fences -- matching this JSON Schema: "
+        "다음 JSON Schema에 맞는 JSON 객체 하나만 응답하세요. "
+        "설명문이나 Markdown 코드 펜스는 포함하지 마세요: "
         + json.dumps(response_schema)
     )
     return f"{system}\n\n{instruction}" if system else instruction

@@ -138,8 +138,8 @@ async def parse_objective(utterance: str, *, llm: Any = None) -> tuple[str, list
                 "required": ["objective"],
             },
             system=(
-                "Rewrite the operator's request as a single concise security-test "
-                "objective sentence. Do not include any credential, token or secret."
+                "운영자의 요청을 간결한 보안 테스트 목표 문장 하나로 다시 작성하세요. "
+                "자격 증명, 토큰 또는 비밀 정보는 포함하지 마세요."
             ),
         )
     except Exception:  # noqa: BLE001 - planning must not fail on a bad LLM reply

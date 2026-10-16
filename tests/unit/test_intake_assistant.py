@@ -97,4 +97,4 @@ async def test_editing_session_gets_the_edit_context_appended() -> None:
     await assistant.step(session, "max actions를 200으로")
 
     assert captured_system[0] is not None
-    assert "editing an EXISTING" in captured_system[0]
+    assert "기존 참여 설정을 수정" in captured_system[0]

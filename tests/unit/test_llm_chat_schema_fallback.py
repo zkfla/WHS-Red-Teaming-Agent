@@ -16,8 +16,8 @@ from redteam.llm.litellm import LiteLLMClient, _schema_json_system
 
 SCHEMA = {"type": "object", "properties": {"a": {"type": "integer"}}, "required": ["a"]}
 INSTRUCTION = (
-    "Respond with a single JSON object only -- no prose, no markdown fences -- "
-    "matching this JSON Schema: " + json.dumps(SCHEMA)
+    "다음 JSON Schema에 맞는 JSON 객체 하나만 응답하세요. "
+    "설명문이나 Markdown 코드 펜스는 포함하지 마세요: " + json.dumps(SCHEMA)
 )
 
 

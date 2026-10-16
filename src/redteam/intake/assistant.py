@@ -46,8 +46,8 @@ class IntakeAssistant:
         self._system_prompt = build_system_prompt()
         if reply_language:
             self._system_prompt += (
-                f"\n\nWrite `acknowledgement` and `follow_up_questions` in {reply_language}. "
-                "Ask one or two short questions per turn."
+                f"\n\n`acknowledgement`와 `follow_up_questions`는 {reply_language}로 작성하세요. "
+                "한 번에 짧은 질문을 한두 개만 하세요."
             )
 
     async def step(self, session: IntakeSession, user_message: str) -> IntakeTurn:

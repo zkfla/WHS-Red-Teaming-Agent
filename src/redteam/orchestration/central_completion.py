@@ -298,8 +298,8 @@ async def complete_goal(deps, runtime, *, budget=None):
             ),
             response_schema=GoalReview.model_json_schema(),
             system=RESULT_REVIEW_INSTRUCTION +
-                   " Judge only the original goal criteria. Unrelated open hypotheses/questions "
-                   "may be reported without blocking success. A registered follow-up is not proof.",
+                   " 원래 목표 기준만 판단하세요. 관련 없는 미해결 가설이나 질문은 성공을 "
+                   "막지 않고 보고할 수 있습니다. 등록된 후속 작업은 증거가 아닙니다.",
             budget=budget,
         ))
     criteria = [item.criterion for item in review.criteria]

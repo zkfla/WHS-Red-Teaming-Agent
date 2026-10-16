@@ -21,10 +21,10 @@ def test_rendered_schema_guides_criterion_principals_without_changing_fields():
     assert set(rendered["$defs"]["PlannedQuestionSelection"]["properties"]) == question_fields
     assert set(rendered["$defs"]["CompletionCriterion"]["properties"]) == criterion_fields
     guidance = rendered["$defs"]["CompletionCriterion"]["properties"]["principal_refs"]
-    assert "subset" in guidance["description"]
-    assert "question's principal_refs" in guidance["description"]
-    assert "registered and permitted" in guidance["description"]
-    assert "never broaden subjects or grant authorization" in guidance["description"]
+    assert "부분집합" in guidance["description"]
+    assert "question의 principal_refs" in guidance["description"]
+    assert "등록되고 허용" in guidance["description"]
+    assert "subjects를 넓히거나 권한을 부여하지" in guidance["description"]
 
 
 def test_existing_binder_rejects_registered_criterion_principal_outside_question():
