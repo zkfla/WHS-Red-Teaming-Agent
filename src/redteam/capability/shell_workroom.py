@@ -2521,7 +2521,7 @@ class ShellWorkroomManager:
         )
 
     async def _read_spool_bytes(
-        self, container_name: str, tag: str, *, stream: str
+        self, container_name: str, tag: str, *, stream: str, limit_bytes: int | None = None
     ) -> bytes | None:
         # Best-effort read of one sealed spool stream. None when absent.
         # Reads as container root under the system-only PATH, like the
@@ -2533,6 +2533,15 @@ class ShellWorkroomManager:
         try:
             out_path, err_path, _meta_path = self._spool_paths(tag)
             spool_path = out_path if stream == "out" else err_path
+            stream_limit = self._policy.max_output_bytes
+            if limit_bytes is not None:
+                if (
+                    isinstance(limit_bytes, bool)
+                    or not isinstance(limit_bytes, int)
+                    or not 1 <= limit_bytes <= 2 * 1024 * 1024
+                ):
+                    return None
+                stream_limit = limit_bytes
             code, stdout, _stderr, outer, trunc = await self._run_docker(
                 (
                     "exec", "--user", "0",
@@ -2541,7 +2550,7 @@ class ShellWorkroomManager:
                 ),
                 None,
                 _KILL_TIMEOUT_SECONDS,
-                2 * self._policy.max_output_bytes + 65536,
+                2 * stream_limit + 65536,
             )
             if code != 0 or outer or trunc:
                 return None
@@ -2550,7 +2559,12 @@ class ShellWorkroomManager:
             return None
 
     async def read_spool_stream(
-        self, key: str, supervisor_id: str, *, stream: str = "out"
+        self,
+        key: str,
+        supervisor_id: str,
+        *,
+        stream: str = "out",
+        limit_bytes: int | None = None,
     ) -> bytes | None:
         # One spool stream for a supervisor execution, or None when
         # unreadable. Never raises. The selector must be the
@@ -2562,7 +2576,9 @@ class ShellWorkroomManager:
             if stream not in ("out", "err"):
                 return None
             name = self._known.get(key) or container_name_for(key)
-            return await self._read_spool_bytes(name, supervisor_id, stream=stream)
+            return await self._read_spool_bytes(
+                name, supervisor_id, stream=stream, limit_bytes=limit_bytes
+            )
         except Exception:
             return None
 
@@ -2855,6 +2871,33 @@ class ShellWorkroomManager:
                     "exec", "--user", "0", "-e", "PATH=" + _MECHANISM_PATH,
                     "-i", name, "/bin/rm", "-f", result_path, pgid_path,
                     out_path, err_path, meta_path,
+                ),
+                None,
+                _KILL_TIMEOUT_SECONDS,
+                None,
+            )
+            return code == 0 and not timed_out and not truncated
+        except Exception:
+            return False
+
+    async def discard_provider_streams(self, key: str, tag: str) -> bool:
+        """Delete raw provider stdout/stderr while retaining terminal proof.
+
+        Canonical protocol adapters project any needed safe receipt before
+        calling this method. The protected supervisor result, process-group
+        selector, and digest-only spool metadata remain available for a later
+        termination check; response bytes and credentials do not.
+        """
+        try:
+            check_workroom_key(key)
+            if not isinstance(tag, str) or not _JOB_TAG.fullmatch(tag):
+                return False
+            name = self._known.get(key) or container_name_for(key)
+            out_path, err_path, _meta_path = self._spool_paths(tag)
+            code, _out, _err, timed_out, truncated = await self._run_docker(
+                (
+                    "exec", "--user", "0", "-e", "PATH=" + _MECHANISM_PATH,
+                    "-i", name, "/bin/rm", "-f", out_path, err_path,
                 ),
                 None,
                 _KILL_TIMEOUT_SECONDS,

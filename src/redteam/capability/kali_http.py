@@ -36,6 +36,12 @@ from redteam.capability.shell_workroom import (
     ShellWorkroomManager,
     workroom_key_for,
 )
+from redteam.core.contracts.evidence import EvidenceRecord
+from redteam.core.contracts.execution import (
+    ExecutionRecoveryAnswer,
+    ExecutionReference,
+    ExecutionState,
+)
 from redteam.core.contracts.target import UrlTarget
 from redteam.core.contracts.tool import (
     EXECUTION_STARTED_METADATA_KEY,
@@ -44,13 +50,21 @@ from redteam.core.contracts.tool import (
     ToolError,
     ToolInvocation,
     ToolResourceEffect,
+    ToolResult,
     ToolTargetBinding,
 )
-from redteam.core.convert import execution_input_digest
-from redteam.core.enums import RiskLevel, ToolHealthStatus
+from redteam.core.convert import digest_payload, execution_input_digest
+from redteam.core.enums import EvidenceSourceType, RiskLevel, ToolHealthStatus
+from redteam.core.ids import EvidenceId, new_id
+from redteam.core.ports.evidence_store import EvidenceStore
 
 SERVER_ID = "web-http"
 RECEIPT_VERSION = 1
+_RECOVERY_RECORD_SOURCE = "capability.kali_http"
+_RECOVERY_RECORD_VERSION = 1
+_RECOVERY_TOOL_NAMES = frozenset({
+    "http_request", "http_compare_sessions", "http_compare_anonymous", "http_security_posture",
+})
 
 
 # The request envelope, including any credential, is stdin.  The script and
@@ -269,6 +283,7 @@ class BuiltinKaliHttpAdapter:
         executor: DirectTargetExecutionPolicy,
         provider: DirectTargetProviderConfig,
         policy: ServerPolicy,
+        evidence_store: EvidenceStore | None = None,
     ) -> None:
         self._workroom, self._executor, self._provider, self._policy = (
             workroom,
@@ -276,6 +291,8 @@ class BuiltinKaliHttpAdapter:
             provider,
             policy,
         )
+        self._evidence_store = evidence_store
+        self._ordinal_admission_lock = asyncio.Lock()
         self._resource_effects_by_tool: dict[str, list[ToolResourceEffect]] | None = None
         for _ref, profile in policy.targets.items():
             parsed = urlsplit(profile.origin)
@@ -326,6 +343,531 @@ class BuiltinKaliHttpAdapter:
         except Exception:
             return ToolHealthStatus.UNKNOWN
         return ToolHealthStatus.HEALTHY if alive else ToolHealthStatus.UNHEALTHY
+
+    def prepare_reference(self, invocation: ToolInvocation) -> ExecutionReference | None:
+        """Derive stable per-ordinal recovery selectors without provider I/O."""
+        if self._evidence_store is None:
+            return None
+        try:
+            prefix = f"web.{SERVER_ID}."
+            tool_id = str(invocation.tool_id)
+            if not tool_id.startswith(prefix):
+                return None
+            tool_name = tool_id[len(prefix):]
+            if tool_name not in _RECOVERY_TOOL_NAMES:
+                return None
+            context = invocation.execution_context
+            if context.instance_id is None:
+                return None
+            input_digest = execution_input_digest(invocation)
+            workroom_key = workroom_key_for(
+                str(invocation.run_id), str(context.instance_id)
+            )
+            ordinal_count = 2 if tool_name in {
+                "http_compare_sessions", "http_compare_anonymous",
+            } else 1
+            tags = [
+                self._supervisor_tag(invocation, input_digest, ordinal)
+                for ordinal in range(ordinal_count)
+            ]
+            return ExecutionReference(
+                engagement_id=context.engagement_id,
+                run_id=invocation.run_id,
+                instance_id=context.instance_id,
+                action_id=invocation.action_id,
+                invocation_id=invocation.invocation_id,
+                tool_id=invocation.tool_id,
+                input_digest=input_digest,
+                provider_handle={
+                    "version": _RECOVERY_RECORD_VERSION,
+                    "tool": tool_name,
+                    "workroom_key": workroom_key,
+                    "ordinal_tags": tags,
+                },
+            )
+        except Exception:
+            return None
+
+    @staticmethod
+    def _supervisor_tag(invocation: ToolInvocation, input_digest: str, ordinal: int) -> str:
+        identity = "\0".join((
+            str(invocation.run_id), str(invocation.action_id),
+            str(invocation.invocation_id), input_digest, str(ordinal),
+        ))
+        return "khttp_" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24] + (
+            "_" + str(ordinal)
+        )
+
+    @staticmethod
+    def _reference_parts(reference: ExecutionReference) -> tuple[str, list[str]] | None:
+        try:
+            prefix = f"web.{SERVER_ID}."
+            tool_id = str(reference.tool_id)
+            if not tool_id.startswith(prefix) or reference.instance_id is None:
+                return None
+            tool_name = tool_id[len(prefix):]
+            if tool_name not in _RECOVERY_TOOL_NAMES:
+                return None
+            workroom_key = workroom_key_for(
+                str(reference.run_id), str(reference.instance_id)
+            )
+            ordinal_count = 2 if tool_name in {
+                "http_compare_sessions", "http_compare_anonymous",
+            } else 1
+            tags = []
+            for ordinal in range(ordinal_count):
+                identity = "\0".join((
+                    str(reference.run_id), str(reference.action_id),
+                    str(reference.invocation_id), reference.input_digest, str(ordinal),
+                ))
+                tags.append(
+                    "khttp_" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+                    + "_" + str(ordinal)
+                )
+            expected = {
+                "version": _RECOVERY_RECORD_VERSION,
+                "tool": tool_name,
+                "workroom_key": workroom_key,
+                "ordinal_tags": tags,
+            }
+            if reference.provider_handle != expected:
+                return None
+            return workroom_key, tags
+        except Exception:
+            return None
+
+    @staticmethod
+    def _reference_digest(reference: ExecutionReference) -> str:
+        canonical = json.dumps(
+            reference.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(canonical).hexdigest()
+
+    async def query_execution(
+        self, reference: ExecutionReference
+    ) -> ExecutionRecoveryAnswer:
+        """Prove only provider termination; never promote partial output to a result."""
+        held = ExecutionRecoveryAnswer(
+            state=ExecutionState.UNKNOWN,
+            verified=False,
+            uncertain=True,
+            result_available=False,
+        )
+        if self._evidence_store is None:
+            return held
+        parts = self._reference_parts(reference)
+        if parts is None:
+            return held
+        workroom_key, tags = parts
+        try:
+            entered = await self._ordinal_entries(reference)
+            if entered is None:
+                return held
+            for ordinal, tag in enumerate(tags):
+                has_started, has_receipt = entered.get(ordinal, (False, False))
+                if has_receipt and not has_started:
+                    return held
+                record = await self._workroom.supervisor_record(workroom_key, tag)
+                if not has_started:
+                    if record is not None:
+                        return held
+                    outcome, alive = await self._workroom.supervisor_outcome(
+                        workroom_key, tag
+                    )
+                    if outcome is not None or alive:
+                        return held
+                    continue
+                if not isinstance(record, dict) or not ShellWorkroomManager.record_trusted(record):
+                    return held
+                if record.get("outcome") not in {"completed", "timeout", "cancelled"}:
+                    return held
+                outcome, alive = await self._workroom.supervisor_outcome(
+                    workroom_key, tag
+                )
+                if outcome != record.get("outcome") or alive:
+                    return held
+            if not await self._route_is_closed(workroom_key):
+                return held
+        except Exception:
+            return held
+        return ExecutionRecoveryAnswer(
+            state=ExecutionState.UNKNOWN,
+            verified=True,
+            uncertain=True,
+            result_available=False,
+            execution_terminated=True,
+            error=ToolError(
+                code="kali_http_original_result_unavailable",
+                message=(
+                    "HTTP execution termination is verified; the complete result is unavailable"
+                ),
+            ),
+        )
+
+    async def fetch_execution(self, reference: ExecutionReference) -> ToolResult | None:
+        # Ordinal projections deliberately are not reassembled as a successful
+        # composite response. The normal executor owns the final ToolResult.
+        return None
+
+    async def _ordinal_entries(
+        self, reference: ExecutionReference,
+    ) -> dict[int, tuple[bool, bool]] | None:
+        if self._evidence_store is None:
+            return None
+        reference_digest = self._reference_digest(reference)
+        states: dict[int, tuple[bool, bool]] = {}
+        event_counts: dict[int, tuple[int, int]] = {}
+        for record in await self._evidence_store.list_for_run(reference.run_id):
+            if (
+                record.source_type is not EvidenceSourceType.SYSTEM
+                or record.source_id != _RECOVERY_RECORD_SOURCE
+                or record.invocation_id != reference.invocation_id
+            ):
+                continue
+            payload = record.metadata
+            if (
+                record.run_id != reference.run_id
+                or record.engagement_id != reference.engagement_id
+                or record.action_id != reference.action_id
+            ):
+                return None
+            if (
+                payload.get("record_kind") not in {
+                    "kali_http_ordinal_started", "kali_http_ordinal_receipt",
+                }
+                or payload.get("schema_version") != _RECOVERY_RECORD_VERSION
+                or payload.get("invocation_id") != str(reference.invocation_id)
+                or payload.get("action_id") != str(reference.action_id)
+                or payload.get("tool_id") != str(reference.tool_id)
+                or payload.get("input_digest") != reference.input_digest
+                or payload.get("reference_digest") != reference_digest
+                or record.digest != digest_payload(payload)
+            ):
+                return None
+            ordinal = payload.get("ordinal")
+            tags = reference.provider_handle.get("ordinal_tags")
+            if (
+                type(ordinal) is not int or not isinstance(tags, list)
+                or not 0 <= ordinal < len(tags) or payload.get("tag") != tags[ordinal]
+            ):
+                return None
+            was_started, has_receipt = states.get(ordinal, (False, False))
+            if payload.get("record_kind") == "kali_http_ordinal_started":
+                started_count, receipt_count = event_counts.get(ordinal, (0, 0))
+                if started_count:
+                    return None
+                event_counts[ordinal] = (1, receipt_count)
+                states[ordinal] = (True, has_receipt)
+            else:
+                started_count, receipt_count = event_counts.get(ordinal, (0, 0))
+                if receipt_count:
+                    return None
+                event_counts[ordinal] = (started_count, 1)
+                safe = payload.get("safe_result")
+                if not isinstance(safe, dict) or not self._safe_result_matches_reference(
+                    safe, reference, ordinal
+                ):
+                    return None
+                states[ordinal] = (was_started, True)
+        return states
+
+    @staticmethod
+    def _safe_result_matches_reference(
+        safe: dict[str, Any], reference: ExecutionReference, ordinal: int,
+    ) -> bool:
+        receipt = safe.get("http_receipt")
+        if not isinstance(receipt, dict):
+            return False
+        if set(safe) - {"ordinal", "success", "http_receipt", "diagnostic_code"}:
+            return False
+        if set(receipt) != {"version", "provider", "request", "response"}:
+            return False
+        request = receipt.get("request")
+        response = receipt.get("response")
+        body = response.get("body") if isinstance(response, dict) else None
+        if not isinstance(request, dict) or not isinstance(response, dict):
+            return False
+        if set(request) - {
+            "binding", "invocation_id", "action_id", "input_digest", "method", "target_ref",
+            "canonical_target", "path", "query_sha256", "query_keys", "allowed_header_names",
+            "body_sha256", "body_bytes", "session_ref", "principal_ref", "principal_scope",
+            "redirect_policy",
+        }:
+            return False
+        if set(response) - {
+            "request_binding", "response_received", "status", "safe_headers", "body", "peer",
+            "transport", "failure_phase",
+        }:
+            return False
+        if not isinstance(body, dict) or set(body) - {
+            "artifact_ref", "sha256", "size_bytes", "truncated", "retention",
+        }:
+            return False
+        headers = response.get("safe_headers")
+        if isinstance(headers, dict) and set(headers) - {
+            "names", "content_type", "security_headers_present", "posture_headers_present",
+            "cache_control_no_store", "content_type_nosniff", "cookies",
+            "set_cookie_header_count", "cookies_truncated", "values_omitted", "redirect",
+            "auth_challenge",
+        }:
+            return False
+        return (
+            safe.get("ordinal") == ordinal
+            and type(safe.get("success")) is bool
+            and receipt.get("version") == RECEIPT_VERSION
+            and receipt.get("provider") == "kali-http-v1"
+            and request.get("invocation_id") == str(reference.invocation_id)
+            and request.get("action_id") == str(reference.action_id)
+            and request.get("input_digest") == reference.input_digest
+            and response.get("request_binding") == request.get("binding")
+            and body.get("retention") == "digest_only"
+            and isinstance(body.get("sha256"), str)
+            and type(body.get("size_bytes")) is int
+        )
+
+    def _provider_output_limit(self) -> int:
+        return min(
+            2 * 1024 * 1024,
+            max(
+                self._workroom.policy.max_output_bytes,
+                (self._policy.max_response_bytes * 4 // 3) + 131072,
+            ),
+        )
+
+    @staticmethod
+    def _safe_ordinal_projection(
+        result: MCPCallResult, ordinal: int, reference: ExecutionReference,
+    ) -> dict[str, Any] | None:
+        raw_output = result.output if isinstance(result.output, dict) else {}
+        raw_receipt = raw_output.get("http_receipt")
+        if not isinstance(raw_receipt, dict):
+            return None
+        request = raw_receipt.get("request")
+        response = raw_receipt.get("response")
+        if not isinstance(request, dict) or not isinstance(response, dict):
+            return None
+        request_fields = (
+            "binding", "invocation_id", "action_id", "input_digest", "method", "target_ref",
+            "canonical_target", "path", "query_sha256", "query_keys", "allowed_header_names",
+            "body_sha256", "body_bytes", "session_ref", "principal_ref", "principal_scope",
+            "redirect_policy",
+        )
+        response_fields = (
+            "request_binding", "response_received", "status", "safe_headers", "body", "peer",
+            "transport", "failure_phase",
+        )
+        safe_request = {key: request[key] for key in request_fields if key in request}
+        safe_response = {key: response[key] for key in response_fields if key in response}
+        safe_headers = safe_response.get("safe_headers")
+        if isinstance(safe_headers, dict):
+            header_fields = (
+                "names", "content_type", "security_headers_present", "posture_headers_present",
+                "cache_control_no_store", "content_type_nosniff", "cookies",
+                "set_cookie_header_count", "cookies_truncated", "values_omitted", "redirect",
+                "auth_challenge",
+            )
+            safe_response["safe_headers"] = {
+                key: safe_headers[key] for key in header_fields if key in safe_headers
+            }
+        raw_body = safe_response.get("body")
+        if isinstance(raw_body, dict):
+            safe_response["body"] = {
+                key: raw_body[key]
+                for key in ("artifact_ref", "sha256", "size_bytes", "truncated", "retention")
+                if key in raw_body
+            }
+        safe_receipt = {
+            "version": raw_receipt.get("version"),
+            "provider": raw_receipt.get("provider"),
+            "request": safe_request,
+            "response": safe_response,
+        }
+        safe_result: dict[str, Any] = {
+            "ordinal": ordinal,
+            "success": result.success,
+            "http_receipt": safe_receipt,
+        }
+        error_code = result.error.code if result.error is not None else None
+        if isinstance(error_code, str) and len(error_code) <= 128:
+            safe_result["diagnostic_code"] = error_code
+        if not BuiltinKaliHttpAdapter._safe_result_matches_reference(
+            safe_result, reference, ordinal
+        ):
+            return None
+        try:
+            json.dumps(safe_result, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        except (TypeError, ValueError):
+            return None
+        return safe_result
+
+    async def _route_is_closed(self, workroom_key: str) -> bool:
+        extension = getattr(self._executor, "extension", None)
+        inventory_mode = getattr(extension, "inventory_mode", None)
+        expected_networks = getattr(extension, "expected_networks", None)
+        if not callable(inventory_mode) or not callable(expected_networks):
+            return False
+        if inventory_mode(workroom_key) != "full":
+            return False
+        if expected_networks(workroom_key) != frozenset({"none"}):
+            return False
+        container_state = await self._workroom.workroom_container_state(workroom_key)
+        if container_state == "gone":
+            return True
+        if container_state not in {"running", "stopped"}:
+            return False
+        return await self._workroom.verify_workroom_ownership(workroom_key)
+
+    async def _append_ordinal_marker(
+        self, reference: ExecutionReference, ordinal: int, *, receipt: dict[str, Any] | None = None,
+    ) -> None:
+        if self._evidence_store is None:
+            return
+        entries = await self._ordinal_entries(reference)
+        if entries is None:
+            raise ShellWorkroomError("kali_http_recovery_store_unreadable")
+        started, has_receipt = entries.get(ordinal, (False, False))
+        if receipt is None:
+            if started or has_receipt:
+                raise ShellWorkroomError("kali_http_ordinal_replay_refused", uncertainty=True)
+            parts = self._reference_parts(reference)
+            if parts is None:
+                raise ShellWorkroomError("kali_http_recovery_reference_invalid")
+            workroom_key, tags = parts
+            tag = tags[ordinal]
+            prior = await self._workroom.supervisor_record(workroom_key, tag)
+            outcome, alive = await self._workroom.supervisor_outcome(workroom_key, tag)
+            if prior is not None or outcome is not None or alive:
+                raise ShellWorkroomError("kali_http_ordinal_replay_refused", uncertainty=True)
+        elif not started or has_receipt:
+            raise ShellWorkroomError("kali_http_ordinal_receipt_state_invalid", uncertainty=True)
+        payload: dict[str, Any] = {
+            "record_kind": (
+                "kali_http_ordinal_receipt" if receipt is not None
+                else "kali_http_ordinal_started"
+            ),
+            "schema_version": _RECOVERY_RECORD_VERSION,
+            "reference_digest": self._reference_digest(reference),
+            "invocation_id": str(reference.invocation_id),
+            "action_id": str(reference.action_id),
+            "tool_id": str(reference.tool_id),
+            "input_digest": reference.input_digest,
+            "ordinal": ordinal,
+            "tag": reference.provider_handle["ordinal_tags"][ordinal],
+        }
+        if receipt is not None:
+            payload["safe_result"] = receipt
+        record = EvidenceRecord(
+            evidence_id=EvidenceId(new_id("evidence")),
+            run_id=reference.run_id,
+            engagement_id=reference.engagement_id,
+            source_type=EvidenceSourceType.SYSTEM,
+            source_id=_RECOVERY_RECORD_SOURCE,
+            action_id=reference.action_id,
+            invocation_id=reference.invocation_id,
+            content_type="application/json",
+            digest=digest_payload(payload),
+            summary=(
+                f"Kali HTTP ordinal {ordinal} safe receipt"
+                if receipt is not None else f"Kali HTTP ordinal {ordinal} entered"
+            ),
+            created_at=datetime.now(timezone.utc),
+            metadata=payload,
+        )
+        await self._evidence_store.append(record)
+
+    async def _capture_safe_ordinal_from_spool(
+        self,
+        invocation: ToolInvocation,
+        reference: ExecutionReference,
+        args: _RequestArgs,
+        *,
+        started: datetime,
+        ordinal: int,
+        tag: str,
+        payload: dict[str, Any],
+        body: bytes,
+        host: str,
+        port: int,
+        principal: str | None,
+        request_binding: str,
+    ) -> bool:
+        """Project a complete protected envelope, then leave only safe fields."""
+        if self._evidence_store is None:
+            return False
+        try:
+            workroom_key = workroom_key_for(
+                str(invocation.run_id), str(invocation.execution_context.instance_id)
+            )
+            record = await self._workroom.supervisor_record(
+                workroom_key, tag,
+            )
+            if (
+                not isinstance(record, dict)
+                or not ShellWorkroomManager.record_trusted(record)
+                or record.get("outcome") not in {"completed", "timeout", "cancelled"}
+                or record.get("spool") != "complete"
+            ):
+                return False
+            workroom_key = workroom_key_for(
+                str(invocation.run_id), str(invocation.execution_context.instance_id)
+            )
+            meta = await self._workroom.spool_record(workroom_key, tag)
+            if (
+                not isinstance(meta, dict)
+                or meta.get("sealed") is not True
+                or meta.get("invocation_id") != str(invocation.invocation_id)
+                or meta.get("input_digest") != reference.input_digest
+            ):
+                return False
+            expected_digest = record.get("spool_digest")
+            if not isinstance(expected_digest, str):
+                return False
+            canonical = json.dumps(meta, sort_keys=True).encode("utf-8")
+            if hashlib.sha256(canonical).hexdigest() != expected_digest:
+                return False
+            for stream in ("out", "err"):
+                entry = meta.get(stream)
+                if (
+                    not isinstance(entry, dict)
+                    or entry.get("complete") is not True
+                    or entry.get("truncated") is not False
+                    or type(entry.get("size")) is not int
+                    or entry["size"] < 0
+                    or entry["size"] > self._provider_output_limit()
+                    or not isinstance(entry.get("sha256"), str)
+                ):
+                    return False
+            output_limit = self._provider_output_limit()
+            raw_out = await self._workroom.read_spool_stream(
+                workroom_key, tag, stream="out", limit_bytes=output_limit
+            )
+            raw_err = await self._workroom.read_spool_stream(
+                workroom_key, tag, stream="err", limit_bytes=output_limit
+            )
+            if raw_out is None or raw_err is None:
+                return False
+            for raw, stream in ((raw_out, "out"), (raw_err, "err")):
+                entry = meta[stream]
+                if (
+                    len(raw) != entry["size"]
+                    or hashlib.sha256(raw).hexdigest() != entry["sha256"]
+                ):
+                    return False
+            try:
+                raw_envelope = json.loads(raw_out.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                return False
+            result = self._result_from_envelope(
+                raw_envelope, invocation, args, body, host, port, principal,
+                request_binding, started,
+            )
+            safe = self._safe_ordinal_projection(result, ordinal, reference)
+            if safe is None:
+                return False
+            await self._append_ordinal_marker(reference, ordinal, receipt=safe)
+            return True
+        except Exception:
+            return False
 
     async def invoke(self, tool: ToolDescriptor, arguments: dict[str, Any]) -> MCPCallResult:
         return self._failure("kali_http_context_required", "approved invocation context required")
@@ -602,6 +1144,16 @@ class BuiltinKaliHttpAdapter:
         self._validate_approved_url_scheme(invocation, args)
         payload, body, host, port, principal = self._prepare(args)
         input_digest = execution_input_digest(invocation)
+        reference = self.prepare_reference(invocation) if self._evidence_store is not None else None
+        tags = reference.provider_handle.get("ordinal_tags") if reference is not None else None
+        if reference is not None and (
+            not isinstance(tags, list) or ordinal >= len(tags) or not isinstance(tags[ordinal], str)
+        ):
+            raise ShellWorkroomError("kali_http_recovery_reference_invalid")
+        tag = tags[ordinal] if isinstance(tags, list) else self._supervisor_tag(
+            invocation, input_digest, ordinal
+        )
+        recoverable = self._evidence_store is not None and reference is not None
         request_binding = hashlib.sha256(
             json.dumps(
                 {
@@ -623,15 +1175,67 @@ class BuiltinKaliHttpAdapter:
         key = workroom_key_for(
             str(invocation.run_id), str(invocation.execution_context.instance_id)
         )
+        entered = False
+        receipt_persisted = False
+        cancelled = False
+
+        async def persist_safe_result(result: MCPCallResult) -> MCPCallResult:
+            nonlocal receipt_persisted
+            if recoverable and reference is not None:
+                safe = self._safe_ordinal_projection(result, ordinal, reference)
+                if safe is None:
+                    raise ShellWorkroomError(
+                        "kali_http_safe_ordinal_receipt_invalid", uncertainty=True
+                    )
+                try:
+                    await self._append_ordinal_marker(reference, ordinal, receipt=safe)
+                except ShellWorkroomError:
+                    raise
+                except Exception as exc:
+                    raise ShellWorkroomError(
+                        "kali_http_ordinal_receipt_persist_failed", uncertainty=True
+                    ) from exc
+                receipt_persisted = True
+            return result
+
+        async def cleanup_provider_record() -> None:
+            if recoverable:
+                discard_streams = getattr(self._workroom, "discard_provider_streams", None)
+                if callable(discard_streams):
+                    cleaned = await discard_streams(key, tag)
+                else:
+                    cleaned = await self._workroom.discard_provider_record(key, tag)
+                if cleaned is not True:
+                    # Raw bytes take precedence over the recovery seal. If the
+                    # narrow cleanup fails, remove the full record as a safe
+                    # fallback; termination will then remain unverified.
+                    cleaned = await self._workroom.discard_provider_record(key, tag)
+            else:
+                cleaned = await self._workroom.discard_provider_record(key, tag)
+            if cleaned is not True:
+                raise ShellWorkroomError("kali_http_spool_cleanup_failed", uncertainty=True)
 
         async def execute():
-            output_limit = min(
-                2 * 1024 * 1024,
-                max(
-                    self._workroom.policy.max_output_bytes,
-                    (self._policy.max_response_bytes * 4 // 3) + 131072,
-                ),
-            )
+            nonlocal entered, cancelled
+            output_limit = self._provider_output_limit()
+            if recoverable and reference is not None:
+                try:
+                    async with self._ordinal_admission_lock:
+                        await self._append_ordinal_marker(reference, ordinal)
+                except ShellWorkroomError as exc:
+                    return self._workroom_failure(
+                        exc,
+                        str(invocation.tool_id).split(".")[-1],
+                        started,
+                        execution_started=exc.uncertainty,
+                    )
+                except Exception:
+                    return self._workroom_failure(
+                        ShellWorkroomError("kali_http_recovery_store_unavailable"),
+                        str(invocation.tool_id).split(".")[-1],
+                        started,
+                    )
+            entered = True
             try:
                 execution = await self._workroom.exec_program(
                     key,
@@ -641,6 +1245,7 @@ class BuiltinKaliHttpAdapter:
                     timeout_seconds=min(
                         invocation.timeout_seconds, self._policy.timeout_seconds + 2
                     ),
+                    exec_tag=tag,
                     invocation_id=str(invocation.invocation_id),
                     input_digest=input_digest,
                     retain_record=True,
@@ -649,62 +1254,77 @@ class BuiltinKaliHttpAdapter:
                     _provider_argv_limit=64 * 1024,
                 )
                 if execution.timed_out:
-                    return self._transport_failure(
-                        "target_http_execution_timeout",
-                        "execution",
-                        started,
-                        request_binding,
-                        args,
-                        host,
-                        port,
-                        request_body=body,
-                        principal=principal,
-                        invocation=invocation,
+                    return await persist_safe_result(self._transport_failure(
+                        "target_http_execution_timeout", "execution", started,
+                        request_binding, args, host, port,
+                        request_body=body, principal=principal, invocation=invocation,
                         input_digest=input_digest,
-                    )
+                    ))
                 if execution.exit_code != 0 or execution.truncated:
-                    return self._transport_failure(
-                        "kali_http_receipt_unavailable",
-                        "execution",
-                        started,
-                        request_binding,
-                        args,
-                        host,
-                        port,
-                        request_body=body,
-                        principal=principal,
-                        invocation=invocation,
+                    return await persist_safe_result(self._transport_failure(
+                        "kali_http_receipt_unavailable", "execution", started,
+                        request_binding, args, host, port,
+                        request_body=body, principal=principal, invocation=invocation,
                         input_digest=input_digest,
-                    )
+                    ))
                 try:
                     raw = json.loads(execution.stdout)
                 except (TypeError, ValueError):
-                    return self._transport_failure(
-                        "kali_http_receipt_invalid",
-                        "protocol",
-                        started,
-                        request_binding,
-                        args,
-                        host,
-                        port,
-                        request_body=body,
-                        principal=principal,
-                        invocation=invocation,
+                    return await persist_safe_result(self._transport_failure(
+                        "kali_http_receipt_invalid", "protocol", started,
+                        request_binding, args, host, port,
+                        request_body=body, principal=principal, invocation=invocation,
                         input_digest=input_digest,
-                    )
-                return self._result_from_envelope(
+                    ))
+                result = self._result_from_envelope(
                     raw, invocation, args, body, host, port, principal, request_binding, started
                 )
+                return await persist_safe_result(result)
+            except asyncio.CancelledError:
+                cancelled = True
+                raise
             finally:
-                cleaned = await asyncio.shield(
-                    self._workroom.discard_provider_record(key, str(invocation.invocation_id))
-                )
-                if cleaned is not True:
-                    raise ShellWorkroomError("kali_http_spool_cleanup_failed", uncertainty=True)
+                if entered:
+                    try:
+                        if recoverable and not receipt_persisted and reference is not None:
+                            await asyncio.shield(self._capture_safe_ordinal_from_spool(
+                                invocation,
+                                reference,
+                                args,
+                                started=started,
+                                ordinal=ordinal,
+                                tag=tag,
+                                payload=payload,
+                                body=body,
+                                host=host,
+                                port=port,
+                                principal=principal,
+                                request_binding=request_binding,
+                            ))
+                        await asyncio.shield(cleanup_provider_record())
+                    except asyncio.CancelledError:
+                        if not cancelled:
+                            raise
+                    except Exception:
+                        if not cancelled:
+                            raise ShellWorkroomError(
+                                "kali_http_spool_cleanup_failed", uncertainty=True
+                            ) from None
 
-        return await self._executor.execute_route(
-            invocation, target_ref=host, port=port, delegate=execute
-        )
+        try:
+            return await self._executor.execute_route(
+                invocation, target_ref=host, port=port, delegate=execute
+            )
+        except ShellWorkroomError as exc:
+            tool_name = str(invocation.tool_id).split(".")[-1]
+            if tool_name in {"http_compare_sessions", "http_compare_anonymous"}:
+                raise
+            return self._workroom_failure(
+                exc,
+                tool_name,
+                started,
+                execution_started=entered or exc.uncertainty,
+            )
 
     def _transport_failure(
         self,

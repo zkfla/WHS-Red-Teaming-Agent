@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import io
@@ -24,10 +25,12 @@ from redteam.capability.shell_policy import ShellWorkroomPolicy
 from redteam.capability.shell_workroom import ExecResult, ShellWorkroomError, ShellWorkroomManager
 from redteam.core.contracts.target import HostTarget, UrlTarget
 from redteam.core.contracts.tool import ExecutionContext, ToolInvocation, ToolResult
+from redteam.core.enums import EvidenceSourceType
 from redteam.core.ids import (
     ActionId,
     AgentInstanceId,
     EngagementId,
+    EvidenceId,
     InvocationId,
     RunId,
     ToolId,
@@ -70,6 +73,223 @@ class FakeRoute:
         result = await delegate()
         result.metadata["direct_target_network"] = "attached_for_execution"
         return result
+
+
+class MemoryEvidenceStore:
+    def __init__(self):
+        self.records = []
+
+    async def append(self, evidence):
+        await asyncio.sleep(0)
+        self.records.append(evidence.model_copy(deep=True))
+
+    async def list_for_run(self, run_id):
+        await asyncio.sleep(0)
+        return [item.model_copy(deep=True) for item in self.records if item.run_id == run_id]
+
+
+class AppendThenFailEvidenceStore(MemoryEvidenceStore):
+    def __init__(self):
+        super().__init__()
+        self.failed = False
+
+    async def append(self, evidence):
+        await super().append(evidence)
+        if (
+            not self.failed
+            and evidence.metadata.get("record_kind") == "kali_http_ordinal_started"
+        ):
+            self.failed = True
+            raise RuntimeError("append acknowledgement lost")
+
+
+class RecoverableWorkroom(FakeWorkroom):
+    def __init__(self, envelope, state=None, *, hang_first=False, hang_second=False):
+        super().__init__(envelope)
+        self.state = state or {"records": {}, "meta": {}, "streams": {}, "alive": {}}
+        self.hang_first = hang_first
+        self.hang_second = hang_second
+        self.removed_streams = []
+        self.first_started = asyncio.Event()
+        self.second_started = asyncio.Event()
+
+    async def exec_program(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        tag = kwargs["exec_tag"]
+        ordinal = int(tag.rsplit("_", 1)[1])
+        if (ordinal == 0 and self.hang_first) or (ordinal == 1 and self.hang_second):
+            (self.first_started if ordinal == 0 else self.second_started).set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self._seal(tag, "cancelled", json.dumps(self.envelope))
+                raise
+        output = json.dumps(self.envelope)
+        self._seal(tag, "completed", output)
+        return ExecResult(
+            exit_code=0,
+            stdout=output,
+            stderr="",
+            timed_out=False,
+            truncated=False,
+            duration_ms=3,
+            workroom_key=args[0],
+            container_name="room",
+        )
+
+    def _seal(self, tag, outcome, stdout):
+        raw_out = stdout.encode("utf-8")
+        raw_err = b""
+        meta = {
+            "sealed": True,
+            "invocation_id": "inv_http_1",
+            "input_digest": self.calls[-1][1]["input_digest"],
+            "cap_bytes": self.calls[-1][1]["_provider_output_limit"],
+            "started_epoch": 1.0,
+            "finished_epoch": 2.0,
+            "out": {
+                "complete": True,
+                "truncated": False,
+                "size": len(raw_out),
+                "sha256": hashlib.sha256(raw_out).hexdigest(),
+            },
+            "err": {
+                "complete": True,
+                "truncated": False,
+                "size": 0,
+                "sha256": hashlib.sha256(raw_err).hexdigest(),
+            },
+        }
+        canonical = json.dumps(meta, sort_keys=True).encode("utf-8")
+        self.state["meta"][tag] = meta
+        self.state["streams"][tag] = (raw_out, raw_err)
+        self.state["records"][tag] = {
+            "outcome": outcome,
+            "protected": True,
+            "subreaper": True,
+            "unreaped": [],
+            "spool": "complete",
+            "spool_digest": hashlib.sha256(canonical).hexdigest(),
+        }
+        self.state["alive"][tag] = False
+
+    async def supervisor_record(self, key, tag):
+        record = self.state["records"].get(tag)
+        return dict(record) if isinstance(record, dict) else None
+
+    async def spool_record(self, key, tag):
+        meta = self.state["meta"].get(tag)
+        return dict(meta) if isinstance(meta, dict) else None
+
+    async def read_spool_stream(self, key, tag, *, stream="out", limit_bytes=None):
+        pair = self.state["streams"].get(tag)
+        if pair is None:
+            return None
+        return pair[0] if stream == "out" else pair[1]
+
+    async def supervisor_outcome(self, key, tag):
+        record = self.state["records"].get(tag)
+        outcome = record.get("outcome") if isinstance(record, dict) else None
+        return outcome, bool(self.state["alive"].get(tag, False))
+
+    async def discard_provider_streams(self, key, tag):
+        self.removed_streams.append((key, tag))
+        self.state["streams"].pop(tag, None)
+        return True
+
+    async def workroom_container_state(self, key):
+        return "running"
+
+    async def verify_workroom_ownership(self, key):
+        return getattr(self, "ownership_verified", True)
+
+
+class RecoverableRoute:
+    def __init__(self):
+        self.active = False
+        self.active_count = 0
+        self.extension = self
+
+    def inventory_mode(self, _key):
+        return "static" if self.active or self.active_count else "full"
+
+    def expected_networks(self, _key):
+        if self.active or self.active_count:
+            return frozenset({"target-net"})
+        return frozenset({"none"})
+
+    async def execute_route(self, invocation, *, target_ref, port, delegate):
+        self.active_count += 1
+        try:
+            result = await delegate()
+            result.metadata["direct_target_network"] = "attached_for_execution"
+            return result
+        finally:
+            self.active_count -= 1
+
+
+class ExclusiveRecoverableRoute(RecoverableRoute):
+    async def execute_route(self, invocation, *, target_ref, port, delegate):
+        if self.active_count or self.active:
+            raise ShellWorkroomError("direct_target_busy")
+        return await super().execute_route(
+            invocation, target_ref=target_ref, port=port, delegate=delegate
+        )
+
+
+async def test_concurrent_invocations_cannot_enter_the_same_http_ordinal(monkeypatch):
+    store = MemoryEvidenceStore()
+    workroom = RecoverableWorkroom(envelope(), hang_first=True)
+    adapter = BuiltinKaliHttpAdapter(
+        workroom,
+        RecoverableRoute(),
+        provider(),
+        policy(monkeypatch),
+        evidence_store=store,
+    )
+    call = invocation()
+    first = asyncio.create_task(adapter.invoke_contextual(call))
+    await asyncio.wait_for(workroom.first_started.wait(), timeout=1)
+
+    duplicate = await adapter.invoke_contextual(call)
+
+    assert duplicate.success is False
+    assert duplicate.error is not None
+    assert duplicate.error.code == "kali_http_ordinal_replay_refused"
+    assert len(workroom.calls) == 1
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+
+
+async def test_distinct_adapters_share_route_admission_for_duplicate_invocation(monkeypatch):
+    store = MemoryEvidenceStore()
+    workroom = RecoverableWorkroom(envelope(), hang_first=True)
+    route = ExclusiveRecoverableRoute()
+    configured_policy = policy(monkeypatch)
+    first_adapter = BuiltinKaliHttpAdapter(
+        workroom, route, provider(), configured_policy, evidence_store=store
+    )
+    second_adapter = BuiltinKaliHttpAdapter(
+        workroom, route, provider(), configured_policy, evidence_store=store
+    )
+    call = invocation()
+    reference = first_adapter.prepare_reference(call)
+    assert reference is not None
+
+    first = asyncio.create_task(first_adapter.invoke_contextual(call))
+    await asyncio.wait_for(workroom.first_started.wait(), timeout=1)
+    duplicate = await second_adapter.invoke_contextual(call)
+
+    assert duplicate.success is False
+    assert duplicate.error is not None
+    assert duplicate.error.code == "direct_target_busy"
+    assert len(workroom.calls) == 1
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    answer = await second_adapter.query_execution(reference)
+    assert answer.execution_terminated is True
 
 
 def policy(monkeypatch, *, with_session=False):
@@ -279,6 +499,25 @@ async def test_provider_program_envelope_has_separate_bounded_limits():
     assert manager._exec_supervised.await_args.kwargs["output_limit"] == 256 * 1024
 
 
+async def test_provider_stream_cleanup_retains_terminal_seal_and_metadata():
+    manager = ShellWorkroomManager(
+        ShellWorkroomPolicy(image="fixture", allow_unpinned_image=True)
+    )
+    manager._known["run.instance"] = "room"
+    manager._run_docker = AsyncMock(return_value=(0, b"", b"", False, False))
+
+    assert await manager.discard_provider_streams("run.instance", "khttp_fixture_0")
+
+    argv = manager._run_docker.await_args.args[0]
+    assert argv[-4:] == (
+        "/bin/rm", "-f",
+        "/run/whs-shell/.whs-spool-khttp_fixture_0.out",
+        "/run/whs-shell/.whs-spool-khttp_fixture_0.err",
+    )
+    assert not any(".whs-result-" in item or ".whs-pgid-" in item for item in argv)
+    assert not any(".whs-spool-khttp_fixture_0.meta" in item for item in argv)
+
+
 async def test_public_identity_is_preserved_and_only_registered_provider_emits_receipts(
     monkeypatch,
 ):
@@ -468,7 +707,9 @@ async def test_anonymous_receipt_is_bound_to_kali_route_and_consumed(monkeypatch
     assert result.success
     assert route.calls[0][1:] == ("lab", 80)
     assert 4096 < len(_CLIENT_SOURCE.encode()) <= workroom.calls[0][1]["_provider_argv_limit"]
-    assert workroom.discarded == [("run_http_1.inst_http_1", "inv_http_1")]
+    assert workroom.discarded == [
+        ("run_http_1.inst_http_1", workroom.calls[0][1]["exec_tag"])
+    ]
     output = result.output
     receipt = output["http_receipt"]
     assert output["actual_session_ref"] is None
@@ -498,6 +739,222 @@ async def test_anonymous_receipt_is_bound_to_kali_route_and_consumed(monkeypatch
         arguments=call.arguments,
         result=public,
     ).nodes
+
+
+async def test_cancelled_session_comparison_keeps_safe_ordinals_and_restart_termination_proof(
+    monkeypatch,
+):
+    store = MemoryEvidenceStore()
+    workroom = RecoverableWorkroom(
+        envelope(b"private-response-fragment"), hang_second=True
+    )
+    route = RecoverableRoute()
+    configured_policy = comparison_policy(monkeypatch)
+    adapter = BuiltinKaliHttpAdapter(
+        workroom, route, provider(), configured_policy, evidence_store=store
+    )
+    call = invocation(tool="http_compare_sessions").model_copy(
+        update={
+            "arguments": {
+                "target_ref": "target_lab",
+                "path": "/account",
+                "first_session_ref": "alice",
+                "second_session_ref": "bob",
+            }
+        }
+    )
+    reference = adapter.prepare_reference(call)
+    assert reference is not None
+    first_call = asyncio.create_task(adapter.invoke_contextual(call))
+    gateway_wait = asyncio.create_task(asyncio.wait_for(first_call, timeout=10))
+    await asyncio.wait_for(workroom.second_started.wait(), timeout=1)
+    gateway_wait.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await gateway_wait
+
+    assert len(workroom.calls) == 2
+    assert workroom.calls[0][1]["exec_tag"] != workroom.calls[1][1]["exec_tag"]
+    provider_records = [
+        record for record in store.records
+        if record.source_type is EvidenceSourceType.SYSTEM
+        and record.source_id == "capability.kali_http"
+    ]
+    assert len(provider_records) == 4
+    serialized = json.dumps([record.metadata for record in provider_records], sort_keys=True)
+    assert "private-response-fragment" not in serialized
+    assert "secret-value-never-in-receipt" not in serialized
+    assert "second-secret-never-in-receipt" not in serialized
+    assert "body_b64" not in serialized
+    ordinal_receipts = [
+        record.metadata["safe_result"] for record in provider_records
+        if record.metadata["record_kind"] == "kali_http_ordinal_receipt"
+    ]
+    assert [item["ordinal"] for item in ordinal_receipts] == [0, 1]
+    assert all(
+        item["http_receipt"]["response"]["body"]["retention"] == "digest_only"
+        for item in ordinal_receipts
+    )
+    assert all("body_preview" not in item for item in ordinal_receipts)
+    assert all(
+        tag not in workroom.state["streams"]
+        for tag in reference.provider_handle["ordinal_tags"]
+    )
+
+    # A fresh adapter/route sees only trusted provider records and detached
+    # workroom state. It can release capacity while keeping the result UNKNOWN.
+    restarted = BuiltinKaliHttpAdapter(
+        RecoverableWorkroom(envelope(), workroom.state),
+        RecoverableRoute(),
+        provider(),
+        configured_policy,
+        evidence_store=store,
+    )
+    answer = await restarted.query_execution(reference)
+    assert answer.state.value == "unknown"
+    assert answer.verified is True
+    assert answer.uncertain is True
+    assert answer.result_available is False
+    assert answer.execution_terminated is True
+    assert await restarted.fetch_execution(reference) is None
+
+    # A duplicate invocation with the same identity is held before exec_program.
+    replay = await restarted.invoke_contextual(call)
+    assert replay.success is False
+    assert replay.error is not None
+    assert replay.error.code == "kali_http_ordinal_replay_refused"
+    assert len(restarted._workroom.calls) == 0
+
+    # Either an attached route or an untrusted terminal seal defeats the
+    # independent termination proof.
+    restarted._executor.active = True
+    attached = await restarted.query_execution(reference)
+    assert attached.execution_terminated is False
+    restarted._executor.active = False
+    first_tag = reference.provider_handle["ordinal_tags"][0]
+    restarted._workroom.state["records"][first_tag]["unreaped"] = [1234]
+    untrusted = await restarted.query_execution(reference)
+    assert untrusted.state.value == "unknown"
+    assert untrusted.execution_terminated is False
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "missing_marker",
+        "corrupt_marker_digest",
+        "duplicate_marker",
+        "supervisor_alive",
+        "supervisor_error",
+        "route_unowned",
+    ],
+)
+async def test_termination_query_fails_closed_on_ambiguous_provider_state(monkeypatch, failure):
+    store = MemoryEvidenceStore()
+    original_workroom = RecoverableWorkroom(envelope())
+    route = RecoverableRoute()
+    adapter = BuiltinKaliHttpAdapter(
+        original_workroom, route, provider(), policy(monkeypatch), evidence_store=store
+    )
+    call = invocation()
+    reference = adapter.prepare_reference(call)
+    assert reference is not None
+    result = await adapter.invoke_contextual(call)
+    assert result.success
+
+    restarted_workroom = RecoverableWorkroom(envelope(), original_workroom.state)
+    if failure == "missing_marker":
+        store.records = [
+            item for item in store.records
+            if item.metadata.get("record_kind") != "kali_http_ordinal_started"
+        ]
+    elif failure == "corrupt_marker_digest":
+        marker = next(
+            item for item in store.records
+            if item.metadata.get("record_kind") == "kali_http_ordinal_started"
+        )
+        marker.digest = "0" * 64
+    elif failure == "duplicate_marker":
+        marker = next(
+            item for item in store.records
+            if item.metadata.get("record_kind") == "kali_http_ordinal_started"
+        )
+        store.records.append(
+            marker.model_copy(update={"evidence_id": EvidenceId("evidence_duplicate")})
+        )
+    elif failure == "supervisor_alive":
+        tag = reference.provider_handle["ordinal_tags"][0]
+        restarted_workroom.state["alive"][tag] = True
+    elif failure == "supervisor_error":
+        restarted_workroom.supervisor_outcome = AsyncMock(side_effect=RuntimeError("unreadable"))
+    elif failure == "route_unowned":
+        restarted_workroom.ownership_verified = False
+
+    restarted = BuiltinKaliHttpAdapter(
+        restarted_workroom, route, provider(), policy(monkeypatch), evidence_store=store
+    )
+
+    answer = await restarted.query_execution(reference)
+
+    assert answer.state.value == "unknown"
+    assert answer.verified is False
+    assert answer.execution_terminated is False
+
+
+async def test_durable_but_unacknowledged_start_marker_blocks_replay(monkeypatch):
+    store = AppendThenFailEvidenceStore()
+    workroom = RecoverableWorkroom(envelope())
+    adapter = BuiltinKaliHttpAdapter(
+        workroom, RecoverableRoute(), provider(), policy(monkeypatch), evidence_store=store
+    )
+    call = invocation()
+
+    first = await adapter.invoke_contextual(call)
+    replay = await adapter.invoke_contextual(call)
+
+    assert first.success is False
+    assert replay.success is False
+    assert replay.error is not None
+    assert replay.error.code == "kali_http_ordinal_replay_refused"
+    assert workroom.calls == []
+    assert len(store.records) == 1
+
+
+async def test_cancelled_spool_salvage_uses_provider_output_cap(monkeypatch):
+    store = MemoryEvidenceStore()
+    workroom = RecoverableWorkroom(envelope(b"x" * 100_000), hang_first=True)
+    adapter = BuiltinKaliHttpAdapter(
+        workroom, RecoverableRoute(), provider(), policy(monkeypatch), evidence_store=store
+    )
+    call = invocation()
+    reference = adapter.prepare_reference(call)
+    assert reference is not None
+    task = asyncio.create_task(adapter.invoke_contextual(call))
+    await asyncio.wait_for(workroom.first_started.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    receipts = [
+        item.metadata["safe_result"] for item in store.records
+        if item.metadata.get("record_kind") == "kali_http_ordinal_receipt"
+    ]
+    assert len(receipts) == 1
+    assert receipts[0]["http_receipt"]["response"]["body"]["size_bytes"] == 100_000
+
+
+async def test_single_http_request_receives_recovery_reference(monkeypatch):
+    adapter = BuiltinKaliHttpAdapter(
+        FakeWorkroom(envelope()),
+        FakeRoute(),
+        provider(),
+        policy(monkeypatch),
+        evidence_store=MemoryEvidenceStore(),
+    )
+
+    reference = adapter.prepare_reference(invocation())
+
+    assert reference is not None
+    assert len(reference.provider_handle["ordinal_tags"]) == 1
 
 
 async def test_url_target_scheme_mismatch_is_rejected_before_route_open(monkeypatch):

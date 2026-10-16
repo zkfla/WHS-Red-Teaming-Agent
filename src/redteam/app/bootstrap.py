@@ -513,6 +513,7 @@ async def build_application(
                 direct_executor,
                 provider_config,
                 verified_mcp_deployment.spec.server_policy(),
+                evidence_store=resolved_evidence_store,
             )
             builtin_adapters = [*builtin_adapters, http_adapter]
             role = role_spec("web-http")
