@@ -50,7 +50,7 @@ export REDTEAM_VDB_TEST_PYTHON='/absolute/runtime/vdb/venv/bin/python'
 6. Agent/Orchestration이 확정한 engagement/run과 **동일한** 정책을 provisioning한 후 `open_mcp_tool_gateway`를 연다. Agent가 정책이나 실행 ID를 임의로 선택하지 않는다. scope에 해당 지식 DB Asset ID를 제공한다. 기본 CLI의 임의 새 Run과 예제 policy ID를 자동으로 같게 만드는 기능은 없다.
 7. Candidate의 target은 `AssetTarget(asset_id=asset_ref)`다. Gateway는 신뢰된 context에서 engagement/run을 주입하고 인자/schema를 검증한다. Control의 scope/ROE/budget/approval 판정을 거친 뒤 호출한다. 개별 Agent의 후보 생성·지식 조회 시점·Skill 선택은 Agent 팀이 연결한다.
 
-stdio 프로세스는 한 engagement/run에 한 DB root만 바인딩한다. search 라이브러리의 전역 DB 연결을 우리 READONLY 핸들에 연결하고 종료 시 해제한다. MCP ping healthy는 연결 상태일 뿐이다. 작업 시작 전에 `vdb_status`의 데이터 준비 여부를 별도로 확인해야 한다.
+stdio 프로세스는 한 engagement/run에 한 DB root만 바인딩한다. 각 조회는 별도 `sys.executable` worker에서 실행하며, AppThreat의 전역 DB 연결·설정과 임시 캐시는 해당 worker 안에서만 사용한다. `query_timeout_seconds`에는 worker 인터프리터와 모듈의 cold startup 시간도 포함된다. 시간 초과 뒤에는 최대 0.5초의 단일 cleanup budget을 쓴다. 그 안에 child와 pipe thread의 종료를 확인하지 못하면 `vdb_lookup_cleanup_uncertain`을 반환하고, 해당 reader 및 process-wide worker 슬롯을 재사용하지 않는다. 이 경우 provider 프로세스를 재시작하기 전까지 조회 용량이 줄어든 상태로 남을 수 있다. `max_concurrent_lookups`는 기본 1이며 최대 8이다. 1보다 크게 설정할 때는 연결 측 `REDTEAM_MCP_<SERVER_ID>_MAX_CONCURRENCY`도 함께 지정해야 병렬 호출이 gateway에서 대기하지 않는다. MCP ping healthy는 연결 상태일 뿐이다. 작업 시작 전에 `vdb_status`의 데이터 준비 여부를 별도로 확인해야 한다.
 
 ## 출력 해석과 한계
 
