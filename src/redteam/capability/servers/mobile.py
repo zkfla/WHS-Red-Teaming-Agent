@@ -30,7 +30,7 @@ import json
 from pathlib import Path
 
 from mcp.server import MCPServer
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_serializer
 
 from redteam.core.contracts.tool import PROVIDER_METADATA_RESOURCE_BINDINGS
 
@@ -66,6 +66,7 @@ class MobileDiagnosticsPolicy(BaseModel):
     allowed_commands: list[str] = Field(default_factory=lambda: sorted(_ALLOWED_ADB_COMMANDS))
     adb_path: str = "adb"
     timeout_seconds: float = Field(default=10, gt=0, le=30)
+    max_concurrency: int = Field(default=1, ge=1, le=32)
 
     @field_validator("allowed_commands")
     @classmethod
@@ -83,6 +84,13 @@ class MobileDiagnosticsPolicy(BaseModel):
         if not value.strip() or any(c in value for c in "\x00\n\r"):
             raise ValueError("adb_path must be a single executable name or path")
         return value
+
+    @model_serializer(mode="wrap")
+    def compatible_payload(self, handler):
+        payload = handler(self)
+        if self.max_concurrency == 1:
+            payload.pop("max_concurrency", None)
+        return payload
 
     @classmethod
     def load(cls, path: str) -> MobileDiagnosticsPolicy:
@@ -123,7 +131,10 @@ async def _run_adb(argv: list[str], timeout: float) -> str:
 
 def create_server(policy: MobileDiagnosticsPolicy) -> MCPServer:
     server = MCPServer("mobile-diagnostics", log_level="WARNING")
-    execution_lock = asyncio.Lock()
+    execution_limit = asyncio.BoundedSemaphore(policy.max_concurrency)
+    serial_locks = {
+        serial: asyncio.Lock() for serial in {device.serial for device in policy.devices.values()}
+    }
 
     @server.tool(meta={PROVIDER_METADATA_RESOURCE_BINDINGS: [{
         "namespace": "mobile.adb-device", "argument": "device_ref",
@@ -150,8 +161,9 @@ def create_server(policy: MobileDiagnosticsPolicy) -> MCPServer:
             "shell",
             *_ALLOWED_ADB_COMMANDS[command],
         ]
-        async with execution_lock:
-            output = await _run_adb(argv, policy.timeout_seconds)
+        async with serial_locks[device.serial]:
+            async with execution_limit:
+                output = await _run_adb(argv, policy.timeout_seconds)
         return DeviceShellOutput(
             device_ref=device_ref,
             command=command,

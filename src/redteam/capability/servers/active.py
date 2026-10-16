@@ -55,7 +55,7 @@ async def run_nmap(address: str, ports: list[int], timeout: float) -> bytes:
 
 def create_server(policy: ServerPolicy) -> MCPServer:
     server = MCPServer("recon-active", log_level="WARNING")
-    execution_lock = asyncio.Lock()
+    execution_limit = asyncio.BoundedSemaphore(policy.max_concurrency)
 
     @server.tool()
     def active_status() -> dict[str, Any]:
@@ -70,8 +70,8 @@ def create_server(policy: ServerPolicy) -> MCPServer:
         """
         if not policy.active_enabled:
             raise ToolInputError("active scanning is disabled by operator configuration")
-        async with execution_lock:
-            target = await resolve_target(policy, target_ref)
+        target = await resolve_target(policy, target_ref)
+        async with execution_limit:
             output = await run_nmap(
                 target.addresses[0], policy.active_ports, policy.timeout_seconds
             )

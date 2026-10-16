@@ -239,7 +239,7 @@ async def active_query_probe(
 
 def create_server(policy: ServerPolicy, binary: str = "nuclei") -> MCPServer:
     server = MCPServer("web-nuclei", log_level="WARNING")
-    lock = asyncio.Lock()
+    execution_slots = asyncio.BoundedSemaphore(policy.max_concurrency)
 
     @server.tool()
     async def nuclei_response_check(
@@ -255,7 +255,7 @@ def create_server(policy: ServerPolicy, binary: str = "nuclei") -> MCPServer:
         executable = shutil.which(binary)
         if executable is None:
             raise ToolInputError("Nuclei executable unavailable")
-        async with lock:
+        async with execution_slots:
             response = await request(policy, target_ref, path, session_ref=session_ref)
             matched = await analyze(executable, response, check_id, policy.timeout_seconds + 10)
         result = {
@@ -287,7 +287,7 @@ def create_server(policy: ServerPolicy, binary: str = "nuclei") -> MCPServer:
         executable = shutil.which(binary)
         if executable is None:
             raise ToolInputError("Nuclei executable unavailable")
-        async with lock:
+        async with execution_slots:
             matched = await active_query_probe(
                 executable, policy, target_ref, path, query_key, check_id
             )

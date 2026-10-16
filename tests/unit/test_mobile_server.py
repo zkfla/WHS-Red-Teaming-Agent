@@ -47,6 +47,24 @@ def test_device_serial_must_match_safe_pattern() -> None:
         )
 
 
+def test_concurrency_policy_is_bounded_and_omits_compatible_default() -> None:
+    default = mobile.MobileDiagnosticsPolicy.model_validate(
+        {"devices": {"pixel": {"serial": "emulator-5554"}}}
+    )
+    assert default.max_concurrency == 1
+    assert "max_concurrency" not in default.model_dump(mode="json")
+
+    configured = mobile.MobileDiagnosticsPolicy.model_validate(
+        {"devices": {"pixel": {"serial": "emulator-5554"}}, "max_concurrency": 3}
+    )
+    assert configured.model_dump(mode="json")["max_concurrency"] == 3
+    for value in (0, 33):
+        with pytest.raises(ValidationError):
+            mobile.MobileDiagnosticsPolicy.model_validate(
+                {"devices": {"pixel": {"serial": "emulator-5554"}}, "max_concurrency": value}
+            )
+
+
 async def test_unknown_device_ref_rejected(policy: mobile.MobileDiagnosticsPolicy) -> None:
     async with Client(mobile.create_server(policy)) as client:
         result = await client.call_tool(
@@ -149,3 +167,70 @@ async def test_hung_adb_process_is_killed_on_timeout(monkeypatch: pytest.MonkeyP
     with pytest.raises(mobile.ToolInputError, match="timed out"):
         await mobile._run_adb(["adb", "-s", "emulator-5554", "shell", "getprop"], 0.05)
     assert process.killed
+
+
+async def test_independent_devices_overlap_while_same_serial_waiters_do_not_take_slots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    policy = mobile.MobileDiagnosticsPolicy.model_validate(
+        {
+            "devices": {
+                "phone": {"serial": "emulator-5554"},
+                "phone_alias": {"serial": "emulator-5554"},
+                "tablet": {"serial": "emulator-5556"},
+            },
+            "max_concurrency": 2,
+        }
+    )
+    phone_entered = asyncio.Event()
+    tablet_entered = asyncio.Event()
+    release = asyncio.Event()
+    active_by_serial: dict[str, int] = {}
+    max_by_serial: dict[str, int] = {}
+    overall_active = 0
+    overall_max = 0
+
+    async def fake_run_adb(argv: list[str], timeout: float) -> str:
+        nonlocal overall_active, overall_max
+        serial = argv[2]
+        active_by_serial[serial] = active_by_serial.get(serial, 0) + 1
+        max_by_serial[serial] = max(max_by_serial.get(serial, 0), active_by_serial[serial])
+        overall_active += 1
+        overall_max = max(overall_max, overall_active)
+        if serial == "emulator-5554":
+            phone_entered.set()
+        else:
+            tablet_entered.set()
+        try:
+            await release.wait()
+            return "ok"
+        finally:
+            active_by_serial[serial] -= 1
+            overall_active -= 1
+
+    monkeypatch.setattr(mobile, "_run_adb", fake_run_adb)
+    async with Client(mobile.create_server(policy)) as client:
+        phone_first = asyncio.create_task(
+            client.call_tool("device_shell", {"device_ref": "phone", "command": "getprop"})
+        )
+        await asyncio.wait_for(phone_entered.wait(), 1)
+        phone_second = asyncio.create_task(
+            client.call_tool(
+                "device_shell", {"device_ref": "phone_alias", "command": "dumpsys_battery"}
+            )
+        )
+        # Give the second MCP request time to reach the per-serial lock before
+        # the independent device competes for the remaining global slot.
+        await asyncio.sleep(0.05)
+        tablet = asyncio.create_task(
+            client.call_tool("device_shell", {"device_ref": "tablet", "command": "getprop"})
+        )
+        try:
+            await asyncio.wait_for(tablet_entered.wait(), 1)
+        finally:
+            release.set()
+        results = await asyncio.gather(phone_first, phone_second, tablet)
+
+    assert all(result.is_error is False for result in results)
+    assert max_by_serial["emulator-5554"] == 1
+    assert overall_max == 2

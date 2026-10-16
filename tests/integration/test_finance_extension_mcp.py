@@ -21,6 +21,51 @@ def policy() -> ServerPolicy:
     })
 
 
+async def test_nuclei_independent_checks_overlap_within_policy_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configured = policy().model_copy(update={"max_concurrency": 2})
+    condition = asyncio.Condition()
+    release = asyncio.Event()
+    active = peak = started = 0
+
+    async def fetch(*args: Any, **kwargs: Any) -> CapturedResponse:
+        nonlocal active, peak, started
+        async with condition:
+            active += 1
+            started += 1
+            peak = max(peak, active)
+            condition.notify_all()
+            await condition.wait_for(lambda: started >= 2)
+        await release.wait()
+        async with condition:
+            active -= 1
+            condition.notify_all()
+        return CapturedResponse(200, {"content-type": "text/plain"}, b"synthetic")
+
+    async def analyze(*args: Any, **kwargs: Any) -> bool:
+        return False
+
+    monkeypatch.setattr(nuclei.shutil, "which", lambda _: "/test/nuclei")
+    monkeypatch.setattr(nuclei, "request", fetch)
+    monkeypatch.setattr(nuclei, "analyze", analyze)
+    async with Client(nuclei.create_server(configured)) as client:
+        calls = [
+            asyncio.create_task(client.call_tool("nuclei_response_check", {
+                "target_ref": "bank", "path": "/", "check_id": "missing-csp",
+            }))
+            for _ in range(4)
+        ]
+        async with condition:
+            await asyncio.wait_for(condition.wait_for(lambda: started >= 2), 5)
+        await asyncio.sleep(0.05)
+        assert peak == 2
+        release.set()
+        results = await asyncio.gather(*calls)
+    assert all(not result.is_error for result in results)
+    assert peak == 2
+
+
 async def test_zap_live_snapshot_filters_scope_and_credentials(monkeypatch: pytest.MonkeyPatch):
     calls = []
 
@@ -42,6 +87,41 @@ async def test_zap_live_snapshot_filters_scope_and_credentials(monkeypatch: pyte
         assert "secret" not in str(output)
         assert (await client.call_tool("zap_capture_snapshot", {"target_ref": "other"})).is_error
     assert len(calls) == 1
+
+
+async def test_zap_independent_read_exports_overlap_within_policy_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base_policy = policy()
+    other_target = base_policy.targets["bank"].model_copy(update={"origin": "https://other.test"})
+    configured = base_policy.model_copy(update={
+        "targets": {**base_policy.targets, "other": other_target},
+        "max_concurrency": 2,
+    })
+    condition = asyncio.Condition()
+    started: set[str] = set()
+
+    async def export(origin: str, base: str, key: str, limit: int, **kwargs: Any) -> bytes:
+        async with condition:
+            started.add(base)
+            condition.notify_all()
+            await condition.wait_for(lambda: len(started) == 2)
+        return json.dumps({"log": {"entries": [{
+            "request": {"method": "GET", "url": base + "/", "headers": []},
+            "response": {"status": 200, "headers": [], "content": {"text": "safe"}},
+        }]}}).encode()
+
+    monkeypatch.setattr(zap, "fetch_zap_har", export)
+    monkeypatch.setenv("ZAP_KEY", "secret-key")
+    async with Client(zap.create_server(configured, "http://127.0.0.1:8080", "ZAP_KEY")) as client:
+        results = await asyncio.gather(
+            client.call_tool("zap_capture_snapshot", {"target_ref": "bank"}),
+            client.call_tool("zap_capture_snapshot", {"target_ref": "other"}),
+        )
+
+    assert started == {"https://bank.test", "https://other.test"}
+    assert all(result.structured_content is not None for result in results)
+    assert all(len(result.structured_content["flows"]) == 1 for result in results)
 
 
 async def test_nuclei_check_uses_scoped_fetch_and_sanitized_local_response(

@@ -13,15 +13,17 @@ import sqlite3
 import stat
 import time
 import zipfile
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
 import httpx
 from mcp.server import MCPServer
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_serializer, model_validator
 
 from redteam.capability.servers.analysis import AnalysisServerPolicy, _resolve
+from redteam.core.contracts.tool import PROVIDER_METADATA_RESOURCE_BINDINGS
 
 ROUTES = frozenset({"upload", "scan", "scan_logs", "report_json"})
 SECTIONS = ("manifest", "permission", "secret", "network")
@@ -50,7 +52,7 @@ class MobSFPolicy(BaseModel):
     image: str
     workspace_root: str
     analysis: AnalysisServerPolicy
-    hashes: dict[str, str]
+    hashes: dict[str, str] = Field(max_length=1024)
     engagement_id: str
     run_id: str
     state_path: str
@@ -62,6 +64,15 @@ class MobSFPolicy(BaseModel):
     max_polls: int = Field(default=30, ge=1, le=120)
     max_scans: int = Field(default=16, ge=1, le=100)
     retention_seconds: int = Field(default=3600, ge=60, le=86400)
+    max_concurrency: int = Field(default=1, ge=1, le=32)
+
+    @model_serializer(mode="wrap")
+    def compatible_payload(self, handler):
+        payload = handler(self)
+        # Keep policy digests stable for configurations that use the default capacity.
+        if self.max_concurrency == 1:
+            payload.pop("max_concurrency", None)
+        return payload
 
     @model_validator(mode="after")
     def validate_bindings(self):
@@ -128,7 +139,8 @@ class MobSFClient:
     def __init__(self, policy: MobSFPolicy, *, transport: httpx.AsyncBaseTransport | None = None):
         self.policy = policy
         self.transport = transport
-        self.lock = asyncio.Lock()
+        self.execution_slots = asyncio.BoundedSemaphore(policy.max_concurrency)
+        self.artifact_locks: dict[str, asyncio.Lock] = {}
         # Records persist across MCP restarts; the operator chooses a private state file.
         with self._db() as db:
             db.execute(
@@ -136,8 +148,29 @@ class MobSFClient:
                 "run TEXT, apk TEXT, sha TEXT, md5 TEXT, status TEXT, expires REAL)"
             )
 
+    @contextmanager
     def _db(self):
-        return sqlite3.connect(self.policy.state_path, timeout=5)
+        connection = sqlite3.connect(self.policy.state_path, timeout=5)
+        try:
+            yield connection
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def _artifact_lock(self, content_hash: str) -> asyncio.Lock:
+        if not _MD5.fullmatch(content_hash):
+            raise MobSFError("mobsf_scope_denied") from None
+        return self.artifact_locks.setdefault(content_hash, asyncio.Lock())
+
+    @asynccontextmanager
+    async def _operation(self, content_hash: str):
+        # Lock by MobSF's immutable content key, then take a provider-wide slot.
+        async with self._artifact_lock(content_hash):
+            async with self.execution_slots:
+                yield
 
     def _key(self) -> str:
         try:
@@ -230,7 +263,8 @@ class MobSFClient:
         if not self.policy.enabled:
             return False
         try:
-            code, _ = await self._request("upload", probe=True)
+            async with self.execution_slots:
+                code, _ = await self._request("upload", probe=True)
             return code == 405
         except MobSFError:
             return False
@@ -246,6 +280,35 @@ class MobSFClient:
         if row is None:
             raise MobSFError("mobsf_scope_denied")
         return row
+
+    def _claim_scan(self, apk_ref: str, scan_ref: str, engagement_id: str, run_id: str) -> tuple:
+        self._context(engagement_id, run_id, apk_ref)
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT ref, apk, sha, md5, status FROM scans WHERE ref=? AND engagement=? "
+                "AND run=? AND apk=? AND expires>?",
+                (scan_ref, engagement_id, run_id, apk_ref, time.time()),
+            ).fetchone()
+            if row is None:
+                raise MobSFError("mobsf_scope_denied")
+            if row[4] != "uploaded":
+                raise MobSFError("mobsf_scan_already_started")
+            other = db.execute(
+                "SELECT 1 FROM scans WHERE md5=? AND ref<>? AND status IN "
+                "('unknown','running','timeout','cancelled','failed') LIMIT 1",
+                (row[3], scan_ref),
+            ).fetchone()
+            if other is not None:
+                raise MobSFError("mobsf_scan_already_started")
+            updated = db.execute(
+                "UPDATE scans SET status='running' WHERE ref=? AND status='uploaded' "
+                "AND expires>?",
+                (scan_ref, time.time()),
+            ).rowcount
+            if updated != 1:
+                raise MobSFError("mobsf_scan_already_started")
+            return (*row[:4], "running")
 
     def _status(self, scan_ref: str, status: str) -> None:
         with self._db() as db:
@@ -264,25 +327,26 @@ class MobSFClient:
     async def submit(self, apk_ref: str, expected_sha256: str, engagement_id: str, run_id: str):
         self._context(engagement_id, run_id, apk_ref)
         data = self._apk(apk_ref, expected_sha256)
-        async with self.lock:
-            with self._db() as db:
-                count = db.execute("SELECT COUNT(*) FROM scans").fetchone()[0]
-            if count >= self.policy.max_scans:
-                raise MobSFError("mobsf_scan_limit")
-            _, upload = await self._request(
-                "upload",
-                files={"file": ("approved.apk", data, "application/vnd.android.package-archive")},
-            )
-            md5 = upload.get("hash")
-            if (
-                not isinstance(md5, str)
-                or not _MD5.fullmatch(md5)
-                or md5 != hashlib.md5(data, usedforsecurity=False).hexdigest()
-                or upload.get("scan_type") != "apk"
-            ):
-                raise MobSFError("mobsf_upload_schema_drift")
+        md5 = hashlib.md5(data, usedforsecurity=False).hexdigest()
+        async with self._operation(md5):
             ref = "scan_" + secrets.token_hex(16)
             with self._db() as db:
+                # Serialize the global scan quota across distinct artifact locks and processes.
+                db.execute("BEGIN IMMEDIATE")
+                unsettled = db.execute(
+                    "SELECT status FROM scans WHERE md5=? AND status IN "
+                    "('unknown','running','timeout','cancelled','failed') LIMIT 1",
+                    (md5,),
+                ).fetchone()
+                if unsettled is not None:
+                    raise MobSFError(
+                        "mobsf_upload_state_unknown"
+                        if unsettled[0] == "unknown"
+                        else "mobsf_scan_already_started"
+                    )
+                count = db.execute("SELECT COUNT(*) FROM scans").fetchone()[0]
+                if count >= self.policy.max_scans:
+                    raise MobSFError("mobsf_scan_limit")
                 db.execute(
                     "INSERT INTO scans VALUES (?,?,?,?,?,?,?,?)",
                     (
@@ -292,18 +356,34 @@ class MobSFClient:
                         apk_ref,
                         expected_sha256,
                         md5,
-                        "uploaded",
+                        "unknown",
                         time.time() + self.policy.retention_seconds,
                     ),
                 )
+            _, upload = await self._request(
+                "upload",
+                files={
+                    "file": ("approved.apk", data, "application/vnd.android.package-archive")
+                },
+            )
+            if (
+                upload.get("hash") != md5
+                or upload.get("scan_type") != "apk"
+            ):
+                raise MobSFError("mobsf_upload_schema_drift")
+            with self._db() as db:
+                updated = db.execute(
+                    "UPDATE scans SET status='uploaded' WHERE ref=? AND status='unknown'",
+                    (ref,),
+                ).rowcount
+            if updated != 1:
+                raise MobSFError("mobsf_upload_state_unknown")
             return self._output((ref, apk_ref, expected_sha256, md5, "uploaded"))
 
     async def start(self, apk_ref: str, scan_ref: str, engagement_id: str, run_id: str):
-        async with self.lock:
-            row = self._record(apk_ref, scan_ref, engagement_id, run_id)
-            if row[4] != "uploaded":
-                raise MobSFError("mobsf_scan_already_started")
-            self._status(scan_ref, "running")
+        initial = self._record(apk_ref, scan_ref, engagement_id, run_id)
+        async with self._operation(initial[3]):
+            row = self._claim_scan(apk_ref, scan_ref, engagement_id, run_id)
             try:
                 # Re-scan disabled: immutable APK/hash is shared by MobSF's content store.
                 await self._request("scan", data={"hash": row[3], "re_scan": "0"})
@@ -333,13 +413,15 @@ class MobSFClient:
                 raise
 
     async def status(self, apk_ref: str, scan_ref: str, engagement_id: str, run_id: str):
-        row = self._record(apk_ref, scan_ref, engagement_id, run_id)
-        if row[4] == "running":
-            # No upstream task enumeration: only this run's owned content hash.
-            code, report = await self._request("report_json", data={"hash": row[3]})
-            if code == 200 and report.get("md5", report.get("hash")) == row[3]:
-                self._status(scan_ref, "completed")
-        return self._output(self._record(apk_ref, scan_ref, engagement_id, run_id))
+        initial = self._record(apk_ref, scan_ref, engagement_id, run_id)
+        async with self._operation(initial[3]):
+            row = self._record(apk_ref, scan_ref, engagement_id, run_id)
+            if row[4] == "running":
+                # No upstream task enumeration: only this run's owned content hash.
+                code, report = await self._request("report_json", data={"hash": row[3]})
+                if code == 200 and report.get("md5", report.get("hash")) == row[3]:
+                    self._status(scan_ref, "completed")
+            return self._output(self._record(apk_ref, scan_ref, engagement_id, run_id))
 
     async def summary(
         self,
@@ -349,23 +431,26 @@ class MobSFClient:
         engagement_id: str,
         run_id: str,
     ):
-        row = self._record(apk_ref, scan_ref, engagement_id, run_id)
-        if not sections or len(sections) != len(set(sections)) or set(sections) - set(SECTIONS):
-            raise MobSFError("mobsf_section_denied")
-        if row[4] != "completed":
-            raise MobSFError("mobsf_report_not_ready")
-        _, report = await self._request("report_json", data={"hash": row[3]})
-        if report.get("md5", report.get("hash")) != row[3]:
-            raise MobSFError("mobsf_report_hash_mismatch")
-        normalized, missing, truncated = normalize_report(report, sections)
-        output = self._output(
-            row, sections=normalized, missing_sections=missing, truncated=truncated
-        )
-        if len(output.model_dump_json().encode()) > self.policy.max_output_bytes:
-            raise MobSFError("mobsf_output_too_large")
-        # Defense against credentials accidentally appearing even in structural fields.
-        key = self._key()
-        return MobSFOutput.model_validate_json(output.model_dump_json().replace(key, "[REDACTED]"))
+        initial = self._record(apk_ref, scan_ref, engagement_id, run_id)
+        async with self._operation(initial[3]):
+            row = self._record(apk_ref, scan_ref, engagement_id, run_id)
+            if not sections or len(sections) != len(set(sections)) or set(sections) - set(SECTIONS):
+                raise MobSFError("mobsf_section_denied")
+            if row[4] != "completed":
+                raise MobSFError("mobsf_report_not_ready")
+            _, report = await self._request("report_json", data={"hash": row[3]})
+            if report.get("md5", report.get("hash")) != row[3]:
+                raise MobSFError("mobsf_report_hash_mismatch")
+            normalized, missing, truncated = normalize_report(report, sections)
+            output = self._output(
+                row, sections=normalized, missing_sections=missing, truncated=truncated
+            )
+            if len(output.model_dump_json().encode()) > self.policy.max_output_bytes:
+                raise MobSFError("mobsf_output_too_large")
+            # Defense against credentials accidentally appearing even in structural fields.
+            key = self._key()
+            serialized = output.model_dump_json().replace(key, "[REDACTED]")
+            return MobSFOutput.model_validate_json(serialized)
 
 
 def _token(value) -> str | None:
@@ -433,11 +518,26 @@ def normalize_report(report: dict, sections: list[str]) -> tuple[dict, list[str]
     return result, missing, truncated
 
 
+def _resource_bindings(policy: MobSFPolicy) -> list[dict]:
+    identities = {
+        apk_ref: hashlib.sha256(
+            json.dumps([policy.endpoint, sha256], separators=(",", ":")).encode()
+        ).hexdigest()
+        for apk_ref, sha256 in policy.hashes.items()
+    }
+    return [{
+        "namespace": "mobsf.content",
+        "argument": "apk_ref",
+        "value_map": identities,
+    }]
+
+
 def create_server(policy: MobSFPolicy) -> MCPServer:
     client = MobSFClient(policy)
     server = MCPServer("mobsf-static-analysis", log_level="WARNING")
+    metadata = {PROVIDER_METADATA_RESOURCE_BINDINGS: _resource_bindings(policy)}
 
-    @server.tool()
+    @server.tool(meta=metadata)
     async def mobsf_submit_apk(
         apk_ref: str,
         expected_sha256: str,
@@ -447,7 +547,7 @@ def create_server(policy: MobSFPolicy) -> MCPServer:
         """Upload a registered, approved APK with its pinned SHA-256; approval required."""
         return await client.submit(apk_ref, expected_sha256, engagement_id, run_id)
 
-    @server.tool()
+    @server.tool(meta=metadata)
     async def mobsf_start_scan(
         apk_ref: str,
         scan_ref: str,
@@ -457,7 +557,7 @@ def create_server(policy: MobSFPolicy) -> MCPServer:
         """Start bounded static analysis of this run's owned APK; approval required."""
         return await client.start(apk_ref, scan_ref, engagement_id, run_id)
 
-    @server.tool()
+    @server.tool(meta=metadata)
     async def mobsf_scan_status(
         apk_ref: str,
         scan_ref: str,
@@ -467,7 +567,7 @@ def create_server(policy: MobSFPolicy) -> MCPServer:
         """Read only this run's scan status; no scan enumeration."""
         return await client.status(apk_ref, scan_ref, engagement_id, run_id)
 
-    @server.tool()
+    @server.tool(meta=metadata)
     async def mobsf_report_summary(
         apk_ref: str,
         scan_ref: str,

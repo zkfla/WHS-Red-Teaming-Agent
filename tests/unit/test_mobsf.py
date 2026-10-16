@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import time
 import zipfile
 from datetime import datetime, timezone
+from pathlib import Path
 
 import httpx
 import pytest
@@ -31,7 +33,13 @@ from redteam.core.contracts.engagement import (
     ExecutionBudget,
     RateLimitPolicy,
 )
-from redteam.core.contracts.tool import ExecutionContext, ToolDescriptor, ToolInvocation, ToolResult
+from redteam.core.contracts.tool import (
+    PROVIDER_METADATA_RESOURCE_BINDINGS,
+    ExecutionContext,
+    ToolDescriptor,
+    ToolInvocation,
+    ToolResult,
+)
 from redteam.core.enums import ToolHealthStatus
 from redteam.orchestration.mobile_mcp_binding import MobileMCPEligibility
 from redteam.orchestration.observations.mobsf import map_mobsf_report
@@ -100,6 +108,269 @@ def client_for(policy, *, scan_error=False, missing_report=False):
         raise AssertionError("unexpected endpoint")
 
     return MobSFClient(policy, transport=httpx.MockTransport(respond)), calls
+
+
+def policy_with_assets(policy, assets: dict[str, Path], *, max_concurrency: int = 1):
+    payload = policy.model_dump(mode="python")
+    for apk_ref, path in assets.items():
+        payload["analysis"]["apks"][apk_ref] = {"path": str(path)}
+        payload["hashes"][apk_ref] = hashlib.sha256(path.read_bytes()).hexdigest()
+    payload["max_concurrency"] = max_concurrency
+    return MobSFPolicy.model_validate(payload)
+
+
+def test_mobsf_policy_concurrency_default_keeps_legacy_json(policy):
+    payload = policy.model_dump(mode="json")
+    assert policy.max_concurrency == 1
+    assert "max_concurrency" not in payload
+    configured = MobSFPolicy.model_validate({**payload, "max_concurrency": 4})
+    assert configured.model_dump(mode="json")["max_concurrency"] == 4
+
+
+async def test_parallel_mobsf_submits_lock_by_content_hash(policy, tmp_path):
+    other_apk = tmp_path / "other.apk"
+    with zipfile.ZipFile(other_apk, "w") as archive:
+        archive.writestr("AndroidManifest.xml", b"other manifest")
+    other_sha256 = hashlib.sha256(other_apk.read_bytes()).hexdigest()
+    payload = policy.model_dump(mode="python")
+    payload["analysis"]["apks"].update({
+        "apk-alias": {"path": policy.analysis.apks["apk"].path},
+        "other": {"path": str(other_apk)},
+    })
+    payload["hashes"].update({"apk-alias": policy.hashes["apk"], "other": other_sha256})
+    payload["max_concurrency"] = 2
+    configured = MobSFPolicy.model_validate(payload)
+    client = MobSFClient(configured)
+
+    same_sha256 = configured.hashes["apk"]
+    same_md5 = hashlib.md5(
+        Path(configured.analysis.apks["apk"].path).read_bytes(), usedforsecurity=False
+    ).hexdigest()
+    other_md5 = hashlib.md5(other_apk.read_bytes(), usedforsecurity=False).hexdigest()
+    first_started = asyncio.Event()
+    other_started = asyncio.Event()
+    release = asyncio.Event()
+    active_by_hash = {same_md5: 0, other_md5: 0}
+    peak_by_hash = {same_md5: 0, other_md5: 0}
+    active_total = peak_total = 0
+
+    async def upload(route, **kwargs):
+        nonlocal active_total, peak_total
+        assert route == "upload"
+        data = kwargs["files"]["file"][1]
+        sha256 = hashlib.sha256(data).hexdigest()
+        md5 = hashlib.md5(data, usedforsecurity=False).hexdigest()
+        active_total += 1
+        peak_total = max(peak_total, active_total)
+        active_by_hash[md5] += 1
+        peak_by_hash[md5] = max(peak_by_hash[md5], active_by_hash[md5])
+        if sha256 == same_sha256:
+            first_started.set()
+        else:
+            other_started.set()
+        try:
+            await release.wait()
+        finally:
+            active_by_hash[md5] -= 1
+            active_total -= 1
+        return 200, {"hash": md5, "scan_type": "apk"}
+
+    client._request = upload
+    first = asyncio.create_task(client.submit(
+        "apk", configured.hashes["apk"], "eng", "run"
+    ))
+    await asyncio.wait_for(first_started.wait(), 2)
+    alias = asyncio.create_task(client.submit(
+        "apk-alias", configured.hashes["apk-alias"], "eng", "run"
+    ))
+    await asyncio.sleep(0)
+    independent = asyncio.create_task(client.submit(
+        "other", configured.hashes["other"], "eng", "run"
+    ))
+    calls = [first, alias, independent]
+    try:
+        await asyncio.wait_for(other_started.wait(), 2)
+        assert peak_total == 2
+        assert peak_by_hash[same_md5] == 1
+    finally:
+        release.set()
+        results = await asyncio.gather(*calls, return_exceptions=True)
+    assert all(not isinstance(result, BaseException) for result in results)
+    assert peak_total == 2
+    assert peak_by_hash[same_md5] == 1
+
+
+async def test_cancelled_mobsf_upload_keeps_unknown_quota_and_blocks_retry(policy, tmp_path):
+    other_apk = tmp_path / "other.apk"
+    with zipfile.ZipFile(other_apk, "w") as archive:
+        archive.writestr("AndroidManifest.xml", b"other manifest")
+    payload = policy.model_dump(mode="python")
+    other_sha256 = hashlib.sha256(other_apk.read_bytes()).hexdigest()
+    payload["analysis"]["apks"]["other"] = {"path": str(other_apk)}
+    payload["hashes"]["other"] = other_sha256
+    payload["max_scans"] = 1
+    payload["max_concurrency"] = 2
+    configured = MobSFPolicy.model_validate(payload)
+    client = MobSFClient(configured)
+    upload_started = asyncio.Event()
+    calls = 0
+
+    async def uncertain_upload(route, **kwargs):
+        nonlocal calls
+        assert route == "upload"
+        calls += 1
+        upload_started.set()
+        await asyncio.Event().wait()
+
+    client._request = uncertain_upload
+    task = asyncio.create_task(client.submit(
+        "apk", configured.hashes["apk"], "eng", "run"
+    ))
+    await asyncio.wait_for(upload_started.wait(), 2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    with client._db() as db:
+        row = db.execute("SELECT sha, md5, status FROM scans").fetchone()
+    assert row == (
+        configured.hashes["apk"],
+        hashlib.md5(
+            Path(configured.analysis.apks["apk"].path).read_bytes(),
+            usedforsecurity=False,
+        ).hexdigest(),
+        "unknown",
+    )
+    with pytest.raises(MobSFError, match="upload_state_unknown"):
+        await client.submit("apk", configured.hashes["apk"], "eng", "run")
+    with pytest.raises(MobSFError, match="scan_limit"):
+        await client.submit("other", configured.hashes["other"], "eng", "run")
+    assert calls == 1
+
+
+async def test_mobsf_scan_claim_fences_aliases_across_clients_and_after_cancel(policy):
+    configured = policy_with_assets(
+        policy,
+        {"apk-alias": Path(policy.analysis.apks["apk"].path)},
+        max_concurrency=2,
+    )
+    client, _ = client_for(configured)
+    alias_client = MobSFClient(configured)
+    first = await client.submit("apk", configured.hashes["apk"], "eng", "run")
+    alias = await client.submit(
+        "apk-alias", configured.hashes["apk-alias"], "eng", "run"
+    )
+    original = client._request
+    scan_started = asyncio.Event()
+    scan_calls = 0
+    alias_calls = 0
+
+    async def block_original_scan(route, **kwargs):
+        nonlocal scan_calls
+        if route == "scan":
+            scan_calls += 1
+            scan_started.set()
+            await asyncio.Event().wait()
+        return await original(route, **kwargs)
+
+    async def count_alias_call(route, **kwargs):
+        nonlocal alias_calls
+        alias_calls += 1
+        raise AssertionError("a fenced alias must not reach the backend")
+
+    client._request = block_original_scan
+    alias_client._request = count_alias_call
+    running = asyncio.create_task(
+        client.start("apk", first.scan_ref, "eng", "run")
+    )
+    await asyncio.wait_for(scan_started.wait(), 2)
+    with pytest.raises(MobSFError, match="scan_already_started"):
+        await alias_client.start("apk-alias", alias.scan_ref, "eng", "run")
+    assert alias_calls == 0
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+    with pytest.raises(MobSFError, match="scan_already_started"):
+        await alias_client.start("apk-alias", alias.scan_ref, "eng", "run")
+    assert scan_calls == 1
+    with client._db() as db:
+        status = db.execute("SELECT status FROM scans WHERE ref=?", (first.scan_ref,)).fetchone()[0]
+    assert status == "cancelled"
+
+
+@pytest.mark.parametrize(
+    "unsettled_status", ["unknown", "running", "timeout", "cancelled", "failed"]
+)
+async def test_mobsf_unsettled_content_status_blocks_alias_start(policy, unsettled_status):
+    configured = policy_with_assets(
+        policy,
+        {"apk-alias": Path(policy.analysis.apks["apk"].path)},
+        max_concurrency=2,
+    )
+    client, _ = client_for(configured)
+    first = await client.submit("apk", configured.hashes["apk"], "eng", "run")
+    alias = await client.submit(
+        "apk-alias", configured.hashes["apk-alias"], "eng", "run"
+    )
+    with client._db() as db:
+        db.execute("UPDATE scans SET status=? WHERE ref=?", (unsettled_status, first.scan_ref))
+    with pytest.raises(MobSFError, match="scan_already_started"):
+        await client.start("apk-alias", alias.scan_ref, "eng", "run")
+
+
+async def test_mobsf_distinct_content_scans_overlap_within_policy_capacity(policy, tmp_path):
+    other_apk = tmp_path / "other.apk"
+    with zipfile.ZipFile(other_apk, "w") as archive:
+        archive.writestr("AndroidManifest.xml", b"other manifest")
+    configured = policy_with_assets(policy, {"other": other_apk}, max_concurrency=2)
+    client = MobSFClient(configured)
+    condition = asyncio.Condition()
+    release = asyncio.Event()
+    active = peak = started = 0
+
+    async def request(route, **kwargs):
+        nonlocal active, peak, started
+        if route == "upload":
+            data = kwargs["files"]["file"][1]
+            return 200, {
+                "hash": hashlib.md5(data, usedforsecurity=False).hexdigest(),
+                "scan_type": "apk",
+            }
+        md5 = kwargs["data"]["hash"]
+        if route == "scan":
+            async with condition:
+                active += 1
+                started += 1
+                peak = max(peak, active)
+                condition.notify_all()
+            await release.wait()
+            async with condition:
+                active -= 1
+                condition.notify_all()
+            return 200, {"hash": md5}
+        if route == "report_json":
+            return 200, {"md5": md5}
+        raise AssertionError(f"unexpected MobSF route: {route}")
+
+    client._request = request
+    uploads = [
+        await client.submit(apk_ref, configured.hashes[apk_ref], "eng", "run")
+        for apk_ref in ("apk", "other")
+    ]
+    calls = [
+        asyncio.create_task(client.start(apk_ref, upload.scan_ref, "eng", "run"))
+        for apk_ref, upload in zip(("apk", "other"), uploads, strict=True)
+    ]
+    try:
+        async with condition:
+            await asyncio.wait_for(condition.wait_for(lambda: started == 2), 2)
+            assert peak == 2
+    finally:
+        release.set()
+        results = await asyncio.gather(*calls, return_exceptions=True)
+    assert all(not isinstance(result, BaseException) for result in results)
+    assert all(result.status == "completed" for result in results)
+    assert peak == 2
 
 
 async def test_owned_upload_scan_status_report_and_restart(policy):
@@ -176,18 +447,27 @@ async def test_scan_failure_and_cancel_are_distinct(policy):
     with pytest.raises(MobSFError, match="scan_failed"):
         await client.start("apk", uploaded.scan_ref, "eng", "run")
     assert (await client.status("apk", uploaded.scan_ref, "eng", "run")).status == "failed"
-    uploaded = await client.submit("apk", policy.hashes["apk"], "eng", "run")
-    original = client._request
+    with pytest.raises(MobSFError, match="scan_already_started"):
+        await client.submit("apk", policy.hashes["apk"], "eng", "run")
+    isolated = MobSFPolicy.model_validate({
+        **policy.model_dump(mode="python"),
+        "state_path": str(Path(policy.state_path).with_name("cancel.sqlite3")),
+    })
+    cancel_client, _ = client_for(isolated)
+    uploaded = await cancel_client.submit("apk", isolated.hashes["apk"], "eng", "run")
+    original = cancel_client._request
 
     async def cancel(route, **kwargs):
         if route == "scan":
             raise asyncio.CancelledError()
         return await original(route, **kwargs)
 
-    client._request = cancel
+    cancel_client._request = cancel
     with pytest.raises(asyncio.CancelledError):
-        await client.start("apk", uploaded.scan_ref, "eng", "run")
-    assert (await client.status("apk", uploaded.scan_ref, "eng", "run")).status == "cancelled"
+        await cancel_client.start("apk", uploaded.scan_ref, "eng", "run")
+    assert (
+        await cancel_client.status("apk", uploaded.scan_ref, "eng", "run")
+    ).status == "cancelled"
 
 
 async def test_output_caps_schema_drift_and_section_allowlist(policy):
@@ -210,12 +490,29 @@ async def test_output_caps_schema_drift_and_section_allowlist(policy):
 
 
 async def test_actual_mcp_discovery_matches_pinned_schema(policy):
-    async with Client(create_server(policy)) as sdk:
+    payload = policy.model_dump(mode="python")
+    payload["analysis"]["apks"]["apk-alias"] = {
+        "path": policy.analysis.apks["apk"].path,
+    }
+    payload["hashes"]["apk-alias"] = policy.hashes["apk"]
+    configured = MobSFPolicy.model_validate(payload)
+    async with Client(create_server(configured)) as sdk:
         listing = await sdk.list_tools()
     specs = {spec.tool_id.rpartition(".")[2]: spec for spec in MOBILE_ANALYSIS_TOOLS["mobsf"]}
     assert {tool.name for tool in listing.tools} == set(specs)
     for tool in listing.tools:
         validate_discovered_schema(specs[tool.name], tool.input_schema, tool.output_schema)
+        binding = tool.meta[PROVIDER_METADATA_RESOURCE_BINDINGS][0]
+        assert binding["namespace"] == "mobsf.content"
+        assert binding["argument"] == "apk_ref"
+        identities = binding["value_map"]
+        assert identities["apk"] == identities["apk-alias"]
+        expected = hashlib.sha256(
+            json.dumps(
+                [configured.endpoint, configured.hashes["apk"]], separators=(",", ":")
+            ).encode()
+        ).hexdigest()
+        assert identities["apk"] == expected
 
 
 @pytest.mark.parametrize(
@@ -415,13 +712,25 @@ async def test_primary_recovery_blocks_a_previously_selected_fallback():
 
 
 async def test_auth_failure_is_unhealthy_and_cannot_leak_body(policy):
+    requests = []
+
+    def reject(request):
+        requests.append((request.method, request.url.path))
+        return httpx.Response(403, json={"error": "secret-api-key"})
+
     client = MobSFClient(
         policy,
-        transport=httpx.MockTransport(
-            lambda request: httpx.Response(403, json={"error": "secret-api-key"})
-        ),
+        transport=httpx.MockTransport(reject),
     )
     assert not await client.healthy()
     with pytest.raises(MobSFError, match="upload_failed") as error:
         await client.submit("apk", policy.hashes["apk"], "eng", "run")
     assert "secret-api-key" not in str(error.value)
+    with client._db() as db:
+        assert db.execute("SELECT status FROM scans").fetchone()[0] == "unknown"
+    with pytest.raises(MobSFError, match="upload_state_unknown"):
+        await client.submit("apk", policy.hashes["apk"], "eng", "run")
+    assert requests == [
+        ("GET", "/api/v1/upload"),
+        ("POST", "/api/v1/upload"),
+    ]

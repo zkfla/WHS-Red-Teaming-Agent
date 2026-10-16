@@ -1,6 +1,5 @@
 """Read live ZAP capture pages through the existing neutral HAR boundary."""
 
-import asyncio
 import os
 import re
 from typing import Any
@@ -19,7 +18,7 @@ def create_server(policy: ServerPolicy, api_origin: str, api_key_env: str) -> MC
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", api_key_env):
         raise ToolInputError("invalid ZAP credential environment name")
     server = MCPServer("web-zap", log_level="WARNING")
-    lock = asyncio.Lock()
+    execution_slots = anyio.Semaphore(policy.max_concurrency)
 
     @server.tool()
     async def zap_capture_snapshot(target_ref: str) -> dict[str, Any]:
@@ -36,7 +35,7 @@ def create_server(policy: ServerPolicy, api_origin: str, api_key_env: str) -> MC
             raise ToolInputError("ZAP API credential unavailable")
         try:
             with anyio.fail_after(policy.timeout_seconds):
-                async with lock:
+                async with execution_slots:
                     raw = await fetch_zap_har(
                         origin, target.origin, key, policy.proxy_max_flows,
                         timeout_seconds=policy.timeout_seconds,
