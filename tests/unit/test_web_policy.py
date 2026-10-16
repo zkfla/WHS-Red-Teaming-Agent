@@ -14,7 +14,11 @@ from redteam.app.cli.commands import run as run_command
 from redteam.app.mcp_deployment import DeploymentBinding, synchronize_deployment
 from redteam.app.web.engagement import EngagementError, EngagementStore
 from redteam.app.web.host import RealLauncher
-from redteam.app.web_policy import prepare_web_deployment, select_engagement_startup
+from redteam.app.web_policy import (
+    WebPolicySelection,
+    prepare_web_deployment,
+    select_engagement_startup,
+)
 from redteam.capability.deployment import DeploymentSpec
 from redteam.capability.servers.config import ServerPolicy, TargetProfile
 from redteam.capability.servers.network import ToolInputError, validate_path
@@ -23,6 +27,19 @@ from redteam.core.environment import env_snapshot, environment_context
 
 DRAFT = {"name": "local lab", "allowed_hosts": ["https://127.0.0.1:8443"],
          "allowed_capabilities": ["web"], "max_actions": 5, "web_policy_mode": "site"}
+
+
+def test_web_selection_preserves_approved_provider_concurrency():
+    selection = WebPolicySelection(
+        mode="site", origins=["https://127.0.0.1:8443"], max_concurrency=6,
+    )
+    assert selection.spec(["127.0.0.1/32"]).policy.max_concurrency == 6
+    assert selection.model_dump()["max_concurrency"] == 6
+    assert "max_concurrency" not in WebPolicySelection(
+        mode="site", origins=["https://127.0.0.1:8443"],
+    ).model_dump()
+    with pytest.raises(ValidationError):
+        WebPolicySelection(mode="site", origins=["https://127.0.0.1:8443"], max_concurrency=33)
 
 
 def save(path, **changes):

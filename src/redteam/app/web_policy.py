@@ -66,6 +66,7 @@ _PERMISSION_DEFAULTS = {
     "response_body_max_chars": 0, "sessions": [], "kali_network_mode": "inherit",
     "kali_network_policy_path": None, "kali_network_policy_sha256": None,
     "kali_network_preparation": None,
+    "max_concurrency": 1,
 }
 
 
@@ -83,6 +84,7 @@ class WebPolicySelection(BaseModel):
     allow_all_request_headers: bool = False
     request_body_enabled: bool = False
     response_body_max_chars: int = Field(default=0, ge=0, le=16384)
+    max_concurrency: int = Field(default=1, ge=1, le=32)
     sessions: list[WebSessionSelection] = Field(default_factory=list, max_length=60)
     kali_network_mode: Literal["inherit", "closed", "configured", "prepare"] = "inherit"
     kali_network_policy_path: str | None = None
@@ -171,7 +173,10 @@ class WebPolicySelection(BaseModel):
         sessions, access = self.session_bindings(bindings)
         return DeploymentSpec(
             request_permissions="read_only" if self.permissions == "read_only" else "testing",
-            policy=ServerPolicy(targets=targets, allowed_networks=networks, sessions=sessions),
+            policy=ServerPolicy(
+                targets=targets, allowed_networks=networks, sessions=sessions,
+                max_concurrency=self.max_concurrency,
+            ),
             host_bindings=bindings, session_access=access,
         )
 
