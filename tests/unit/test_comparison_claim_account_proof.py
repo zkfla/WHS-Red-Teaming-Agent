@@ -369,3 +369,104 @@ async def test_alias_candidate_must_match_its_original_proposal_target(
         assert assessment.outcome == "success"
     else:
         assert assessment.reason.startswith("claimed account lacks actual-use proof")
+
+
+@pytest.mark.parametrize("receipt", [
+    {"anonymous": {"actual_session_ref": None},
+     "authenticated": {"actual_session_ref": "session-alice", "principal_ref": "alice"}},
+    {"actual_session_ref": None},
+])
+async def test_posthoc_anonymous_claim_accepts_only_an_explicit_anonymous_unit(
+    monkeypatch, receipt: dict[str, Any]
+):
+    raw = {
+        "success": True,
+        "action_id": "action-1",
+        "invocation_id": "invocation-1",
+        "tool_id": "tool-1",
+        "output": receipt,
+    }
+    record = _execution_record(evidence_id="evidence-anonymous", raw=raw, arguments={})
+    verifier = StructuredLLMAnalysisVerifier(
+        object(), cast(EvidenceStore, _EvidenceStore(record))
+    )
+    meaning_call = AsyncMock(return_value={
+        "meaning": "The evidence supports the claim.",
+        "outcome": "success",
+        "reason": "The original anonymous request measured the target.",
+        "claim_supported": True,
+    })
+    monkeypatch.setattr(verifier._decider, "ask", cast(Any, meaning_call))
+
+    assessment = await verifier.verify_claim_with_budget(
+        claim={"target_node_id": "target-node", "principal_refs": ["anonymous"]},
+        evidence_ids=["evidence-anonymous"],
+        run_id="run-1",
+        budget=DecisionBudget(1),
+    )
+
+    assert meaning_call.await_count == 1
+    assert assessment.outcome == "success"
+
+
+@pytest.mark.parametrize("case", [
+    "absent",
+    "wrong_comparison_leg",
+    "named_request_null",
+    "failed",
+    "mock",
+    "derived_only",
+])
+async def test_posthoc_anonymous_claim_rejects_missing_or_untrusted_receipts(
+    monkeypatch, case: str
+):
+    arguments: dict[str, Any] = {}
+    raw = {
+        "success": case != "failed",
+        "action_id": "action-1",
+        "invocation_id": "invocation-1",
+        "tool_id": "tool-1",
+        "output": {},
+    }
+    if case == "wrong_comparison_leg":
+        raw["output"] = {
+            "first_actual_session_ref": None,
+            "second_actual_session_ref": "session-alice",
+            "second_principal_ref": "alice",
+        }
+        arguments = {"first_session_ref": "session-first", "second_session_ref": "session-alice"}
+    elif case == "named_request_null":
+        raw["output"] = {"actual_session_ref": None}
+        arguments = {"session_ref": "session-alice"}
+    elif case in {"failed", "mock"}:
+        raw["output"] = {"anonymous": {"actual_session_ref": None}}
+        if case == "mock":
+            raw["metadata"] = {"mock": True}
+    elif case == "derived_only":
+        record_metadata = {"http_observation": {"actual_session_ref": None}}
+    else:
+        record_metadata = None
+
+    record = _execution_record(evidence_id="evidence-anonymous", raw=raw, arguments=arguments)
+    if case == "derived_only":
+        record.metadata.update(record_metadata)
+    verifier = StructuredLLMAnalysisVerifier(
+        object(), cast(EvidenceStore, _EvidenceStore(record))
+    )
+    meaning_call = AsyncMock(return_value={
+        "meaning": "The evidence supports the claim.",
+        "outcome": "success",
+        "reason": "Should not be reached without an original anonymous receipt.",
+        "claim_supported": True,
+    })
+    monkeypatch.setattr(verifier._decider, "ask", cast(Any, meaning_call))
+
+    assessment = await verifier.verify_claim_with_budget(
+        claim={"target_node_id": "target-node", "principal_refs": ["anonymous"]},
+        evidence_ids=["evidence-anonymous"],
+        run_id="run-1",
+        budget=DecisionBudget(1),
+    )
+
+    assert meaning_call.await_count == 0
+    assert assessment.outcome == "unknown"

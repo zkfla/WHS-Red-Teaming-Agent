@@ -29,6 +29,7 @@ from redteam.orchestration.paths import (
 from redteam.orchestration.session_proof import (
     actual_receipt_conflict,
     collect_actual_sessions,
+    original_anonymous_receipt_matches,
     original_session_receipt_matches,
     original_unit_account_pairs,
 )
@@ -1332,20 +1333,8 @@ def _completion_receipted_accounts(
 def _completion_has_anonymous_receipt(
     meta: dict[str, Any], raw: Any, stored_args: Any
 ) -> bool:
-    """Accept only an explicitly anonymous request unit, not another leg's null."""
-    if original_session_receipt_matches(
-        meta, raw, unit="anonymous", expected_session_ref=None
-    ):
-        return True
-    args = stored_args if isinstance(stored_args, dict) else {}
-    if any(
-        isinstance(args.get(key), str) and args[key].strip()
-        for key in ("session_ref", "first_session_ref", "second_session_ref")
-    ):
-        return False
-    return original_session_receipt_matches(
-        meta, raw, unit="request", expected_session_ref=None
-    )
+    """Accept only an explicitly anonymous original request unit."""
+    return original_anonymous_receipt_matches(meta, raw, stored_args)
 
 
 def _verified_completion_accounts(

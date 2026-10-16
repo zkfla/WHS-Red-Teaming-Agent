@@ -151,6 +151,30 @@ def original_session_receipt_matches(
     )
 
 
+def original_anonymous_receipt_matches(
+    metadata: Any, raw: Any, arguments: Any
+) -> bool:
+    """Whether an original request unit explicitly ran anonymously.
+
+    A nested anonymous unit is explicit on its own. A top-level request null
+    is anonymous only when no named request session was selected. Null values
+    on comparison legs are never promoted to an anonymous request claim.
+    """
+    if original_session_receipt_matches(
+        metadata, raw, unit="anonymous", expected_session_ref=None
+    ):
+        return True
+    args = arguments if isinstance(arguments, dict) else {}
+    if any(
+        isinstance(args.get(key), str) and args[key].strip()
+        for key in ("session_ref", "first_session_ref", "second_session_ref")
+    ):
+        return False
+    return original_session_receipt_matches(
+        metadata, raw, unit="request", expected_session_ref=None
+    )
+
+
 def has_anonymous_receipt(metadata: Any, raw: Any) -> bool:
     """An explicit null on an original request unit, never an echo/declaration.
 

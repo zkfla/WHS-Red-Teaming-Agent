@@ -40,6 +40,7 @@ from redteam.orchestration.session_proof import (
     actual_receipt_conflict,
     collect_actual_accounts,
     collect_actual_sessions,
+    original_anonymous_receipt_matches,
     original_session_receipt_matches,
 )
 
@@ -526,6 +527,8 @@ def _has_raw_account_artifact(
         return False
     if not _comparison_account_source_is_valid(metadata, raw, args):
         return False
+    if claimed.strip().lower() == "anonymous":
+        return original_anonymous_receipt_matches(metadata, raw, args)
     raw_principals = collect_actual_accounts(metadata, raw, expected_sessions)
     return claimed in raw_principals or claimed in (raw_sessions & expected_sessions)
 
