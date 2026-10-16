@@ -1,5 +1,6 @@
 """Recovery uses the registered owner and preserved invocation identity."""
 
+import asyncio
 from datetime import datetime, timezone
 
 import pytest
@@ -125,3 +126,39 @@ async def test_approved_target_is_part_of_recoverable_input_digest():
     changed = gateway.prepare_reference(foreign)
     assert changed is not None and changed.input_digest != reference.input_digest
     assert provider.calls == []
+
+
+async def test_recovery_uses_caller_deadline_not_short_health_probe_budget():
+    provider = RecoverableProvider()
+    gateway = await build_mcp_tool_gateway(
+        [], builtin_adapters=[provider], health_refresh_timeout_seconds=0.001,
+    )
+    reference = gateway.prepare_reference(invocation({}))
+
+    async def delayed_query(reference):
+        await asyncio.sleep(0.02)
+        return ExecutionRecoveryAnswer(state=ExecutionState.UNKNOWN, verified=True,
+                                       execution_terminated=True)
+
+    provider.query_execution = delayed_query
+    answer = await asyncio.wait_for(gateway.query_execution(reference), timeout=1)
+    assert answer.execution_terminated and answer.uncertain
+    assert provider.calls == []
+
+
+async def test_recovery_caller_cancellation_propagates_without_provider_replay():
+    provider = RecoverableProvider()
+    gateway = await build_mcp_tool_gateway([], builtin_adapters=[provider])
+    reference = gateway.prepare_reference(invocation({}))
+    cancelled = asyncio.Event()
+
+    async def blocked_query(reference):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    provider.query_execution = blocked_query
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(gateway.query_execution(reference), timeout=0.02)
+    assert cancelled.is_set() and provider.calls == []

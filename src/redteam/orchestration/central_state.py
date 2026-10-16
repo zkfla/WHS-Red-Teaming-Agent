@@ -303,6 +303,7 @@ def execution_identity_hash(record: TaskExecution) -> str:
     excluded = {
         "state", "wait_reason", "job_ref", "result_evidence_id",
         "resource_execution_pending", "resource_lease_until", "outcome",
+        "termination_evidence_id",
     }
     if record.target_node_id is None:
         excluded.add("target_node_id")  # Preserve historical identity hashes.
@@ -313,6 +314,8 @@ def execution_identity_hash(record: TaskExecution) -> str:
 
 def execution_occupies_capacity(record: TaskExecution) -> bool:
     """Original reservations and external activity survive actor/lease return."""
+    if record.state is ExecutionState.UNKNOWN and record.termination_evidence_id is not None:
+        return False  # Proven cessation returns a slot, never its resource fences.
     return (
         record.state in {ExecutionState.RUNNING, ExecutionState.UNKNOWN}
         or record.job_ref is not None
@@ -1997,6 +2000,8 @@ class CentralTransaction:
             if execution_identity_hash(previous) != execution_identity_hash(execution):
                 raise StateConflict("execution_identity_conflict")
             return previous
+        if execution.termination_evidence_id is not None:
+            raise StateConflict("execution_termination_requires_verified_receipt")
         if task.probe_limits is not None and self.probe_usage(str(task.task_id))[
             "actions"
         ] >= task.probe_limits.max_actions:
@@ -2059,6 +2064,42 @@ class CentralTransaction:
             }))
         return execution
 
+    def record_execution_termination(
+        self, invocation_id: str, *, submission: CheckedEvidence, proof: CheckedEvidence,
+        owner: str, version: int,
+    ) -> TaskExecution:
+        """Release capacity only after a correlated provider cessation receipt."""
+        execution = self.get_execution(invocation_id)
+        if execution is None:
+            raise StateConflict("original_execution_missing")
+        task = self._owned(str(execution.task_id), owner, version)
+        check_execution_receipt(execution, submission.record, result=False, task=task)
+        data = checked_receipt(proof.record)
+        original = checked_receipt(submission.record)
+        if (str(submission.record.evidence_id) != str(execution.proposal_evidence_id)
+                or data["receipt_kind"] != "execution_termination"
+                or data.get("submission_id") != str(submission.record.evidence_id)
+                or data.get("submission_digest") != submission.record.digest
+                or any(data.get(key) != original.get(key) for key in (
+                    "invocation", "proposal", "plan_step", "candidate_key", "work_id",
+                    "instance_id", "execution_reference",
+                ))):
+            raise StateConflict("execution_termination_submission_mismatch")
+        if execution.state not in {ExecutionState.RUNNING, ExecutionState.UNKNOWN}:
+            raise StateConflict("execution_termination_requires_unsettled_original")
+        if execution.termination_evidence_id is not None:
+            if execution.termination_evidence_id != proof.record.evidence_id:
+                raise StateConflict("execution_termination_proof_changed")
+            return execution
+        self.add_evidence_refs([submission, proof])
+        execution = execution.model_copy(update={
+            "state": ExecutionState.UNKNOWN,
+            "termination_evidence_id": proof.record.evidence_id,
+        })
+        self.db.execute("UPDATE state_executions SET payload=? WHERE run_id=? AND invocation_id=?",
+                        (execution.model_dump_json(), self.run_id, invocation_id))
+        return execution
+
     def update_execution(
         self, execution: TaskExecution, *, owner: str, checked: Sequence[CheckedEvidence] = (),
         now: float, ownership_version: int | None = None, admitted_revision: int | None = None,
@@ -2073,6 +2114,8 @@ class CentralTransaction:
         if (previous is None
                 or execution_identity_hash(previous) != execution_identity_hash(execution)):
             raise StateConflict("execution_identity_conflict")
+        if previous.termination_evidence_id != execution.termination_evidence_id:
+            raise StateConflict("execution_termination_requires_verified_receipt")
         if previous == execution:
             return previous
         if previous.state in _RESOLVED and previous.wait_reason != "job":

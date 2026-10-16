@@ -4,6 +4,8 @@ Preparing a reference does not create a process, environment or external
 effect. Query/fetch only collect an existing execution. They must never
 resubmit a missing or uncertain execution. Unverified terminal states or
 missing originals cannot become successful observations through this port.
+The caller bounds query/fetch by the preserved invocation timeout; health
+probe limits do not replace that recovery deadline. Cancellation propagates.
 """
 
 from __future__ import annotations

@@ -14,7 +14,10 @@ from redteam.orchestration.central_runtime import commit_result, runtime_token, 
 from redteam.orchestration.central_state import check_evidence, check_execution_receipt
 from redteam.orchestration.coordination import StateConflict
 from redteam.orchestration.diagnostics import DecisionDiagnostic
-from redteam.orchestration.execution_collection import collect_execution_original
+from redteam.orchestration.execution_collection import (
+    collect_execution_original,
+    collect_execution_termination,
+)
 from redteam.orchestration.execution_journal import (
     ExecutionReceiptError,
     append_execution_receipt,
@@ -157,6 +160,33 @@ async def collect_original(deps, execution, submission):
     return await asyncio.wait_for(fetch(), timeout=invocation.timeout_seconds)
 
 
+async def reconcile_termination(deps, runtime, execution):
+    """One bounded read-only cessation collection, including during a live hold."""
+    checked = await check_evidence(
+        deps.evidence_store, run_id=deps.central_state.run_id,
+        engagement_id=deps.central_state.engagement_id,
+        evidence_ids=[str(execution.proposal_evidence_id)],
+    )
+    task = await deps.central_state.get_task(str(execution.task_id))
+    check_execution_receipt(execution, checked[0].record, result=False, task=task)
+    termination_id = execution.termination_evidence_id
+    if termination_id is None:
+        termination = await collect_execution_termination(deps, checked[0].record)
+        termination_id = termination.evidence_id if termination is not None else None
+    if termination_id is None:
+        return False
+    proofs = await check_evidence(
+        deps.evidence_store, run_id=deps.central_state.run_id,
+        engagement_id=deps.central_state.engagement_id,
+        evidence_ids=[str(termination_id)],
+    )
+    await deps.central_state.transaction(lambda tx: tx.record_execution_termination(
+        str(execution.invocation_id), submission=checked[0], proof=proofs[0],
+        owner=runtime.work_owner, version=runtime.task_ownership_version,
+    ))
+    return True
+
+
 async def _job_resolution(deps, invocation, data, result, prior, state, job_id):
     from redteam.core.contracts.execution import ExecutionReference
     from redteam.core.convert import execution_input_digest
@@ -280,6 +310,7 @@ async def reconcile_originals(deps, runtime, *, snapshot=None):
                 continue
             original = await collect_original(deps, execution, submission)
             if original is None:
+                await reconcile_termination(deps, runtime, execution)
                 outcome.pending_invocations.append(identity)
                 continue
             data = checked_receipt(submission)

@@ -27,6 +27,7 @@ from redteam.orchestration.execution_journal import (
     EXECUTION_RECEIPT_KINDS,
     ExecutionReceiptError,
     append_execution_receipt,
+    append_execution_termination,
     checked_receipt,
     preserved_result,
 )
@@ -54,6 +55,34 @@ class ExecutionOriginalCollection(BaseModel):
 
 _SUBMISSION_BINDING = ("invocation", "proposal", "plan_step", "candidate_key",
                        "work_id", "instance_id")
+
+
+async def collect_execution_termination(
+    deps: RuntimeDeps, submission: EvidenceRecord,
+) -> EvidenceRecord | None:
+    """Read a provider's cessation proof without resolving or retrying the action."""
+    data = checked_receipt(submission)
+    if data["receipt_kind"] != "execution_submission":
+        raise ExecutionReceiptError("execution_collection_requires_submission")
+    provider = deps.execution_recovery
+    raw = data.get("execution_reference")
+    if provider is None or raw is None:
+        return None
+    invocation = ToolInvocation.model_validate(data["invocation"])
+    reference = ExecutionReference.model_validate(raw)
+    expected = provider.prepare_reference(invocation.model_copy(deep=True))
+    if expected is None or expected.model_dump(exclude={"provider_handle"}) != (
+        reference.model_dump(exclude={"provider_handle"})
+    ):
+        raise ExecutionReceiptError("execution_recovery_input_mismatch")
+    answer = await asyncio.wait_for(
+        provider.query_execution(reference.model_copy(deep=True)),
+        timeout=invocation.timeout_seconds,
+    )
+    answer = ExecutionRecoveryAnswer.model_validate(answer.model_dump(mode="json"))
+    if not answer.verified or not answer.execution_terminated:
+        return None
+    return await append_execution_termination(deps.evidence_store, submission, answer)
 
 
 async def collect_execution_original(

@@ -5,6 +5,7 @@ functions bind their original identities, ownership and prepared writes to SQL.
 Explicit selection and recovery reuse this boundary; goal close is plan2d.
 """
 
+import logging
 from collections.abc import Collection, Mapping
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -895,6 +896,18 @@ async def commit_result(deps, local, item):
             batch.commit(tx, nodes, edges)
 
         await deps.central_state.transaction(commit)
+        if unknown:
+            from redteam.orchestration.central_recovery import reconcile_termination
+
+            # The result is already durable. A failed optional read must leave
+            # that UNKNOWN and its capacity/resource reservations untouched.
+            try:
+                current = await deps.central_state.get_execution(str(result.invocation_id))
+                await reconcile_termination(deps, runtime, current)
+            except Exception as exc:
+                logging.getLogger(__name__).warning(
+                    "Execution cessation proof unavailable: %s", type(exc).__name__,
+                )
         if not unknown:
             from redteam.orchestration.execution_journal import mark_execution_processed
 

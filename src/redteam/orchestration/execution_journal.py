@@ -23,7 +23,7 @@ from redteam.core.contracts.tool import (
     ToolResult,
     execution_outcome_uncertain,
 )
-from redteam.core.convert import digest_payload
+from redteam.core.convert import digest_payload, execution_input_digest
 from redteam.core.enums import EvidenceSourceType
 from redteam.core.ids import ActionId, EvidenceId, RunId, new_id
 from redteam.core.ports.evidence_store import EvidenceStore
@@ -31,6 +31,7 @@ from redteam.orchestration.agents.base import PlanStep
 
 EXECUTION_RECEIPT_KINDS = frozenset({
     "execution_submission", "execution_result", "execution_resolution", "execution_retry_admission",
+    "execution_termination",
 })
 
 
@@ -40,6 +41,40 @@ class ExecutionReceiptError(ValueError):
     def __init__(self, reason_code: str) -> None:
         self.reason_code = reason_code
         super().__init__(reason_code)
+
+
+async def append_execution_termination(
+    store: EvidenceStore, submission: EvidenceRecord, answer: ExecutionRecoveryAnswer,
+) -> EvidenceRecord:
+    """Persist verified cessation, never a result or permission to replay."""
+    payload = dict(checked_receipt(submission))
+    if (payload["receipt_kind"] != "execution_submission"
+            or payload.get("execution_reference") is None
+            or not answer.verified or not answer.execution_terminated):
+        raise ExecutionReceiptError("execution_termination_unverified")
+    payload.update(
+        receipt_kind="execution_termination", submission_id=str(submission.evidence_id),
+        submission_digest=submission.digest, recovery_answer=answer.model_dump(mode="json"),
+    )
+    assert submission.action_id is not None  # checked_receipt binds a required action.
+    for record in await store.list_for_action(submission.action_id):
+        if (record.run_id == submission.run_id
+                and record.metadata.get("receipt_kind") == "execution_termination"
+                and record.metadata.get("submission_id") == str(submission.evidence_id)):
+            prior = checked_receipt(record)
+            if prior["submission_digest"] != submission.digest:
+                raise ExecutionReceiptError("execution_termination_submission_mismatch")
+            return record
+    record = submission.model_copy(update={
+        "evidence_id": EvidenceId(new_id("evidence")),
+        "source_id": "orchestration.execution_reconciliation",
+        "created_at": datetime.now(timezone.utc), "metadata": payload,
+        "digest": digest_payload(payload),
+        "summary": "Verified execution termination; operation outcome remains separate",
+    })
+    checked_receipt(record)
+    await store.append(record)
+    return record
 
 
 async def append_execution_receipt(
@@ -163,6 +198,16 @@ def checked_receipt(record: EvidenceRecord) -> dict[str, Any]:
             or reference.invocation_id != record.invocation_id
             or reference.tool_id != invocation.tool_id):
             raise ExecutionReceiptError("execution_receipt_reference_mismatch")
+        if (payload["receipt_kind"] == "execution_termination"
+                and reference.input_digest != execution_input_digest(invocation)):
+            raise ExecutionReceiptError("execution_termination_input_mismatch")
+    if payload["receipt_kind"] == "execution_termination":
+        answer = ExecutionRecoveryAnswer.model_validate(payload.get("recovery_answer"))
+        if (not answer.verified or not answer.execution_terminated
+                or payload.get("execution_reference") is None
+                or not payload.get("submission_id") or not payload.get("submission_digest")
+                or record.source_id != "orchestration.execution_reconciliation"):
+            raise ExecutionReceiptError("execution_termination_unverified")
     return payload
 
 

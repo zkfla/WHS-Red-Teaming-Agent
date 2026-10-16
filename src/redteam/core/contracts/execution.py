@@ -68,7 +68,18 @@ class ExecutionRecoveryAnswer(BaseModel):
     verified: bool = False
     uncertain: bool = True
     result_available: bool = False
+    # Execution termination is independent of knowing the operation's outcome.
+    # Only a verified provider proof (including its execution route) may set it.
+    execution_terminated: bool = False
     error: ToolError | None = None
+
+    @model_validator(mode="after")
+    def _termination_proof(self):
+        if self.execution_terminated and (
+            not self.verified or self.state in {ExecutionState.PENDING, ExecutionState.RUNNING}
+        ):
+            raise ValueError("execution_termination_requires_verified_nonrunning_state")
+        return self
 
 
 class ExecutionSelectionProjection(BaseModel):
@@ -160,6 +171,8 @@ class TaskExecution(BaseModel):
     wait_reason: Literal["approval", "job", "resource"] | None = None
     job_ref: str | None = None
     result_evidence_id: EvidenceId | None = None
+    # This proof returns capacity only; UNKNOWN and resource fences remain intact.
+    termination_evidence_id: EvidenceId | None = None
     resource_keys: list[str] = Field(default_factory=list)
     resource_execution_pending: bool = False
     resource_lease_until: float = Field(default=0, ge=0, allow_inf_nan=False)
@@ -169,6 +182,8 @@ class TaskExecution(BaseModel):
     @model_serializer(mode="wrap")
     def serialize_optional_projection(self, handler):
         value = handler(self)
+        if self.termination_evidence_id is None:
+            value.pop("termination_evidence_id", None)
         if self.selection is None:
             value.pop("selection", None)
         if self.outcome is None:

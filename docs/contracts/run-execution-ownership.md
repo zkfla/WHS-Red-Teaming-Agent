@@ -1,5 +1,23 @@
 # 전문 Run 실행 소유권 계약
 
+## 실행 종료 증명과 결과 불확실성 (2026-10-16)
+
+`ExecutionRecoveryAnswer.execution_terminated`는 결과 성공 여부와 독립적인 제공자
+증명이다. 기본값 false이며 verified=true와 비실행 상태가 함께 있어야 한다.
+UNKNOWN 결과라도 프로세스 트리와 실행 경로의 종료가 증명되면 true일 수 있다.
+단순 coroutine 취소·timeout·빈 결과·컨테이너 연결 실패는 종료 증명이 아니다.
+
+기존 evidence store의 `execution_termination` 영수증은 원 제출 ID/digest, 입력과
+제공자 reference에 결속된다. 중앙 원장은 검사한 영수증을
+`TaskExecution.termination_evidence_id`로 저장한다. 이 필드는 일반 실행 갱신으로
+설정할 수 없다. 재개는 저장된 증명도 다시 확인한다. 이로써 UNKNOWN이 차지하던
+실행 용량만 반환하며, 원래 자원 키·UNKNOWN 상태·재전송 금지·목표 완료 차단은
+유지한다. 결과 확정은 기존 execution_resolution 경로에서 별도로 처리한다.
+
+구형 요청/원장에는 새 필드가 없고 기본 false/None이므로 보수적으로 용량을
+계속 점유한다. None 필드는 TaskExecution 직렬화에서 생략해 과거 식별 hash를
+바꾸지 않는다. 새로운 증명은 과거 실행을 소급 추정하거나 예산을 환불하지 않는다.
+
 이 계약은 같은 Run을 두 실행 조립자가 동시에 변경하는 것을 막는다.
 Task claim, 도구 자원 lease, Control 승인, 실행 영수증 검증을 대체하지 않는다.
 기존 Coordinator의 저장소 제공자가 소유권을 제공하고 기존 InstanceDriver가 보유한다.

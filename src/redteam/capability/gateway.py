@@ -262,8 +262,9 @@ class MCPToolGateway:
                                 message="the registered provider cannot recover this execution"),
             )
         try:
-            return await asyncio.wait_for(provider.query_execution(reference),
-                                          timeout=self._health_refresh_timeout)
+            # Recovery consumers bound query/fetch together by the original
+            # invocation deadline. A health-probe timeout is not that budget.
+            return await provider.query_execution(reference)
         except Exception as exc:
             return ExecutionRecoveryAnswer(
                 state=ExecutionState.UNKNOWN,
@@ -278,8 +279,7 @@ class MCPToolGateway:
             return None
         # Failures propagate to the recovery consumer, which must preserve
         # its unsettled receipt. Absence never authorizes another invocation.
-        result = await asyncio.wait_for(provider.fetch_execution(reference),
-                                        timeout=self._health_refresh_timeout)
+        result = await provider.fetch_execution(reference)
         if result is None:
             return None
         if (result.invocation_id != reference.invocation_id
