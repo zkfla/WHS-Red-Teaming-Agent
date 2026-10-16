@@ -146,12 +146,14 @@ def authentication_assess_descriptor() -> LocalToolDescriptor:
             "Returns an authentication observation and source refs, never a confirmed finding. "
             "An inconclusive baseline comparison includes a fixed mismatch_reason naming "
             "the first failed source or request condition; correct the cited inputs before "
-            "repeating the comparison. A successful tool call alone is not a resolved comparison. "
+            "repeating the comparison. The baseline needs an explicit original anonymous receipt; "
+            "the current response needs an original receipt matching its selected session. "
+            "A successful tool call alone is not a resolved comparison. "
             "Submit any security claim through the supplied recording tool."
         ),
         input_schema=AuthenticationAssessmentInput.model_json_schema(),
         contribution_id="authentication-assessment",
-        version="2",
+        version="3",
     )
 
 
@@ -160,5 +162,5 @@ def authentication_assessment_contribution() -> Contribution:
         return authentication_assess_descriptor(), authentication_assess_handler
 
     return runtime_tool_contribution(
-        contribution_id="authentication-assessment", version="2", factory=factory,
+        contribution_id="authentication-assessment", version="3", factory=factory,
     )

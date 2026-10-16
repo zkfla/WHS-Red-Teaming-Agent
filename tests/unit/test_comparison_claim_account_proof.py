@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from redteam.core.enums import EvidenceSourceType
 from redteam.core.ports.evidence_store import EvidenceStore
 from redteam.orchestration.analysis import (
     StructuredLLMAnalysisVerifier,
@@ -104,6 +105,94 @@ class _EvidenceStore:
         return self.record
 
 
+class _FullEvidenceStore:
+    def __init__(self, records):
+        self.records = records
+
+    async def get(self, evidence_id):
+        return next(
+            (record for record in self.records if str(record.evidence_id) == str(evidence_id)),
+            None,
+        )
+
+    async def list_for_run(self, run_id):
+        return [record for record in self.records if str(record.run_id) == str(run_id)]
+
+
+def _execution_record(
+    *,
+    evidence_id: str,
+    raw: dict[str, Any],
+    arguments: dict[str, Any],
+    proposal_target_ref: str = "target-node",
+    metadata_target_node_id: str = "target-node",
+):
+    action_id = raw["action_id"]
+    invocation_id = raw["invocation_id"]
+    metadata = {
+        "tool_result": raw,
+        "target_node_id": metadata_target_node_id,
+        "action_id": action_id,
+        "invocation_id": invocation_id,
+        "tool_id": "tool-1",
+        "proposal": {
+            "action_id": action_id,
+            "run_id": "run-1",
+            "engagement_id": "engagement-1",
+            "agent_id": "agent-1",
+            "target": {"kind": "graph_node", "node_id": proposal_target_ref},
+            "reason": "Test evidence origin.",
+            "created_at": "2026-10-16T00:00:00Z",
+            "arguments": arguments,
+        },
+    }
+    return SimpleNamespace(
+        evidence_id=evidence_id,
+        run_id="run-1",
+        engagement_id="engagement-1",
+        source_type=EvidenceSourceType.TOOL,
+        source_id="tool-1",
+        action_id=action_id,
+        invocation_id=invocation_id,
+        metadata=metadata,
+    )
+
+
+def _comparison_alias_records(case: str | None = None):
+    metadata, raw, arguments = comparison_fixture()
+    raw["tool_id"] = "tool-1"
+    raw["output"]["second"]["actual_session_ref"] = "session-bob"
+    metadata["session_comparison"]["second_session_ref"] = "session-bob"
+    metadata["session_comparison"]["second_actual_session_ref"] = "session-bob"
+    arguments.update({"second_session_ref": "session-bob"})
+    if case == "swapped_leg":
+        raw["output"]["first"]["actual_session_ref"] = "session-bob"
+    elif case == "missing_comparison_metadata":
+        raw["output"]["first"]["actual_session_ref"] = "session-bob"
+    elif case == "mismatched_session":
+        arguments["second_session_ref"] = "another-session"
+    elif case == "derived_spoof":
+        metadata["session_comparison"]["second_principal_ref"] = "test-alice"
+    cited = _execution_record(evidence_id="evidence-1", raw=raw, arguments=arguments)
+    cited.metadata["session_comparison"] = metadata["session_comparison"]
+    if case == "missing_comparison_metadata":
+        cited.metadata.pop("session_comparison")
+
+    alias_raw = {
+        "success": True,
+        "action_id": "action-alias",
+        "invocation_id": "invocation-alias",
+        "tool_id": "tool-1",
+        "output": {"actual_session_ref": "session-bob", "principal_ref": "bob"},
+    }
+    alias = _execution_record(
+        evidence_id="evidence-alias",
+        raw=alias_raw,
+        arguments={},
+    )
+    return cited, alias
+
+
 @pytest.mark.parametrize("claim_principal,alias_ok,expected_called", [
     ("test-bob", False, True),
     ("bob", True, True),
@@ -170,6 +259,112 @@ async def test_posthoc_account_proof_gates_meaning_review(
     assert bool(meaning_call.await_count) is expected_called
     if claim_principal == "bob" and expected_called:
         assert any(call["session_name"] == "session-bob" for call in alias_calls)
+    if expected_called:
+        assert assessment.outcome == "success"
+    else:
+        assert assessment.reason.startswith("claimed account lacks actual-use proof")
+
+
+@pytest.mark.parametrize("case", [
+    "swapped_leg", "mismatched_session", "derived_spoof",
+    "missing_comparison_metadata",
+])
+async def test_invalid_comparison_source_cannot_borrow_runwide_alias_proof(
+    monkeypatch, case: str
+):
+    cited, alias = _comparison_alias_records(case)
+    verifier = StructuredLLMAnalysisVerifier(
+        object(), cast(EvidenceStore, _FullEvidenceStore([cited, alias]))
+    )
+    monkeypatch.setattr(
+        "redteam.orchestration.analysis._posthoc_source_gap", lambda *_: None
+    )
+    monkeypatch.setattr(
+        "redteam.orchestration.analysis.claim_target_is_grounded",
+        AsyncMock(return_value=True),
+    )
+    meaning_call = AsyncMock(return_value={
+        "meaning": "The evidence supports the claim.",
+        "outcome": "success",
+        "reason": "Measured response.",
+        "claim_supported": True,
+    })
+    monkeypatch.setattr(verifier._decider, "ask", cast(Any, meaning_call))
+
+    assessment = await verifier.verify_claim_with_budget(
+        claim={"target_node_id": "target-node", "principal_refs": ["bob"]},
+        evidence_ids=["evidence-1"],
+        run_id="run-1",
+        budget=DecisionBudget(1),
+    )
+
+    assert meaning_call.await_count == 0
+    assert assessment.reason.startswith("comparison account receipt is inconsistent")
+
+
+async def test_consistent_comparison_can_use_real_runwide_alias_proof(monkeypatch):
+    cited, alias = _comparison_alias_records()
+    verifier = StructuredLLMAnalysisVerifier(
+        object(), cast(EvidenceStore, _FullEvidenceStore([cited, alias]))
+    )
+    monkeypatch.setattr(
+        "redteam.orchestration.analysis._posthoc_source_gap", lambda *_: None
+    )
+    monkeypatch.setattr(
+        "redteam.orchestration.analysis.claim_target_is_grounded",
+        AsyncMock(return_value=True),
+    )
+    meaning_call = AsyncMock(return_value={
+        "meaning": "The evidence supports the claim.",
+        "outcome": "success",
+        "reason": "Measured response.",
+        "claim_supported": True,
+    })
+    monkeypatch.setattr(verifier._decider, "ask", cast(Any, meaning_call))
+
+    assessment = await verifier.verify_claim_with_budget(
+        claim={"target_node_id": "target-node", "principal_refs": ["bob"]},
+        evidence_ids=["evidence-1"],
+        run_id="run-1",
+        budget=DecisionBudget(1),
+    )
+
+    assert meaning_call.await_count == 1
+    assert assessment.outcome == "success"
+
+
+@pytest.mark.parametrize(
+    "proposal_target_ref,expected_called",
+    [("other-target", False), ("target-node", True)],
+)
+async def test_alias_candidate_must_match_its_original_proposal_target(
+    monkeypatch, proposal_target_ref: str, expected_called: bool
+):
+    cited, alias = _comparison_alias_records()
+    alias.metadata["proposal"]["target"] = {
+        "kind": "graph_node",
+        "node_id": proposal_target_ref,
+    }
+    verifier = StructuredLLMAnalysisVerifier(
+        object(), cast(EvidenceStore, _FullEvidenceStore([cited, alias]))
+    )
+    meaning_call = AsyncMock(return_value={
+        "meaning": "The evidence supports the claim.",
+        "outcome": "success",
+        "reason": "Measured response.",
+        "claim_supported": True,
+    })
+    monkeypatch.setattr(verifier._decider, "ask", cast(Any, meaning_call))
+
+    assessment = await verifier.verify_claim_with_budget(
+        claim={"target_node_id": "target-node", "principal_refs": ["bob"]},
+        evidence_ids=["evidence-1"],
+        run_id="run-1",
+        budget=DecisionBudget(1),
+    )
+
+    assert bool(meaning_call.await_count) is expected_called
+    assert "target_ref" not in cited.metadata["proposal"]["arguments"]
     if expected_called:
         assert assessment.outcome == "success"
     else:

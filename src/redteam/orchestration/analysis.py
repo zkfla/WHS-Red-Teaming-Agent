@@ -40,6 +40,7 @@ from redteam.orchestration.session_proof import (
     actual_receipt_conflict,
     collect_actual_accounts,
     collect_actual_sessions,
+    original_session_receipt_matches,
 )
 
 VerificationOutcome = Literal["success", "refuted", "inconclusive", "blocked", "unknown"]
@@ -520,66 +521,124 @@ def _has_raw_account_artifact(
     # Shared with completion: only each unit's own actual-use pair proves
     # its account. Echoes and configured inventory never prove use.
     raw_sessions = collect_actual_sessions(metadata, raw)
-    raw_account_pairs = actual_account_pairs(raw)
     # Cross-layer actual disagreement is unprovable; fail closed outright.
     if actual_receipt_conflict(metadata, raw) is not None:
         return False
-    comparison = metadata.get("session_comparison")
-    comparison_dict: dict[str, Any] | None = comparison if isinstance(comparison, dict) else None
+    if not _comparison_account_source_is_valid(metadata, raw, args):
+        return False
     raw_principals = collect_actual_accounts(metadata, raw, expected_sessions)
-    if comparison_dict is not None:
-        # Derived comparison principals must agree with their own original
-        # request unit. Comparing them with the claim's allowed-name set
-        # incorrectly rejects a valid unrelated leg, while comparing against
-        # all raw principals would let one leg borrow the other's identity.
-        output = raw.get("output") if isinstance(raw, dict) else None
-        for side in ("first", "second"):
-            observed_principal = _clean_identity(
-                comparison_dict.get(f"{side}_principal_ref")
-            )
-            observed_session = _clean_identity(
-                comparison_dict.get(f"{side}_actual_session_ref")
-            )
-            observed_request = _clean_identity(comparison_dict.get(f"{side}_session_ref"))
-            requested_session = _clean_identity(args.get(f"{side}_session_ref"))
-            if (
-                requested_session is not None
-                and observed_request is not None
-                and observed_request != requested_session
-            ):
-                return False
-            if observed_principal is None:
-                continue
-            if requested_session is None or not isinstance(output, dict):
-                return False
-            original_pairs: set[tuple[str, str]] = set()
-            original_session: str | None = None
-            original_principal = _clean_identity(output.get(f"{side}_principal_ref"))
-            direct_session = _clean_identity(output.get(f"{side}_actual_session_ref"))
-            if original_principal is not None and direct_session is not None:
-                original_session = direct_session
-                original_pairs.add((direct_session, original_principal))
-            nested = output.get(side)
-            if isinstance(nested, dict):
-                original_principal = _clean_identity(nested.get("principal_ref"))
-                nested_session = _clean_identity(nested.get("actual_session_ref"))
-                if original_principal is not None and nested_session is not None:
-                    original_session = nested_session
-                    original_pairs.add((nested_session, original_principal))
-            if len({principal for _, principal in original_pairs}) > 1:
-                return False
-            if (
-                original_session is None
-                or original_session != requested_session
-                or (observed_session is not None and observed_session != original_session)
-            ):
-                return False
-            if (
-                (original_session, observed_principal) not in original_pairs
-                or (original_session, observed_principal) not in raw_account_pairs
-            ):
-                return False
     return claimed in raw_principals or claimed in (raw_sessions & expected_sessions)
+
+
+def _comparison_account_source_is_valid(
+    metadata: Any, raw: Any, arguments: Any
+) -> bool:
+    """Check that every comparison leg remains bound to its selected unit.
+
+    This separates a sound receipt with no account alias yet from a malformed
+    comparison. The latter must not be repaired by a run-wide alias lookup.
+    """
+    if not isinstance(arguments, dict):
+        return False
+    metadata_dict = metadata if isinstance(metadata, dict) else {}
+    comparison_present = "session_comparison" in metadata_dict
+    comparison = metadata_dict.get("session_comparison")
+    output = raw.get("output") if isinstance(raw, dict) else None
+    raw_comparison_units = isinstance(output, dict) and (
+        any(key in output for key in (
+            "first_actual_session_ref", "second_actual_session_ref"
+        ))
+        or any(side in output for side in ("first", "second"))
+    )
+    requested_comparison_units = any(
+        _clean_identity(arguments.get(f"{side}_session_ref")) is not None
+        for side in ("first", "second")
+    )
+    if not comparison_present and not raw_comparison_units and not requested_comparison_units:
+        return True
+    if comparison_present and not isinstance(comparison, dict):
+        return False
+    if not isinstance(comparison, dict):
+        comparison = {}
+    if actual_receipt_conflict(metadata, raw) is not None:
+        return False
+    if not isinstance(output, dict):
+        return False
+
+    raw_pairs = actual_account_pairs(raw)
+    for side in ("first", "second"):
+        requested = _clean_identity(arguments.get(f"{side}_session_ref"))
+        comparison_request = _clean_identity(comparison.get(f"{side}_session_ref"))
+        has_raw_side_data = isinstance(output, dict) and (
+            f"{side}_actual_session_ref" in output or side in output
+        )
+        has_side_data = requested is not None or has_raw_side_data or any(
+            key in comparison
+            for key in (
+                f"{side}_session_ref",
+                f"{side}_actual_session_ref",
+                f"{side}_principal_ref",
+            )
+        )
+        if not has_side_data:
+            continue
+        if requested is None or (
+            comparison_request is not None and comparison_request != requested
+        ):
+            return False
+        if f"{side}_session_ref" in comparison and comparison_request is None:
+            return False
+        if not original_session_receipt_matches(
+            metadata, raw, unit=side, expected_session_ref=requested
+        ):
+            return False
+
+        observed_session = _clean_identity(
+            comparison.get(f"{side}_actual_session_ref")
+        )
+        if (
+            f"{side}_actual_session_ref" in comparison
+            and observed_session != requested
+        ):
+            return False
+
+        original_pairs: set[tuple[str, str]] = set()
+        flat_session = _clean_identity(output.get(f"{side}_actual_session_ref"))
+        flat_principal = _clean_identity(output.get(f"{side}_principal_ref"))
+        if flat_session is not None and flat_principal is not None:
+            original_pairs.add((flat_session, flat_principal))
+        nested = output.get(side)
+        if isinstance(nested, dict):
+            nested_session = _clean_identity(nested.get("actual_session_ref"))
+            nested_principal = _clean_identity(nested.get("principal_ref"))
+            if nested_session is not None and nested_principal is not None:
+                original_pairs.add((nested_session, nested_principal))
+        if len({principal for _, principal in original_pairs}) > 1:
+            return False
+        if any(session != requested for session, _ in original_pairs):
+            return False
+
+        derived_principal = _clean_identity(
+            comparison.get(f"{side}_principal_ref")
+        )
+        if f"{side}_principal_ref" in comparison and derived_principal is None:
+            return False
+        if derived_principal is not None and (
+            (requested, derived_principal) not in original_pairs
+            or (requested, derived_principal) not in raw_pairs
+        ):
+            return False
+    return True
+
+
+def _raw_unit_receipts_session(metadata: Any, raw: Any, session_name: str) -> bool:
+    """Require a run-wide alias candidate to be receipted on its own unit."""
+    return any(
+        original_session_receipt_matches(
+            metadata, raw, unit=unit, expected_session_ref=session_name
+        )
+        for unit in ("request", "first", "second", "authenticated", "anonymous")
+    )
 
 
 async def _session_alias_grounded(
@@ -620,6 +679,8 @@ async def _session_alias_grounded(
         meta = record.metadata
         if str(meta.get("target_node_id", "")).strip() != target_ref.strip():
             continue
+        if _grounding_source(record) != target_ref.strip():
+            continue
         raw = raw_from_metadata(meta)
         if not isinstance(raw, dict) or raw.get("success") is not True:
             continue
@@ -637,11 +698,15 @@ async def _session_alias_grounded(
         if not isinstance(stored, dict) or str(stored.get("action_id")) != str(record.action_id):
             continue
         args = stored.get("arguments", {})
+        if not _comparison_account_source_is_valid(meta, raw, args):
+            continue
         record_target = args.get("target_ref") if isinstance(args, dict) else None
         if record_target is not None and record_target != expected_target:
             continue
         actual_sessions = collect_actual_sessions(meta, raw)
         if session_name.strip() not in actual_sessions:
+            continue
+        if not _raw_unit_receipts_session(meta, raw, session_name.strip()):
             continue
         if _posthoc_source_gap(record, raw) is not None:
             continue
@@ -828,6 +893,12 @@ class StructuredLLMAnalysisVerifier:
                                 _stored_args = _maybe
                     except Exception:
                         _stored_args = {}
+                    if not _comparison_account_source_is_valid(
+                        _meta, _raw, _stored_args
+                    ):
+                        return self._unknown_claim(
+                            refs, "comparison account receipt is inconsistent"
+                        )
                     try:
                         if _has_raw_account_artifact(_meta, _raw, _wanted, _stored_args):
                             _proven = True

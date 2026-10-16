@@ -15,6 +15,8 @@ from redteam.core.contracts.target import UrlTarget
 from redteam.core.contracts.tool import ToolResult
 from redteam.core.ids import EvidenceId
 from redteam.core.ports.evidence_store import EvidenceStore
+from redteam.orchestration.evidence_access import raw_from_metadata
+from redteam.orchestration.session_proof import original_session_receipt_matches
 
 
 class AuthSession(BaseModel):
@@ -200,6 +202,8 @@ BaselineMismatchReason = Literal[
     "baseline_method_mismatch",
     "baseline_path_mismatch",
     "baseline_target_ref_mismatch",
+    "baseline_actual_session_receipt_mismatch",
+    "request_actual_session_receipt_mismatch",
 ]
 
 
@@ -241,6 +245,8 @@ def _baseline_mismatch_reason(
     evidence: EvidenceRecord,
     baseline: EvidenceRecord | None,
     previous: Any,
+    baseline_raw: Any,
+    current_receipt_matches: bool,
 ) -> BaselineMismatchReason | None:
     """Return the first failed baseline or request condition, or None when valid."""
     if baseline is None:
@@ -269,6 +275,12 @@ def _baseline_mismatch_reason(
         return "baseline_path_mismatch"
     if previous.get("target_ref") != proposal.arguments.get("target_ref"):
         return "baseline_target_ref_mismatch"
+    if not original_session_receipt_matches(
+        baseline.metadata, baseline_raw, unit="request", expected_session_ref=None,
+    ):
+        return "baseline_actual_session_receipt_mismatch"
+    if not current_receipt_matches:
+        return "request_actual_session_receipt_mismatch"
     return None
 
 
@@ -278,9 +290,17 @@ def _assess_observations(
     evidence: EvidenceRecord,
     baseline: EvidenceRecord | None,
     current: dict[str, Any] | None,
+    current_raw: Any,
 ) -> AuthenticationAssessment:
     previous = baseline.metadata.get("http_observation") if baseline else None
-    reason = _baseline_mismatch_reason(check, proposal, evidence, baseline, previous)
+    baseline_raw = raw_from_metadata(baseline.metadata) if baseline else None
+    current_receipt_matches = current is None or original_session_receipt_matches(
+        evidence.metadata, current_raw, unit="request", expected_session_ref=check.session_ref,
+    )
+    reason = _baseline_mismatch_reason(
+        check, proposal, evidence, baseline, previous, baseline_raw,
+        current_receipt_matches,
+    )
     refs = [str(evidence.evidence_id)]
     if reason is not None:
         return AuthenticationAssessment(
@@ -318,7 +338,7 @@ async def assess_authentication(
     """Compare observations; HTTP status alone cannot verify a vulnerability."""
     return _assess_observations(
         check, proposal, evidence, await store.get(check.baseline_evidence_id),
-        http_observation(proposal.arguments, result),
+        http_observation(proposal.arguments, result), result.model_dump(mode="json"),
     )
 
 
@@ -329,7 +349,8 @@ async def assess_preserved_authentication(
     from redteam.orchestration.evidence_access import raw_from_metadata
 
     proposal = ActionProposal.model_validate(evidence.metadata.get("proposal"))
-    result = ToolResult.model_validate(raw_from_metadata(evidence.metadata))
+    raw = raw_from_metadata(evidence.metadata)
+    result = ToolResult.model_validate(raw)
     baseline = await store.get(check.baseline_evidence_id)
     if baseline is not None:
         before = ActionProposal.model_validate(baseline.metadata.get("proposal"))
@@ -341,5 +362,5 @@ async def assess_preserved_authentication(
             "http_observation": http_observation(before.arguments, before_result),
         }})
     return _assess_observations(
-        check, proposal, evidence, baseline, http_observation(proposal.arguments, result),
+        check, proposal, evidence, baseline, http_observation(proposal.arguments, result), raw,
     )

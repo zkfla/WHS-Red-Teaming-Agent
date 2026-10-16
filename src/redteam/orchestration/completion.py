@@ -28,9 +28,9 @@ from redteam.orchestration.paths import (
 )
 from redteam.orchestration.session_proof import (
     actual_receipt_conflict,
-    collect_actual_accounts,
     collect_actual_sessions,
-    has_anonymous_receipt,
+    original_session_receipt_matches,
+    original_unit_account_pairs,
 )
 
 _ALLOWED_KINDS = ALLOWED_CRITERION_KINDS
@@ -1295,15 +1295,57 @@ def _final_success_violation_receipts(
     return matching
 
 
-def _expected_session_refs(stored_args: Any) -> set[str]:
-    """Sessions the stored request named, under any of the tool field names."""
+def _matched_completion_units(
+    meta: dict[str, Any], raw: Any, stored_args: Any
+) -> set[tuple[str, str]]:
     args = stored_args if isinstance(stored_args, dict) else {}
-    expected: set[str] = set()
-    for key in ("session_ref", "first_session_ref", "second_session_ref"):
-        value = args.get(key)
-        if isinstance(value, str) and value.strip():
-            expected.add(value.strip())
-    return expected
+    requested_units = (
+        ("request", args.get("session_ref")),
+        ("first", args.get("first_session_ref")),
+        ("second", args.get("second_session_ref")),
+        ("authenticated", args.get("session_ref")),
+    )
+    return {
+        (unit, session.strip())
+        for unit, session in requested_units
+        if isinstance(session, str)
+        and session.strip()
+        and original_session_receipt_matches(
+            meta, raw, unit=unit, expected_session_ref=session
+        )
+    }
+
+
+def _completion_receipted_accounts(
+    meta: dict[str, Any], raw: Any, stored_args: Any
+) -> set[str]:
+    accounts: set[str] = set()
+    for unit, session in _matched_completion_units(meta, raw, stored_args):
+        accounts.update(
+            principal
+            for paired_session, principal in original_unit_account_pairs(raw, unit)
+            if paired_session == session
+        )
+    return accounts
+
+
+def _completion_has_anonymous_receipt(
+    meta: dict[str, Any], raw: Any, stored_args: Any
+) -> bool:
+    """Accept only an explicitly anonymous request unit, not another leg's null."""
+    if original_session_receipt_matches(
+        meta, raw, unit="anonymous", expected_session_ref=None
+    ):
+        return True
+    args = stored_args if isinstance(stored_args, dict) else {}
+    if any(
+        isinstance(args.get(key), str) and args[key].strip()
+        for key in ("session_ref", "first_session_ref", "second_session_ref")
+    ):
+        return False
+    return original_session_receipt_matches(
+        meta, raw, unit="request", expected_session_ref=None
+    )
 
 
 def _verified_completion_accounts(
@@ -1329,26 +1371,16 @@ def _verified_completion_accounts(
     }
     if not cleaned_claimed and not cleaned_required:
         return set()
-    expected_sessions = _expected_session_refs(stored_args)
-    # Session names and per-unit accounts come from the shared actual-use
-    # collector only; the receipt-vs-echo rule lives in session_proof.
-    raw_sessions: set[str] = collect_actual_sessions(meta, raw)
-    raw_accounts: set[str] = collect_actual_accounts(meta, raw, expected_sessions)
-    # Configured session inventory (session_list rows) is never actual-use
-    # proof: it is not merged into the raw receipt sets above. Session to
-    # principal binding stays on the separate alias-grounded lookup, and an
-    # absent receipt proves nothing, including anonymous use.
-    if raw_sessions and expected_sessions and raw_sessions.isdisjoint(expected_sessions):
-        # The response says it used sessions nobody asked for: the whole
-        # receipt channel is rejected and only the separate alias-grounded
-        # lookup (outside this function) may still ground the claim.
-        return set()
+    # A receipt on one leg cannot authorize another leg's principal or alias.
+    matched_units = _matched_completion_units(meta, raw, stored_args)
+    raw_accounts = _completion_receipted_accounts(meta, raw, stored_args)
+    raw_sessions = {session for _, session in matched_units}
     verified: set[str] = set()
     for name in cleaned_claimed | cleaned_required:
         if name in raw_accounts:
             verified.add(name)
     for name in cleaned_claimed | cleaned_required:
-        if name in raw_sessions and name in expected_sessions:
+        if name in raw_sessions:
             verified.add(name)
     return verified
 
@@ -1805,8 +1837,14 @@ async def validate_result_claims(
         # The declared principal is the single execution representative; the
         # response's own unit receipts name the accounts it actually used.
         # Scope is judged on both, never on the representative alone.
-        observed_principals = ev_principals | collect_actual_accounts(meta, raw)
-        anonymous = has_anonymous_receipt(meta, raw)
+        stored_origin = meta.get("proposal")
+        origin_args = (
+            stored_origin.get("arguments") if isinstance(stored_origin, dict) else None
+        )
+        observed_principals = ev_principals | _completion_receipted_accounts(
+            meta, raw, origin_args
+        )
+        anonymous = _completion_has_anonymous_receipt(meta, raw, origin_args)
         if anonymous:
             observed_principals.add("anonymous")
         step_principal_lower = {str(item).strip().lower() for item in step_principal_set}
@@ -2034,9 +2072,7 @@ async def validate_result_claims(
             # accounts. Prove each record's actual account, then let each
             # condition select its own coverage; unrelated proven accounts
             # must not fail an anonymous condition.
-            required_accounts |= collect_actual_accounts(
-                meta, raw, _expected_session_refs(stored_args),
-            )
+            required_accounts |= _completion_receipted_accounts(meta, raw, stored_args)
             verified_names = _verified_completion_accounts(
                 meta, raw, claimed_accounts, stored_args, required_accounts
             )
@@ -2047,10 +2083,10 @@ async def validate_result_claims(
                 # record receipted and this request named: a receipt for
                 # sessions nobody asked for proves nothing, exactly as the
                 # direct check above rejects it.
-                expected_sessions = _expected_session_refs(stored_args)
-                actual_sessions = collect_actual_sessions(meta, raw)
-                if expected_sessions:
-                    actual_sessions = actual_sessions & expected_sessions
+                actual_sessions = {
+                    session
+                    for _, session in _matched_completion_units(meta, raw, stored_args)
+                }
                 if actual_sessions:
                     try:
                         for claimed_name in sorted(pending_accounts):

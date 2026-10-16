@@ -105,6 +105,26 @@ CASES: list[Any] = [
         {"observation": {"target_ref": "other"}},
         id="baseline_target_ref_mismatch",
     ),
+    pytest.param(
+        "baseline_actual_session_receipt_mismatch",
+        {"baseline_output": {"status_code": 401}},
+        id="baseline_receipt_echo_only",
+    ),
+    pytest.param(
+        "baseline_actual_session_receipt_mismatch",
+        {"baseline_output": {"status_code": 401, "actual_session_ref": "alice"}},
+        id="baseline_receipt_wrong_session",
+    ),
+    pytest.param(
+        "request_actual_session_receipt_mismatch",
+        {"current_output": {"status_code": 200}},
+        id="current_receipt_missing",
+    ),
+    pytest.param(
+        "request_actual_session_receipt_mismatch",
+        {"current_output": {"status_code": 200, "actual_session_ref": "mallory"}},
+        id="current_receipt_wrong_session",
+    ),
 ]
 
 
@@ -141,6 +161,12 @@ async def _assess(case: dict[str, Any], *, status: int | None = 200) -> Authenti
     }
     if not case.get("drop_observation"):
         baseline_meta["http_observation"] = {**BASE_OBSERVATION, **case.get("observation", {})}
+    baseline_meta["tool_result"] = {
+        "success": True,
+        "output": case.get(
+            "baseline_output", {"status_code": 401, "actual_session_ref": None}
+        ),
+    }
     baseline = _record(
         "ev-base",
         metadata=baseline_meta,
@@ -166,7 +192,10 @@ async def _assess(case: dict[str, Any], *, status: int | None = 200) -> Authenti
         reason="unit",
         created_at=now,
     )
-    output: dict[str, Any] = {} if status is None else {"status_code": status}
+    output: dict[str, Any] = (
+        case.get("current_output", {"status_code": status, "actual_session_ref": "alice"})
+        if status is not None else {}
+    )
     result = ToolResult(
         invocation_id=InvocationId("inv_unit"),
         action_id=ActionId("action_unit"),

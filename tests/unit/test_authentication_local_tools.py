@@ -77,6 +77,7 @@ def _output(*, status: int, session_ref: str | None) -> dict[str, Any]:
         "target_ref": TARGET_REF,
         "session_ref": session_ref,
         "status_code": status,
+        "actual_session_ref": session_ref,
         "body_bytes": 0,
         "body_sha256": ("b" if session_ref else "a") * 64,
         "redirect": False,
@@ -176,7 +177,8 @@ async def _world() -> SimpleNamespace:
 
 
 def _parts(
-    *, current_target: Any | None = None, current_args: dict[str, Any] | None = None
+    *, current_target: Any | None = None, current_args: dict[str, Any] | None = None,
+    baseline_receipt: bool = True, current_receipt: str | None = SESSION,
 ) -> tuple:
     baseline_arguments = {"target_ref": TARGET_REF, "path": PATH, "method": "GET"}
     session_arguments = current_args or {
@@ -196,12 +198,27 @@ def _parts(
     baseline_result = _result(
         action_id="action-base", invocation_id="inv-base", status=401, session_ref=None
     )
+    if not baseline_receipt:
+        assert isinstance(baseline_result.output, dict)
+        baseline_output = dict(baseline_result.output)
+        baseline_output.pop("actual_session_ref", None)
+        baseline_result = baseline_result.model_copy(update={
+            "output": baseline_output,
+        })
     session_result = _result(
         action_id="action-now",
         invocation_id="inv-now",
         status=200,
         session_ref=session_arguments.get("session_ref"),
     )
+    if current_receipt != SESSION:
+        assert isinstance(session_result.output, dict)
+        output = dict(session_result.output)
+        if current_receipt == "missing":
+            output.pop("actual_session_ref", None)
+        else:
+            output["actual_session_ref"] = current_receipt
+        session_result = session_result.model_copy(update={"output": output})
     return (baseline_proposal, session_proposal, baseline_result, session_result)
 
 
@@ -211,9 +228,12 @@ async def _stored_pair(
     current_target: Any | None = None,
     current_node: str | None = None,
     current_args: dict[str, Any] | None = None,
+    baseline_receipt: bool = True,
+    current_receipt: str | None = SESSION,
 ) -> tuple[str, str]:
     baseline_proposal, session_proposal, baseline_result, session_result = _parts(
-        current_target=current_target, current_args=current_args
+        current_target=current_target, current_args=current_args,
+        baseline_receipt=baseline_receipt, current_receipt=current_receipt,
     )
     node_id = current_node or world.host_node_id
     baseline = _record(
@@ -422,4 +442,32 @@ async def test_host_baseline_to_endpoint_current_compares_by_network_identity() 
     checks = facts_of(node.properties).get("authentication_checks")
     assert isinstance(checks, list) and len(checks) == 1
     assert checks[0]["outcome"] == "session_access_observed"
+    assert await world.service.list_findings() == []
+
+
+@pytest.mark.parametrize(
+    ("baseline_receipt", "current_receipt"),
+    [(False, SESSION), (True, "missing"), (True, "mallory")],
+    ids=["baseline-echo-only", "current-receipt-missing", "current-receipt-wrong"],
+)
+async def test_missing_or_mismatched_actual_receipt_stays_inconclusive(
+    baseline_receipt: bool, current_receipt: str | None,
+) -> None:
+    world = await _world()
+    baseline_id, session_id = await _stored_pair(
+        world, baseline_receipt=baseline_receipt, current_receipt=current_receipt,
+    )
+    result = await _call(
+        world, baseline_evidence_id=baseline_id, session_evidence_id=session_id,
+        session_ref=SESSION,
+    )
+    expected = (
+        "baseline_actual_session_receipt_mismatch"
+        if not baseline_receipt else "request_actual_session_receipt_mismatch"
+    )
+    assert result.ok is True
+    assert result.payload["outcome"] == "baseline_evidence_unavailable_or_mismatched"
+    assert result.payload["hypothesis_status"] == "inconclusive"
+    assert result.payload["mismatch_reason"] == expected
+    assert result.refs == (session_id,)
     assert await world.service.list_findings() == []

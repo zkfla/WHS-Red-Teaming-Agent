@@ -108,6 +108,10 @@ def _unit_evidence(
         metadata={
             "success": True,
             "target_node_id": HOST_NODE,
+            "tool_result": {
+                "success": True,
+                "output": {"status_code": http_status, "actual_session_ref": session_ref},
+            },
             "http_observation": {
                 "kind": "http_response",
                 "method": "GET",
@@ -167,7 +171,7 @@ async def test_mismatched_baseline_or_request_cannot_confirm(mismatch: str) -> N
         action_id=ActionId("action_unit"),
         tool_id=ToolId("web.http_request"),
         success=True,
-        output={"status_code": 200},
+        output={"status_code": 200, "actual_session_ref": "alice"},
         started_at=now,
         finished_at=now,
     )
