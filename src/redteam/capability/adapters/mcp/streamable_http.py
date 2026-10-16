@@ -82,7 +82,7 @@ class MCPServerAdapter:
             for tool in remote_tools
         ]
         for descriptor, remote_tool in zip(descriptors, remote_tools, strict=True):
-            _apply_provider_metadata(descriptor, remote_tool.metadata)
+            apply_provider_metadata(descriptor, remote_tool.metadata)
         self._discovered_output_schemas = {
             descriptor.tool_id: deepcopy(remote_tool.output_schema)
             for descriptor, remote_tool in zip(descriptors, remote_tools, strict=True)
@@ -130,7 +130,7 @@ class MCPServerAdapter:
         return ToolHealthStatus.HEALTHY if healthy else ToolHealthStatus.UNHEALTHY
 
 
-def _apply_provider_metadata(
+def apply_provider_metadata(
     descriptor: ToolDescriptor, metadata: Mapping[str, Any] | None
 ) -> None:
     # Provider-declared target semantics and command fields from the
@@ -181,6 +181,10 @@ def _apply_provider_metadata(
     # target binding or target types here.
     if isinstance(requires_target, bool):
         descriptor.requires_target = requires_target
+
+
+# Keep the original internal name available to existing callers and tests.
+_apply_provider_metadata = apply_provider_metadata
 
 
 def _safe_error_message(output: dict[str, Any] | str | None) -> str:

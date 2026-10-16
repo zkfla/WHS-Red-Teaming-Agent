@@ -20,6 +20,8 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 
 from redteam.capability.adapters.mcp.base import MCPCallResult
 from redteam.capability.adapters.mcp.naming import build_canonical_mcp_tool_id
+from redteam.capability.adapters.mcp.streamable_http import apply_provider_metadata
+from redteam.capability.adapters.mcp.transport import remote_tool_metadata
 from redteam.capability.direct_target import DirectTargetExecutionPolicy, DirectTargetProviderConfig
 from redteam.capability.servers.config import ServerPolicy
 from redteam.capability.servers.network import (
@@ -41,6 +43,7 @@ from redteam.core.contracts.tool import (
     ToolDescriptor,
     ToolError,
     ToolInvocation,
+    ToolResourceEffect,
     ToolTargetBinding,
 )
 from redteam.core.convert import execution_input_digest
@@ -273,6 +276,7 @@ class BuiltinKaliHttpAdapter:
             provider,
             policy,
         )
+        self._resource_effects_by_tool: dict[str, list[ToolResourceEffect]] | None = None
         for _ref, profile in policy.targets.items():
             parsed = urlsplit(profile.origin)
             host = (parsed.hostname or "").lower().rstrip(".")
@@ -298,16 +302,23 @@ class BuiltinKaliHttpAdapter:
             "http_security_posture": "response_analysis",
             "http_compare_anonymous": "response_analysis",
         }
-        return [
-            _descriptor(
+        descriptors: list[ToolDescriptor] = []
+        resource_effects_by_tool: dict[str, list[ToolResourceEffect]] = {}
+        for name, operation in operations.items():
+            public_tool = public[name]
+            descriptor = _descriptor(
                 name,
-                public[name].description or "Canonical scoped HTTP operation.",
-                dict(public[name].input_schema),
-                dict(public[name].output_schema or {}),
+                public_tool.description or "Canonical scoped HTTP operation.",
+                dict(public_tool.input_schema),
+                dict(public_tool.output_schema or {}),
                 operation,
             )
-            for name, operation in operations.items()
-        ]
+            apply_provider_metadata(descriptor, remote_tool_metadata(public_tool))
+            descriptors.append(descriptor)
+            if descriptor.resource_effects is not None:
+                resource_effects_by_tool[str(descriptor.tool_id)] = descriptor.resource_effects
+        self._resource_effects_by_tool = resource_effects_by_tool
+        return descriptors
 
     async def health_check(self) -> ToolHealthStatus:
         try:
@@ -403,6 +414,20 @@ class BuiltinKaliHttpAdapter:
         return result
 
     async def invoke_contextual(self, invocation: ToolInvocation) -> MCPCallResult:
+        resource_effects_by_tool = self._resource_effects_by_tool
+        if resource_effects_by_tool is None:
+            await self.discover_tools()
+            resource_effects_by_tool = self._resource_effects_by_tool
+        assert resource_effects_by_tool is not None
+        result = await self._invoke_contextual(invocation)
+        resource_effects = resource_effects_by_tool.get(str(invocation.tool_id))
+        if resource_effects is not None:
+            result.metadata["resource_effects"] = [
+                effect.model_dump(mode="json") for effect in resource_effects
+            ]
+        return result
+
+    async def _invoke_contextual(self, invocation: ToolInvocation) -> MCPCallResult:
         started = datetime.now(timezone.utc)
         name = str(invocation.tool_id).split(".")[-1]
         try:

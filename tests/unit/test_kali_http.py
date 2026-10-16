@@ -324,6 +324,93 @@ async def test_public_identity_is_preserved_and_only_registered_provider_emits_r
     assert "do not encode them into path" in query_description
 
 
+async def test_session_inventory_effect_metadata_reaches_cleanup_without_clearing_unknowns(
+    monkeypatch,
+):
+    from mcp import Client
+
+    from redteam.capability import kali_http
+    from redteam.capability.adapters.mcp.transport import remote_tool_metadata
+    from redteam.core.contracts.tool import PROVIDER_METADATA_RESOURCE_EFFECTS
+    from redteam.orchestration.resource_cleanup import unmapped_resource_effects
+
+    public_server = create_legacy_web_http_server(policy(monkeypatch))
+    async with Client(public_server) as client:
+        public_tools = (await client.list_tools()).tools
+    remote_session_list = next(tool for tool in public_tools if tool.name == "session_list")
+    assert remote_tool_metadata(remote_session_list)[PROVIDER_METADATA_RESOURCE_EFFECTS] == []
+
+    class PublicSDKDefinitions:
+        async def list_tools(self):
+            return public_tools
+
+    monkeypatch.setattr(
+        kali_http,
+        "create_legacy_web_http_server",
+        lambda _policy: PublicSDKDefinitions(),
+    )
+    workroom, route = FakeWorkroom(envelope()), FakeRoute()
+    adapter = BuiltinKaliHttpAdapter(workroom, route, provider(), policy(monkeypatch))
+    inventory_result = await adapter.invoke_contextual(
+        invocation(tool="session_list").model_copy(update={"arguments": {}})
+    )
+    assert inventory_result.metadata["resource_effects"] == []
+    assert workroom.calls == []
+    assert route.calls == []
+
+    descriptors = await adapter.discover_tools()
+    by_name = {item.tool_name: item for item in descriptors}
+
+    assert by_name["session_list"].resource_effects == []
+    assert all(
+        by_name[name].resource_effects is None
+        for name in (
+            "http_request",
+            "http_compare_sessions",
+            "http_security_posture",
+            "http_compare_anonymous",
+        )
+    )
+    request_result = await adapter.invoke_contextual(invocation())
+    posture_result = await adapter.invoke_contextual(invocation(tool="http_security_posture"))
+    assert "resource_effects" not in request_result.metadata
+    assert "resource_effects" not in posture_result.metadata
+
+    original_metadata = {
+        "inventory": inventory_result.metadata,
+        "shell": {},
+        "recon": {},
+        "request": request_result.metadata,
+        "posture": posture_result.metadata,
+    }
+
+    class EvidenceStore:
+        async def get(self, evidence_id):
+            return SimpleNamespace(
+                metadata={
+                    "original_result": {"metadata": original_metadata[evidence_id]}
+                }
+            )
+
+    executions = [
+        SimpleNamespace(tool_id=tool_id, result_evidence_id=evidence_id)
+        for evidence_id, tool_id in (
+            ("inventory", "web.web-http.session_list"),
+            ("shell", "analysis.shell_target_run"),
+            ("recon", "recon.recon-passive.http_probe"),
+            ("request", "web.web-http.http_request"),
+            ("posture", "web.web-http.http_security_posture"),
+        )
+    ]
+
+    assert await unmapped_resource_effects(EvidenceStore(), executions) == [
+        "analysis.shell_target_run",
+        "recon.recon-passive.http_probe",
+        "web.web-http.http_request",
+        "web.web-http.http_security_posture",
+    ]
+
+
 @pytest.mark.parametrize("path", ["/account?user=alice", "/account#section"])
 async def test_query_or_fragment_in_path_is_rejected_before_route_or_workroom(monkeypatch, path):
     workroom, route = FakeWorkroom(envelope()), FakeRoute()

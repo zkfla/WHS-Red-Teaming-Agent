@@ -16,14 +16,20 @@ from redteam.capability.servers.network import (
     session_header,
     target_network_tool,
 )
-from redteam.core.contracts.tool import PROVIDER_METADATA_REQUIRES_TARGET
+from redteam.core.contracts.tool import (
+    PROVIDER_METADATA_REQUIRES_TARGET,
+    PROVIDER_METADATA_RESOURCE_EFFECTS,
+)
 
 
 def create_server(policy: ServerPolicy) -> MCPServer:
     server = MCPServer("web-http", log_level="WARNING")
     execution_lock = asyncio.Lock()
 
-    @server.tool(meta={PROVIDER_METADATA_REQUIRES_TARGET: False})
+    @server.tool(meta={
+        PROVIDER_METADATA_REQUIRES_TARGET: False,
+        PROVIDER_METADATA_RESOURCE_EFFECTS: [],
+    })
     def session_list() -> dict[str, Any]:
         """List operator-provisioned test principals; never return credentials.
 
