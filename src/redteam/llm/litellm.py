@@ -694,12 +694,17 @@ class LiteLLMClient:
         num_retries: int = 0,
         use_responses_api: bool = False,
         reasoning_effort: str | None = None,
+        cyber_access_program: str | None = None,
         api_key_env_var: str | None = None,
         **default_kwargs: Any,
     ) -> None:
-        from redteam.core.contracts.llm_config import normalize_reasoning_effort
+        from redteam.core.contracts.llm_config import (
+            normalize_cyber_access_program,
+            normalize_reasoning_effort,
+        )
 
         effort = normalize_reasoning_effort(reasoning_effort)
+        cyber_program = normalize_cyber_access_program(cyber_access_program)
         if effort is not None and bool(default_kwargs.get("drop_params", False)):
             raise ValueError(
                 "reasoning_effort with drop_params enabled would silently "
@@ -709,6 +714,7 @@ class LiteLLMClient:
         self._api_key = api_key
         self._num_retries = num_retries
         self._reasoning_effort = effort
+        self._cyber_access_program = cyber_program
         # Credential REFERENCE for the secret-free connection identity only;
         # the value is never read here.
         self._api_key_env_var = api_key_env_var
@@ -733,6 +739,11 @@ class LiteLLMClient:
         # from the local device-flow cache.
         _, provider, _, _ = litellm.get_llm_provider(model)
         self._is_chatgpt_subscription = provider == _CHATGPT_PROVIDER
+        if cyber_program is not None and not self._is_chatgpt_subscription:
+            raise ValueError(
+                "cyber_access_program is currently supported only for chatgpt/ "
+                "subscription models"
+            )
         # The ChatGPT subscription already owns the Responses route, so an
         # explicit API-key Responses selection never overrides it.
         self._use_responses_api = self._use_responses_api and (
@@ -779,6 +790,21 @@ class LiteLLMClient:
 
         merged: dict[str, Any] = {**self._default_kwargs, **kwargs}
         merged.setdefault("num_retries", self._num_retries)
+        if self._cyber_access_program is not None:
+            raw_body = merged.get("extra_body")
+            if raw_body is not None and not isinstance(raw_body, Mapping):
+                raise ValueError("extra_body must be a mapping")
+            body = dict(raw_body or {})
+            raw_programs = body.get("access_programs")
+            if raw_programs is not None and not isinstance(raw_programs, Mapping):
+                raise ValueError("extra_body.access_programs must be a mapping")
+            programs = dict(raw_programs or {})
+            selected = programs.get("cyber")
+            if selected is not None and selected != self._cyber_access_program:
+                raise ValueError("per-call cyber access program conflicts with pinned config")
+            programs["cyber"] = self._cyber_access_program
+            body["access_programs"] = programs
+            merged["extra_body"] = body
         if "reasoning_effort" in kwargs:
             level = normalize_reasoning_effort(kwargs["reasoning_effort"])
             pinned = self._reasoning_effort
@@ -859,13 +885,12 @@ class LiteLLMClient:
 
     @property
     def connection_fingerprint(self) -> str | None:
-        """Secret-free connection identity; None when effort is unset.
+        """Secret-free identity for explicit effort or cyber access selection.
 
-        Mirrors the shared resume preflight for explicit LiteLLM effort so
-        a changed effort alters the binding and refuses resume. Unset
-        effort stays unpinned (historical None).
+        Mirrors the shared resume preflight so either request-semantic change
+        alters the binding and refuses resume. Fully unset stays unpinned.
         """
-        if self._reasoning_effort is None:
+        if self._reasoning_effort is None and self._cyber_access_program is None:
             return None
         from types import SimpleNamespace
 
@@ -879,6 +904,7 @@ class LiteLLMClient:
                 default_model=self._model,
                 api_key_env_var=self._api_key_env_var or "",
                 reasoning_effort=self._reasoning_effort,
+                cyber_access_program=self._cyber_access_program,
             )
         )
 

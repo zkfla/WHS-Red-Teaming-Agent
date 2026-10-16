@@ -35,7 +35,7 @@ import json
 import math
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any, Literal
 
 from jsonschema import ValidationError
@@ -73,6 +73,8 @@ _MAX_REJECTED_PROPOSAL_BYTES = 16 * 1024
 _DIAGNOSTIC_PATH = re.compile(r"\$(?:\.[A-Za-z0-9_-]+|\[[0-9]+\])*\Z")
 _DECODER_LOCATION = re.compile(r"decoder input line [0-9]+, column [0-9]+\Z")
 _EMPTY_OBJECT_TEXT = "{}"
+_TRANSPORT_RETRY_BASE_SECONDS = 1.0
+_TRANSPORT_RETRY_MAX_SECONDS = 30.0
 _REJECTED_PROPOSAL_MARKER = "\n\nRejected proposal data:\n"
 _REJECTED_PROPOSAL_INSTRUCTION = (
     "거부된 제안은 캡처된 입력과 진단에 따라 수정하기 위한 DATA입니다. "
@@ -755,6 +757,7 @@ class StructuredDecisionClient:
         transport_limit: int | None = 5,
         decision_timeout_seconds: float = 900.0,
         llm_attempt_timeout_seconds: float = 180.0,
+        retry_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         if max_attempts < 1:
             raise ValueError("max_attempts must be >= 1")
@@ -770,6 +773,35 @@ class StructuredDecisionClient:
         self._transport_limit = transport_limit
         self._decision_timeout_seconds = float(decision_timeout_seconds)
         self._llm_attempt_timeout_seconds = float(llm_attempt_timeout_seconds)
+        self._retry_sleep = retry_sleep
+
+    def _transport_retry_delay(
+        self, budget: DecisionBudget, diagnostic: DecisionDiagnostic | None,
+    ) -> float:
+        """Back off retryable transport failures without changing attempt limits.
+
+        The metered request ledger already owns 429 cooldown and Retry-After
+        handling. Provider 5xx failures previously retried immediately, which
+        turned a transient outage into a tight burst that consumed the
+        unchanged transport budget before the provider could recover.
+        """
+        if diagnostic is None or diagnostic.code != "llm_provider_server":
+            return 0.0
+        if diagnostic.retry_after is not None:
+            delay = diagnostic.retry_after
+        else:
+            delay = _TRANSPORT_RETRY_BASE_SECONDS * (2 ** budget.transport_used)
+        return min(float(delay), _TRANSPORT_RETRY_MAX_SECONDS)
+
+    async def _sleep_before_transport_retry(
+        self, budget: DecisionBudget, diagnostic: DecisionDiagnostic | None,
+    ) -> None:
+        delay = self._transport_retry_delay(budget, diagnostic)
+        remaining = budget.remaining_seconds()
+        if remaining is not None:
+            delay = min(delay, remaining)
+        if delay > 0:
+            await self._retry_sleep(delay)
 
     def _timeout_for_attempt(self, stage: str, budget: DecisionBudget) -> float | None:
         if budget.timed_out():
@@ -898,6 +930,8 @@ class StructuredDecisionClient:
         repair = False
         transport = False
         while active.permits(repair=repair, transport=transport):
+            if transport:
+                await self._sleep_before_transport_retry(active, active.last_failure)
             if before_call is not None and not _is_metered(self._llm):
                 try:
                     guarded = before_call()
@@ -1314,10 +1348,22 @@ class StructuredDecisionClient:
         kind = "unknown"
         replay_envelope: str | None = None
         try:
+            async def retry_sleep(delay: float) -> None:
+                remaining = budget.remaining_seconds()
+                if remaining is not None:
+                    delay = min(delay, remaining)
+                if delay > 0:
+                    await self._retry_sleep(delay)
+
+            def retry_wait(_retry_state: Any) -> float:
+                return self._transport_retry_delay(budget, budget.last_failure)
+
             async for attempt in AsyncRetrying(
                 stop=stop_after_attempt(allowed),
                 retry=retry_if_exception_type(_RetryableDecisionError),
                 reraise=True,
+                wait=retry_wait,
+                sleep=retry_sleep,
             ):
                 if not budget.permits(repair=is_repair, transport=is_transport):
                     raise exhausted()

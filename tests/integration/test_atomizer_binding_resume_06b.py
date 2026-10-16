@@ -28,6 +28,7 @@ from redteam.orchestration.specialist_planner import SpecialistPlanner
 from tests.integration.test_central_completion import OriginalProtocolDouble
 from tests.integration.test_central_development import TARGET, gateway
 from tests.integration.test_central_parallel import limits
+from tests.integration.test_hypothesis_planner import candidate as legacy_candidate
 from tests.integration.test_hypothesis_planner import probe as legacy_probe
 
 SHIPPED_AGENTS = Path(__file__).resolve().parents[2] / "config" / "agents"
@@ -42,7 +43,17 @@ def _obs(description):
 
 def _plan_two_questions():
     return {
-        "updates": [],
+        "updates": [{
+            "expected_revision": None,
+            "hypothesis": {
+                "contract_version": 2,
+                "hypothesis_id": "initial-local",
+                "description": "A target security premise remains untested",
+                "target_node_ids": [TARGET],
+                "reason": "Preserve the first scoped uncertainty for investigation",
+                "status": "open",
+            },
+        }],
         "questions": [
             {
                 "question_id": "q1",
@@ -270,7 +281,11 @@ async def test_legacy_single_stage_same_identity_resumes_and_changed_prompt_refu
     )
     config, base = _run_config(base_profile)
     _, changed = _run_config(changed_profile)
-    llm = FakeLLMClient(canned_structured={"tasks": [legacy_probe()], "reason": "No candidate yet"})
+    llm = FakeLLMClient(canned_structured={
+        "updates": [legacy_candidate()],
+        "tasks": [legacy_probe(candidate="local")],
+        "reason": "Observe the initial candidate",
+    })
     root = tmp_path / "run"
     async with open_central_run(config, directory=root, settings=base, **_options(llm)) as session:
         assert session.deps.specialist_policy.probe_atomization is False

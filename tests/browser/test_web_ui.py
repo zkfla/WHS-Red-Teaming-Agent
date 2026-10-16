@@ -406,6 +406,131 @@ def test_graph_paths_zoom_search_and_details(ui):
     assert not writes
 
 
+def test_graph_detail_disclosures_survive_live_refresh(ui):
+    page, data, _ = ui
+    data["graph"]["llm"] = {
+        "provider_requests": 1,
+        "responses": 1,
+        "failures": 0,
+        "unknown": 0,
+        "waiting": 0,
+        "exchanges": [
+            {
+                "request_id": "req-preserved",
+                "sequence": 1,
+                "stage": "worker",
+                "response_state": "received",
+                "request_state": "settled",
+                "request_content": "stored prompt",
+                "response_content": "stored response",
+                "tokens": {"total": 2, "input": 1, "output": 1},
+            }
+        ],
+    }
+    page.reload()
+    page.locator(".nav-item[data-view=graph]").click()
+    page.locator('[data-node="llm"]').click()
+    assert "stored response" in page.locator("#graph-detail .gexchange-latest").inner_text()
+    disclosure = page.locator("#graph-detail details[data-key='req-preserved']")
+    disclosure.locator("summary").click()
+    assert disclosure.get_attribute("open") is not None
+
+    page.evaluate(
+        """async (view) => {
+          const {renderDetail} = await import('/static/graph_detail.js');
+          renderDetail(document.getElementById('graph-detail'), view, 'llm');
+        }""",
+        data["graph"],
+    )
+
+    assert page.locator("#graph-detail-panel").is_visible()
+    assert disclosure.get_attribute("open") is not None
+    assert "stored response" in disclosure.inner_text()
+
+
+def test_graph_candidate_shows_structured_review_application_and_finding(ui):
+    page, data, _ = ui
+    data["graph"]["candidates"] = [{
+        "hypothesis_id": "candidate-reviewed",
+        "description": "SQL 조건이 인증 결과를 제어한다",
+        "status": "confirmed",
+        "revision": 2,
+        "confidence": 0.95,
+        "reason": "독립 리뷰 완료",
+        "target_node_ids": ["host:bank.local"],
+        "task_ids": ["t3"],
+        "supporting_evidence_ids": ["ev-baseline", "ev-true", "ev-false"],
+        "refuting_evidence_ids": [],
+        "source_hypothesis_ids": [],
+        "review_applications": [{
+            "review_receipt_id": "ev-review",
+            "candidate_pre_verdict_revision": 1,
+            "candidate_revision": 2,
+            "task_id": "t3",
+            "finding_id": "find-sqli",
+            "status": "promoted",
+            "reason": None,
+        }, {
+            "review_receipt_id": "ev-review-pending",
+            "candidate_pre_verdict_revision": 1,
+            "candidate_revision": None,
+            "task_id": "t3",
+            "finding_id": None,
+            "status": "pending_task_result",
+            "reason": "canonical Task result 대기",
+        }, {
+            "review_receipt_id": "ev-review-inconclusive",
+            "candidate_pre_verdict_revision": 1,
+            "candidate_revision": None,
+            "task_id": "t3",
+            "finding_id": None,
+            "status": "inconclusive",
+            "reason": "review did not settle candidate",
+        }, {
+            "review_receipt_id": "ev-review-refused",
+            "candidate_pre_verdict_revision": 1,
+            "candidate_revision": None,
+            "task_id": "t3",
+            "finding_id": None,
+            "status": "refused",
+            "reason": "review_source_origin_mismatch",
+        }],
+        "findings": [{
+            "finding_id": "find-sqli",
+            "title": "SQL condition controls authentication outcome",
+            "description": "SQL 조건으로 로그인 결과가 바뀌어 인증 결과를 우회함",
+            "severity": "high",
+            "verified": True,
+            "review_receipt_id": "ev-review",
+            "original_evidence_ids": ["ev-baseline", "ev-true", "ev-false"],
+            "reviewed_detail": {
+                "statement": "참/거짓 SQL 조건이 로그인 결과를 제어한다.",
+                "impact": "관리자 로그인 결과를 얻을 수 있다.",
+                "severity_reason": "인증 우회 범위로 검토됨",
+                "limitations": ["세션 및 보호 리소스 접근은 확인하지 않음"],
+            },
+        }],
+    }]
+    data["graph"]["findings"] = data["graph"]["candidates"][0]["findings"]
+    data["graph"]["edges"].append({
+        "from": "planner", "to": "candidate:candidate-reviewed", "kind": "judged",
+    })
+    page.reload()
+    page.locator(".nav-item[data-view=graph]").click()
+    page.locator('[data-node="candidate:candidate-reviewed"]').click()
+    detail = page.locator("#graph-detail")
+    assert "promoted" in detail.inner_text()
+    assert "pending_task_result" in detail.inner_text()
+    assert "inconclusive" in detail.inner_text()
+    assert "refused" in detail.inner_text()
+    assert "1 → 2" in detail.inner_text()
+    assert "ev-review" in detail.inner_text()
+    detail.locator("details[data-key='find-sqli'] summary").click()
+    assert "참/거짓 SQL 조건이 로그인 결과를 제어한다" in detail.inner_text()
+    assert "세션 및 보호 리소스 접근은 확인하지 않음" in detail.inner_text()
+    assert "코드가 취약점 의미를 규칙으로 재판정" in detail.inner_text()
+
+
 def test_graph_all_tasks_multiple_workers_and_returned_connections(ui):
     page, data, _ = ui
     graph = data["graph"]

@@ -90,6 +90,14 @@ async def test_scripted_conversation_explains_plan_before_execution() -> None:
     assert any("MCP" in item for item in decision.plan)
     assert len(llm.structured_calls) == 1
     assert llm.structured_calls[0].get("num_retries") == 0
+    system = llm.structured_calls[0]["system"]
+    assert "운영자와 승인된 보안 조사 런타임 사이의 대화 담당자" in system
+    assert "mode와 investigation" in system
+    assert 'execute: 구체적인 새 조사 요청이며 investigation="new"' in system
+    assert "최종 결과와 관찰 가능한" in system
+    assert "완료 조건을 적습니다" in system
+    assert "도구, 기법과 조사 순서를 완료 조건으로 쓰지 않습니다" in system
+    assert len(system.encode()) < 4 * 1024
     assert llm.complete_calls == []
 
 
@@ -107,6 +115,21 @@ async def test_execute_without_success_criteria_keeps_legacy_optional_contract()
 
     assert decision.mode == "execute"
     assert decision.success_criteria == []
+
+
+async def test_profiled_conversation_leaves_role_declaration_to_prompt_snapshot() -> None:
+    from redteam.app.cli.conversation import (
+        _CONVERSATION_RUNTIME_CONTRACT,
+        _conversation_system,
+    )
+
+    class _ProfiledClient:
+        prompts = object()
+
+    system = _conversation_system(_ProfiledClient())  # type: ignore[arg-type]
+
+    assert system == _CONVERSATION_RUNTIME_CONTRACT
+    assert "당신은" not in system
 
 
 async def test_success_criteria_schema_publishes_list_and_item_bounds() -> None:

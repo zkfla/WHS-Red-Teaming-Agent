@@ -80,9 +80,12 @@ _RESULT_PUBLICATION_RULES = {
     "result_question_duplicate": (
         ("questions",), "Give each result question a unique id."
     ),
+    "result_assessment_duplicate": (
+        ("assessment_drafts",), "Give each assessment draft a unique id."
+    ),
     "result_v1_extensions_forbidden": (
         ("contract_version",),
-        "Use contract version 2 when observations or limitations are present.",
+        "Use contract version 2 when observations, limitations or assessment drafts are present.",
     ),
     "question_id_blank": (
         ("question_id",), "Provide a nonblank question id."
@@ -794,6 +797,7 @@ def diagnostic_for_exception(
             # validation location so caller data never supplies a path label.
             safe_fields = frozenset({
                 "result", "questions", "observations", "limitations", "result_id",
+                "assessment_drafts",
                 "summary", "question_id", "question", "reason", "contract_version",
             })
             safe_prefix = tuple(

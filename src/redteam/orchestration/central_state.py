@@ -31,7 +31,7 @@ from redteam.core.contracts.engagement import EngagementScope
 from redteam.core.contracts.events import EventEnvelope, EventType
 from redteam.core.contracts.evidence import EvidenceRecord
 from redteam.core.contracts.execution import ExecutionState, TaskExecution
-from redteam.core.contracts.graph import Hypothesis, HypothesisUpdate
+from redteam.core.contracts.graph import CandidateHypothesis, Hypothesis, HypothesisUpdate
 from redteam.core.contracts.mission import (
     InvestigationResult,
     MissionPlan,
@@ -795,6 +795,289 @@ class CentralTransaction:
             (self.run_id,),
         )]
 
+    def candidate_review_applications(
+        self, *, task_id: str | None = None, status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Run-scoped final-review application ledger and pending retry source."""
+        self.binding()
+        records = [json.loads(row[0]) for row in self.db.execute(
+            "SELECT payload FROM state_requests WHERE run_id=? "
+            "AND kind='candidate_review_application' ORDER BY identity",
+            (self.run_id,),
+        )]
+        if task_id is not None:
+            records = [item for item in records if item.get("task_id") == task_id]
+        if status is not None:
+            records = [item for item in records if item.get("status") == status]
+        return records
+
+    def _save_candidate_review_application(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Insert once; only a matching pending application may become terminal."""
+        identity = str(payload["review_receipt_id"])
+        serialized = json.dumps(payload, sort_keys=True)
+        row = self.db.execute(
+            "SELECT payload FROM state_requests WHERE run_id=? "
+            "AND kind='candidate_review_application' AND identity=?",
+            (self.run_id, identity),
+        ).fetchone()
+        if row is None:
+            self.db.execute(
+                "INSERT INTO state_requests VALUES(?,'candidate_review_application',?,?)",
+                (self.run_id, identity, serialized),
+            )
+            return payload
+        previous = json.loads(row[0])
+        if previous == payload:
+            return previous
+        immutable = (
+            "review_receipt_id", "review_receipt_hash", "candidate_id",
+            "candidate_pre_verdict_revision", "candidate_purpose_hash", "claim_identity",
+            "task_id", "result_id", "draft_id", "draft_content_hash",
+        )
+        if any(previous.get(key) != payload.get(key) for key in immutable):
+            raise StateConflict("candidate_review_application_identity_conflict")
+        if previous.get("status") != "pending_task_result":
+            raise StateConflict("candidate_review_application_result_conflict")
+        if payload.get("status") == "pending_task_result":
+            return previous
+        self.db.execute(
+            "UPDATE state_requests SET payload=? WHERE run_id=? "
+            "AND kind='candidate_review_application' AND identity=?",
+            (serialized, self.run_id, identity),
+        )
+        return payload
+
+    def apply_candidate_review(
+        self, *, receipt: EvidenceRecord, checked: Sequence[CheckedEvidence],
+        validity_read: Any = None, task_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Apply a final independent review without a second Planner verdict.
+
+        External Evidence Store reads are captured before this synchronous
+        transaction. Candidate CAS, Finding, projection, application ledger and
+        outbox are committed together here.
+        """
+        from redteam.attack_graph.identity import hypothesis_node_id
+        from redteam.attack_graph.predicates import Provenance, facts_of
+        from redteam.core.contracts.graph import Finding
+        from redteam.core.enums import GraphNodeType
+        from redteam.core.ids import GraphNodeId
+        from redteam.orchestration.findings import (
+            FindingPromoter,
+            candidate_review_input,
+            claim_keys_from_findings,
+            promotion_request_from_review,
+        )
+
+        receipt_id = str(receipt.evidence_id)
+        inspected = {str(item.record.evidence_id): item.record for item in checked}
+        receipt_hash = next(
+            (item.content_hash for item in checked if str(item.record.evidence_id) == receipt_id),
+            "",
+        )
+        if not receipt_hash or inspected.get(receipt_id) != receipt:
+            raise StateConflict("candidate_review_receipt_not_inspected")
+        previous = next(
+            (item for item in self.candidate_review_applications()
+             if item.get("review_receipt_id") == receipt_id),
+            None,
+        )
+        if previous is not None and previous.get("review_receipt_hash") != receipt_hash:
+            raise StateConflict("candidate_review_application_identity_conflict")
+        if previous is not None and previous.get("status") != "pending_task_result":
+            return {
+                **previous,
+                "applied_status": previous.get("status"),
+                "status": "already_applied",
+            }
+
+        if validity_read is not None:
+            validity_read.check(self)
+        self.add_evidence_refs(checked)
+        self._require_refs(list(inspected))
+
+        meta = receipt.metadata if isinstance(receipt.metadata, dict) else {}
+        candidate_id = str(meta.get("hypothesis_id") or "").strip()
+        receipt_revision = meta.get("candidate_revision")
+        node = self.graph.get_local_node(hypothesis_node_id(candidate_id)) if candidate_id else None
+        candidate = Hypothesis.model_validate(facts_of(node.properties)) if node else None
+        if candidate is None:
+            raise StateConflict("candidate_review_candidate_missing")
+        review = candidate_review_input(
+            candidate=candidate,
+            receipt=receipt,
+            originals=inspected,
+            run_id=self.run_id,
+            engagement_id=self.engagement_id,
+            task_results=self.list_tasks(),
+        )
+        base: dict[str, Any] = {
+            "contract_version": 1,
+            "review_receipt_id": receipt_id,
+            "review_receipt_hash": receipt_hash,
+            "candidate_id": candidate.hypothesis_id,
+            "candidate_pre_verdict_revision": receipt_revision,
+            "candidate_revision": None,
+            "candidate_purpose_hash": str(meta.get("candidate_purpose_hash") or ""),
+            "claim_identity": str(meta.get("claim_identity") or ""),
+            "review_confidence": review.confidence,
+            "task_id": task_id,
+            "finding_id": None,
+            "status": "refused",
+            "reason": review.refused_reason,
+        }
+        if review.reviewed_detail is not None:
+            binding = review.reviewed_detail.draft_binding
+            base.update({
+                "result_id": binding.result_id,
+                "draft_id": binding.draft_id,
+                "draft_content_hash": binding.content_hash,
+            })
+
+        if review.refused_reason == "reviewed_assessment_draft_not_stored":
+            binding = review.reviewed_detail.draft_binding if review.reviewed_detail else None
+            selected_task = self.get_task(task_id) if task_id else None
+            if selected_task is None and binding is not None:
+                matching = [item for item in self.list_tasks() if (
+                    item.hypothesis_revisions.get(candidate.hypothesis_id) == candidate.revision
+                    and (
+                        str(item.result.result_id) if item.result is not None
+                        else "result_" + content_hash(str(item.task_id))
+                    ) == binding.result_id
+                )]
+                selected_task = matching[0] if len(matching) == 1 else None
+            expected_result_id = (
+                str(selected_task.result.result_id) if selected_task and selected_task.result
+                else "result_" + content_hash(str(selected_task.task_id))
+                if selected_task is not None else ""
+            )
+            if (
+                binding is None
+                or selected_task is None
+                or selected_task.hypothesis_revisions.get(candidate.hypothesis_id)
+                != candidate.revision
+                or expected_result_id != binding.result_id
+            ):
+                base["reason"] = "reviewed_assessment_draft_task_mismatch"
+                return self._save_candidate_review_application(base)
+            base.update({
+                "task_id": str(selected_task.task_id),
+                "status": "pending_task_result",
+                "reason": "reviewed assessment draft awaits canonical task settlement",
+            })
+            return self._save_candidate_review_application(base)
+        if review.refused_reason:
+            return self._save_candidate_review_application(base)
+        if review.status == "inconclusive":
+            base.update({"status": "inconclusive", "reason": "review did not settle candidate"})
+            return self._save_candidate_review_application(base)
+
+        evidence_field = (
+            "supporting_evidence_ids" if review.status == "confirmed"
+            else "refuting_evidence_ids"
+        )
+        values = candidate.model_dump(mode="json")
+        values["status"] = review.status
+        values[evidence_field] = sorted(set(values[evidence_field]) | set(review.source_ids))
+        values["reason"] = str(meta.get("reason") or candidate.reason or "independent review")
+        values["metadata"] = {
+            **candidate.metadata,
+            "candidate_review_application": receipt_id,
+        }
+        proposed = CandidateHypothesis.model_validate(values)
+        update = HypothesisUpdate(
+            hypothesis=proposed,
+            expected_revision=candidate.revision,
+            review_evidence_id=receipt_id,
+        )
+        expected_committed = proposed.model_copy(update={"revision": candidate.revision + 1})
+
+        finding = None
+        promotion_request = None
+        if review.status == "confirmed":
+            promotion_request = promotion_request_from_review(
+                review=review, committed=expected_committed, receipt=receipt,
+            )
+            findings: list[Finding] = []
+            for finding_node in self.graph.query(node_type=GraphNodeType.FINDING):
+                try:
+                    findings.append(Finding.model_validate(facts_of(finding_node.properties)))
+                except Exception:
+                    continue
+            decision = FindingPromoter().promote(
+                promotion_request,
+                existing_claims=claim_keys_from_findings(findings),
+            )
+            if decision.finding is None:
+                base["reason"] = decision.refused_reason
+                return self._save_candidate_review_application(base)
+            finding = decision.finding
+
+        now = datetime.now(timezone.utc)
+        saved_node = self.graph.save_hypothesis(update, now=now)
+        committed = Hypothesis.model_validate(facts_of(saved_node.properties))
+        if (
+            committed.hypothesis_id != expected_committed.hypothesis_id
+            or committed.revision != expected_committed.revision
+            or committed.status != expected_committed.status
+            or set(committed.supporting_evidence_ids)
+            != set(expected_committed.supporting_evidence_ids)
+            or set(committed.refuting_evidence_ids)
+            != set(expected_committed.refuting_evidence_ids)
+            or committed.metadata.get("candidate_review_evidence_id") != receipt_id
+        ):
+            raise StateConflict("candidate_review_transition_mismatch")
+        if finding is not None and promotion_request is not None:
+            self.graph.save_finding(
+                finding,
+                hypothesis_id=committed.hypothesis_id,
+                about=GraphNodeId(promotion_request.target_node_id),
+                now=now,
+                provenance=Provenance(
+                    source="review:independent-candidate-finding-v2",
+                    evidence_id=receipt_id,
+                    run_id=self.run_id,
+                ),
+            )
+            self.queue(EventEnvelope(
+                event_id=EventId("evt_" + content_hash([
+                    self.run_id, "candidate_review_finding_v2", finding.finding_id,
+                ])[:24]),
+                event_type=EventType.FINDING_CREATED,
+                run_id=RunId(self.run_id),
+                engagement_id=EngagementId(self.engagement_id),
+                source="orchestration.central_state",
+                timestamp=now,
+                correlation_id=promotion_request.action_id or self.run_id,
+                payload={
+                    "finding_id": finding.finding_id,
+                    "severity": finding.severity,
+                    "evidence_ids": finding.evidence_ids,
+                    "hypothesis_id": committed.hypothesis_id,
+                    "action_id": promotion_request.action_id,
+                },
+            ))
+        final_status = "promoted" if finding is not None else "candidate_rejected"
+        projection = {
+            "contract_version": 2,
+            "candidate_id": committed.hypothesis_id,
+            "candidate_pre_verdict_revision": candidate.revision,
+            "candidate_revision": committed.revision,
+            "review_receipt_id": receipt_id,
+            "finding_id": finding.finding_id if finding is not None else None,
+            "status": final_status,
+            "reason": "",
+            "claim_key": finding.metadata.get("claim_key") if finding is not None else None,
+        }
+        self._save_candidate_finding_promotion(projection)
+        base.update({
+            "candidate_revision": committed.revision,
+            "finding_id": finding.finding_id if finding is not None else None,
+            "status": final_status,
+            "reason": "",
+        })
+        return self._save_candidate_review_application(base)
+
     def _save_candidate_finding_promotion(self, payload: dict[str, Any]) -> None:
         identity = f"{payload['candidate_id']}:{payload['candidate_revision']}"
         serialized = json.dumps(payload, sort_keys=True)
@@ -870,6 +1153,8 @@ class CentralTransaction:
             committed = Hypothesis.model_validate(node.properties["facts"])
             revisions[candidate.hypothesis_id] = committed.revision
             if committed.status == "confirmed":
+                # Compatibility admission for historical/direct callers. Active Planner wire
+                # contracts cannot submit terminal updates; new reviews use apply_candidate_review.
                 from redteam.attack_graph.predicates import Provenance, facts_of
                 from redteam.core.contracts.graph import Finding
                 from redteam.core.enums import GraphNodeType
@@ -889,6 +1174,7 @@ class CentralTransaction:
                     originals=inspected,
                     run_id=self.run_id,
                     engagement_id=self.engagement_id,
+                    task_results=self.list_tasks(),
                 )
                 projection: dict[str, Any] = {
                     "contract_version": 1,
@@ -1486,6 +1772,7 @@ class CentralTransaction:
         self.add_evidence_refs(checked)
         refs = list(result.evidence_ids)
         refs += [ref for question in result.questions for ref in question.evidence_ids]
+        refs += list(map(EvidenceId, result.assessment_evidence_ids()))
         if result.completion_receipt_id is not None:
             refs.append(result.completion_receipt_id)
         self._require_refs(refs)
@@ -1515,11 +1802,23 @@ class CentralTransaction:
         self._check_result_lineage(task, result)
         self.add_evidence_refs(checked)
         self._require_refs([*result.evidence_ids,
+                            *result.assessment_evidence_ids(),
                             *(ref for q in result.questions for ref in q.evidence_ids)])
+        if task.result == result:
+            return task
         return self._write_task(task.model_copy(update={"result": result,
                                   "updated_at": datetime.now(timezone.utc)}))
 
     def _check_result_lineage(self, task: MissionTask, result: InvestigationResult) -> None:
+        for draft in result.assessment_drafts:
+            if (
+                draft.target_node_id not in set(map(str, task.related_attack_graph_node_ids))
+                or set(draft.principal_refs) - set(task.principal_refs)
+                or (draft.hypothesis_id and draft.hypothesis_id not in set(
+                    map(str, task.related_hypothesis_ids)
+                ))
+            ):
+                raise StateConflict("assessment_subject_outside_task")
         if task.investigation_contract_version == 2:
             if result.contract_version != 2 or set(result.hypothesis_ids) - set(
                 task.related_hypothesis_ids
@@ -1529,6 +1828,9 @@ class CentralTransaction:
             return
         if task.result.result_id != result.result_id:
             raise StateConflict("task_result_identity_conflict")
+        drafts = {draft.draft_id: draft for draft in result.assessment_drafts}
+        if any(drafts.get(draft.draft_id) != draft for draft in task.result.assessment_drafts):
+            raise StateConflict("original_result_assessment_changed")
         previous = {q.question_id: q for q in task.result.questions}
         proposed = {q.question_id: q for q in result.questions}
         if any(proposed.get(identity) != question for identity, question in previous.items()):
@@ -2623,6 +2925,14 @@ class CentralStateStore:
 
     async def candidate_finding_promotions(self) -> list[dict[str, Any]]:
         return await self.transaction(lambda tx: tx.candidate_finding_promotions(), write=False)
+
+    async def candidate_review_applications(
+        self, *, task_id: str | None = None, status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        return await self.transaction(
+            lambda tx: tx.candidate_review_applications(task_id=task_id, status=status),
+            write=False,
+        )
 
     async def activation_inventory(self, *, instance_ids: set[str] | None = None) -> list[dict]:
         """Original proof rows for explicit quiescent recovery, not scheduling."""

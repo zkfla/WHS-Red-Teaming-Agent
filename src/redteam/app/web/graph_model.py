@@ -10,8 +10,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from redteam.app.cli.display import safe_text
+from redteam.core.contracts.assessment import ReviewedFindingDetail
 from redteam.core.contracts.execution import ExecutionState, TaskExecution
-from redteam.core.contracts.graph import Hypothesis
+from redteam.core.contracts.graph import Finding, Hypothesis
 from redteam.core.contracts.mission import MissionPlan, MissionTask
 from redteam.orchestration.llm_requests import request_stage_usage, request_usage
 
@@ -43,6 +44,8 @@ class GraphRaw:
     finding_count: int = 0
     verified_finding_count: int = 0
     candidate_finding_promotions: list[dict[str, Any]] = field(default_factory=list)
+    candidate_review_applications: list[dict[str, Any]] = field(default_factory=list)
+    findings: list[Finding] = field(default_factory=list)
     events: list[dict[str, Any]] = field(default_factory=list)  # newest first
     budget_remaining: int | None = None
 
@@ -290,6 +293,7 @@ def _execution(execution: TaskExecution) -> dict[str, Any]:
         "program_executable": selection.program_executable if selection else None,
         "result_kind": outcome.result_kind if outcome else None,
         "success": outcome.success if outcome else None,
+        "receipt_provider": outcome.receipt_provider if outcome else None,
         "executed_program": outcome.executed_program if outcome else None,
         "executed_program_path": outcome.program_executable if outcome else None,
         "diagnostic_category": outcome.diagnostic_category if outcome else None,
@@ -393,6 +397,8 @@ def _candidate(
     candidate: Hypothesis,
     tasks: list[MissionTask],
     promotions: list[dict[str, Any]],
+    applications: list[dict[str, Any]],
+    findings: list[dict[str, Any]],
 ) -> dict[str, Any]:
     related = [str(task.task_id) for task in tasks
                if candidate.hypothesis_id in task.related_hypothesis_ids]
@@ -418,7 +424,74 @@ def _candidate(
     }
     if promotion is not None:
         result["finding_promotion"] = promotion
+    projected_applications = [
+        _review_application(item) for item in applications
+        if item.get("candidate_id") == candidate.hypothesis_id
+    ]
+    result["review_applications"] = projected_applications
+    finding_ids = {
+        item.get("finding_id") for item in projected_applications
+        if item.get("finding_id")
+    }
+    result["findings"] = [
+        item for item in findings
+        if item.get("finding_id") in finding_ids
+        or item.get("candidate_id") == candidate.hypothesis_id
+    ]
     return result
+
+
+def _review_application(item: dict[str, Any]) -> dict[str, Any]:
+    """Bounded structured status; never expose internal binding/content hashes."""
+    return {
+        "review_receipt_id": _text(item.get("review_receipt_id"), 120),
+        "candidate_pre_verdict_revision": _optional_count(
+            item.get("candidate_pre_verdict_revision")
+        ),
+        "candidate_revision": _optional_count(item.get("candidate_revision")),
+        "task_id": _text(item.get("task_id"), 120),
+        "finding_id": _text(item.get("finding_id"), 120),
+        "status": _text(item.get("status"), 80) or "unknown",
+        "reason": _text(item.get("reason"), 500),
+    }
+
+
+def _finding(finding: Finding) -> dict[str, Any]:
+    metadata = finding.metadata if isinstance(finding.metadata, dict) else {}
+    reviewed = None
+    try:
+        detail = ReviewedFindingDetail.model_validate(metadata.get("reviewed_finding_detail"))
+        reviewed = {
+            "title": _text(detail.title, 240),
+            "statement": _text(detail.statement, 4000),
+            "summary": _text(detail.summary, 1000),
+            "vulnclass": _text(detail.vulnclass, 160),
+            "severity": _text(detail.severity, 40),
+            "severity_reason": _text(detail.severity_reason, 1000),
+            "impact": _text(detail.impact, 2000),
+            "limitations": [_text(item, 1000) for item in detail.limitations],
+        }
+    except Exception:
+        pass
+    evidence_ids = {_text(item, 120) for item in finding.evidence_ids}
+    raw_originals = metadata.get("verification_source_refs", [])
+    raw_originals = raw_originals if isinstance(raw_originals, (list, tuple)) else []
+    originals = [
+        identity for identity in (
+            _text(item, 120) for item in raw_originals[:20]
+        ) if identity is not None and identity in evidence_ids
+    ]
+    return {
+        "finding_id": _text(finding.finding_id, 120),
+        "title": _text(finding.title, 240),
+        "description": _text(finding.description, 1000),
+        "severity": _text(finding.severity, 40),
+        "verified": finding.verified,
+        "candidate_id": _text(metadata.get("hypothesis_id"), 120),
+        "review_receipt_id": _text(metadata.get("review_receipt_id"), 120),
+        "original_evidence_ids": originals[:20],
+        "reviewed_detail": reviewed,
+    }
 
 
 def _event(row: dict[str, Any]) -> dict[str, Any]:
@@ -436,7 +509,14 @@ def build_graph(raw: GraphRaw) -> dict[str, Any]:
     tasks = [_task(t, workers, raw) for t in raw.tasks]
     task_ids = {item["task_id"] for item in tasks}
     llm, llm_actors = _llm(raw, task_ids)
-    candidates = [_candidate(item, raw.tasks, raw.candidate_finding_promotions)
+    findings = [_finding(item) for item in raw.findings]
+    candidates = [_candidate(
+        item,
+        raw.tasks,
+        raw.candidate_finding_promotions,
+        raw.candidate_review_applications,
+        findings,
+    )
                   for item in raw.hypotheses
                   if item.contract_version == 2]
     candidate_ids = {item["hypothesis_id"] for item in candidates}
@@ -471,6 +551,10 @@ def build_graph(raw: GraphRaw) -> dict[str, Any]:
         "planner": _planner(raw),
         "candidates": candidates,
         "candidate_finding_promotions": raw.candidate_finding_promotions,
+        "candidate_review_applications": [
+            _review_application(item) for item in raw.candidate_review_applications
+        ],
+        "findings": findings,
         "tasks": tasks,
         "workers": workers,
         "executions": [_execution(item) for item in raw.executions],

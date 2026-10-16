@@ -48,11 +48,11 @@ def test_environment_policy_reaches_cli_settings_without_implicit_unlimited():
 def test_native_contract_and_stage_prompts_not_json_path_contract():
     loaded = load_specialist_profile(PROFILE)
     native = loaded.prompts.compose("native_action", "NATIVE TOOLS", role_id="mobile-executor")
-    assert "모바일 실행 담당자" in native
+    assert "# Mobile Verification Worker" in native
     assert "NATIVE TOOLS" in native
     assert "response_schema" not in native
-    assert "웹 실행 담당자" not in native
-    assert "조사 계획자" in loaded.prompts.compose("attack_path_proposal", "schema")
+    assert "# Web Verification Worker" not in native
+    assert "# Attack-path Planner" in loaded.prompts.compose("attack_path_proposal", "schema")
     with pytest.raises(ValueError, match="binding_missing"):
         loaded.prompts.compose("unknown-stage", "schema")
 

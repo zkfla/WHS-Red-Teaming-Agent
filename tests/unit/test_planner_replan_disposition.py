@@ -168,24 +168,25 @@ def test_continue_accepts_new_tasks_or_questions():
     assert updates == [] and len(questions) == 1
 
 
-def test_empty_inventory_requires_candidate_only_for_captured_continuing_investigation():
+@pytest.mark.parametrize("termination", ["held", "exhausted"])
+def test_empty_inventory_accepts_observation_and_noncontinuing_judgments(termination):
     snapshot = _snapshot()
     legacy = HypothesisDecision(
-        reason="No candidate was proposed", termination="held",
+        reason="No candidate was proposed", termination=termination,
         resume_conditions=["A captured target observation becomes available"],
     )
     assert bind_decision(
         legacy, snapshot, issued={}, targets={TARGET}, principals=set(), roles={ROLE},
-        max_tasks=4, limits=ProbeLimits(), require_initial_candidate=True,
+        max_tasks=4, limits=ProbeLimits(),
     ) is None
 
     split = _plan_draft(
-        reason="No candidate was proposed", termination="held",
+        reason="No candidate was proposed", termination=termination,
         resume_conditions=["A captured target observation becomes available"],
     )
     updates, questions, _ = bind_plan(
         split, snapshot, issued={}, targets={TARGET}, principals=set(), max_tasks=4,
-        existing_work_validator=_witness_validator(snapshot), require_initial_candidate=True,
+        existing_work_validator=_witness_validator(snapshot),
     )
     assert updates is None and questions == []
 
@@ -194,26 +195,25 @@ def test_empty_inventory_requires_candidate_only_for_captured_continuing_investi
         "role_id": ROLE, "target_node_ids": [TARGET],
         "completion_criteria": [{"kind": "observation", "description": "Inspect response"}],
     })
-    with pytest.raises(HypothesisProposalError) as legacy_error:
-        bind_decision(
-            HypothesisDecision(tasks=[task], reason="Continue the captured investigation"),
-            snapshot, issued={}, targets={TARGET}, principals=set(), roles={ROLE},
-            max_tasks=4, limits=ProbeLimits(), require_initial_candidate=True,
-        )
-    assert legacy_error.value.code == "candidate_inventory_empty_requires_new_candidate"
+    accepted = bind_decision(
+        HypothesisDecision(tasks=[task], reason="Observe before forming a candidate"),
+        snapshot, issued={}, targets={TARGET}, principals=set(), roles={ROLE},
+        max_tasks=4, limits=ProbeLimits(),
+    )
+    assert accepted.updates == [] and accepted.tasks[0].hypothesis_revisions == {}
 
     question = PlannedInvestigationQuestion.model_validate({
         "question_id": "q-initial", "objective": "Inspect the response",
         "target_node_ids": [TARGET],
         "completion_criteria": [{"kind": "observation", "description": "Inspect response"}],
     })
-    with pytest.raises(AtomizationProposalError) as split_error:
-        bind_plan(
-            _plan_draft(questions=[question.model_dump(mode="json")]), snapshot,
-            issued={}, targets={TARGET}, principals=set(), max_tasks=4,
-            existing_work_validator=_witness_validator(snapshot), require_initial_candidate=True,
-        )
-    assert split_error.value.code == "candidate_inventory_empty_requires_new_candidate"
+    updates, questions, versions = bind_plan(
+        _plan_draft(questions=[question.model_dump(mode="json")]), snapshot,
+        issued={}, targets={TARGET}, principals=set(), max_tasks=4,
+        existing_work_validator=_witness_validator(snapshot),
+    )
+    assert updates == [] and versions == {} and len(questions) == 1
+    assert questions[0].hypothesis_revisions == {}
 
     new_candidate = _candidate("proposal-local")
     update = HypothesisUpdate(hypothesis=new_candidate, expected_revision=None)
@@ -231,7 +231,6 @@ def test_empty_inventory_requires_candidate_only_for_captured_continuing_investi
         roles={ROLE},
         max_tasks=4,
         limits=ProbeLimits(),
-        require_initial_candidate=True,
     )
     assert accepted is not None and len(accepted.updates) == 1
 
@@ -459,6 +458,16 @@ class _FakeDeps:
         self.central_state = _FakeState(mission, tasks, nodes)
         self.settings = SimpleNamespace(global_concurrency=10)
         self.specialist_policy = SimpleNamespace(max_instances=10, probe_limits=ProbeLimits())
+        self.candidate_review_applicator = _FakeReviewApplicator()
+
+
+class _FakeReviewApplicator:
+    def __init__(self):
+        self.retry_calls = 0
+
+    async def retry_pending(self):
+        self.retry_calls += 1
+        return ()
 
 
 async def test_ready_workers_uses_the_shared_claimability_predicate_on_one_snapshot(monkeypatch):
@@ -503,5 +512,6 @@ async def test_ready_workers_uses_the_shared_claimability_predicate_on_one_snaps
 
     workers = await central_runtime.ready_workers(deps, _FakeRuntime())
     returned = {str(worker.active_task_id) for worker in workers}
+    assert deps.candidate_review_applicator.retry_calls == 1
     assert set(called) == {str(task.task_id) for task in tasks}
     assert returned == expected == {"ready", "matching-revision"}

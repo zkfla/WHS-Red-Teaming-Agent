@@ -43,7 +43,21 @@ def test_code_owned_request_contract_changes_planning_binding_for_custom_prompts
     deps = SimpleNamespace(specialist_policy=loaded.run_policy(), engagement=None,
                            component_binding=None)
     selected = specialist_planning_inputs(deps)
-    assert selected["planner_request_contract_version"] == 7
+    assert selected["planner_request_contract_version"] == 9
     historical = {key: value for key, value in selected.items()
                   if key != "planner_request_contract_version"}
     assert content_hash(selected) != content_hash(historical)
+    previous = {**selected, "planner_request_contract_version": 7}
+    assert content_hash(selected) != content_hash(previous)
+
+
+def test_evidence_field_contract_is_part_of_the_assembled_planning_binding(monkeypatch):
+    from redteam.core import evidence_paths
+
+    loaded = load_specialist_profile(PROFILE)
+    deps = SimpleNamespace(specialist_policy=loaded.run_policy(), engagement=None,
+                           component_binding=None)
+    original = specialist_planning_inputs(deps)
+    assert original["evidence_field_contract_version"] == 2
+    monkeypatch.setattr(evidence_paths, "EVIDENCE_FIELD_CONTRACT_VERSION", 3)
+    assert content_hash(specialist_planning_inputs(deps)) != content_hash(original)

@@ -22,10 +22,12 @@ import yaml
 
 from redteam.app.cli._shared import DEFAULT_ENV_PATH, env_file_is_gitignored, write_env_var
 from redteam.core.config import (
+    CYBER_ACCESS_PROGRAMS,
     DEFAULT_SPECIALIST_PROFILE_PATH,
     REASONING_EFFORTS,
     LLMConfig,
     OrchestrationConfig,
+    normalize_cyber_access_program,
     normalize_reasoning_effort,
 )
 from redteam.core.environment import OrchestrationEnvInput
@@ -45,6 +47,7 @@ STATE_PATH = Path("data/web/settings.json")
 ENV_PROVIDER = "REDTEAM_LLM_PROVIDER"
 ENV_MODEL = "REDTEAM_LLM_MODEL"
 ENV_EFFORT = "REDTEAM_LLM_REASONING_EFFORT"
+ENV_CYBER = "REDTEAM_LLM_CYBER_ACCESS_PROGRAM"
 ENV_KEY_VAR = "REDTEAM_LLM_API_KEY_ENV_VAR"
 ENV_PROFILE = "REDTEAM_SPECIALIST_PROFILE"
 ENV_POLICY = "REDTEAM_LLM_REQUEST_POLICY_JSON"
@@ -67,6 +70,7 @@ _ALLOWED = frozenset(
         "max_concurrent_requests",
         "provider",
         "reasoning_effort",
+        "cyber_access_program",
     }
 )
 _REQUEST_LIMIT = (1, 1_000_000)
@@ -198,6 +202,25 @@ class SettingsStore:
             return False
         return True
 
+    def _cyber_program(self) -> str | None:
+        raw = self.env.get(ENV_CYBER)
+        if raw is None:
+            return None
+        try:
+            return normalize_cyber_access_program(raw)
+        except ValueError:
+            return None
+
+    def _cyber_program_valid(self) -> bool:
+        raw = self.env.get(ENV_CYBER)
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            return True
+        try:
+            normalize_cyber_access_program(raw)
+        except ValueError:
+            return False
+        return True
+
     def problems(self) -> list[dict[str, str]]:
         found: list[dict[str, str]] = []
         provider = self.env.get(ENV_PROVIDER)
@@ -215,6 +238,10 @@ class SettingsStore:
                 found.append({"field": "model", "code": "invalid"})
         if not self._effort_valid():
             found.append({"field": "reasoning_effort", "code": "invalid"})
+        if not self._cyber_program_valid():
+            found.append({"field": "cyber_access_program", "code": "invalid"})
+        elif self._cyber_program() is not None and provider != "litellm":
+            found.append({"field": "cyber_access_program", "code": "unsupported"})
         if not (model or "").startswith("chatgpt/") and not self.env.get(self._key_var()):
             found.append({"field": "api_key", "code": "missing"})
         if self._selected_profile_id() is None:
@@ -239,6 +266,8 @@ class SettingsStore:
             "provider": self.env.get(ENV_PROVIDER) or None,
             "reasoning_effort": self._effort(),
             "reasoning_effort_options": sorted(REASONING_EFFORTS),
+            "cyber_access_program": self._cyber_program(),
+            "cyber_access_program_options": sorted(CYBER_ACCESS_PROGRAMS),
             "api_key_set": bool(self.env.get(self._key_var())),
             "api_key_env_var": self._key_var(),
             "profile_id": self._selected_profile_id(),
@@ -284,6 +313,14 @@ class SettingsStore:
                 normalized = None
             if normalized is not None:
                 self.env.setdefault(ENV_EFFORT, normalized)
+        cyber_program = saved.get("cyber_access_program")
+        if isinstance(cyber_program, str) and cyber_program.strip():
+            try:
+                normalized_cyber = normalize_cyber_access_program(cyber_program)
+            except ValueError:
+                normalized_cyber = None
+            if normalized_cyber is not None:
+                self.env.setdefault(ENV_CYBER, normalized_cyber)
         profile = saved.get("profile_id")
         if isinstance(profile, str):
             path = self._profile_path(profile)
@@ -360,6 +397,24 @@ class SettingsStore:
                     saved["reasoning_effort"] = normalized
             else:
                 raise SettingsError("reasoning_effort", "invalid")
+        if "cyber_access_program" in payload:
+            raw_cyber = payload["cyber_access_program"]
+            if raw_cyber is None or (isinstance(raw_cyber, str) and not raw_cyber.strip()):
+                removals.append(ENV_CYBER)
+                saved_removals.append("cyber_access_program")
+            elif isinstance(raw_cyber, str):
+                try:
+                    normalized_cyber = normalize_cyber_access_program(raw_cyber)
+                except ValueError:
+                    raise SettingsError("cyber_access_program", "invalid") from None
+                if normalized_cyber is None:
+                    removals.append(ENV_CYBER)
+                    saved_removals.append("cyber_access_program")
+                else:
+                    updates[ENV_CYBER] = normalized_cyber
+                    saved["cyber_access_program"] = normalized_cyber
+            else:
+                raise SettingsError("cyber_access_program", "invalid")
         if "model" in payload:
             model = payload["model"]
             if not isinstance(model, str) or not _MODEL.match(model):
@@ -441,6 +496,8 @@ class SettingsStore:
         candidate_is_go = is_go_provider(
             candidate_provider if isinstance(candidate_provider, str) else None
         )
+        if candidate.get(ENV_CYBER) and candidate_provider != "litellm":
+            raise SettingsError("cyber_access_program", "unsupported")
         if candidate_is_go and ("model" in payload or "provider" in payload):
             if not isinstance(candidate_model, str) or not candidate_model:
                 raise SettingsError("model", "missing")
@@ -459,6 +516,7 @@ class SettingsStore:
             or updates.get(ENV_MODEL)
             or updates.get(ENV_PROVIDER)
             or updates.get(ENV_EFFORT)
+            or updates.get(ENV_CYBER)
             or removals
         ):
             try:

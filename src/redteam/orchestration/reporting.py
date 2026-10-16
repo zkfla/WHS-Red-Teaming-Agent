@@ -6,13 +6,26 @@ from collections import Counter, defaultdict
 from collections.abc import Collection, Iterable
 from typing import TYPE_CHECKING, Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_serializer,
+    field_validator,
+    model_serializer,
+)
 
 from redteam.attack_graph.service import AttackGraphService
+from redteam.core.contracts.assessment import ReviewedFindingDetail
 from redteam.core.contracts.completion import completion_conditions, completion_contract_hash
 from redteam.core.contracts.evidence import EvidenceRecord
 from redteam.core.contracts.execution import ExecutionState, TaskExecution
-from redteam.core.contracts.mission import MissionPlan, MissionTask
+from redteam.core.contracts.mission import (
+    InvestigationResult,
+    MissionPlan,
+    MissionTask,
+    redact_secret_material,
+)
 from redteam.core.enums import AgentPhase, MissionStatus, TaskStatus
 from redteam.core.ids import ApprovalId, EvidenceId, FindingId, MissionId, RunId, TaskId
 from redteam.core.ports.evidence_store import EvidenceStore
@@ -30,11 +43,115 @@ if TYPE_CHECKING:
 
 
 class FindingProjection(BaseModel):
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     finding_id: FindingId
     title: str
     severity: str
     verified: bool
     evidence_ids: list[str] = Field(default_factory=list)
+    # None means a historical report never retained this field. An empty
+    # string is a stored empty description; neither is inferred from a draft.
+    description: str | None = None
+    reviewed_detail: ReviewedFindingDetail | None = None
+    review_receipt_id: str | None = None
+    original_evidence_ids: list[str] = Field(default_factory=list)
+
+    @field_validator("description")
+    @classmethod
+    def _safe_description(cls, value):
+        return redact_text(value) if value is not None else None
+
+    @field_serializer("description")
+    def _serialize_description(self, value):
+        # Preserve the boundary when model_copy or direct assignment bypasses validation.
+        return redact_text(value) if value is not None else None
+
+    @field_serializer("reviewed_detail")
+    def _serialize_reviewed_detail(self, value):
+        if value is None:
+            return None
+        return ReviewedFindingDetail.model_validate(value).model_dump(mode="json")
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        result = handler(self)
+        if self.description is None:
+            result.pop("description", None)
+        if self.reviewed_detail is None:
+            result.pop("reviewed_detail", None)
+        if self.review_receipt_id is None:
+            result.pop("review_receipt_id", None)
+        if not self.original_evidence_ids:
+            result.pop("original_evidence_ids", None)
+        return result
+
+
+class AssessmentReviewProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    receipt_id: EvidenceId
+    reviewer_id: str
+    verdict: str
+    outcome: str | None = None
+    confidence: float | None = None
+    hypothesis_outcome: str | None = None
+    candidate_id: str | None = None
+    candidate_revision: int | None = None
+    reviewed_detail: ReviewedFindingDetail
+
+
+class CandidateReviewApplicationProjection(BaseModel):
+    """Safe report view of one code-owned final-review application."""
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    review_receipt_id: str
+    candidate_id: str
+    candidate_pre_verdict_revision: int | None = None
+    candidate_revision: int | None = None
+    task_id: str | None = None
+    finding_id: str | None = None
+    status: str
+    review_confidence: float | None = None
+    reason: str | None = None
+
+
+def _project_review_application(item: dict[str, Any]) -> CandidateReviewApplicationProjection:
+    """Omit internal hashes and bodies while preserving application identity/result."""
+    return CandidateReviewApplicationProjection(
+        review_receipt_id=_safe_id_token(item.get("review_receipt_id")) or "unknown",
+        candidate_id=_safe_id_token(item.get("candidate_id")) or "unknown",
+        candidate_pre_verdict_revision=(
+            item.get("candidate_pre_verdict_revision")
+            if type(item.get("candidate_pre_verdict_revision")) is int else None
+        ),
+        candidate_revision=(
+            item.get("candidate_revision")
+            if type(item.get("candidate_revision")) is int else None
+        ),
+        task_id=_safe_id_token(item.get("task_id")),
+        finding_id=_safe_id_token(item.get("finding_id")),
+        status=_safe_id_token(item.get("status"), limit=80) or "unknown",
+        review_confidence=(
+            float(item["review_confidence"])
+            if isinstance(item.get("review_confidence"), (int, float))
+            and not isinstance(item.get("review_confidence"), bool)
+            else None
+        ),
+        reason=(
+            redact_text(str(item["reason"]))[:500]
+            if item.get("reason") not in (None, "") else None
+        ),
+    )
+
+
+def _finding_reviewed_detail(item: Any) -> ReviewedFindingDetail | None:
+    metadata = item.metadata if isinstance(item.metadata, dict) else {}
+    try:
+        return ReviewedFindingDetail.model_validate(metadata.get("reviewed_finding_detail"))
+    except Exception:
+        return None
 
 
 #: Canonical workstream families. Ordered so the more specific labels win:
@@ -178,6 +295,14 @@ class CandidateProjection(BaseModel):
     refuting_evidence_ids: list[str] = Field(default_factory=list)
     source_hypothesis_ids: list[str] = Field(default_factory=list)
     probe_task_ids: list[str] = Field(default_factory=list)
+    review_applications: list[CandidateReviewApplicationProjection] = Field(default_factory=list)
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        result = handler(self)
+        if not self.review_applications:
+            result.pop("review_applications", None)
+        return result
 
 
 class MissionProjection(BaseModel):
@@ -657,7 +782,36 @@ _RELEASE_OK_REASONS = (
 )
 
 
+def investigation_report_views(investigations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Normalize report-only draft DATA; derive references without storing another ledger.
+
+    Keep the canonical nested result shape and all unrelated investigation fields.
+    Old reports without drafts gain no inferred observations or review approval.
+    A Task completion receipt is not an exact assessment-draft review binding.
+    """
+    views = []
+    for investigation in investigations:
+        result = investigation.get("result") or {}
+        drafts = result.get("assessment_drafts", [])
+        if drafts is None or drafts == []:
+            views.append({key: value for key, value in investigation.items()
+                          if key != "assessment_draft_refs"})
+            continue
+        normalized = InvestigationResult.model_validate(redact_secret_material(result))
+        views.append({
+            **investigation,
+            "result": normalized.model_dump(mode="json"),
+            "assessment_draft_refs": [
+                {**item.identity(normalized.result_id), "contract_version": item.contract_version,
+                 "review_binding": "unknown"} for item in normalized.assessment_drafts
+            ],
+        })
+    return views
+
+
 class TerminalReportProjection(BaseModel):
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     run_id: RunId
     phase: AgentPhase
     termination_reason: str | None
@@ -677,8 +831,12 @@ class TerminalReportProjection(BaseModel):
     evidence_count: int
     work_status_counts: dict[str, int] = Field(default_factory=dict)
     findings: list[FindingProjection] = Field(default_factory=list)
+    assessment_reviews: list[AssessmentReviewProjection] = Field(default_factory=list)
     candidates: list[CandidateProjection] = Field(default_factory=list)
     candidate_finding_promotions: list[dict[str, Any]] = Field(default_factory=list)
+    candidate_review_applications: list[CandidateReviewApplicationProjection] = Field(
+        default_factory=list
+    )
     evidence_ids: list[EvidenceId] = Field(default_factory=list)
     integrity_blockers: list[str] = Field(default_factory=list)
     unresolved_hypotheses: list[str] = Field(default_factory=list)
@@ -718,6 +876,16 @@ class TerminalReportProjection(BaseModel):
     cleanup_unmapped_tools: list[str] = Field(default_factory=list)
     effective_limits: dict[str, Any] = Field(default_factory=dict)
     feature_availability: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("investigations")
+    @classmethod
+    def _safe_investigations(cls, value):
+        return investigation_report_views(value)
+
+    @field_serializer("investigations", mode="wrap")
+    def _serialize_investigations(self, value, handler):
+        # model_copy/update and direct assignments bypass construction validators.
+        return handler(investigation_report_views(value))
 
 
 class ReportingAgent:
@@ -785,9 +953,43 @@ class ReportingAgent:
                 severity=item.severity,
                 verified=item.verified,
                 evidence_ids=sorted(set(item.evidence_ids) & current_evidence_ids),
+                description=item.description,
+                reviewed_detail=_finding_reviewed_detail(item),
+                review_receipt_id=_safe_id_token(
+                    item.metadata.get("review_receipt_id")
+                    if isinstance(item.metadata, dict) else None
+                ),
+                original_evidence_ids=sorted(
+                    set(_safe_id_list(
+                        item.metadata.get("verification_source_refs", [])
+                        if isinstance(item.metadata, dict) else []
+                    )) & current_evidence_ids
+                ),
             )
             for item in findings
         ]
+        assessment_reviews: list[AssessmentReviewProjection] = []
+        for record in evidence:
+            metadata = record.metadata if isinstance(record.metadata, dict) else {}
+            if metadata.get("review_contract_version") not in (3, 4):
+                continue
+            try:
+                detail = ReviewedFindingDetail.model_validate(
+                    metadata.get("reviewed_finding_detail")
+                )
+                assessment_reviews.append(AssessmentReviewProjection(
+                    receipt_id=record.evidence_id,
+                    reviewer_id=str(metadata.get("reviewer_id") or ""),
+                    verdict=str(metadata.get("verdict") or "unknown"),
+                    outcome=metadata.get("outcome"),
+                    confidence=metadata.get("confidence"),
+                    hypothesis_outcome=metadata.get("hypothesis_outcome"),
+                    candidate_id=metadata.get("hypothesis_id"),
+                    candidate_revision=metadata.get("candidate_revision"),
+                    reviewed_detail=detail,
+                ))
+            except Exception:
+                continue
         mission = None
         candidate_tasks: dict[str, list[str]] = {}
         reuse_support: set[str] = set()
@@ -814,10 +1016,10 @@ class ReportingAgent:
         by_id = {str(item.evidence_id): item for item in evidence}
         pending_support = list(reuse_support)
         while pending_support:
-            record = by_id.get(pending_support.pop())
-            if record is None:
+            linked_record = by_id.get(pending_support.pop())
+            if linked_record is None:
                 continue
-            for source in record.metadata.get("source_evidence_ids", []):
+            for source in linked_record.metadata.get("source_evidence_ids", []):
                 if str(source) not in reuse_support:
                     reuse_support.add(str(source))
                     pending_support.append(str(source))
@@ -870,11 +1072,17 @@ class ReportingAgent:
         evidence_read_projections = _project_evidence_reads(runtime)
         request_accounting = None
         candidate_finding_promotions: list[dict[str, Any]] = []
+        candidate_review_applications: list[CandidateReviewApplicationProjection] = []
         if central_state is not None:
             request_accounting = await central_state.request_ledger().snapshot(str(runtime.run_id))
             read_promotions = getattr(central_state, "candidate_finding_promotions", None)
             if callable(read_promotions):
                 candidate_finding_promotions = await read_promotions()
+            read_applications = getattr(central_state, "candidate_review_applications", None)
+            if callable(read_applications):
+                candidate_review_applications = [
+                    _project_review_application(item) for item in await read_applications()
+                ]
         elif runtime.llm_request_policy is not None and coordinator is not None:
             from redteam.orchestration.llm_requests import RunRequestLedger
 
@@ -933,6 +1141,7 @@ class ReportingAgent:
             evidence_count=len(evidence),
             work_status_counts=dict(sorted(status_counts.items())),
             findings=projected_findings,
+            assessment_reviews=assessment_reviews,
             candidates=[CandidateProjection(
                 hypothesis_id=item.hypothesis_id,
                 description=redact_text(item.description),
@@ -945,8 +1154,13 @@ class ReportingAgent:
                 refuting_evidence_ids=list(item.refuting_evidence_ids),
                 source_hypothesis_ids=list(item.source_hypothesis_ids),
                 probe_task_ids=sorted(candidate_tasks.get(item.hypothesis_id, [])),
+                review_applications=[
+                    application for application in candidate_review_applications
+                    if application.candidate_id == item.hypothesis_id
+                ],
             ) for item in hypotheses],
             candidate_finding_promotions=candidate_finding_promotions,
+            candidate_review_applications=candidate_review_applications,
             evidence_ids=[item.evidence_id for item in evidence],
             integrity_blockers=integrity.blocking,
             unresolved_hypotheses=unresolved,
@@ -984,7 +1198,9 @@ class ReportingAgent:
 
             tasks = await central_state.list_tasks()
             plan = await central_state.get_mission(runtime.mission_id)
-            report.investigations = [task.model_dump(mode="json") for task in tasks]
+            report.investigations = investigation_report_views([
+                task.model_dump(mode="json") for task in tasks
+            ])
             report.executions = [item.model_dump(mode="json") for item in work]
             by_task = request_accounting.get("by_task", {})
             for task in tasks:

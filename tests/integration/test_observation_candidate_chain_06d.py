@@ -1,4 +1,4 @@
-"""06D: observation Task review, graph.record receipt, and Planner judgment on one candidate.
+"""06D: observation review receipt and direct central candidate application.
 
 Real Task review, real GraphRecordingHandler, real StructuredLLMAnalysisVerifier, and real
 canonical admission. Only model answers are scripted. The verifier meaning answers come from a
@@ -19,6 +19,7 @@ from redteam.orchestration.analysis import (
     StructuredLLMAnalysisVerifier,
     append_posthoc_claim_receipt,
 )
+from redteam.orchestration.candidate_review_application import apply_candidate_review_receipt
 from redteam.orchestration.central_runtime import ready_workers
 from redteam.orchestration.cognition import DecisionBudget
 from redteam.orchestration.coordination import StateConflict, content_hash
@@ -65,13 +66,13 @@ class MeaningLLM(FakeLLMClient):
         return dict(self.answers.pop(0))
 
 
-def _meaning(outcome):
+def _meaning(outcome, *, confidence=0.9):
     return {
         "meaning": "The preserved response " + outcome + " the candidate premise",
         "outcome": outcome,
         "reason": "Scripted independent meaning review",
         "claim_supported": outcome == "success",
-        "confidence": 0.9,
+        "confidence": confidence,
         "hypothesis_outcome": outcome,
     }
 
@@ -137,7 +138,7 @@ async def _commit(session, identity, update):
 
 
 @pytest.mark.parametrize("outcome", ["success", "refuted", "unknown"])
-async def test_observation_review_receipt_then_planner_judgment_admits_only_exact_purpose(
+async def test_observation_review_receipt_directly_applies_only_a_terminal_outcome(
     tmp_path, outcome,
 ):
     opening = {"updates": [candidate()], "tasks": [probe(candidate="local")],
@@ -152,61 +153,31 @@ async def test_observation_review_receipt_then_planner_judgment_admits_only_exac
                                      source=source)
         receipt = await _receipt(session, result)
         assert meaning.review_calls == 1
-        # graph.record only produces the receipt; the candidate itself is untouched.
-        assert (await service.get_hypothesis(current.hypothesis_id)).revision == 1
         assert receipt.metadata["candidate_revision"] == 1
         assert receipt.metadata["candidate_purpose_hash"] == content_hash(
             hypothesis_purpose(current))
         assert receipt.metadata["hypothesis_outcome"] == outcome
-        assert await service.list_findings() == []
+        application = result.payload["findings"][0]["application"]
+        saved = await service.get_hypothesis(current.hypothesis_id)
 
         if outcome == "unknown":
-            # UNKNOWN never admits a verdict: the Planner holds and a confirmation is rejected.
-            llm.decisions.append(held("Review did not settle the candidate"))
-            assert await SpecialistPlanner(session.deps).advance(session.runtime) == []
-            saved = await service.get_hypothesis(current.hypothesis_id)
+            assert application["status"] == "inconclusive"
             assert saved.status == "open" and saved.revision == 1
-            assert len(llm.planner_inputs) == 2
-            unknown_receipts = [item for item in llm.planner_inputs[-1]["review_receipts"]
-                                if item["evidence_id"] == str(receipt.evidence_id)]
-            assert len(unknown_receipts) == 1
-            assert unknown_receipts[0]["metadata"]["hypothesis_outcome"] == "unknown"
-            mission = await session.deps.central_state.get_mission(session.runtime.mission_id)
-            assert mission.status is MissionStatus.ACTIVE
             # The producer's review-outcome gate rejects UNKNOWN before canonical receipt binding.
             with pytest.raises(StateConflict, match="candidate_verdict_unproven"):
                 await _commit(session, "unknown-confirm", candidate(
                     current=saved.model_dump(mode="json"), status="confirmed",
                     evidence=[str(source.evidence_id)], review=str(receipt.evidence_id),
                 ))
+            assert await service.list_findings() == []
             return
 
         status = "confirmed" if outcome == "success" else "rejected"
-        judged = candidate(current=current.model_dump(mode="json"), status=status,
-                           evidence=[str(source.evidence_id)], review=str(receipt.evidence_id))
-        wrong = {**judged, "hypothesis": {**judged["hypothesis"],
-                                          "premise": "A different untested prerequisite"}}
-        with pytest.raises(StateConflict, match="candidate_verdict_receipt_unbound"):
-            await _commit(session, "wrong-purpose", wrong)
-        assert (await service.get_hypothesis(current.hypothesis_id)).revision == 1
-        llm.decisions.append({"updates": [judged], "termination": "replan",
-                              "reason": "The bound independent review supports this verdict"})
-        assert await SpecialistPlanner(session.deps).advance(session.runtime) == []
-        # The judgment is the second Planner call; the first was the opening observation.
-        assert len(llm.planner_inputs) == 2
-        wake = llm.planner_inputs[-1]
-        candidate_receipts = [item for item in wake["review_receipts"]
-                              if item["evidence_id"] == str(receipt.evidence_id)]
-        assert len(candidate_receipts) == 1
-        meta = candidate_receipts[0]["metadata"]
-        assert meta["candidate_revision"] == 1
-        assert meta["candidate_purpose_hash"] == content_hash(hypothesis_purpose(current))
-        assert meta["hypothesis_outcome"] == outcome
-        saved = await service.get_hypothesis(current.hypothesis_id)
         assert saved.revision == 2 and saved.status == status
         findings = await service.list_findings()
         promotions = await session.deps.central_state.candidate_finding_promotions()
         if outcome == "success":
+            assert application["status"] == "promoted"
             assert len(findings) == 1
             finding = findings[0]
             assert finding.verified is True
@@ -222,18 +193,54 @@ async def test_observation_review_receipt_then_planner_judgment_admits_only_exac
             assert promotions[0]["status"] == "promoted"
             assert promotions[0]["finding_id"] == finding.finding_id
         else:
+            assert application["status"] == "candidate_rejected"
             assert findings == []
-            assert promotions == []
+            assert len(promotions) == 1
+            assert promotions[0]["status"] == "candidate_rejected"
         mission = await session.deps.central_state.get_mission(session.runtime.mission_id)
         assert mission.status is MissionStatus.ACTIVE
-        # A receipt bound to revision 1 cannot admit a judgment against revision 2.
-        reopened = {**saved.model_dump(mode="json"), "status": "open"}
-        with pytest.raises(StateConflict, match="candidate_verdict_receipt_unbound"):
-            await _commit(session, "stale-revision", candidate(
-                current=reopened, status=status,
-                evidence=[str(source.evidence_id)], review=str(receipt.evidence_id),
-            ))
+        replay = await apply_candidate_review_receipt(
+            session.deps, str(receipt.evidence_id),
+        )
+        assert replay.status == "already_applied"
+        assert replay.candidate_revision == 2
         assert (await service.get_hypothesis(current.hypothesis_id)).revision == 2
+
+
+@pytest.mark.parametrize(
+    ("confidence", "expected_status", "expected_findings"),
+    [(0.8, "promoted", 1), (0.79, "inconclusive", 0)],
+)
+async def test_finding_promotion_uses_eighty_percent_review_threshold(
+    tmp_path, confidence, expected_status, expected_findings,
+):
+    opening = {"updates": [candidate()], "tasks": [probe(candidate="local")],
+               "reason": "Observe the candidate's smallest uncertainty"}
+    async with selection(tmp_path, llm=ChainLLM([opening])) as (session, llm, tools):
+        service = AttackGraphService(session.deps.graph_store)
+        current, source = await _observe_candidate(session, llm)
+        verifier = StructuredLLMAnalysisVerifier(
+            MeaningLLM([_meaning("success", confidence=confidence)]),
+            session.deps.evidence_store,
+            service,
+        )
+        result = await _graph_record(
+            session, verifier, candidate_id=current.hypothesis_id, source=source,
+        )
+        receipt = await _receipt(session, result)
+
+        assert receipt.metadata["review_contract_version"] == 4
+        assert receipt.metadata["confidence"] == confidence
+        application = result.payload["findings"][0]["application"]
+        assert application["status"] == expected_status
+        assert application["review_confidence"] == confidence
+        assert len(await service.list_findings()) == expected_findings
+        saved = await service.get_hypothesis(current.hypothesis_id)
+        assert saved.status == ("confirmed" if confidence >= 0.8 else "open")
+        if expected_findings:
+            finding, = await service.list_findings()
+            assert finding.metadata["review_confidence"] == confidence
+            assert finding.metadata["minimum_finding_confidence"] == 0.8
 
 
 async def _receipts(session):
@@ -253,15 +260,14 @@ async def test_exact_confirmation_replay_keeps_one_v2_finding(tmp_path):
         receipt = await _receipt(session, await _graph_record(
             session, verifier, candidate_id=current.hypothesis_id, source=source,
         ))
-        judged = candidate(
-            current=current.model_dump(mode="json"), status="confirmed",
-            evidence=[str(source.evidence_id)], review=str(receipt.evidence_id),
+        first = await apply_candidate_review_receipt(
+            session.deps, str(receipt.evidence_id),
+        )
+        replay = await apply_candidate_review_receipt(
+            session.deps, str(receipt.evidence_id),
         )
 
-        first = await _commit(session, "exact-confirm", judged)
-        replay = await _commit(session, "exact-confirm", judged)
-
-        assert replay == first
+        assert first.status == replay.status == "already_applied"
         assert (await service.get_hypothesis(current.hypothesis_id)).revision == 2
         assert len(await service.list_findings()) == 1
         assert len(await session.deps.central_state.candidate_finding_promotions()) == 1
@@ -279,13 +285,6 @@ async def test_v2_finding_failure_rolls_back_candidate_and_retry_converges(
         verifier = StructuredLLMAnalysisVerifier(
             MeaningLLM([_meaning("success")]), session.deps.evidence_store, service,
         )
-        receipt = await _receipt(session, await _graph_record(
-            session, verifier, candidate_id=current.hypothesis_id, source=source,
-        ))
-        judged = candidate(
-            current=current.model_dump(mode="json"), status="confirmed",
-            evidence=[str(source.evidence_id)], review=str(receipt.evidence_id),
-        )
         original = GraphTransaction.save_finding
 
         def fail(self, *args, **kwargs):
@@ -294,14 +293,22 @@ async def test_v2_finding_failure_rolls_back_candidate_and_retry_converges(
             raise RuntimeError("simulated candidate/finding transaction crash")
 
         monkeypatch.setattr(GraphTransaction, "save_finding", fail)
-        with pytest.raises(RuntimeError, match="simulated"):
-            await _commit(session, "atomic-confirm", judged)
+        reviewed = await _graph_record(
+            session, verifier, candidate_id=current.hypothesis_id, source=source,
+        )
+        receipt = await _receipt(session, reviewed)
+        application = reviewed.payload["findings"][0]["application"]
+        assert application["status"] == "retryable_error"
+        assert application["reason"] == "RuntimeError"
         assert (await service.get_hypothesis(current.hypothesis_id)).revision == 1
         assert await service.list_findings() == []
         assert await session.deps.central_state.candidate_finding_promotions() == []
 
         monkeypatch.setattr(GraphTransaction, "save_finding", original)
-        await _commit(session, "atomic-confirm", judged)
+        retried = await apply_candidate_review_receipt(
+            session.deps, str(receipt.evidence_id),
+        )
+        assert retried.status == "promoted"
         assert (await service.get_hypothesis(current.hypothesis_id)).revision == 2
         assert len(await service.list_findings()) == 1
 

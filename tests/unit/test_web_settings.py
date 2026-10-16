@@ -7,6 +7,7 @@ import json
 import pytest
 
 from redteam.app.web.settings import (
+    ENV_CYBER,
     ENV_EFFORT,
     ENV_KEY_VAR,
     ENV_MODEL,
@@ -272,6 +273,45 @@ def test_invalid_effort_is_rejected_atomically(store, effort):
     assert (caught.value.field, caught.value.code) == ("reasoning_effort", "invalid")
     assert store.env == {}
     assert not store.state_path.exists()
+
+
+@pytest.mark.parametrize("program", ["blue", "red", 123, True, ["daybreak_blue"]])
+def test_invalid_cyber_program_is_rejected_atomically(store, program):
+    with pytest.raises(SettingsError) as caught:
+        store.apply({"cyber_access_program": program})
+    assert (caught.value.field, caught.value.code) == ("cyber_access_program", "invalid")
+    assert store.env == {}
+    assert not store.state_path.exists()
+
+
+def test_cyber_program_is_saved_reloaded_and_cleared(store):
+    complete(store)
+    store.apply({"cyber_access_program": "DAYBREAK_BLUE"})
+    assert store.env[ENV_CYBER] == "daybreak_blue"
+    assert store.summary()["cyber_access_program"] == "daybreak_blue"
+    fresh = SettingsStore(
+        env={}, state_path=store.state_path, profile_dir=store.profile_dir,
+        env_path=store.env_path,
+    )
+    fresh.load_saved()
+    assert fresh.env[ENV_CYBER] == "daybreak_blue"
+    fresh.apply({"cyber_access_program": ""})
+    assert ENV_CYBER not in fresh.env
+    assert "cyber_access_program" not in json.loads(
+        fresh.state_path.read_text(encoding="utf-8")
+    )
+
+
+def test_cyber_program_rejects_opencode_provider(store):
+    with pytest.raises(SettingsError) as caught:
+        store.apply({
+            "provider": "opencode-go",
+            "model": "openai/gpt-x",
+            "cyber_access_program": "daybreak_blue",
+        })
+    assert (caught.value.field, caught.value.code) == (
+        "cyber_access_program", "unsupported"
+    )
 
 
 @pytest.mark.parametrize("clear", ["", "   ", None])

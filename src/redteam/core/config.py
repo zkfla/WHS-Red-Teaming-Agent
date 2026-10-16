@@ -44,7 +44,13 @@ from redteam.core.contracts.engagement import (
     TargetActionPolicy,
 )
 from redteam.core.contracts.llm_config import (
+    CYBER_ACCESS_PROGRAMS as CYBER_ACCESS_PROGRAMS,
+)
+from redteam.core.contracts.llm_config import (
     REASONING_EFFORTS as REASONING_EFFORTS,
+)
+from redteam.core.contracts.llm_config import (
+    normalize_cyber_access_program as normalize_cyber_access_program,
 )
 from redteam.core.contracts.llm_config import (
     normalize_reasoning_effort as normalize_reasoning_effort,
@@ -116,11 +122,24 @@ class LLMConfig(BaseModel):
     api_key_env_var: str = "LLM_API_KEY"
     #: Optional provider-requested reasoning effort; None keeps the default.
     reasoning_effort: str | None = None
+    #: Optional Responses API cyber access selection; None keeps provider behavior.
+    cyber_access_program: str | None = None
 
     @field_validator("reasoning_effort", mode="before")
     @classmethod
     def _validate_reasoning_effort(cls, value: object) -> str | None:
         return normalize_reasoning_effort(value)
+
+    @field_validator("cyber_access_program", mode="before")
+    @classmethod
+    def _validate_cyber_access_program(cls, value: object) -> str | None:
+        return normalize_cyber_access_program(value)
+
+    @model_validator(mode="after")
+    def _cyber_program_requires_litellm(self):
+        if self.cyber_access_program is not None and self.provider != "litellm":
+            raise ValueError("cyber_access_program requires the litellm provider")
+        return self
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
@@ -128,6 +147,8 @@ class LLMConfig(BaseModel):
         result = handler(self)
         if self.reasoning_effort is None:
             result.pop("reasoning_effort", None)
+        if self.cyber_access_program is None:
+            result.pop("cyber_access_program", None)
         return result
 
     def resolve_api_key(self) -> str | None:
@@ -171,6 +192,9 @@ class LLMConfig(BaseModel):
         reasoning_effort = vals.get("reasoning_effort")
         if reasoning_effort is not None:
             kwargs["reasoning_effort"] = reasoning_effort
+        cyber_access_program = vals.get("cyber_access_program")
+        if cyber_access_program is not None:
+            kwargs["cyber_access_program"] = cyber_access_program
         return cls(**kwargs)
 
 

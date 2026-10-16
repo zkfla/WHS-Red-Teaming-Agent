@@ -28,6 +28,7 @@ class RecordingLLM:
     def __init__(self, *, reply: dict[str, Any] | None = None, raises: Exception | None = None):
         self.calls = 0
         self.last_prompt = ""
+        self.last_system = ""
         self._reply = reply or {}
         self._raises = raises
 
@@ -39,6 +40,7 @@ class RecordingLLM:
     ) -> dict[str, Any]:
         self.calls += 1
         self.last_prompt = "\n".join(str(item.get("content", "")) for item in messages)
+        self.last_system = system or ""
         if self._raises is not None:
             raise self._raises
         return dict(self._reply)
@@ -99,13 +101,15 @@ async def test_hybrid_fallback_helper_is_retired() -> None:
 
 
 async def test_llm_planner_honours_offered_choice_with_explicit_client() -> None:
-    llm = FakeLLMClient(canned_structured={"step_id": "second"})
+    llm = RecordingLLM(reply={"step_id": "second"})
     planner = LLMPlanner(llm)
 
     picked = await planner.plan(context([step("first"), step("second")], llm=llm))
 
     assert picked is not None and picked.step_id == "second"
     assert planner.last_fallback_reason is None
+    assert "실행 가능 option 중 하나를 고르는 Step Selector" in llm.last_system
+    assert llm.last_system.count("당신은") == 1
 
 
 async def test_llm_planner_refuses_unoffered_choice() -> None:

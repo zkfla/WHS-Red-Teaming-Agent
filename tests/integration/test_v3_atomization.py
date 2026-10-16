@@ -69,25 +69,6 @@ class SplitDouble(FakeLLMClient):
             result = response(payload) if callable(response) else response
             if stdlib_inspect.isawaitable(result):
                 result = await result
-            if (
-                not payload.get("candidates")
-                and isinstance(result, dict)
-                and result.get("context_request") is None
-                and not result.get("updates")
-                and result.get("termination", "continue") == "continue"
-                and result.get("questions")
-            ):
-                result = {**result, "updates": [{
-                    "expected_revision": None,
-                    "hypothesis": {
-                        "contract_version": 2,
-                        "hypothesis_id": "initial-local",
-                        "description": "A target security premise remains untested",
-                        "target_node_ids": [TARGET],
-                        "reason": "Preserve the first scoped uncertainty for investigation",
-                        "status": "open",
-                    },
-                }]}
             return result
         if "tasks" in props:
             body = messages[-1]["content"].split("\n\nPrevious attempt failed")[0]

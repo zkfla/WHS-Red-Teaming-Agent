@@ -230,7 +230,7 @@ async def test_worker_executes_bash_and_keeps_every_display_byte_identical(
         assert initial_context["probe"]["remaining"] == {
             "actions": 4,
             "model_requests": 8,
-                "repairs": 6,
+            "repairs": 8,
         }
         for previous, current in zip(llm.envelopes, llm.envelopes[1:], strict=False):
             count = len(previous["messages"])

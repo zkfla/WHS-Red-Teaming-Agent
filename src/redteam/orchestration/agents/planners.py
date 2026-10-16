@@ -30,11 +30,8 @@ CHOICE_SCHEMA: dict[str, Any] = {
 }
 
 DEFAULT_SYSTEM_PROMPT = (
-    "승인된 보안 테스트의 다음 단계를 계획하세요. 현재 공격 그래프 상태와 지금 "
-    "실행 가능한 단계 목록이 주어집니다. "
-    "목록에서 하나만 골라 step_id를 그대로 복사하세요. "
-    "단계, 도구, 대상을 새로 만들어 내지 마세요. 목록에 없는 항목은 사용할 수 없습니다. "
-    "열린 가설을 해결하거나 새로운 공격 표면을 드러낼 수 있는 단계를 우선하세요."
+    "당신은 코드가 제공한 실행 가능 option 중 하나를 고르는 Step Selector다. "
+    "새 단계·도구·대상을 만들지 말고 가장 가치 있는 option의 ID를 그대로 반환한다."
 )
 
 #: The hybrid planner asks for a unique option id rather than a step_id: one

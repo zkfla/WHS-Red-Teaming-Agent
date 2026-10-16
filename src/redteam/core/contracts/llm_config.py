@@ -1,4 +1,4 @@
-"""Reasoning-effort vocabulary shared by config, CLI, web and providers.
+"""LLM request-option vocabularies shared by config, CLI, web and providers.
 
 The config-level vocabulary is a single owned contract. Provider/model wire
 support is dynamic and verified at request time: a known level is forwarded
@@ -10,6 +10,10 @@ from __future__ import annotations
 
 REASONING_EFFORTS: frozenset[str] = frozenset(
     {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
+)
+
+CYBER_ACCESS_PROGRAMS: frozenset[str] = frozenset(
+    {"standard", "daybreak_blue", "daybreak_red"}
 )
 
 
@@ -33,5 +37,23 @@ def normalize_reasoning_effort(value: object) -> str | None:
         raise ValueError(
             f"unsupported reasoning effort {value!r}; "
             f"REDTEAM_LLM_REASONING_EFFORT must be one of: {allowed}"
+        )
+    return cleaned
+
+
+def normalize_cyber_access_program(value: object) -> str | None:
+    """Canonical Responses API cyber program, or ``None`` when unset."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("cyber_access_program must be a string or None")
+    cleaned = value.strip().lower()
+    if not cleaned:
+        return None
+    if cleaned not in CYBER_ACCESS_PROGRAMS:
+        allowed = ", ".join(sorted(CYBER_ACCESS_PROGRAMS))
+        raise ValueError(
+            f"unsupported cyber access program {value!r}; "
+            f"REDTEAM_LLM_CYBER_ACCESS_PROGRAM must be one of: {allowed}"
         )
     return cleaned

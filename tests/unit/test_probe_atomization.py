@@ -429,7 +429,7 @@ def test_missing_verdict_reference_requires_repair_when_candidate_is_not_unique(
     assert diagnostic.owner == "orchestration.probe_atomization"
 
 
-def test_initial_candidate_gate_only_applies_to_validated_continuing_investigation():
+def test_initial_observation_binds_and_atomizes_without_candidates():
     selection = HypothesisPlanSelection.model_validate({
         "updates": [],
         "questions": [{
@@ -440,11 +440,17 @@ def test_initial_candidate_gate_only_applies_to_validated_continuing_investigati
         "reason": "A target-specific investigation is proposed",
         "termination": "continue",
     })
-    with pytest.raises(AtomizationProposalError, match="candidate_inventory_empty"):
-        bind_plan_selection(
-            selection, _snap(), issued={}, targets={"n1"}, principals=PRINCIPALS,
-            max_tasks=MAX_TASKS, require_initial_candidate=True,
-        )
+    issued = {}
+    _, updates, questions, versions = bind_plan_selection(
+        selection, _snap(), issued=issued, targets={"n1"}, principals=PRINCIPALS,
+        max_tasks=MAX_TASKS,
+    )
+    assert updates == [] and versions == {} and issued == {}
+    (question,) = questions
+    assert question.hypothesis_revisions == {}
+    (task,) = _validate_resolved([_selection(question)], questions)
+    assert task.hypothesis_revisions == {} and task.goal_required_hypothesis_ids == []
+    assert all(criterion.hypothesis_id is None for criterion in task.completion_criteria)
 
     held = HypothesisPlanSelection.model_validate({
         "updates": [], "questions": [], "reason": "Await an external prerequisite",
@@ -452,17 +458,18 @@ def test_initial_candidate_gate_only_applies_to_validated_continuing_investigati
     })
     _, updates, questions, _ = bind_plan_selection(
         held, _snap(), issued={}, targets={"n1"}, principals=PRINCIPALS,
-        max_tasks=MAX_TASKS, require_initial_candidate=True,
+        max_tasks=MAX_TASKS,
     )
     assert updates is None and questions == []
 
 
-def test_initial_candidate_gate_does_not_mask_invalid_question_scope():
+@pytest.mark.parametrize("field", ["target_node_ids", "principal_refs"])
+def test_candidate_free_observation_rejects_invalid_question_scope(field):
     selection = HypothesisPlanSelection.model_validate({
         "updates": [],
         "questions": [{
             "question_id": "q1", "objective": "Inspect an uncaptured response",
-            "target_node_ids": ["outside"], "candidate_refs": [],
+            "target_node_ids": ["n1"], "candidate_refs": [], field: ["outside"],
             "completion_criteria": [_criterion()],
         }],
         "reason": "A target-specific investigation is proposed",
@@ -471,7 +478,23 @@ def test_initial_candidate_gate_does_not_mask_invalid_question_scope():
     with pytest.raises(AtomizationProposalError, match="plan_question_subject_not_registered"):
         bind_plan_selection(
             selection, _snap(), issued={}, targets={"n1"}, principals=PRINCIPALS,
-            max_tasks=MAX_TASKS, require_initial_candidate=True,
+            max_tasks=MAX_TASKS,
+        )
+
+
+def test_initial_observation_cannot_reference_an_undeclared_candidate():
+    selection = HypothesisPlanSelection.model_validate({
+        "updates": [], "termination": "continue", "reason": "Observe the response",
+        "questions": [{
+            "question_id": "q1", "objective": "Inspect the response",
+            "target_node_ids": ["n1"], "candidate_refs": ["undeclared"],
+            "completion_criteria": [_criterion()],
+        }],
+    })
+    with pytest.raises(AtomizationProposalError, match="plan_question_candidate_ref_unknown"):
+        bind_plan_selection(
+            selection, _snap(), issued={}, targets=TARGETS, principals=PRINCIPALS,
+            max_tasks=MAX_TASKS,
         )
 
 

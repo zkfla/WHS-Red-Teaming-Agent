@@ -16,6 +16,7 @@ from pydantic import (
 )
 from pydantic_core import InitErrorDetails, PydanticCustomError
 
+from redteam.core.contracts.assessment import AssessmentDraft
 from redteam.core.contracts.completion import CompletionCriterion, criterion_id
 from redteam.core.contracts.specialists import ProbeLimits
 from redteam.core.enums import MissionStatus, OperatorIntentType, TaskStatus
@@ -256,6 +257,7 @@ class InvestigationResult(BaseModel):
     contract_version: Literal[1, 2] = 1
     observations: list[str] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
+    assessment_drafts: list[AssessmentDraft] = Field(default_factory=list, max_length=32)
 
     @field_validator("observations", "limitations")
     @classmethod
@@ -270,6 +272,8 @@ class InvestigationResult(BaseModel):
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         result = handler(self)
+        if not self.assessment_drafts:
+            result.pop("assessment_drafts", None)
         if self.contract_version == 1:
             for key in ("contract_version", "observations", "limitations"):
                 result.pop(key, None)
@@ -291,12 +295,24 @@ class InvestigationResult(BaseModel):
             raise PydanticCustomError(
                 "result_question_duplicate", "result question ids must be unique"
             )
-        if self.contract_version == 1 and (self.observations or self.limitations):
+        draft_ids = [draft.draft_id for draft in self.assessment_drafts]
+        if len(draft_ids) != len(set(draft_ids)):
+            raise PydanticCustomError(
+                "result_assessment_duplicate", "result assessment draft ids must be unique",
+            )
+        if self.contract_version == 1 and (
+            self.observations or self.limitations or self.assessment_drafts
+        ):
             raise PydanticCustomError(
                 "result_v1_extensions_forbidden",
                 "structured probe observations require result contract v2",
             )
         return self
+
+    def assessment_evidence_ids(self) -> list[str]:
+        return list(dict.fromkeys(
+            ref for draft in self.assessment_drafts for ref in draft.all_evidence_ids()
+        ))
 
 
 class MissionTask(BaseModel):

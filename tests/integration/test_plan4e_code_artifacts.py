@@ -49,9 +49,10 @@ class CodeDouble(FakeLLMClient):
 
     async def complete_structured(self, *, messages, response_schema, system=None, **kwargs):
         await self._wait_response("complete_structured", messages)
-        if "Author a Python" in (system or ""):
+        properties = response_schema.get("properties", {})
+        if {"language", "source", "cases"} <= properties.keys():
             return dict(self.program)
-        if "Independently review" in (system or ""):
+        if {"accepted", "artifact_digest", "reason"} <= properties.keys():
             try:
                 body = json.loads(messages[0]["content"].split("\n\nPrevious attempt failed")[0])
                 digest = body.get("artifact_digest", "0" * 64)

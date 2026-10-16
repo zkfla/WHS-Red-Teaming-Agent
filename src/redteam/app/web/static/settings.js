@@ -25,8 +25,14 @@ export function setupSettings(getStore, afterApply) {
     replace(effortSelect, h("option", { value: "", text: "모델 기본값" }),
       effortLevels.map((level) => h("option", { value: level, text: level })));
     effortSelect.value = settings && settings.reasoning_effort ? settings.reasoning_effort : "";
+    const cyberPrograms = (settings && settings.cyber_access_program_options) || [];
+    const cyberSelect = $("s-cyber");
+    replace(cyberSelect, h("option", { value: "", text: "지정 안 함" }),
+      cyberPrograms.map((program) => h("option", { value: program, text: program })));
+    cyberSelect.value = settings && settings.cyber_access_program ? settings.cyber_access_program : "";
     $("s-provider").dataset.initial = $("s-provider").value;
     effortSelect.dataset.initial = effortSelect.value;
+    cyberSelect.dataset.initial = cyberSelect.value;
     $("s-key").value = "";
     $("s-persist").checked = false;
     $("s-max").value = settings && settings.max_requests ? settings.max_requests : "";
@@ -66,6 +72,10 @@ export function setupSettings(getStore, afterApply) {
     const effort = $("s-effort").value;
     if (effort !== ($("s-effort").dataset.initial || "")) {
       payload.reasoning_effort = effort || "";
+    }
+    const cyberProgram = $("s-cyber").value;
+    if (cyberProgram !== ($("s-cyber").dataset.initial || "")) {
+      payload.cyber_access_program = cyberProgram || "";
     }
     if (profile) payload.profile_id = profile;
     if (max) payload.max_requests = Number(max);

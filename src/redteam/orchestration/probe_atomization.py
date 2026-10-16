@@ -466,26 +466,6 @@ def post_update_candidates(
     return views
 
 
-def _require_initial_candidate_for_proposed_investigation(
-    *, enabled: bool, snapshot: PlanningSnapshot,
-    updates: list[HypothesisUpdate], draft: HypothesisPlanDraft,
-    questions: list[PlannedInvestigationQuestion], targets: set[str],
-) -> None:
-    """Require an initial premise only for a validated, continuing investigation."""
-    has_captured_question_target = any(
-        target in targets for question in questions for target in question.target_node_ids
-    )
-    if (
-        enabled
-        and not snapshot.candidates
-        and not updates
-        and draft.termination == "continue"
-        and questions
-        and has_captured_question_target
-    ):
-        raise AtomizationProposalError("candidate_inventory_empty_requires_new_candidate")
-
-
 def bind_plan(
     draft: HypothesisPlanDraft,
     snapshot: PlanningSnapshot,
@@ -495,7 +475,6 @@ def bind_plan(
     principals: set[str],
     max_tasks: int,
     existing_work_validator: Callable[[list[str], dict[str, int]], set[str]] | None = None,
-    require_initial_candidate: bool = False,
 ) -> tuple[list[HypothesisUpdate] | None, list[PlannedInvestigationQuestion], dict[str, int]]:
     """Resolve local references for stage-1 updates+questions without mutating originals.
 
@@ -513,14 +492,9 @@ def bind_plan(
         draft.questions, snapshot, issued=issued, targets=targets, principals=principals,
         versions=versions, candidate_views=post_update_candidates(snapshot, updates),
     )
-    result = _finish_plan_judgment(
+    return _finish_plan_judgment(
         draft, updates, questions, versions, snapshot, existing_work_validator,
     )
-    _require_initial_candidate_for_proposed_investigation(
-        enabled=require_initial_candidate, snapshot=snapshot, updates=updates,
-        draft=draft, questions=questions, targets=targets,
-    )
-    return result
 
 
 def _bind_plan_questions(
@@ -730,7 +704,6 @@ def bind_plan_selection(
     principals: set[str],
     max_tasks: int,
     existing_work_validator: Callable[[list[str], dict[str, int]], set[str]] | None = None,
-    require_initial_candidate: bool = False,
 ) -> tuple[HypothesisPlanDraft, list[HypothesisUpdate] | None,
            list[PlannedInvestigationQuestion], dict[str, int]]:
     """Wire-to-canonical stage-1 binding: (canonical draft, updates_or_None, questions, versions).
@@ -760,10 +733,6 @@ def bind_plan_selection(
     )
     finished_updates, questions, versions = _finish_plan_judgment(
         draft, updates, questions, versions, snapshot, existing_work_validator,
-    )
-    _require_initial_candidate_for_proposed_investigation(
-        enabled=require_initial_candidate, snapshot=snapshot, updates=updates,
-        draft=draft, questions=questions, targets=targets,
     )
     return draft, finished_updates, questions, versions
 

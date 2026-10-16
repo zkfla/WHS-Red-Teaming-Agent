@@ -11,6 +11,7 @@ from pydantic import ValidationError
 from redteam.app.bootstrap import build_central_graph
 from redteam.attack_graph.service import AttackGraphService
 from redteam.attack_graph.stores.central import GraphTransaction
+from redteam.core.contracts.assessment import AssessmentDraft
 from redteam.core.contracts.completion import CompletionCriterion
 from redteam.core.contracts.execution import TaskExecution
 from redteam.core.contracts.graph import Hypothesis
@@ -25,6 +26,7 @@ from redteam.orchestration.investigation_context import (
     capture_investigation_context,
     context_bytes,
 )
+from tests.fakes.assessment_drafts import draft
 from tests.unit.test_central_state import BINDING, ENG, NOW, RUN, mission, task, world
 
 
@@ -108,6 +110,40 @@ def test_frontier_size_is_bounded_and_old_source_details_remain_readable():
     candidate_view = large.query(read("candidate", "c"))
     assert candidate_view["records"][0]["data"]["revision"] == 2
     assert candidate_view["records"][0]["data"]["status"] == "held"
+
+
+def test_task_card_keeps_draft_count_identity_and_detail_pointer():
+    captured = snapshot(historical=0)
+    tasks = [
+        type(task()).model_validate_json(record.payload)
+        for record in captured.records if record.kind == "task"
+    ]
+    source = next(item for item in tasks if str(item.task_id) == "source")
+    assessment = AssessmentDraft.model_validate(draft(
+        target="host:a", evidence_id="original-old", statement="Qualified assessment claim",
+    ))
+    source = source.model_copy(update={
+        "result": source.result.model_copy(update={"assessment_drafts": [assessment]})
+    })
+    tasks = [source if str(item.task_id) == "source" else item for item in tasks]
+    reader = InvestigationContextReader(InvestigationSnapshot.create(
+        run_id=RUN, engagement_id=ENG, mission=mission(), binding_hash=BINDING,
+        tasks=tasks, candidates=[candidate()], executions=[execution()],
+    ))
+    listed = reader.query(ContextQuery(kind="task", count=8, max_bytes=16384))
+    card = next(item for item in listed["records"] if item["identity"] == "source")
+    result = card["data"]["result"]
+    assert result["assessment_draft_count"] == 1
+    assert result["assessment_drafts_omitted_count"] == 0
+    assert result["assessment_drafts"][0]["draft_id"] == "draft-a"
+    assert len(result["assessment_drafts"][0]["content_hash"]) == 64
+    assert result["assessment_drafts_detail"] == {
+        "kind": "task", "identity": "source", "section": "result",
+    }
+    detail = reader.query(read("task", "source", section="result", max_bytes=65536))
+    assert detail["records"][0]["data"]["assessment_drafts"][0]["statement"] == (
+        "Qualified assessment claim"
+    )
 
 
 def test_pages_are_bound_to_query_scope_snapshot_and_do_not_lose_records():

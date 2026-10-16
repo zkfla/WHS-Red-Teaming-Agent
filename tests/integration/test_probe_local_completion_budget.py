@@ -19,6 +19,7 @@ from redteam.llm.fake import FakeLLMClient
 from redteam.orchestration.central_runtime import process_controls
 from redteam.orchestration.operator_intents.models import IntentRecord
 from redteam.orchestration.state import TerminationReason
+from tests.fakes.worker_input import worker_input
 from tests.integration.test_central_completion import OriginalProtocolDouble
 from tests.integration.test_central_development import TOOL, call, discover, gateway, inspect, turn
 from tests.integration.test_probe_workers import drive, register, selection
@@ -36,7 +37,7 @@ class LocalCompletionLLM(FakeLLMClient):
         self.model_calls = []
 
     async def complete_native(self, messages, tools, system=None, **kwargs):
-        context = json.loads(messages[-1]["content"])
+        context = worker_input(messages)
         if (context.get("active_task") or {}).get("task_id") != self.worker:
             return NativeCompletion(text="No action for this purpose.")
         self.model_calls.append(messages)

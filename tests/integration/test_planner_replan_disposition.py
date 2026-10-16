@@ -132,10 +132,12 @@ async def test_candidate_only_continue_repairs_to_replan_in_both_probe_schemas(t
     from tests.integration.test_hypothesis_planner import candidate
 
     for index, profile in enumerate(("native-probes-legacy.yaml", "native-probes.yaml")):
+        empty_questions = {"questions": []} if profile == "native-probes.yaml" else {}
         llm = PlannerDouble([
-            {"updates": [candidate()], "reason": "Revise this candidate"},
-            {"updates": [candidate()], "reason": "Request a bounded planning pass",
-             "termination": "replan"},
+            {**empty_questions, "updates": [candidate()], "reason": "Revise this candidate",
+             "termination": "continue"},
+            {**empty_questions, "updates": [candidate()],
+             "reason": "Request a bounded planning pass", "termination": "replan"},
         ])
         async with profile_selection(
             tmp_path / str(index), profile=PROFILE.with_name(profile), llm=llm,

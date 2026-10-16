@@ -319,14 +319,16 @@ def task_settle_descriptor() -> LocalToolDescriptor:
             "success or refuted closes it completed; inconclusive or "
             "blocked records a canonical unresolved gap and blocks it. "
             "Provide outcome, reason, the stored evidence ids that prove "
-            "it, and gaps for unresolved results. The current task and its "
+            "it, and gaps for unresolved results. Matching pending final-review receipts "
+            "are applied only after the canonical assessment draft is stored, in the same "
+            "central transaction. The current task and its "
             "purpose come from the run; no path is required. 미해결 결과의 `gaps`는 "
             "문자열 배열이 아니라 비어 있지 않은 `description`이 든 객체 배열입니다 "
             "(예: `[{\"code\":\"insufficient_evidence\",\"description\":\"...\"}]`)."
         ),
         input_schema=CompletionProposal.model_json_schema(),
         contribution_id=TASK_SETTLE_CONTRIBUTION_ID,
-        version="v5", initial_exposure=True, decision_kind="settlement",
+        version="v7", initial_exposure=True, decision_kind="settlement",
     )
 
 
@@ -345,7 +347,7 @@ def goal_settle_descriptor() -> LocalToolDescriptor:
         ),
         input_schema=CompletionProposal.model_json_schema(),
         contribution_id=GOAL_SETTLE_CONTRIBUTION_ID,
-        version="v3", decision_kind="settlement",
+        version="v4", decision_kind="settlement",
     )
 
 
@@ -377,7 +379,7 @@ def evidence_read_contribution() -> Contribution:
 
     return runtime_tool_contribution(
         contribution_id=EVIDENCE_READ_CONTRIBUTION_ID,
-        version="v5", factory=factory,
+        version="v6", factory=factory,
     )
 
 

@@ -73,13 +73,9 @@ ACTIONS_SCHEMA: dict[str, Any] = {
 }
 
 SYSTEM_PROMPT = (
-    "승인된 보안 테스트의 다음 조사 행동을 계획하세요. 해결되지 않은 질문을 풀거나 "
-    "새로운 공격 표면을 드러낼 수 있는 구체적인 행동을 제안하세요. "
-    "각 행동에는 capability, operation, 대상 하나(Known targets 목록에서 그대로 복사), "
-    "그리고 필요한 arguments를 포함하세요. 고정된 메뉴에 제한되지는 않습니다. "
-    "적절하다고 판단하는 행동을 제안하세요. 실행 전에 모든 제안은 범위, 도구 카탈로그, "
-    "정책에 따라 각각 검증됩니다. 범위를 벗어나거나 지원되지 않는 제안은 "
-    "제외되므로 자유롭게 제안하되 목록에 있는 대상만 사용하세요."
+    "당신은 등록된 대상과 catalog를 바탕으로 다음 Action candidate를 제안하는 Generator다. "
+    "제공된 target node만 사용하고, capability·operation·arguments를 현재 schema로 반환한다. "
+    "제안은 실행 권한이나 성공이 아니며 이후 compiler와 Control 검사를 받아야 한다."
 )
 
 REFERENCE_DATA_RULES = """

@@ -141,11 +141,29 @@ web-http mapper registration and therefore cannot manufacture this receipt.
 Successful observation coverage still needs the normal independent Task
 review. It does not confirm a candidate, create a Finding, or satisfy the
 Mission; those retain their existing revision/purpose and evidence gates.
-A posthoc security review receipt likewise creates no Finding by itself. The
-canonical consumer is the later exact Planner confirmation: central admission
-cross-checks the receipt against its inspected originals and invokes the shared
-promotion gate atomically with the candidate revision. Promotion does not imply
-Task or Mission completion.
+A posthoc security review receipt is immutable evidence and grants no write by
+itself. Its canonical consumer is the Run-bound central review application
+service, rather than a later Planner verdict. Central admission cross-checks the
+receipt against its inspected originals, current validity, candidate
+revision/purpose, target/principals, source origins and optional stored draft.
+It then applies the candidate transition and shared promotion gate atomically in
+Central SQLite. Promotion does not imply Task or Mission completion.
+
+The Evidence Store receipt and Central application are separate durable
+boundaries. A version-3/4 receipt may therefore have `pending_task_result` until
+its exact Task result/draft is canonical. Resume retries only an explicit
+current-Run pending application. `inconclusive` means the final review did not
+settle the claim; `refused` means a structural gate permanently rejected that
+application; `retryable_error` identifies a bounded preparation/storage failure.
+These states do not create a Finding. Merely opening, inspecting or reporting a
+Run performs no application, retry or migration, and historical receipts are
+never bulk-promoted.
+
+Version-4 receipts preserve a numeric review `confidence` in the range `0.0..1.0`.
+Central admission requires `confidence >= 0.80` before a supported security claim
+can confirm its candidate and create a Finding. Lower confidence is stored as an
+inconclusive application. Version-2/3 receipts remain readable under their original
+categorical contract.
 
 ## Runtime diagnostic and review windows
 
@@ -171,6 +189,83 @@ The existing purpose/revision, original-linkage and final-admission checks
 remain mandatory when consuming public review receipts as claim support.
 `unbound` means no current reuse binding; it neither proves nor refutes an
 observation. Repeating a read does not create an original or a validity binding.
+
+### Offline field inspection
+
+`EvidenceReader.read_field` version 2 shares `resolve_output_field` and
+`validate_raw_path` (`core/evidence_paths.py`) with assessment storage validation.
+It accepts scalar, object and array references.
+It remains unavailable as a new autonomous agent tool, but the existing posthoc
+claim reviewer uses it for paths declared by a typed assessment draft. Candidate
+admission and Finding promotion still consume stored originals and receipts, not
+this display projection.
+
+The API requires Run and Engagement identity, accepts an optional exact stored
+target identity, and reads one output field with the shared
+output-relative/optional leading `output` path rule. Paths have at most 32
+segments of at most 512 characters each; negative indices are rejected. Text is
+fully redacted before any optional line filter or character slice. Offsets apply
+to that redacted, filtered field. The envelope reports total/filtered character
+counts, displayed range, omitted leading/trailing characters and display
+truncation; those counts do not describe the raw network body. Query text is not
+echoed. A query miss or partial window does not establish original-wide absence.
+The default field allowance is 4000 characters, capped by the existing 20000
+character reader maximum. This is a single-source API with no batch request or
+automatic follow-up read.
+
+Empty text, unavailable/redacted fields, absent originals, foreign scope,
+and non-TOOL sources have distinct statuses. Structured fields return `status=ok`,
+`field_kind=structured`, empty `text` and `output_fields`: at most eight scalar
+leaves, each with its full source path, displayed character ranges and omissions.
+The same text budget applies across all shown leaves; JSON objects are never
+sliced into apparent standalone values. Offset/query filtering requires a scalar
+leaf path. Optional assessment `text_span` is checked by the shared resolver and
+selects that exact redacted text range; non-text/out-of-bounds spans have explicit
+error statuses in both storage and review. Storage retention
+and transformation flags can be inspected by their own field paths: the API
+does not reconstruct missing content from digests or reinterpret preview
+truncation as display completeness. It preserves source success/uncertainty as
+display data and always reports `execution_verified=false`; stdout JSON remains
+text. Source digests are navigation data, not an integrity check. No source,
+receipt, checkpoint, stored hash or verdict is rewritten by inspection.
+
+Posthoc assessment review input is a valid structured envelope, rather than a
+2,000-character slice of a JSON document. It prioritizes observation and
+expectation paths, shows at most four windows per source and eight sources, and
+uses a 12,000-character aggregate text allowance. Each window retains its path,
+range, lengths and omission flags. Explicit support/refute windows and
+evidence-derived expectation windows are required. Context-only historical
+observation drafts retain required-source semantics; when observations explicitly
+name support/refute windows, other context windows may be unavailable without
+invalidating those essential windows. Missing/foreign originals, target/account
+proof failures and missing required fields remain UNKNOWN. Required windows omitted
+by source/window/text limits also remain UNKNOWN before any meaning-model call.
+Unreadable optional windows are shown with their status and limitations. Sources
+without selected paths get a bounded scalar-leaf projection. Generic execution meaning review uses
+bounded scalar-field windows (first and last fields when needed), so later fields
+cannot be hidden merely by a long earlier object. Task and goal completion review
+uses the same scalar-field projection instead of slicing the first 2,000 characters
+of serialized raw JSON. Long scalar fields receive explicit first and last windows;
+field paths, ranges and omitted counts stay visible. None of these projections
+reconstructs digest-only or provider-truncated content.
+
+The verifier attaches code-captured `source_review` version 2 to the public receipt,
+including the exact draft binding (when supplied), source digest, paths/spans,
+shown windows, truncation, omissions and unavailable required-window counts. The
+meaning model receives only the claim and bounded excerpts, without full execution
+or approval envelopes. Receipt storage does not reconstruct or upgrade omitted
+content. Candidate revision/purpose and reviewed Finding detail gates remain
+unchanged; readable fields and Worker assertions grant no verdict or Finding.
+
+Task completion checks execution originals separately from recognized SYSTEM
+review/diagnostic records. The latter may remain cited for condition checks but
+cannot count as an execution original or enter its raw-result proof path. A
+receipt-only completion still lacks required tool originals; directly proving
+SYSTEM evidence returns `origin_record_not_execution`, not `origin_raw_missing`.
+Unknown SYSTEM formats and foreign-scope records are not silently ignored.
+The assembled planning binding includes `evidence_field_contract_version=2`,
+including custom profiles, so old Runs remain readable but cannot resume under
+changed review semantics. Existing drafts and receipts are not rewritten.
 
 Planner and terminal reports receive bounded `runtime_records` with total and
 omitted counts, separately from Task outcomes, original evidence references

@@ -18,7 +18,18 @@ user 메시지 하나에는 현재 mission/목표, scope/ROE, 운영자 지시, 
 scope/ROE도 이 변경 자료에 남긴다. Run 간 또는 정책 변경 후 이전 범위를 고정 prefix로
 재사용하지 않는다. 각 pass는 자신의 현재 snapshot과 scoped 조회로 판단한다.
 이전 assistant 답변·추론·user 대화를 덧붙이지 않는다. 필요한 과거 의미는 기존
-canonical 결과·후보·공개 review receipt·원본 증거에서 읽는다.
+canonical 결과·후보·Finding·review application·공개 review receipt·원본 증거에서 읽는다.
+
+현재 code-owned 요청 계약은 version 9이다. 후보 inventory가 비어 있어도
+`updates=[]`와 빈 후보 참조로 제한된 초기 관측을 제안할 수 있다. 임의의 `open`
+후보를 형식상 요구하지 않는다. [plan4a 계약](central-state.md#candidate-free-initial-observation-plan4a)을
+따르며, 독립 검토·실행·완료 게이트는 유지한다. 이 version은 사용자 정의 profile에도
+planning binding으로 전달되므로 과거 계약의 Run을 새 의미로 조용히 재개하지 않는다.
+
+`candidate_review_state`는 중앙 코드가 적용한 receipt, candidate revision/status, promotion,
+Finding과 검토된 limitations의 제한된 canonical projection이다. Planner는 이를 소비해 별도 후속
+question이나 완료 판단을 제안한다. `pending_task_result`는 중앙 retry 경로가 소유한다. Planner
+output은 `review_evidence_id`를 선택하거나 `confirmed`/`rejected` transition을 제출할 수 없다.
 
 `candidate_review_support`는 표시된 현재 후보와 같은 개정의 Task/result, 결속된 source
 result, 보존 원본 참조를 연결하는 제한된 탐색 자료다. Task outcome은 후보 verdict가 아니며
@@ -52,7 +63,7 @@ version만 있는 빈 객체, 질의가 둘인 단일 항목, version과 맞지 
 전달되는 JSON schema에서도 거절한다. 런타임의 기존 같은 조건과 조회 권한은 유지한다.
 
 canonical `capture_snapshot`, related reads, exact source/result·후보 revision/purpose 검증,
-독립 public receipt, final CAS 및 종료 inventory/pending gate는 유지한다. 문맥에서 안 보인다는
+독립 public receipt의 중앙 적용, final CAS 및 종료 inventory/pending gate는 유지한다. 문맥에서 안 보인다는
 이유로 작업이 없다고 판단하지 않는다. 관련 source drift는 거부하고 무관 형제 변경은 기존
 의미대로 처리한다. atomizer는 기존의 관련 handoff, issued IDs, coverage 검증을 유지하며
 전체 Planner 자료·모델 원장을 다시 받지 않는다.
@@ -67,11 +78,12 @@ metered 요청은 semaphore/cooldown 뒤 reserve/dispatch 직전에도 검사한
 바꾸지 않는다. 검사를 통과한 뒤 응답 중 발생한 변경은 기존 최종 CAS가 계속 거절한다.
 관련 참조를 아직 알 수 없는 거절 응답에서 모든 snapshot 항목을 관련 입력으로 추측하지 않는다.
 
-Planner가 깨어난 시점의 canonical 후보 inventory가 비어 있으면 최종 judgment는 등록된
-target에 연결된 검증 전 후보를 최소 하나 제안해야 한다. 후보에는 아직 확인하지 않은 전제를
-명시하고 `open`/`inconclusive`/`held` 상태를 사용한다. 코드 validator가 이 조건을 검사하며,
-lookup-only 응답은 조회 후의 최종 judgment가 아니므로 예외다. 이 규칙은 Finding 확정 조건을
-낮추지 않으며 후보 생성 자체를 취약점 확인으로 취급하지 않는다.
+Planner가 깨어난 시점의 canonical 후보 inventory가 비어 있고 실제 관측 또는 운영자가 제공한
+구체적 전제가 없다면, 최종 judgment는 `updates=[]`와 빈 후보 참조를 가진 bounded 초기
+관측을 제안할 수 있다. 코드 validator는 형식 충족용 후보를 요구하지 않는다. 이후 보존 원본이
+시험 가능한 전제를 제공하면 후보는 그 evidence와 등록 subject를 연결하고, 관측 사실과 미시험
+전제를 구분한 뒤 결론을 구별하는 bounded 질문을 제안한다. 후보 생성 자체는 취약점 확인이나
+실행 권한이 아니다.
 
 ## provider 전달과 한계
 
@@ -92,11 +104,11 @@ HTTP JSON 필드 순서는 모델이 해석하는 prompt 순서와 같은 개념
 
 ## version과 resume
 
-10b 도입 당시 profile은 16/13이었다. 현재 `native-probes`는 profile 28 / strategy prompt 15,
-single-stage 호환 profile은 21 / planner prompt 7이다. Worker prompt는 13이며 atomizer는 8이다.
-기존 prompt SHA와 profile fingerprint가 달라지며, `specialist_planning_inputs`에도
-`planner_request_contract_version=6`를 포함한다. 활성 Planner의 candidate update는 상태를
-명시하고, review 참조는 terminal 판정에서만 소비한다. 따라서 prompt bytes가 그대로인 custom
+10b 도입 당시 profile은 16/13이었다. 현재 `native-probes`는 profile 35 / strategy prompt 21,
+single-stage 호환 profile은 27 / planner prompt 12이다. Worker prompt는 17이며 atomizer는 13이다.
+기존 prompt SHA와 profile fingerprint가 달라지며, `specialist_planning_inputs`에도 현재
+`planner_request_contract_version=9`를 포함한다. 활성 Planner의 candidate update는 상태를
+명시하되 nonterminal 상태만 제안하고 review 참조를 소비하지 않는다. 따라서 prompt bytes가 그대로인 custom
 profile도 기존 코드 계약의 Run으로 조용히 재개되지 않는다. 기존 planning binding 검사에서
 다른 입력으로 거부하고 새 Run을 사용한다. 과거 DB/보고서/checkpoint를 수정하거나 backfill하지 않는다.
 

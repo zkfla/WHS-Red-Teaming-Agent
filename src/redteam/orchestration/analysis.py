@@ -2,20 +2,28 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Callable
 from datetime import datetime, timezone
+from math import isfinite
 from typing import Any, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field
 
 from redteam.attack_graph.identity import node_id_for_target
 from redteam.core.contracts.action import ActionProposal
+from redteam.core.contracts.assessment import (
+    AssessmentDraft,
+    AssessmentDraftBinding,
+    AssessmentEvidenceRef,
+    ReviewAdoption,
+    ReviewedFindingDetail,
+)
 from redteam.core.contracts.evidence import EvidenceRecord
 from redteam.core.contracts.graph import Hypothesis
 from redteam.core.contracts.tool import ToolResult
 from redteam.core.convert import digest_payload
 from redteam.core.enums import EvidenceSourceType, Verdict
+from redteam.core.evidence_paths import EVIDENCE_FIELD_CONTRACT_VERSION
 from redteam.core.ids import (
     ActionId,
     EngagementId,
@@ -32,7 +40,12 @@ from redteam.orchestration.action_naming import tool_matches_action_namespace
 from redteam.orchestration.cognition import DecisionBudget, StructuredDecisionClient
 from redteam.orchestration.coordination import content_hash
 from redteam.orchestration.diagnostics import DecisionDiagnostic
-from redteam.orchestration.evidence_access import execution_view, raw_from_metadata
+from redteam.orchestration.evidence_access import (
+    EvidenceReader,
+    execution_view,
+    project_review_output,
+    raw_from_metadata,
+)
 from redteam.orchestration.expectations import Expectation, ExpectationOutcome, verdict_for
 from redteam.orchestration.observations.shell_execution import is_shell_execution_envelope
 from redteam.orchestration.session_proof import (
@@ -65,7 +78,11 @@ class VerificationAssessment(BaseModel):
     outcome: VerificationOutcome | None = None
     last_record_stage: str | None = None
     claim_supported: bool | None = None
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     hypothesis_outcome: VerificationOutcome | None = None
+    adopted_detail: ReviewAdoption | None = None
+    # Code-captured display windows, never model-supplied verdict authority.
+    source_review: dict[str, Any] | None = None
 
 
 class AnalysisVerifier(Protocol):
@@ -114,9 +131,12 @@ class PosthocClaimVerifier(Protocol):
 
 
 _CLAIM_SYSTEM = (
-    "보존된 원문 발췌를 근거로 새 주장을 판단하세요. 발췌가 해당 주장에 대해 "
-    "보여 주는 내용만 확인하세요. 성공했다는 말만으로는 아무것도 입증되지 않습니다. "
-    "JSON만 응답하세요."
+    "이 호출은 새 assessment claim을 보존 원본 field와 대조한다. 구조화된 source "
+    "window에 실제 표시된 scalar leaf와 경로만 판정 근거로 사용한다. supported일 "
+    "때만 adopted_detail을 반환하고 statement는 "
+    "검토 입력과 동일하게 유지한다. 그 외에는 adopted_detail=null이다. confidence는 현재 "
+    "bounded claim에 대한 판단 확신도를 0.0부터 1.0 사이로 보정하며 1.0을 기본값으로 "
+    "사용하지 않는다. JSON schema만 반환한다."
 )
 
 
@@ -177,21 +197,12 @@ class DeterministicAnalysisVerifier:
 
 
 _ANALYSIS_SYSTEM = (
-    "검증 대상 가설 주장을 도구 출력 및 사전 기록된 기대와 대조해 판단하세요. "
-    "출력이 해당 주장에 대해 보여 주는 내용만 확인하세요. 기대만으로는 결코 충분하지 "
-    "않으며, 성공했다는 말만으로는 아무것도 입증되지 않습니다. JSON만 응답하세요."
+    "이 호출은 사전 등록된 expectation과 ToolResult가 hypothesis claim을 지지하거나 "
+    "반증하는지 판정한다. meaning, outcome, reason, confidence, claim_supported를 JSON schema에 "
+    "맞춰 반환한다. expectation이나 tool success만으로 "
+    "claim_supported=true를 반환하지 않는다. confidence는 현재 bounded claim에 대한 판단 "
+    "확신도를 0.0부터 1.0 사이로 보정하며 1.0을 기본값으로 사용하지 않는다."
 )
-
-
-def _truncate_for_prompt(output: Any, *, budget: int = 2000) -> Any:
-    """Cap the payload sent out for a meaning judgment."""
-    if output is None:
-        return None
-    if isinstance(output, str):
-        text = output
-    else:
-        text = json.dumps(output, ensure_ascii=False, default=str)
-    return text if len(text) <= budget else text[:budget]
 
 
 def _claimed_principal(proposal: ActionProposal) -> str | None:
@@ -253,6 +264,8 @@ def _posthoc_source_gap(record: Any, raw: Any) -> str | None:
     """
     if record is None:
         return "linked evidence is missing"
+    if getattr(record, "source_type", None) is not EvidenceSourceType.TOOL:
+        return "linked evidence is not a tool original"
     action = getattr(record, "action_id", None)
     invocation = getattr(record, "invocation_id", None)
     if action is None or invocation is None:
@@ -781,6 +794,139 @@ class StructuredLLMAnalysisVerifier:
     ) -> VerificationAssessment:
         return await self.verify(request, budget=budget, before_call=before_call)
 
+    async def _claim_source_views(
+        self,
+        *,
+        claim: dict[str, Any],
+        evidence_ids: list[str],
+        records: dict[str, Any],
+        run_id: str,
+        engagement_id: str,
+        target_node_id: str,
+    ) -> dict[str, Any]:
+        """Build bounded, independently valid source windows for claim review.
+
+        A whole JSON document is never sliced. Assessment field references get
+        priority; structured paths use bounded scalar leaves. Sources without
+        selected paths receive a fallback projection with explicit omissions.
+        """
+        draft = None
+        if isinstance(claim.get("assessment_draft"), dict):
+            try:
+                draft = AssessmentDraft.model_validate(claim["assessment_draft"])
+            except Exception:
+                draft = None
+        selected: list[tuple[AssessmentEvidenceRef, bool]] = []
+        if draft is not None:
+            observations = [ref for item in draft.observations for ref in item.sources]
+            # Old drafts default to context. Without explicit support/refute links,
+            # their observation sources remain required; unreadable observations
+            # must not become a successful review with no shown support.
+            explicit_support = any(ref.role != "context" for ref in observations)
+            selected.extend((ref, ref.role != "context" or not explicit_support)
+                            for ref in observations)
+            selected.extend((ref, True) for ref in draft.expectation.evidence_refs)
+        paths: dict[str, list[tuple[AssessmentEvidenceRef, bool]]] = {}
+        for ref, required in selected:
+            bucket = paths.setdefault(ref.evidence_id, [])
+            if (ref, required) not in bucket:
+                bucket.append((ref, required))
+
+        reader = EvidenceReader(self._store)
+        views: list[dict[str, Any]] = []
+        remaining_chars = 12000
+        omitted_windows = 0
+        required_unavailable = sum(
+            required for identity, requested in paths.items() if identity not in evidence_ids[:8]
+            for _, required in requested
+        )
+        for evidence_id in evidence_ids[:8]:
+            record = records[evidence_id]
+            windows: list[dict[str, Any]] = []
+            requested = paths.get(evidence_id, [])
+            if requested:
+                # Essential windows consume the bounded display before optional context.
+                requested = sorted(requested, key=lambda item: not item[1])
+                for index, (ref, required) in enumerate(requested):
+                    if index >= 4 or remaining_chars <= 0:
+                        omitted_windows += 1
+                        required_unavailable += int(required)
+                        continue
+                    try:
+                        window = await reader.read_field(
+                            evidence_id, run_id, list(ref.raw_path),
+                            engagement_id=engagement_id,
+                            target_node_id=target_node_id,
+                            text_span=ref.text_span, limit=min(2000, remaining_chars),
+                        )
+                    except Exception:
+                        window = {
+                            "contract_version": 2, "status": "field_projection_failed",
+                            "raw_path": list(ref.raw_path), "text": "", "truncated": False,
+                            "note": "The selected stored field could not be projected.",
+                        }
+                    # Reader provenance, policy/audit and general transport instructions
+                    # stay outside the meaning payload. Preserve exact shown coordinates.
+                    window = {key: value for key, value in window.items() if key in {
+                        "contract_version", "status", "raw_path", "text", "text_span",
+                        "field_kind", "total_chars", "displayed_range", "truncated",
+                        "omitted_before_chars", "omitted_after_chars", "output_fields", "note",
+                        "redaction_applied", "item_count",
+                    }}
+                    window.update(role=ref.role, required=required)
+                    used = len(str(window.get("text") or ""))
+                    if "output_fields" in window:
+                        used += sum(leaf["displayed_chars"]
+                                    for leaf in window["output_fields"]["fields"])
+                    remaining_chars -= used
+                    if window.get("status") != "ok":
+                        required_unavailable += int(required)
+                    windows.append(window)
+            else:
+                raw = raw_from_metadata(getattr(record, "metadata", None))
+                allowance = min(1600, max(0, remaining_chars))
+                projected = project_review_output(
+                    raw.get("output") if isinstance(raw, dict) else None,
+                    total_limit=allowance, max_fields=4,
+                )
+                windows.append({
+                    "contract_version": 2,
+                    "status": "ok" if isinstance(raw, dict) else "output_unavailable",
+                    "raw_path": [], "output_fields": projected,
+                    "truncated": bool(projected["omitted_field_count"] or any(
+                        item["truncated"] for item in projected["fields"]
+                    )),
+                    "role": "context", "required": False,
+                    "note": "Fallback scalar-field projection; omitted content is unknown.",
+                })
+                remaining_chars -= sum(item["displayed_chars"] for item in projected["fields"])
+            metadata = record.metadata if isinstance(record.metadata, dict) else {}
+            views.append({
+                "evidence_id": evidence_id, "source_digest": record.digest,
+                "target_node_id": metadata.get("target_node_id"),
+                "source_kind": "tool_original", "windows": windows,
+                "window_count": len(windows),
+                "requested_window_count": len(requested) if requested else 1,
+            })
+        review = {
+            "contract_version": EVIDENCE_FIELD_CONTRACT_VERSION,
+            "sources": views,
+            "source_count": len(evidence_ids),
+            "shown_source_count": len(views),
+            "omitted_source_count": max(0, len(evidence_ids) - len(views)),
+            "omitted_window_count": omitted_windows,
+            "total_text_limit": 12000,
+            "remaining_text_chars": remaining_chars,
+            "required_unavailable_count": required_unavailable,
+            "note": "Each window is bounded display DATA. Truncation or a query/path miss "
+                    "does not establish absence in the stored original.",
+        }
+        if draft is not None and claim.get("assessment_draft_binding") is not None:
+            review["draft_binding"] = AssessmentDraftBinding.model_validate(
+                claim["assessment_draft_binding"],
+            ).model_dump(mode="json")
+        return review
+
     async def verify_claim_with_budget(
         self,
         *,
@@ -795,7 +941,25 @@ class StructuredLLMAnalysisVerifier:
         refs = [str(item) for item in (evidence_ids or []) if str(item).strip()]
         if not refs:
             return self._unknown_claim(refs, "no evidence reference to check")
-        excerpts: list[str] = []
+        if "assessment_draft" in claim:
+            try:
+                draft = AssessmentDraft.model_validate(claim["assessment_draft"])
+            except ValueError:
+                return self._unknown_claim(refs, "assessment draft is invalid")
+            if set(draft.original_evidence_ids()) - set(refs):
+                return self._unknown_claim(refs, "assessment source was not supplied for review")
+            if claim.get("assessment_draft_binding") is not None:
+                try:
+                    binding = AssessmentDraftBinding.model_validate(
+                        claim["assessment_draft_binding"],
+                    )
+                except ValueError:
+                    return self._unknown_claim(refs, "assessment draft binding is invalid")
+                if draft.identity(binding.result_id) != binding.model_dump(
+                    exclude={"contract_version"},
+                ):
+                    return self._unknown_claim(refs, "assessment draft binding changed")
+        source_records: dict[str, Any] = {}
         source_engagement: str | None = None
         claim_target = str(claim.get("target_node_id", "") or "").strip()
         if not claim_target:
@@ -830,23 +994,22 @@ class StructuredLLMAnalysisVerifier:
             if not target_ok:
                 return self._unknown_claim(refs, "claim target has no source-backed relation")
             assert isinstance(raw, dict)
-            metadata: Any = getattr(record, "metadata", None)
-            target_ref = (
-                metadata.get("target_node_id") if isinstance(metadata, dict) else None
-            )
-            excerpts.append(
-                json.dumps(
-                    {
-                        "evidence_id": ref,
-                        "action_id": str(getattr(record, "action_id", "")),
-                        "target_node_id": target_ref,
-                        "proposal": metadata.get("proposal"),
-                        "output": raw.get("output"),
-                    },
-                    ensure_ascii=False,
-                    default=str,
-                )[:2000]
-            )
+            source_records[ref] = record
+        excerpts = await self._claim_source_views(
+            claim=claim,
+            evidence_ids=refs,
+            records=source_records,
+            run_id=run_id,
+            engagement_id=source_engagement or "",
+            target_node_id=claim_target,
+        )
+
+        def unknown(reason: str) -> VerificationAssessment:
+            return self._unknown_claim(refs, reason).model_copy(update={"source_review": excerpts})
+
+        if (isinstance(claim.get("assessment_draft"), dict)
+                and excerpts["required_unavailable_count"]):
+            return unknown("assessment source field is unavailable")
         claimed_principals: list[str] = []
         try:
             raw_principals = claim.get("principal_refs") if isinstance(claim, dict) else None
@@ -898,8 +1061,7 @@ class StructuredLLMAnalysisVerifier:
                     if not _comparison_account_source_is_valid(
                         _meta, _raw, _stored_args
                     ):
-                        return self._unknown_claim(
-                            refs, "comparison account receipt is inconsistent"
+                        return unknown("comparison account receipt is inconsistent"
                         )
                     try:
                         if _has_raw_account_artifact(_meta, _raw, _wanted, _stored_args):
@@ -934,11 +1096,12 @@ class StructuredLLMAnalysisVerifier:
                     if _proven:
                         break
                 if not _proven:
-                    return self._unknown_claim(refs, "claimed account lacks actual-use proof")
+                    return unknown("claimed account lacks actual-use proof")
         if self._llm is None:
-            return self._unknown_claim(refs, "no model configured for review")
+            return unknown("no model configured for review")
         try:
-            response_schema = self._meaning_schema()
+            has_assessment = isinstance(claim.get("assessment_draft"), dict)
+            response_schema = self._meaning_schema(include_adoption=has_assessment)
             if claim.get("reference_hypothesis"):
                 response_schema["properties"]["hypothesis_outcome"] = {
                     "type": "string", "enum": ["success", "refuted", "unknown"],
@@ -964,18 +1127,44 @@ class StructuredLLMAnalysisVerifier:
         except Exception as exc:
             kind = getattr(exc, "kind", None)
             suffix = " (" + str(kind) + ")" if kind else ""
-            return self._unknown_claim(refs, "model decision failed" + suffix)
-        assessment = self._claim_decision(refs, meaning, security_claim=security_claim)
+            return unknown("model decision failed" + suffix)
+        assessment = self._claim_decision(
+            refs,
+            meaning,
+            security_claim=security_claim,
+            adoption_required=isinstance(claim.get("assessment_draft"), dict),
+        )
+        if assessment.adopted_detail is not None:
+            try:
+                draft = AssessmentDraft.model_validate(claim["assessment_draft"])
+            except Exception:
+                return unknown("assessment draft is invalid")
+            if " ".join(assessment.adopted_detail.statement.split()) != " ".join(
+                draft.statement.split()
+            ):
+                return unknown("reviewed detail changed the assessed claim")
         if claim.get("reference_hypothesis"):
             hyp_outcome = meaning.get("hypothesis_outcome") if isinstance(meaning, dict) else None
             if hyp_outcome not in ("success", "refuted", "unknown"):
-                return self._unknown_claim(refs, "reference hypothesis meaning not reviewed")
+                return unknown("reference hypothesis meaning not reviewed")
             if assessment.outcome not in ("success", "refuted"):
                 hyp_outcome = "unknown"
             assessment = assessment.model_copy(update={"hypothesis_outcome": hyp_outcome})
-        return assessment
+        return assessment.model_copy(update={"source_review": excerpts})
 
-    def _unknown_claim(self, refs: list[str], reason: str) -> VerificationAssessment:
+    @staticmethod
+    def _confidence(meaning: Any) -> float | None:
+        if not isinstance(meaning, dict):
+            return None
+        raw = meaning.get("confidence")
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            return None
+        value = float(raw)
+        return value if isfinite(value) and 0.0 <= value <= 1.0 else None
+
+    def _unknown_claim(
+        self, refs: list[str], reason: str, *, confidence: float | None = None,
+    ) -> VerificationAssessment:
         return VerificationAssessment(
             verdict=Verdict.UNKNOWN,
             reason=reason + "; evidence preserved, no verdict reached",
@@ -983,29 +1172,58 @@ class StructuredLLMAnalysisVerifier:
             source_refs=list(refs),
             outcome="unknown",
             claim_supported=False,
+            confidence=confidence,
         )
 
     def _claim_decision(
-        self, refs: list[str], meaning: Any, *, security_claim: bool = False
+        self,
+        refs: list[str],
+        meaning: Any,
+        *,
+        security_claim: bool = False,
+        adoption_required: bool = False,
     ) -> VerificationAssessment:
         if not isinstance(meaning, dict):
             return self._unknown_claim(refs, "model returned no decision")
+        confidence = self._confidence(meaning)
+        if confidence is None:
+            return self._unknown_claim(refs, "model omitted valid confidence")
         outcome = meaning.get("outcome")
         if outcome not in self._OUTCOMES:
-            return self._unknown_claim(refs, "model outcome uninterpretable")
+            return self._unknown_claim(
+                refs, "model outcome uninterpretable", confidence=confidence,
+            )
         supported = meaning.get("claim_supported")
         if not isinstance(supported, bool):
-            return self._unknown_claim(refs, "model omitted claim_supported")
+            return self._unknown_claim(
+                refs, "model omitted claim_supported", confidence=confidence,
+            )
         reason = str(meaning.get("reason") or "").strip()[:500]
         suffix = ": " + reason if reason else ""
         if outcome in ("unknown", "inconclusive", "blocked"):
             if supported is not False:
-                return self._unknown_claim(refs, "model reached no conclusion")
-            return self._unknown_claim(refs, "model reached no conclusion" + suffix)
+                return self._unknown_claim(
+                    refs, "model reached no conclusion", confidence=confidence,
+                )
+            return self._unknown_claim(
+                refs, "model reached no conclusion" + suffix, confidence=confidence,
+            )
         if outcome == "success" and supported is not True:
-            return self._unknown_claim(refs, "tested claim not supported" + suffix)
+            return self._unknown_claim(
+                refs, "tested claim not supported" + suffix, confidence=confidence,
+            )
         if outcome == "refuted" and supported is not False:
-            return self._unknown_claim(refs, "refuted needs an unsupported claim")
+            return self._unknown_claim(
+                refs, "refuted needs an unsupported claim", confidence=confidence,
+            )
+        adopted = None
+        if adoption_required and outcome == "success" and supported is True:
+            try:
+                adopted = ReviewAdoption.model_validate(meaning.get("adopted_detail"))
+            except Exception:
+                return self._unknown_claim(
+                    refs, "model omitted valid reviewed detail", confidence=confidence,
+                )
         return VerificationAssessment(
             # A verified runtime-known security claim is a violation; any
             # other verified new claim stays a benign pass. The verdict is
@@ -1022,6 +1240,8 @@ class StructuredLLMAnalysisVerifier:
             source_refs=list(refs),
             outcome=outcome,
             claim_supported=supported,
+            confidence=confidence,
+            adopted_detail=adopted,
         )
 
 
@@ -1107,7 +1327,7 @@ class StructuredLLMAnalysisVerifier:
             "target": str(request.proposal.target),
             "tool_id": str(request.result.tool_id),
             "success": request.result.success,
-            "output": _truncate_for_prompt(request.result.output),
+            "output": project_review_output(request.result.output),
             "error_code": request.result.error.code if request.result.error else None,
             "expectation": (
                 request.expectation.model_dump(mode="json")
@@ -1119,8 +1339,8 @@ class StructuredLLMAnalysisVerifier:
         }
 
     @staticmethod
-    def _meaning_schema() -> dict[str, Any]:
-        return {
+    def _meaning_schema(*, include_adoption: bool = False) -> dict[str, Any]:
+        schema: dict[str, Any] = {
             "type": "object",
             "properties": {
                 "meaning": {"type": "string"},
@@ -1129,12 +1349,27 @@ class StructuredLLMAnalysisVerifier:
                     "enum": ["success", "refuted", "inconclusive", "blocked", "unknown"],
                 },
                 "reason": {"type": "string"},
-                "confidence": {"type": "number"},
+                "confidence": {
+                    "type": "number",
+                    "minimum": 0.0,
+                    "maximum": 1.0,
+                    "description": "Calibrated confidence in this bounded claim judgment.",
+                },
                 "claim_supported": {"type": "boolean"},
             },
-            "required": ["meaning", "outcome", "reason", "claim_supported"],
+            "required": ["meaning", "outcome", "reason", "confidence", "claim_supported"],
             "additionalProperties": False,
         }
+        if include_adoption:
+            schema["properties"]["adopted_detail"] = {
+                "anyOf": [ReviewAdoption.model_json_schema(), {"type": "null"}],
+                "description": (
+                    "For a supported assessment, explicitly adopt reporting detail and keep "
+                    "statement equal to the reviewed statement. Otherwise return null."
+                ),
+            }
+            schema["required"].append("adopted_detail")
+        return schema
 
     async def _decide(self, request: VerificationRequest, meaning: Any) -> VerificationAssessment:
         if not isinstance(meaning, dict):
@@ -1149,6 +1384,12 @@ class StructuredLLMAnalysisVerifier:
                 "model outcome uninterpretable ("
                 + str(outcome)
                 + "); evidence preserved, no verdict reached",
+            )
+        confidence = self._confidence(meaning)
+        if confidence is None:
+            return self._unknown(
+                request,
+                "model omitted valid confidence; evidence preserved, no verdict reached",
             )
         if not request.result.success:
             code = request.result.error.code if request.result.error else "unknown_error"
@@ -1228,6 +1469,7 @@ class StructuredLLMAnalysisVerifier:
                     source_refs=request.source_refs,
                     outcome="success",
                     claim_supported=True,
+                    confidence=confidence,
                 )
             return VerificationAssessment(
                 verdict=Verdict.PASS,
@@ -1236,6 +1478,7 @@ class StructuredLLMAnalysisVerifier:
                 source_refs=request.source_refs,
                 outcome="success",
                 claim_supported=True,
+                confidence=confidence,
             )
         if assessment is not ExpectationOutcome.NOT_MET:
             return self._unknown(
@@ -1257,6 +1500,7 @@ class StructuredLLMAnalysisVerifier:
                 source_refs=request.source_refs,
                 outcome="refuted",
                 claim_supported=False,
+                confidence=confidence,
             )
         return VerificationAssessment(
             verdict=Verdict.PASS,
@@ -1265,6 +1509,7 @@ class StructuredLLMAnalysisVerifier:
             source_refs=request.source_refs,
             outcome="refuted",
             claim_supported=False,
+            confidence=confidence,
         )
 
     async def _grounding_gaps(self, request: VerificationRequest) -> list[str]:
@@ -1547,6 +1792,7 @@ async def append_review_receipt(
         "outcome": outcome,
         "reason": assessment.reason,
         "claim_supported": getattr(assessment, "claim_supported", None),
+        "confidence": assessment.confidence,
         "action_id": str(proposal.action_id),
         "invocation_id": str(result.invocation_id),
         "capability": proposal.capability,
@@ -1643,6 +1889,7 @@ async def append_posthoc_claim_receipt(
     invocation_id: str | None = None,
     target_node_id: str | None = None,
     candidate: Hypothesis | None = None,
+    reviewed_detail: ReviewedFindingDetail | None = None,
 ) -> Any | None:
     """Final-admission receipt for a posthoc common-recording review.
 
@@ -1702,7 +1949,9 @@ async def append_posthoc_claim_receipt(
             for key in ("statement", "description", "claim"):
                 value = claim.get(key)
                 if isinstance(value, str) and value.strip():
-                    statement = value.strip()[:500]
+                    statement = (
+                        value.strip() if reviewed_detail is not None else value.strip()[:500]
+                    )
                     break
     except Exception:
         statement = ""
@@ -1723,8 +1972,12 @@ async def append_posthoc_claim_receipt(
         if hasattr(assessment.verdict, "value")
         else str(assessment.verdict)
     )
+    # Every newly emitted final review uses the confidence-aware contract.
+    # A custom/legacy verifier that omits confidence cannot bypass the gate;
+    # preserve it as zero confidence while old persisted v2/v3 receipts remain readable.
+    confidence = assessment.confidence if assessment.confidence is not None else 0.0
     payload: dict[str, Any] = {
-        "review_contract_version": 2,
+        "review_contract_version": 4,
         "record_kind": "review_receipt",
         "public": True,
         "admission": "final",
@@ -1737,6 +1990,7 @@ async def append_posthoc_claim_receipt(
         "outcome": outcome,
         "reason": str(getattr(assessment, "reason", "") or "")[:500],
         "claim_supported": getattr(assessment, "claim_supported", None),
+        "confidence": confidence,
         "assessment_kind": "security_check",
         "security_violation": (
             verdict == Verdict.VIOLATION.value
@@ -1760,6 +2014,15 @@ async def append_posthoc_claim_receipt(
         "refuting_evidence_ids": refuting,
         "covered_principals": covered_principals,
     }
+    if assessment.source_review is not None:
+        payload["source_review"] = assessment.source_review
+    if reviewed_detail is not None:
+        if reviewed_detail.statement != statement:
+            return None
+        detail_refs = {ref.evidence_id for ref in reviewed_detail.evidence_refs}
+        if detail_refs - set(refs):
+            return None
+        payload["reviewed_finding_detail"] = reviewed_detail.model_dump(mode="json")
     if candidate is not None and candidate.contract_version == 2:
         from redteam.attack_graph.hypotheses import hypothesis_purpose
 

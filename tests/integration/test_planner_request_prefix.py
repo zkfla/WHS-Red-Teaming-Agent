@@ -153,9 +153,11 @@ async def test_lookup_and_mixed_reply_repair_preserve_prefix_and_refresh_request
         assert usage["spent"] == 3
 
 
+@pytest.mark.parametrize("contract", ["planner", "evidence_fields"])
 async def test_changed_code_request_contract_refuses_execution_but_preserves_original_reads(
-    tmp_path, monkeypatch,
+    tmp_path, monkeypatch, contract,
 ):
+    from redteam.core import evidence_paths
     from redteam.orchestration import hypothesis_planner
 
     llm = RequestDouble([])
@@ -163,10 +165,10 @@ async def test_changed_code_request_contract_refuses_execution_but_preserves_ori
         state = session.deps.central_state
         original = await state.get_mission(session.runtime.mission_id)
         # Same profile/prompt, changed code contract: custom profiles are covered too.
-        monkeypatch.setattr(
-            hypothesis_planner, "PLANNER_REQUEST_CONTRACT_VERSION",
-            hypothesis_planner.PLANNER_REQUEST_CONTRACT_VERSION + 1,
-        )
+        owner, field = ((hypothesis_planner, "PLANNER_REQUEST_CONTRACT_VERSION")
+                        if contract == "planner" else
+                        (evidence_paths, "EVIDENCE_FIELD_CONTRACT_VERSION"))
+        monkeypatch.setattr(owner, field, getattr(owner, field) + 1)
         with pytest.raises(StateConflict, match="central_runtime_original_binding_mismatch"):
             await runtime_token(session.deps, session.runtime, require_task=False)
         assert await state.get_mission(session.runtime.mission_id) == original

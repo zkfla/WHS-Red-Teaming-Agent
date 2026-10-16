@@ -158,7 +158,9 @@ async def test_native_worker_corrects_refused_candidate_reference_then_reaches_r
         assert submission.metadata["mission_task_id"] == result_receipt.metadata[
             "mission_task_id"
         ] == str(task_id)
-        assert await service.list_findings() == []
+        # The refused call itself wrote no Finding; the corrected call later in
+        # the same worker run applied its final review directly.
+        assert len(await service.list_findings()) == 1
 
         # The corrected call uses the admitted candidate and reaches the existing review flow.
         good = llm.results["record-good"]
@@ -166,7 +168,10 @@ async def test_native_worker_corrects_refused_candidate_reference_then_reaches_r
         finding, = good["payload"]["findings"]
         receipt_id = finding["receipt_id"]
         receipt = await session.deps.evidence_store.get(EvidenceId(receipt_id))
-        assert finding["candidate_revision"] == receipt.metadata["candidate_revision"]
+        assert finding["application"]["candidate_pre_verdict_revision"] == (
+            receipt.metadata["candidate_revision"]
+        )
+        assert finding["candidate_revision"] == 2
         assert finding["candidate_purpose_hash"] == receipt.metadata["candidate_purpose_hash"]
         assert receipt.metadata["candidate_revision"] == 1
         assert receipt.metadata["candidate_purpose_hash"] == content_hash(
@@ -174,22 +179,12 @@ async def test_native_worker_corrects_refused_candidate_reference_then_reaches_r
         assert receipt.metadata["hypothesis_outcome"] == "success"
         assert llm.meaning_calls == 1
         assert llm.observed["invocations_after_record"] == llm.observed["invocations_before_record"]
-        assert await service.list_findings() == []
+        assert len(await service.list_findings()) == 1
         after_worker = await service.get_hypothesis(current.hypothesis_id)
-        assert after_worker.status == "open" and after_worker.revision == 1
+        assert after_worker.status == "confirmed" and after_worker.revision == 2
 
-        # The Planner consumes the public review receipt from the corrected call.
+        # The final receipt, rather than a second Planner verdict, owns the transition.
         source = llm.observed["source"]
-        judged = candidate(current=current.model_dump(mode="json"), status="confirmed",
-                           evidence=[str(source.evidence_id)], review=receipt_id)
-        llm.decisions.append({"updates": [judged], "termination": "replan",
-                              "reason": "The bound independent review supports this verdict"})
-        assert await SpecialistPlanner(session.deps).advance(session.runtime) == []
-        assert len(llm.planner_inputs) == 2
-        matches = [item for item in llm.planner_inputs[-1]["review_receipts"]
-                   if item["evidence_id"] == receipt_id]
-        assert len(matches) == 1
-        assert matches[0]["metadata"]["hypothesis_outcome"] == "success"
         saved = await service.get_hypothesis(current.hypothesis_id)
         assert saved.status == "confirmed" and saved.revision == 2
         findings = await service.list_findings()

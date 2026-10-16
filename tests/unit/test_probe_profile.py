@@ -35,7 +35,7 @@ def test_probe_profile_uses_one_common_executor_and_split_atomizer():
         max_consecutive_provider_failures=6,
     )
 
-    assert loaded.profile.version == "28"
+    assert loaded.profile.version == "35"
     atomizer_id = loaded.profile.stages.get("task_atomization")
     assert atomizer_id == "probe-atomizer"
     assert atomizer_id != loaded.profile.stages["hypothesis_planning"]
@@ -46,7 +46,7 @@ def test_probe_profile_uses_one_common_executor_and_split_atomizer():
     assert not atomizer.definition.schedulable
     assert loaded.run_policy().probe_atomization is True
     assert loaded.run_policy().model_dump()["probe_atomization"] is True
-    assert "공통 검증 작업자" in loaded.prompts.compose("native_action", "native contract")
+    assert "# Verification Worker" in loaded.prompts.compose("native_action", "native contract")
     assert loaded.prompts.compose("hypothesis_planning", "native contract")
     assert loaded.prompts.compose("task_atomization", "native contract")
     assert loaded.code_artifacts_enabled
@@ -63,7 +63,7 @@ def test_probe_profile_uses_one_common_executor_and_split_atomizer():
 
 def test_legacy_single_stage_profile_has_no_atomizer():
     loaded = load_specialist_profile(LEGACY)
-    assert loaded.profile.version == "21"
+    assert loaded.profile.version == "27"
     assert loaded.run_policy().probe_limits == ProbeLimits(
         max_actions=16, max_model_requests=64, max_repair_requests=16,
         max_consecutive_provider_failures=6,
@@ -72,6 +72,10 @@ def test_legacy_single_stage_profile_has_no_atomizer():
     assert loaded.run_policy().probe_atomization is False
     assert "probe_atomization" not in loaded.run_policy().model_dump()
     assert "probe_atomization" not in loaded.profile.model_dump()
+    planner = loaded.prompts.compose("hypothesis_planning", "legacy contract")
+    assert "# Legacy Investigation Planner" in planner
+    assert "한 응답에서 수행하는 호환 Planner" in planner
+    assert planner.count("당신은") == 1
 
 
 def test_new_cli_and_application_config_default_to_candidate_profile():
@@ -123,29 +127,292 @@ def test_split_policy_serialization_keeps_legacy_fingerprints_stable():
     assert "probe_atomization" not in legacy.profile.model_dump()
 
 
-def test_active_prompt_composition_carries_depth_dispatch_and_review_rules():
+def test_plan8_prompt_and_profile_versions_are_consistent():
+    expected = {
+        "native-probes.yaml": (
+            "35",
+            {
+                "conversation.md": "4",
+                "hypothesis-strategy.md": "21",
+                "probe-atomizer.md": "13",
+                "worker.md": "17",
+                "evidence.md": "8",
+                "code.md": "4",
+            },
+        ),
+        "native-probes-legacy.yaml": (
+            "27",
+            {
+                "conversation.md": "4",
+                "hypothesis-planner.md": "12",
+                "worker.md": "17",
+                "evidence.md": "8",
+                "code.md": "4",
+            },
+        ),
+        "native-specialists.yaml": (
+            "9",
+            {
+                "conversation.md": "4",
+                "planner.md": "4",
+                "atomizer.md": "5",
+                "web.md": "4",
+                "mobile.md": "4",
+                "evidence.md": "8",
+                "code.md": "4",
+            },
+        ),
+        "native-specialists-web.yaml": (
+            "7",
+            {
+                "conversation.md": "4",
+                "planner.md": "4",
+                "atomizer.md": "5",
+                "web.md": "4",
+                "evidence.md": "8",
+                "code.md": "4",
+            },
+        ),
+    }
+    for filename, (profile_version, versions) in expected.items():
+        loaded = load_specialist_profile(PROBES.with_name(filename))
+        assert loaded.profile.version == profile_version
+        assert loaded.profile.common.version == "4"
+        assert {
+            Path(role.prompt.path).name: role.prompt.version
+            for role in loaded.profile.roles
+        } == versions
+
+
+def test_all_active_stages_fit_plan8_static_prompt_limits():
+    from redteam.app.cli.conversation import _CONVERSATION_RUNTIME_CONTRACT
+    from redteam.orchestration.analysis import _ANALYSIS_SYSTEM, _CLAIM_SYSTEM
+    from redteam.orchestration.code_artifacts import GENERATION_SYSTEM, REVIEW_SYSTEM
+    from redteam.orchestration.engine import SYSTEM
+    from redteam.orchestration.hypothesis_planner import (
+        _SINGLE_PLAN_SYSTEM,
+        _SPLIT_ATOMIZE_SYSTEM,
+        _SPLIT_PLAN_SYSTEM,
+    )
+    from redteam.orchestration.probes import PROBE_SYSTEM
+    from redteam.orchestration.result_claims import RESULT_REVIEW_INSTRUCTION
+    from redteam.orchestration.specialist_planner import (
+        ATOMIZATION_SYSTEM,
+        STRATEGY_SYSTEM,
+    )
+
+    profiles = {
+        "native-probes.yaml": {
+            "hypothesis_planning": _SPLIT_PLAN_SYSTEM,
+            "task_atomization": _SPLIT_ATOMIZE_SYSTEM,
+            "native_action": SYSTEM + PROBE_SYSTEM,
+        },
+        "native-probes-legacy.yaml": {
+            "hypothesis_planning": _SINGLE_PLAN_SYSTEM,
+            "native_action": SYSTEM + PROBE_SYSTEM,
+        },
+        "native-specialists.yaml": {
+            "attack_path_proposal": STRATEGY_SYSTEM,
+            "task_atomization": ATOMIZATION_SYSTEM,
+            "native_action": SYSTEM,
+            "path_review": RESULT_REVIEW_INSTRUCTION,
+            "path_draft": STRATEGY_SYSTEM,
+            "reference_paths": STRATEGY_SYSTEM,
+            "next_action": SYSTEM,
+        },
+        "native-specialists-web.yaml": {
+            "attack_path_proposal": STRATEGY_SYSTEM,
+            "task_atomization": ATOMIZATION_SYSTEM,
+            "native_action": SYSTEM,
+            "path_review": RESULT_REVIEW_INSTRUCTION,
+            "path_draft": STRATEGY_SYSTEM,
+            "reference_paths": STRATEGY_SYSTEM,
+            "next_action": SYSTEM,
+        },
+    }
+    shared = {
+        "conversation_decide": _CONVERSATION_RUNTIME_CONTRACT,
+        "analysis_verify": _ANALYSIS_SYSTEM,
+        "analysis_claim_verify": _CLAIM_SYSTEM,
+        "task_completion_review": RESULT_REVIEW_INSTRUCTION,
+        "goal_completion_review": RESULT_REVIEW_INSTRUCTION,
+        "terminal_criteria_review": RESULT_REVIEW_INSTRUCTION,
+        "completion_review": RESULT_REVIEW_INSTRUCTION,
+        "code_generation": GENERATION_SYSTEM,
+        "code_review": REVIEW_SYSTEM,
+    }
+    for filename, specific in profiles.items():
+        loaded = load_specialist_profile(PROBES.with_name(filename))
+        runtime_by_stage = {**shared, **specific}
+        assert loaded.profile.stages.keys() <= runtime_by_stage.keys()
+        for stage in loaded.profile.stages:
+            runtime = runtime_by_stage[stage]
+            role_prompt = loaded.prompts.compose(stage, "")
+            composed = loaded.prompts.compose(stage, runtime)
+            assert len(role_prompt.encode()) < 6 * 1024, (filename, stage)
+            assert len(runtime.encode()) < 4 * 1024, (filename, stage)
+            assert composed.count("당신은") == 1, (filename, stage)
+            if filename == "native-probes.yaml" and stage == "native_action":
+                assert len(composed.encode()) < 10 * 1024
+        if filename == "native-specialists.yaml":
+            mobile = loaded.prompts.compose(
+                "native_action", SYSTEM, role_id="mobile-executor",
+            )
+            assert len(mobile.encode()) < 10 * 1024
+            assert mobile.count("당신은") == 1
+
+    prompt_root = PROBES.parent / "prompts"
+    assert sum(path.stat().st_size for path in prompt_root.glob("*.md")) < 65 * 1024 / 2
+
+
+def test_common_roles_and_runtime_contracts_do_not_repeat_three_sentence_blocks():
+    import re
+
+    from redteam.app.cli.conversation import _CONVERSATION_RUNTIME_CONTRACT
+    from redteam.orchestration.analysis import _ANALYSIS_SYSTEM, _CLAIM_SYSTEM
+    from redteam.orchestration.code_artifacts import GENERATION_SYSTEM, REVIEW_SYSTEM
+    from redteam.orchestration.engine import SYSTEM
+    from redteam.orchestration.hypothesis_planner import (
+        _SINGLE_PLAN_SYSTEM,
+        _SPLIT_ATOMIZE_SYSTEM,
+        _SPLIT_PLAN_SYSTEM,
+    )
+    from redteam.orchestration.probes import PROBE_SYSTEM
+    from redteam.orchestration.specialist_planner import (
+        ATOMIZATION_SYSTEM,
+        STRATEGY_SYSTEM,
+    )
+
+    prompt_root = PROBES.parent / "prompts"
+    documents = {"common": (prompt_root / "common.md").read_text()}
+    documents.update({
+        "role:" + path.name: path.read_text()
+        for path in prompt_root.glob("*.md")
+        if path.name != "common.md"
+    })
+    runtime_contracts = (
+        _CONVERSATION_RUNTIME_CONTRACT,
+        _ANALYSIS_SYSTEM,
+        _CLAIM_SYSTEM,
+        GENERATION_SYSTEM,
+        REVIEW_SYSTEM,
+        SYSTEM,
+        _SINGLE_PLAN_SYSTEM,
+        _SPLIT_PLAN_SYSTEM,
+        _SPLIT_ATOMIZE_SYSTEM,
+        PROBE_SYSTEM,
+        ATOMIZATION_SYSTEM,
+        STRATEGY_SYSTEM,
+    )
+    documents.update({
+        f"runtime:{index}": contract
+        for index, contract in enumerate(runtime_contracts)
+    })
+
+    def windows(text):
+        normalized = re.sub(r"[`#*]", "", text)
+        normalized = re.sub(r"\s+", " ", normalized)
+        sentences = [
+            item.strip()
+            for item in re.split(r"(?<=[.!?])\s+", normalized)
+            if item.strip()
+        ]
+        return {
+            tuple(sentences[index:index + 3])
+            for index in range(max(0, len(sentences) - 2))
+        }
+
+    blocks = {name: windows(text) for name, text in documents.items()}
+    names = sorted(blocks)
+    for index, left in enumerate(names):
+        for right in names[index + 1:]:
+            if left.startswith("runtime:") and right.startswith("runtime:"):
+                continue
+            assert not blocks[left].intersection(blocks[right]), (left, right)
+
+
+def test_active_prompt_composition_assigns_one_responsibility_per_stage():
+    from redteam.orchestration.analysis import _ANALYSIS_SYSTEM, _CLAIM_SYSTEM
+    from redteam.orchestration.code_artifacts import GENERATION_SYSTEM, REVIEW_SYSTEM
+    from redteam.orchestration.hypothesis_planner import (
+        _SPLIT_ATOMIZE_SYSTEM,
+        _SPLIT_PLAN_SYSTEM,
+        FEEDBACK_SYSTEM,
+    )
+    from redteam.orchestration.probes import PROBE_SYSTEM
+
     loaded = load_specialist_profile(PROBES)
+    conversation = loaded.prompts.compose("conversation_decide", "runtime contract")
     strategy = loaded.prompts.compose("hypothesis_planning", "runtime contract")
     atomizer = loaded.prompts.compose("task_atomization", "runtime contract")
-    worker = loaded.prompts.compose("native_action", "runtime contract")
-    reviewer = loaded.prompts.compose("analysis_verify", "runtime contract")
+    worker_role = loaded.prompts.compose("native_action", "")
+    reviewer_role = loaded.prompts.compose("analysis_verify", "")
+    author_role = loaded.prompts.compose("code_generation", "")
+    worker = loaded.prompts.compose("native_action", PROBE_SYSTEM)
+    reviewer = loaded.prompts.compose("analysis_verify", _ANALYSIS_SYSTEM)
+    author = loaded.prompts.compose("code_generation", GENERATION_SYSTEM)
+    artifact_review = loaded.prompts.compose("code_review", REVIEW_SYSTEM)
 
-    assert "깊이가 커버리지보다 우선한다" in strategy
-    assert "2~3개 가설 경로" in strategy
-    assert "가장 강한 고가치 증거 경로" in strategy
-    assert "앞 단계의 실제 출력" in strategy
-    assert "캡처된 후보 결속 사후 검토 기록" in strategy
-    assert (
-        "증거와 범위에 맞는 유용한 경로를 평가했고 "
-        "지금 이어갈 승인된 조사가 남지 않은 판단"
-    ) in strategy
-    assert "미래에 어떤 새 증거나 조건 변화가 생기면 재평가할지" in strategy
-    assert "미래 결과를 전제로 한 의존성 DAG" in atomizer
-    assert "앞 task의 실제 출력" in atomizer
-    assert "도구 호출 수가 아니라 저장된" in worker
-    assert "호출 수·재시도 수·검색량만으로" in worker
-    assert "일치하는 공개 검토 receipt는 독립 판단 기록" in reviewer
-    assert "Finding 또는 Mission 완료를 자동 확정하지 않는다" in reviewer
+    assert "# Conversation Liaison" in conversation
+    assert "운영자와 조사 런타임 사이의 대화 담당자" in conversation
+    assert conversation.count("당신은") == 1
+    assert "# Investigation Planner" in strategy
+    assert "다음 보안 질문을 선택하는 Planner" in strategy
+    assert strategy.count("당신은") == 1
+    assert "candidate_refs=[]" in strategy
+    assert "Worker Task와 도구 호출 순서는 만들지 않는다" in strategy
+    assert "Finding promotion과 Mission 완료를 구분" in strategy
+    assert "# Probe Atomizer" in atomizer
+    assert "question을 실행 가능한 Probe Task로 변환" in atomizer
+    assert atomizer.count("당신은") == 1
+    assert "question을 다시 기획하거나 새 candidate" in atomizer
+    assert "criterion을 정확히 한 Task에 배정" in atomizer
+    assert "새 Kali-backed 대상 관측" in atomizer
+    assert "# Verification Worker" in worker
+    assert "하나의 Probe Task를 수행하는 Worker" in worker
+    assert worker.count("당신은") == 1
+    assert "`graph.record`의 `facts` 입력" in worker
+    assert "graph.record.facts" not in worker
+    assert "graph.record.branches" not in worker
+    assert "`evidence.read`로" in worker
+    assert "`task.settle`로 한 번 반환하고 멈춘다" in worker
+    assert "# Evidence Reviewer" in reviewer
+    assert "독립된 원본 증거 검토자" in reviewer
+    assert reviewer.count("당신은") == 1
+    assert "`raw_path`/window를 판독" in reviewer
+    assert "대상 호출, candidate update, Finding promotion" in reviewer
+    assert "evidence.read" not in reviewer
+    assert "# Artifact Author" in author
+    assert "합성 재현 artifact를 작성하는 코드 작성자" in author
+    assert author.count("당신은") == 1
+    assert "fixture 성공을 실제 대상 재현이나 Finding으로 주장하지 않는다" in author
+    assert "구조화된 정책에 없는 blanket 제한" in strategy
+    assert "정책에 없는 읽기 전용·특정 기법 금지" in atomizer
+    assert "현재 catalog에 노출된 Kali-backed 외부 실행 도구" in worker
+    assert len(conversation.encode()) < 6 * 1024
+    assert len(strategy.encode()) < 6 * 1024
+    assert len(atomizer.encode()) < 6 * 1024
+    assert len(worker_role.encode()) < 6 * 1024
+    assert len(reviewer_role.encode()) < 6 * 1024
+    assert len(author_role.encode()) < 6 * 1024
+    assert len(worker.encode()) < 10 * 1024
+    assert len(reviewer.encode()) < 10 * 1024
+    assert len(author.encode()) < 10 * 1024
+    assert len(artifact_review.encode()) < 10 * 1024
+    assert len(FEEDBACK_SYSTEM.encode()) < 4 * 1024
+    assert len(_SPLIT_PLAN_SYSTEM.encode()) < 4 * 1024
+    assert len(_SPLIT_ATOMIZE_SYSTEM.encode()) < 4 * 1024
+    assert len(PROBE_SYSTEM.encode()) < 4 * 1024
+    assert len(_CLAIM_SYSTEM.encode()) < 4 * 1024
+    assert len(_ANALYSIS_SYSTEM.encode()) < 4 * 1024
+    assert len(GENERATION_SYSTEM.encode()) < 4 * 1024
+    assert len(REVIEW_SYSTEM.encode()) < 4 * 1024
+    assert "physical_cap.budget_available=false" in PROBE_SYSTEM
+    assert "pending/running/UNKNOWN invocation은 원래 ID를 보존" in PROBE_SYSTEM
+    assert "supported일 때만 adopted_detail" in _CLAIM_SYSTEM
+    assert "expectation이나 tool success만으로" in _ANALYSIS_SYSTEM
+    assert "source window 밖의 대상 정보" in GENERATION_SYSTEM
+    assert "artifact digest를 변경 없이 반환" in REVIEW_SYSTEM
 
 
 def test_alternate_specialist_profiles_compose_the_same_methodology():
@@ -157,15 +424,17 @@ def test_alternate_specialist_profiles_compose_the_same_methodology():
         executor = loaded.prompts.compose("native_action", "runtime contract")
         reviewer = loaded.prompts.compose("analysis_verify", "runtime contract")
 
-        assert "깊이가 coverage보다 우선한다" in strategy
-        assert "2~3개 경로" in strategy
-        assert "실제 출력" in strategy
-        assert "외부 선행 조건에 막혀 있으면" in strategy
-        assert "모두 평가해 현재 진행할 유용한 조사가 남지 않았다면" in strategy
-        assert "입력에 없는 의존성 DAG" in atomizer
-        assert "호출 수는 진전이 아니다" in executor
-        assert "일치하는 공개 검토 receipt는 독립 판단 기록" in reviewer
-        assert "Finding 또는 Mission 완료를 자동 확정하지 않는다" in reviewer
+        assert "# Attack-path Planner" in strategy
+        assert "깊이를 coverage보다 우선" in strategy
+        assert strategy.count("당신은") == 1
+        assert "# Specialist Task Atomizer" in atomizer
+        assert "question을 다시 기획하거나 새 subject" in atomizer
+        assert atomizer.count("당신은") == 1
+        assert "# Web Verification Worker" in executor
+        assert "preview에 필요한 내용이 없으면 보존 원본 field를 읽고" in executor
+        assert executor.count("당신은") == 1
+        assert "독립된 원본 증거 검토자" in reviewer
+        assert "대상 호출, candidate update, Finding promotion" in reviewer
 
 
 def _split_raw():

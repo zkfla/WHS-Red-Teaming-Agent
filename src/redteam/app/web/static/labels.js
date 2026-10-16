@@ -84,6 +84,7 @@ export const FIELD = {
   provider: "LLM 제공자",
   model: "LLM 모델",
   reasoning_effort: "추론 강도 (effort)",
+  cyber_access_program: "Cyber access program",
   api_key: "API 키",
   profile_id: "에이전트 프로필",
   llm_request_policy: "LLM 요청 한도",

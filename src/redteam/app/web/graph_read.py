@@ -15,7 +15,7 @@ from typing import Any
 from redteam.app.web.graph_model import GraphRaw, build_graph
 from redteam.attack_graph.predicates import facts_of
 from redteam.core.contracts.execution import TaskExecution
-from redteam.core.contracts.graph import Hypothesis
+from redteam.core.contracts.graph import Finding, Hypothesis
 from redteam.core.enums import GraphNodeType
 from redteam.orchestration.central_state import CentralStateStore, CentralTransaction
 from redteam.orchestration.coordination import CoordinationError, StateConflict
@@ -49,8 +49,17 @@ def _collect(tx: CentralTransaction) -> GraphRaw:
         "SELECT payload FROM state_outbox WHERE run_id=? ORDER BY sequence DESC LIMIT ?",
         (run, EVENT_WINDOW),
     ).fetchall()
-    finding_facts = [facts_of(node.properties)
-                     for node in tx.graph.query(node_type=GraphNodeType.FINDING)]
+    run_evidence_ids = {
+        str(row[0]) for row in db.execute(
+            "SELECT evidence_id FROM state_evidence_refs WHERE run_id=?", (run,),
+        )
+    }
+    finding_facts = [
+        facts
+        for node in tx.graph.query(node_type=GraphNodeType.FINDING)
+        if (facts := facts_of(node.properties))
+        and not set(facts.get("evidence_ids", [])).isdisjoint(run_evidence_ids)
+    ]
     return GraphRaw(
         run_id=run,
         mission=tx.get_mission(mission_id),
@@ -71,6 +80,8 @@ def _collect(tx: CentralTransaction) -> GraphRaw:
         finding_count=len(finding_facts),
         verified_finding_count=sum(item.get("verified") is True for item in finding_facts),
         candidate_finding_promotions=_request_rows(tx, "candidate_finding_promotion"),
+        candidate_review_applications=_request_rows(tx, "candidate_review_application"),
+        findings=[Finding.model_validate(item) for item in finding_facts],
         events=[json.loads(row[0]) for row in events],
         budget_remaining=tx.policy_budget_remaining(),
     )

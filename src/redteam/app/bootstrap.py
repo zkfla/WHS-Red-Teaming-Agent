@@ -175,6 +175,7 @@ def build_llm_client(config: LLMConfig) -> LLMClient:
             model=config.default_model,
             api_key=config.resolve_api_key(),
             reasoning_effort=config.reasoning_effort,
+            cyber_access_program=config.cyber_access_program,
             api_key_env_var=config.api_key_env_var,
         )
     from redteam.llm.opencode_go_config import (
@@ -230,6 +231,30 @@ def _trusted_termination_servers(verified_deployment) -> tuple[str, ...]:
         if (definition := role_spec(role)) is not None
         and definition.supports_execution_termination
     )
+
+
+def _prepared_target_external_servers(server_ids, verified_deployment) -> list[str]:
+    """Keep providers that do not belong to the host-side target deployment.
+
+    A verified web deployment launches its declared roles as local MCP
+    processes. Those processes do not inherit a prepared Docker target
+    route. When that route is selected, route-backed replacements are
+    registered separately as built-in providers; retaining the host-side
+    copy would advertise a healthy tool that cannot reach the selected
+    target.
+    """
+    if verified_deployment is None:
+        return list(server_ids)
+    host_side_roles = frozenset(verified_deployment.spec.roles)
+    return [server_id for server_id in server_ids if server_id not in host_side_roles]
+
+
+def _registered_termination_servers(
+    trusted_servers, server_ids, builtin_adapters,
+) -> tuple[str, ...]:
+    """Retain termination trust only for providers present in the final gateway."""
+    registered = set(server_ids) | {adapter.server_id for adapter in builtin_adapters}
+    return tuple(server_id for server_id in trusted_servers if server_id in registered)
 
 
 async def _build_default_tool_gateway(config: CapabilityConfig) -> ToolGateway:
@@ -512,11 +537,11 @@ async def build_application(
         _extension, direct_executor, _descriptors = configure_direct_target(
             shell, engagement.scope, provider_config
         )
-        # A fully verified local deployment may replace only the web-http
-        # transport with the canonical in-process provider.  Discovery keeps
-        # the same server id / ToolIds / operations, while execution moves
-        # into the selected Kali workroom.  Manual and remote deployments are
-        # left unchanged because they do not establish this binding.
+        # A fully verified local deployment may replace the web-http transport
+        # with the canonical in-process provider. Discovery keeps the same
+        # server id / ToolIds / operations, while execution moves into the
+        # selected Kali workroom. Manual and remote deployments are left
+        # unchanged because they do not establish this binding.
         if (
             verified_mcp_deployment is not None
             and "web-http" in verified_mcp_deployment.spec.roles
@@ -541,14 +566,34 @@ async def build_application(
             builtin_output_limits = {
                 **dict(builtin_output_limits or {}), "web-http": role.max_output_bytes,
             }
+        if verified_mcp_deployment is not None:
+            # Every role in this verified deployment would otherwise run as a
+            # host-side stdio process. It cannot share the prepared Docker
+            # route merely because its health/discovery call succeeded. Keep
+            # only separately registered route-backed replacements.
             config = config.model_copy(update={"capability": config.capability.model_copy(
-                update={"mcp_servers": [
-                    item for item in config.capability.mcp_servers if item != "web-http"
-                ]}
+                update={"mcp_servers": _prepared_target_external_servers(
+                    config.capability.mcp_servers, verified_mcp_deployment,
+                )}
             )})
+            trusted_termination_servers = _registered_termination_servers(
+                trusted_termination_servers,
+                config.capability.mcp_servers,
+                builtin_adapters,
+            )
     resolved_attack_graph = attack_graph or (build_central_graph(central_state))
     resolved_llm = llm or build_llm_client(config.llm)
     llm_connection_fingerprint = getattr(resolved_llm, "connection_fingerprint", None)
+
+    from redteam.orchestration.candidate_review_application import (
+        CandidateReviewApplicationService,
+    )
+
+    candidate_review_applicator = CandidateReviewApplicationService(
+        evidence_store=resolved_evidence_store,
+        graph_store=resolved_attack_graph,
+        central_state=central_state,
+    )
 
     from redteam.orchestration.metered_llm import RunMeteredLLM
 
@@ -566,6 +611,7 @@ async def build_application(
             evidence_store=resolved_evidence_store,
             graph_store=resolved_attack_graph,
             settings=resolved_settings,
+            candidate_review_applicator=candidate_review_applicator,
         ),
     )
 
@@ -592,6 +638,7 @@ async def build_application(
             resolved_evidence_store,
             resolved_attack_graph,
             settings=resolved_settings,
+            candidate_review_applicator=candidate_review_applicator,
         ),
         extension_assembly,
         planning_provider_id=config.planning_provider,
@@ -692,6 +739,7 @@ async def build_application(
 
     register_result_tool(profile_components.local_tools)
     resolved_event_bus = CentralEventBus(central_state, resolved_event_bus)
+    candidate_review_applicator.bind_event_bus(resolved_event_bus)
     component_binding = component_binding.model_copy(update={
         "extension_versions": {**component_binding.extension_versions, "central-runtime": "1"},
     })
@@ -776,6 +824,7 @@ async def build_application(
         operation_bindings=profile_components.operation_bindings,
         execution_recipes=profile_components.execution_recipes,
         retry_policy=profile_components.retry_policy,
+        candidate_review_applicator=candidate_review_applicator,
         local_tools=profile_components.local_tools,
         tool_catalog=resolved_tool_catalog,
         work_store=(None),

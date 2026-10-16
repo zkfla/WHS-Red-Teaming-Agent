@@ -1,7 +1,7 @@
-"""Native worker reaches a public graph.record review receipt, then the Planner consumes it.
+"""Native worker reaches a public review receipt that Central State applies directly.
 
 Real native probe loop, real tool.get_detail discovery, real GraphRecordingHandler, real
-StructuredLLMAnalysisVerifier, and real Planner admission. Only model turns are scripted, and
+StructuredLLMAnalysisVerifier, and real central admission. Only model turns are scripted, and
 the review meaning comes from an explicit fake meaning model. This is protocol evidence, not a
 provider proof. The only target call is the one synthetic original inspection.
 """
@@ -12,7 +12,6 @@ import pytest
 
 from redteam.attack_graph.hypotheses import hypothesis_purpose
 from redteam.attack_graph.service import AttackGraphService
-from redteam.core.enums import MissionStatus
 from redteam.core.ids import EvidenceId
 from redteam.core.ports.llm import NativeCompletion
 from redteam.llm.fake import FakeLLMClient
@@ -23,7 +22,7 @@ from redteam.orchestration.specialist_planner import SpecialistPlanner
 from redteam.orchestration.specialist_tasks import HypothesisProbeProposal, register_probe_tasks
 from redteam.orchestration.tool_discovery import TOOL_GET_DETAIL_ID
 from tests.integration.test_central_development import TARGET, TOOL, call, inspect, turn
-from tests.integration.test_hypothesis_planner import candidate, held, probe, selection
+from tests.integration.test_hypothesis_planner import candidate, probe, selection
 from tests.integration.test_probe_workers import drive
 
 DETAIL = exposed_tool_name(TOOL_GET_DETAIL_ID)
@@ -148,8 +147,8 @@ async def _admit(session, identity, update):
     )
 
 
-@pytest.mark.parametrize("outcome", ["success", "unknown"])
-async def test_native_worker_discovers_graph_record_and_planner_consumes_its_receipt(
+@pytest.mark.parametrize("outcome", ["success", "refuted", "unknown"])
+async def test_native_worker_review_is_applied_without_a_second_planner_verdict(
     tmp_path, outcome,
 ):
     opening = {"updates": [candidate()], "tasks": [_task()],
@@ -189,44 +188,32 @@ async def test_native_worker_discovers_graph_record_and_planner_consumes_its_rec
         assert llm.meaning_calls == 1
         # Posthoc review adds no target execution after the original inspection.
         assert llm.observed["invocations_after_record"] == llm.observed["invocations_before_record"]
-        # A Task observation and its receipt never confirm or refute the candidate by themselves.
+        application = finding["application"]
         after_worker = await service.get_hypothesis(current.hypothesis_id)
-        assert after_worker.status == "open" and after_worker.revision == 1
-
-        def matching_receipts(wake):
-            return [item for item in wake["review_receipts"] if item["evidence_id"] == receipt_id]
-
         if outcome == "unknown":
-            llm.decisions.append(held("Review did not settle the candidate"))
-            assert await SpecialistPlanner(session.deps).advance(session.runtime) == []
-            assert len(llm.planner_inputs) == 2
-            matches = matching_receipts(llm.planner_inputs[-1])
-            assert len(matches) == 1 and matches[0]["metadata"]["hypothesis_outcome"] == "unknown"
-            saved = await service.get_hypothesis(current.hypothesis_id)
-            assert saved.status == "open" and saved.revision == 1
-            mission = await session.deps.central_state.get_mission(session.runtime.mission_id)
-            assert mission.status is MissionStatus.ACTIVE
+            assert application["status"] == "inconclusive"
+            assert after_worker.status == "open" and after_worker.revision == 1
             # UNKNOWN never admits a verdict, even when a confirmation is proposed directly.
             with pytest.raises(StateConflict, match="candidate_verdict_unproven"):
                 await _admit(session, "unknown-confirm", candidate(
-                    current=saved.model_dump(mode="json"), status="confirmed",
+                    current=after_worker.model_dump(mode="json"), status="confirmed",
                     evidence=[str(source.evidence_id)], review=receipt_id,
                 ))
             assert await service.list_findings() == []
             assert await session.deps.central_state.candidate_finding_promotions() == []
             return
+        if outcome == "refuted":
+            assert application["status"] == "candidate_rejected"
+            assert after_worker.status == "rejected" and after_worker.revision == 2
+            assert await service.list_findings() == []
+            promotion, = await session.deps.central_state.candidate_finding_promotions()
+            assert promotion["status"] == "candidate_rejected"
+            assert promotion["finding_id"] is None
+            return
 
-        judged = candidate(current=current.model_dump(mode="json"), status="confirmed",
-                           evidence=[str(source.evidence_id)], review=receipt_id)
-        llm.decisions.append({"updates": [judged], "termination": "replan",
-                              "reason": "The bound independent review supports this verdict"})
-        assert await SpecialistPlanner(session.deps).advance(session.runtime) == []
-        assert len(llm.planner_inputs) == 2
-        matches = matching_receipts(llm.planner_inputs[-1])
-        assert len(matches) == 1
-        assert matches[0]["metadata"]["hypothesis_outcome"] == "success"
-        saved = await service.get_hypothesis(current.hypothesis_id)
-        assert saved.status == "confirmed" and saved.revision == 2
+        assert application["status"] == "promoted"
+        assert after_worker.status == "confirmed" and after_worker.revision == 2
+        assert len(llm.planner_inputs) == 1
         findings = await service.list_findings()
         assert len(findings) == 1
         finding, = findings

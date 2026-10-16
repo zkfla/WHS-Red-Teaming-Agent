@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from pydantic_core import PydanticCustomError
 
 from redteam.attack_graph.predicates import facts_of
+from redteam.core.contracts.assessment import AssessmentDraft
 from redteam.core.contracts.execution import TaskExecution
 from redteam.core.contracts.graph import GraphEdge, GraphNode, Hypothesis
 from redteam.core.contracts.mission import MissionPlan, MissionTask, redact_secret_material
@@ -483,10 +484,45 @@ class InvestigationContextReader:
             body = {field: item.get(field) for field in fields}
             result = item.get("result")
             if isinstance(result, dict):
-                body["result"] = {field: result.get(field) for field in (
+                result_body = {field: result.get(field) for field in (
                     "result_id", "outcome", "summary", "observations", "limitations",
                     "evidence_ids", "questions", "hypothesis_ids", "completion_receipt_id",
                 )}
+                body["result"] = result_body
+                drafts = result.get("assessment_drafts")
+                if isinstance(drafts, list):
+                    cards = []
+                    for raw in drafts[:4]:
+                        try:
+                            draft = AssessmentDraft.model_validate(raw)
+                        except Exception:
+                            continue
+                        cards.append({
+                            "draft_id": draft.draft_id,
+                            "content_hash": draft.identity(str(result.get("result_id") or ""))[
+                                "content_hash"
+                            ],
+                            "name": draft.name,
+                            "vulnclass": draft.vulnclass,
+                            "statement": draft.statement,
+                            "judgment": draft.judgment,
+                            "severity": draft.severity,
+                            "target_node_id": draft.target_node_id,
+                            "hypothesis_id": draft.hypothesis_id,
+                            "evidence_ids": draft.original_evidence_ids(),
+                            "limitation_count": len(draft.limitations),
+                            "alternative_explanation_count": len(
+                                draft.alternative_explanations
+                            ),
+                        })
+                    result_body.update(
+                        assessment_draft_count=len(drafts),
+                        assessment_drafts=cards,
+                        assessment_drafts_omitted_count=max(0, len(drafts) - len(cards)),
+                        assessment_drafts_detail={
+                            "kind": "task", "identity": identity, "section": "result"
+                        },
+                    )
             body["completion_criteria_count"] = len(item.get("completion_criteria", []))
         elif kind == "candidate":
             body = {field: item.get(field) for field in (

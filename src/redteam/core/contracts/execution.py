@@ -129,6 +129,7 @@ class ExecutionOutcomeProjection(BaseModel):
 
     result_kind: ExecutionResultKind
     success: bool | None = None
+    receipt_provider: str | None = Field(default=None, min_length=1, max_length=128)
     executed_program: str | None = Field(default=None, min_length=1, max_length=256)
     program_executable: str | None = Field(default=None, min_length=1, max_length=4096)
     diagnostic_category: ExecutionDiagnosticCategory | None = None

@@ -60,11 +60,22 @@ from redteam.attack_graph.predicates import (
     Provenance,
 )
 from redteam.attack_graph.service import AttackGraphService
+from redteam.core.contracts.assessment import (
+    AssessmentDraft,
+    AssessmentDraftBinding,
+    AssessmentEvidenceRef,
+    ReviewedFindingDetail,
+)
+from redteam.core.contracts.assessment import (
+    FindingDraft as SharedFindingDraft,
+)
 from redteam.core.contracts.evidence import EvidenceRecord
 from redteam.core.contracts.graph import Hypothesis
 from redteam.core.contracts.target import EndpointTarget, HostTarget, TargetRef, UrlTarget
 from redteam.core.convert import digest_payload
 from redteam.core.enums import EvidenceSourceType, GraphEdgeType
+from redteam.core.evidence_paths import RAW_PATH_RULE as _RAW_PATH_RULE
+from redteam.core.evidence_paths import walk_output as _walk_output
 from redteam.core.extensions import Contribution
 from redteam.core.ids import EngagementId, EvidenceId, RunId, new_id
 from redteam.orchestration.analysis import (
@@ -125,16 +136,10 @@ class NewEntityDecl(BaseModel):
 #: consumes it once, so quoting it as the leading segment stays equivalent.
 _OUTPUT_ENVELOPE_KEY = "output"
 
-#: Single source of the model-visible pointer rule; the field descriptions
-#: and the tool descriptor reuse it so the published contract cannot drift.
-_RAW_PATH_RULE = (
-    "The stored raw payload is the full ToolResult dict, and the pointer "
-    "addresses its preserved output: a segment is a dict key or a list "
-    "index, written as decimal text or as an integer. The output-relative "
-    "form lists keys under that output; the equivalent envelope-prefixed "
-    "form may start with the envelope key 'output', which is consumed once "
-    "(['output'] addresses the whole output, as does an empty path)."
-)
+class FindingDraft(SharedFindingDraft):
+    # Keep the legacy checkpoint type address and recording schema. Claim
+    # fields are owned by core; this wrapper adds no separate semantics.
+    pass
 
 
 class RecordedFact(BaseModel):
@@ -186,24 +191,6 @@ class HypothesisDraft(BaseModel):
     )
 
 
-class FindingDraft(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    statement: str = Field(min_length=1)
-    evidence_refs: list[str] = Field(default_factory=list)
-    target_node_id: str | None = None
-    hypothesis_id: str | None = None
-    severity: str = "medium"
-    principal_refs: list[str] = Field(
-        default_factory=list,
-        description=(
-            "Accounts this vulnerability claim is about, if the claim "
-            "names any. Optional: observations without an asserted account "
-            "must not invent one. Each named account needs actual-use proof."
-        ),
-    )
-
-
 class BranchNote(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -218,50 +205,14 @@ class GraphRecordingInput(BaseModel):
     facts: list[RecordedFact] = Field(default_factory=list)
     hypotheses: list[HypothesisDraft] = Field(default_factory=list)
     findings: list[FindingDraft] = Field(default_factory=list)
+    assessment_findings: list[AssessmentDraft] = Field(
+        default_factory=list,
+        description=(
+            "Versioned Worker assessment drafts to review against their exact source fields. "
+            "They remain proposals until the existing candidate and promotion gates accept them."
+        ),
+    )
     branches: list[BranchNote] = Field(default_factory=list)
-
-
-def _locate(raw: Any, path: list[str | int]) -> tuple[bool, Any]:
-    """Walk dict keys / list indices. Never raises for a bad path."""
-    node = raw
-    for part in path:
-        if isinstance(node, dict):
-            if not isinstance(part, str):
-                part = str(part)
-            if part not in node:
-                return False, None
-            node = node[part]
-        elif isinstance(node, (list, tuple)):
-            if not isinstance(part, int):
-                try:
-                    part = int(part)
-                except (TypeError, ValueError):
-                    return False, None
-            try:
-                node = node[part]
-            except (IndexError, TypeError):
-                return False, None
-        else:
-            return False, None
-    return True, node
-
-
-def _walk_output(output: Any, path: list[str | int]) -> tuple[bool, Any]:
-    """Locate one pointer under the preserved output.
-
-    The pointer is tried exactly as sent. Only when it does not resolve and
-    it starts with the envelope key ``output`` is that single leading
-    segment dropped once, so the output-relative form and the
-    envelope-prefixed form address the same stored location. A pointer that
-    already resolves is never re-pointed, so a value mismatch at the sent
-    location stays a mismatch.
-    """
-    found, actual = _locate(output, path)
-    if found:
-        return found, actual
-    if path and path[0] == _OUTPUT_ENVELOPE_KEY:
-        return _locate(output, list(path[1:]))
-    return False, None
 
 
 def _remember(refs: list[str], value: Any) -> None:
@@ -415,7 +366,7 @@ def _probe_candidate_refusal(
             summary=_PROBE_HYPOTHESES_SUMMARY, repair_condition=_PROBE_HYPOTHESES_REPAIR,
         )
     issues: list[dict[str, str]] = []
-    for index, item in enumerate(recording.findings):
+    for index, item in enumerate([*recording.findings, *recording.assessment_findings]):
         assigned = (item.hypothesis_id or "").strip()
         if assigned and assigned in admitted:
             continue
@@ -423,7 +374,9 @@ def _probe_candidate_refusal(
             "required_admitted_candidate_id" if not assigned
             else "admitted_candidate_id_in_hypothesis_revisions"
         )
-        issues.append({"rule": rule, "location": f"$.findings[{index}].hypothesis_id"})
+        collection = "findings" if index < len(recording.findings) else "assessment_findings"
+        position = index if collection == "findings" else index - len(recording.findings)
+        issues.append({"rule": rule, "location": f"$.{collection}[{position}].hypothesis_id"})
     if not issues:
         return None
     return DecisionDiagnostic(
@@ -605,10 +558,12 @@ class GraphRecordingHandler:
         evidence_store: Any = None,
         graph_service: Any = None,
         verifier: Any = None,
+        candidate_review_applicator: Any = None,
     ) -> None:
         self._store = evidence_store
         self._graph = graph_service
         self._verifier = verifier
+        self._candidate_review_applicator = candidate_review_applicator
 
     async def _sources_same_run(
         self, store: Any, refs: list[str], run_id: str, engagement_id: str
@@ -1152,12 +1107,23 @@ class GraphRecordingHandler:
         # hypothesis; other hypotheses resolve through execution verification.
         findings_out: list[dict[str, Any]] = []
         existing_claims: set[str] = set()
-        if recording.findings and service is not None:
+        if (recording.findings or recording.assessment_findings) and service is not None:
             try:
                 existing_claims = claim_keys_from_findings(await service.list_findings())
             except Exception:
                 existing_claims = set()
-        for finding_draft in recording.findings:
+        review_items: list[tuple[FindingDraft, AssessmentDraft | None]] = [
+            (item, None) for item in recording.findings
+        ]
+        review_items.extend((FindingDraft(
+            statement=item.statement,
+            evidence_refs=item.original_evidence_ids(),
+            target_node_id=item.target_node_id,
+            hypothesis_id=item.hypothesis_id,
+            severity=item.severity,
+            principal_refs=item.principal_refs,
+        ), item) for item in recording.assessment_findings)
+        for finding_draft, assessment_draft in review_items:
             for ref in finding_draft.evidence_refs:
                 _remember(seen_refs, ref)
             findings_out.append(
@@ -1175,6 +1141,9 @@ class GraphRecordingHandler:
                     existing_claims=existing_claims,
                     new_evidence_ids=new_evidence_ids,
                     record_ids=record_ids,
+                    task=task,
+                    assessment_draft=assessment_draft,
+                    deps=context.deps,
                 )
             )
         for entry in hypotheses_out:
@@ -1196,7 +1165,7 @@ class GraphRecordingHandler:
                 )
             )
         refused_any = bool(refused_facts) or any(
-            entry.get("status") == "refused"
+            entry.get("status") in {"refused", "retryable_error"}
             for entry in (*hypotheses_out, *findings_out, *branches_out)
         )
         call_id = "local_" + content_hash(
@@ -1236,6 +1205,9 @@ class GraphRecordingHandler:
         existing_claims: set[str],
         new_evidence_ids: list[str],
         record_ids: list[str],
+        task: Any = None,
+        assessment_draft: AssessmentDraft | None = None,
+        deps: Any = None,
     ) -> dict[str, Any]:
         base: dict[str, Any] = {"statement": draft.statement[:500]}
         refs = [str(item or "").strip() for item in draft.evidence_refs]
@@ -1334,6 +1306,10 @@ class GraphRecordingHandler:
                 and target not in stored_hypothesis.target_node_ids)
         ):
             return _refused_entry(base, "hypothesis claim or target differs", "finding_id")
+        if assessment_draft is not None and stored_hypothesis.contract_version != 2:
+            return _refused_entry(
+                base, "assessment detail requires a versioned candidate", "finding_id"
+            )
         reviewed_hypothesis = stored_hypothesis.model_copy(deep=True)
         candidate_review_binding: dict[str, Any] = {}
         if reviewed_hypothesis.contract_version == 2:
@@ -1366,13 +1342,38 @@ class GraphRecordingHandler:
                 claimed_principals.append(_clean)
             if len(claimed_principals) >= 8:
                 break
+        draft_binding: AssessmentDraftBinding | None = None
+        if assessment_draft is not None:
+            if task is None or str(assessment_draft.target_node_id) != target:
+                return _refused_entry(base, "assessment draft task binding invalid", "finding_id")
+            if assessment_draft.hypothesis_id != hypothesis_id:
+                return _refused_entry(base, "assessment draft candidate differs", "finding_id")
+            allowed_targets = set(getattr(task, "related_attack_graph_node_ids", ()) or ())
+            allowed_candidates = set(getattr(task, "hypothesis_revisions", {}) or {})
+            allowed_principals = set(getattr(task, "principal_refs", ()) or ())
+            if target not in allowed_targets or hypothesis_id not in allowed_candidates:
+                return _refused_entry(base, "assessment draft outside task subject", "finding_id")
+            if set(assessment_draft.principal_refs) - allowed_principals:
+                return _refused_entry(base, "assessment draft principal outside task", "finding_id")
+            result_id = (
+                str(task.result.result_id)
+                if getattr(task, "result", None) is not None
+                else "result_" + content_hash(str(task.task_id))
+            )
+            draft_binding = AssessmentDraftBinding.model_validate(
+                assessment_draft.identity(result_id)
+            )
         try:
             assessment = await verify(
                 claim={
-                    "statement": draft.statement[:2000],
+                    "statement": draft.statement,
                     "target_node_id": target,
                     "hypothesis_id": hypothesis_id,
                     "principal_refs": list(claimed_principals),
+                    **({
+                        "assessment_draft": assessment_draft.model_dump(mode="json"),
+                        "assessment_draft_binding": draft_binding.model_dump(mode="json"),
+                    } if assessment_draft is not None and draft_binding is not None else {}),
                     "reference_hypothesis": {
                         "hypothesis_id": hypothesis_id,
                         "description": stored_hypothesis.description,
@@ -1415,6 +1416,24 @@ class GraphRecordingHandler:
             stored_hypothesis = None
         hypothesis_status = str(getattr(stored_hypothesis, "status", "") or "")
         try:
+            reviewed_detail = None
+            adopted = getattr(assessment, "adopted_detail", None)
+            if adopted is not None and assessment_draft is not None and draft_binding is not None:
+                linked_refs: list[AssessmentEvidenceRef] = []
+                for observation in assessment_draft.observations:
+                    linked_refs.extend(observation.sources)
+                linked_refs.extend(assessment_draft.expectation.evidence_refs)
+                seen = {ref.evidence_id for ref in linked_refs}
+                linked_refs.extend(
+                    AssessmentEvidenceRef(evidence_id=identity, role="context")
+                    for identity in assessment_draft.original_evidence_ids()
+                    if identity not in seen
+                )
+                reviewed_detail = ReviewedFindingDetail(
+                    **adopted.model_dump(mode="json"),
+                    draft_binding=draft_binding,
+                    evidence_refs=linked_refs,
+                )
             receipt = await append_posthoc_claim_receipt(
                 evidence_store=store,
                 run_id=run_id,
@@ -1431,6 +1450,7 @@ class GraphRecordingHandler:
                 invocation_id=str(invocation_id),
                 target_node_id=target,
                 candidate=reviewed_hypothesis,
+                reviewed_detail=reviewed_detail,
             )
         except Exception:
             receipt = None
@@ -1446,11 +1466,30 @@ class GraphRecordingHandler:
             }
         new_evidence_ids.append(str(receipt.evidence_id))
         if reviewed_hypothesis.contract_version == 2:
+            applicator = self._candidate_review_applicator or getattr(
+                deps, "candidate_review_applicator", None,
+            )
+            if applicator is None:
+                return {
+                    **base, "hypothesis_id": hypothesis_id, "target_node_id": target,
+                    "receipt_id": str(receipt.evidence_id), **candidate_review_binding,
+                    "finding_id": None, "status": "retryable_error",
+                    "reason": "candidate_review_applicator_unavailable",
+                    "review": review_summary,
+                }
+            application = await applicator.apply(
+                str(receipt.evidence_id),
+                task_id=str(task.task_id) if task is not None else None,
+            )
             return {
                 **base, "hypothesis_id": hypothesis_id, "target_node_id": target,
                 "receipt_id": str(receipt.evidence_id), **candidate_review_binding,
-                "finding_id": None,
-                "status": "reviewed", "reason": "candidate judgment belongs to the planner",
+                "finding_id": application.finding_id,
+                "candidate_revision": application.candidate_revision
+                or candidate_review_binding.get("candidate_revision"),
+                "status": application.status,
+                "reason": application.reason,
+                "application": application.model_dump(mode="json", exclude_none=True),
                 "review": review_summary,
             }
         # Only this matching claim is resolved, after its receipt is durable.
@@ -1622,7 +1661,9 @@ def graph_recording_descriptor() -> LocalToolDescriptor:
             "when a verifier and review budget are available. During a probe the candidate "
             "must be admitted in the Task hypothesis_revisions. The receipt is bound to the "
             "candidate revision and purpose, without another target call; UNKNOWN remains "
-            "unresolved. The review outcome judges the claim; hypothesis_outcome separately "
+            "unresolved. A final supported review is applied directly to the candidate and "
+            "Finding; a version-3 assessment waits for its canonical task result when needed. "
+            "The review outcome judges the claim; hypothesis_outcome separately "
             "judges the cited candidate and may remain unknown despite claim success. "
             "Task completion receipts are not candidate reviews. "
             "Shell streams and exit codes are program "
@@ -1631,7 +1672,7 @@ def graph_recording_descriptor() -> LocalToolDescriptor:
         ),
         input_schema=GraphRecordingInput.model_json_schema(),
         contribution_id=GRAPH_RECORD_CONTRIBUTION_ID,
-        version="6",
+        version="8",
     )
 
 
@@ -1653,12 +1694,16 @@ def graph_recording_contribution() -> Contribution:
             except Exception:
                 service = None
         return graph_recording_descriptor(), GraphRecordingHandler(
-            evidence_store=store, graph_service=service
+            evidence_store=store,
+            graph_service=service,
+            candidate_review_applicator=getattr(
+                wiring, "candidate_review_applicator", None,
+            ),
         )
 
 
     return runtime_tool_contribution(
         contribution_id=GRAPH_RECORD_CONTRIBUTION_ID,
-        version="6",
+        version="7",
         factory=factory,
     )

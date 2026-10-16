@@ -3,8 +3,8 @@
 # selection contract; they never grant scope or execution permission.
 schema_version: '3'
 profile_id: native-probes
-version: '21'
-common: {path: prompts/common.md, version: '3', contract_version: '1'}
+version: '27'
+common: {path: prompts/common.md, version: '4', contract_version: '1'}
 probe_limits: {max_actions: 16, max_model_requests: 64, max_repair_requests: 16, max_consecutive_provider_failures: 6}
 max_instances: 2
 max_activations: 8
@@ -20,7 +20,7 @@ roles:
       capabilities: []
       tool_selection: {}
       context_profile: {profile_id: conversation}
-    prompt: {path: prompts/conversation.md, version: '2'}
+    prompt: {path: prompts/conversation.md, version: '4'}
   - definition:
       agent_id: planner
       role: hypothesis_planning
@@ -30,7 +30,7 @@ roles:
       capabilities: []
       tool_selection: {}
       context_profile: {profile_id: hypothesis_planning}
-    prompt: {path: prompts/hypothesis-planner.md, version: '7'}
+    prompt: {path: prompts/hypothesis-planner.md, version: '12'}
   - definition:
       agent_id: probe-worker
       role: probe_execution
@@ -39,7 +39,7 @@ roles:
       capabilities: [web, api, recon, mobile, analysis]
       tool_selection: {capability_tags: [web, api, recon, mobile, analysis]}
       context_profile: {profile_id: probe_execution}
-    prompt: {path: prompts/worker.md, version: '13'}
+    prompt: {path: prompts/worker.md, version: '17'}
   - definition:
       agent_id: research-evidence
       role: research_evidence
@@ -49,7 +49,7 @@ roles:
       capabilities: []
       tool_selection: {}
       context_profile: {profile_id: research_evidence}
-    prompt: {path: prompts/evidence.md, version: '5'}
+    prompt: {path: prompts/evidence.md, version: '8'}
   - definition:
       agent_id: code-author
       role: code_artifact
@@ -59,7 +59,7 @@ roles:
       capabilities: []
       tool_selection: {}
       context_profile: {profile_id: code_artifact}
-    prompt: {path: prompts/code.md, version: '3'}
+    prompt: {path: prompts/code.md, version: '4'}
 stages:
   hypothesis_planning: planner
   native_action: probe-worker

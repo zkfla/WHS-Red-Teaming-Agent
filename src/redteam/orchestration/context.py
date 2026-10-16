@@ -38,6 +38,7 @@ from redteam.orchestration.agents.providers import (
 )
 from redteam.orchestration.agents.registry import AgentRegistry, default_registry
 from redteam.orchestration.analysis import AnalysisVerifier, StructuredLLMAnalysisVerifier
+from redteam.orchestration.candidate_review_application import CandidateReviewApplicator
 from redteam.orchestration.central_state import CentralStateStore
 from redteam.orchestration.checkpointing import StateCodecRegistry
 from redteam.orchestration.component_binding import RuntimeComponentBinding
@@ -124,6 +125,10 @@ class RuntimeDeps:
     agent_prompts: AgentPrompts | None = field(default=None, compare=False)
     artifact_store: ArtifactStore | None = field(default=None, compare=False)
     code_fixture_runner: CodeFixtureRunner | None = field(default=None, compare=False)
+    candidate_review_applicator: CandidateReviewApplicator | None = field(
+        default=None,
+        compare=False,
+    )
     # Execution has one domain owner. Historical stores are migration inputs.
     central_state: CentralStateStore = field(kw_only=True, compare=False)
 
@@ -134,6 +139,21 @@ class RuntimeDeps:
     def __post_init__(self) -> None:
         if self.central_state is None:
             raise ValueError("runtime_requires_central_state")
+        if self.candidate_review_applicator is None:
+            from redteam.orchestration.candidate_review_application import (
+                CandidateReviewApplicationService,
+            )
+
+            object.__setattr__(
+                self,
+                "candidate_review_applicator",
+                CandidateReviewApplicationService(
+                    evidence_store=self.evidence_store,
+                    graph_store=self.graph_store,
+                    central_state=self.central_state,
+                    event_bus=self.event_bus,
+                ),
+            )
         if any(store is not None for store in
                  (self.path_store, self.work_store, self.task_graph_store, self.coordinator)):
             raise ValueError("central_runtime_cannot_mix_legacy_state_owners")

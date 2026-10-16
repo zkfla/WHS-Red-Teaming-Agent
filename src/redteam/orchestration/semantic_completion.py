@@ -43,10 +43,7 @@ from redteam.core.contracts.completion import (
     completion_contract_hash,
     criterion_id,
 )
-from redteam.core.contracts.mission import (
-    MissionTask,
-    redact_secret_material,
-)
+from redteam.core.contracts.mission import MissionTask
 from redteam.core.enums import EvidenceSourceType, TaskStatus
 from redteam.core.ids import EvidenceId, new_id
 from redteam.event_bus.publisher import EventPublisher
@@ -69,7 +66,11 @@ from redteam.orchestration.context_projection import (
     review_path_reference,
 )
 from redteam.orchestration.coordination import content_hash
-from redteam.orchestration.evidence_access import raw_from_metadata
+from redteam.orchestration.evidence_access import (
+    project_review_output,
+    raw_from_metadata,
+    record_view,
+)
 from redteam.orchestration.result_claims import (
     RESULT_REVIEW_INSTRUCTION,
     CriterionReview,
@@ -343,6 +344,11 @@ async def prove_original(
     meta = getattr(record, "metadata", None) or {}
     if not isinstance(meta, dict):
         return refused("origin_metadata_invalid", "evidence '" + key + "' has unreadable metadata")
+    if getattr(record, "source_type", None) is not EvidenceSourceType.TOOL:
+        return refused(
+            "origin_record_not_execution",
+            "evidence '" + key + "' is a review or diagnostic record, not a tool original",
+        )
     raw = raw_from_metadata(meta)
     if not isinstance(raw, dict):
         return refused("origin_raw_missing", "evidence '" + key + "' has no preserved raw result")
@@ -673,22 +679,20 @@ async def _verify_task_origin(
 def _excerpt_of(record: Any, *, limit: int = EXCERPT_CHARS) -> dict[str, Any]:
     meta = getattr(record, "metadata", None) or {}
     raw = raw_from_metadata(meta) if isinstance(meta, dict) else None
-    try:
-        rendered = json.dumps(
-            redact_secret_material(raw, drop_secret_keys=True),
-            ensure_ascii=False,
-            default=str,
-        )
-    except Exception:
-        rendered = _record_text(raw)
     kept = max(1, int(limit))
+    output = raw.get("output") if isinstance(raw, dict) else raw
+    projected = project_review_output(output, total_limit=kept, max_fields=8)
     return {
         "evidence_id": _record_text(getattr(record, "evidence_id", "")),
         "source_type": _record_text(getattr(record, "source_type", "")),
-        "success": (meta.get("success") if isinstance(meta, dict) else None),
+        "success": (raw.get("success") if isinstance(raw, dict) else None),
         "target_node_id": (meta.get("target_node_id") if isinstance(meta, dict) else None),
-        "excerpt": rendered[:kept],
-        "truncated": len(rendered) > kept,
+        "output_fields": projected,
+        "truncated": bool(
+            projected["omitted_field_count"]
+            or any(field["truncated"] for field in projected["fields"])
+        ),
+        "note": "Structured bounded fields; omitted content remains unknown.",
     }
 
 
@@ -762,12 +766,18 @@ def _task_review_payload(
     context: Any,
     evidence_ids: list[str],
     excerpts: list[dict[str, Any]],
+    assessment_drafts: list[Any] | tuple[Any, ...] = (),
 ) -> dict[str, Any]:
     """Assemble the task review payload: subjects, ownership and shown contents.
 
     The full task record and the full path stay in their stores. Every proven
     origin id is named even when the excerpt cap trims the shown contents.
     """
+    result_id = (
+        str(task.result.result_id)
+        if task.result is not None
+        else "result_" + content_hash(str(task.task_id))
+    )
     return {
         **context,
         "task": _task_review_subject(task),
@@ -780,6 +790,14 @@ def _task_review_payload(
         "verified_source_ids": list(evidence_ids),
         "task_evidence": {str(task.task_id): list(evidence_ids)},
         "review_note": REVIEW_EXCERPT_NOTE,
+        "assessment_drafts": [
+            {
+                "draft": draft.model_dump(mode="json"),
+                "binding": draft.identity(result_id),
+                "status": "worker_proposal_not_finding",
+            }
+            for draft in assessment_drafts
+        ],
     }
 
 
@@ -906,6 +924,16 @@ async def complete_task(
             return await settle_unresolved(
                 engine, path, proposal, runtime, token=token, task=task,
             )
+        from redteam.orchestration.assessment_drafts import validate_assessments
+        from redteam.orchestration.central_results import result_for
+
+        if proposal.assessment_drafts or (task.result and task.result.assessment_drafts):
+            assessment_result = result_for(
+                task, outcome="inconclusive", summary=proposal.reason or task.title,
+                evidence_ids=proposal.evidence_ids, observations=proposal.observations,
+                limitations=proposal.limitations, assessment_drafts=proposal.assessment_drafts,
+            )
+            await validate_assessments(engine.deps, runtime, task, assessment_result)
     pending = await _pending_execution_errors(engine, runtime, scope="task", task=task)
     if pending:
         return pending
@@ -933,6 +961,18 @@ async def complete_task(
     task_edge_proof: dict[str, str] = {}
     origin_proofs: list[OriginProof] = []
     for identity in evidence_ids:
+        # A review/diagnostic may support a declared condition, but it cannot
+        # enter the execution-original proof path or satisfy the original count.
+        # Keep the full evidence list for condition/claim receipt validation.
+        try:
+            candidate_record = await engine.deps.evidence_store.get(identity)
+        except Exception:
+            candidate_record = None  # The origin prover reports the owned lookup diagnostic.
+        if (candidate_record is not None
+                and str(candidate_record.run_id) == str(runtime.run_id)
+                and str(candidate_record.engagement_id) == str(runtime.engagement_id)
+                and record_view(candidate_record)[0] != "unsupported"):
+            continue
         record, errors, proof, origin_proof = await _verify_task_origin(
             evidence_store=engine.deps.evidence_store,
             path_store=getattr(getattr(engine, "deps", None), "path_store", None),
@@ -990,6 +1030,10 @@ async def complete_task(
                 context=await engine.review_context(runtime, context, evidence_ids),
                 evidence_ids=evidence_ids,
                 excerpts=excerpt_notes,
+                assessment_drafts=(
+                    proposal.assessment_drafts
+                    or (task.result.assessment_drafts if task.result is not None else [])
+                ),
             ),
             response_schema=(
                 TaskContractReview if task.completion_contract_version == 2 else ResultReview

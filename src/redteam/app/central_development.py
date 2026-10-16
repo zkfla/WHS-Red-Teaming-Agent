@@ -86,6 +86,15 @@ async def build_central_development(engagement, *, llm, tools, settings, jobs=No
                 settings.llm_request_policy.max_concurrent_requests
             ),
         )
+        from redteam.orchestration.candidate_review_application import (
+            CandidateReviewApplicationService,
+        )
+
+        candidate_review_applicator = CandidateReviewApplicationService(
+            evidence_store=evidence,
+            graph_store=graph,
+            central_state=state,
+        )
         components, binding = instantiate(
             resolve_selection(),
             ComponentFactoryContext(
@@ -93,6 +102,7 @@ async def build_central_development(engagement, *, llm, tools, settings, jobs=No
                 evidence,
                 graph,
                 settings=settings,
+                candidate_review_applicator=candidate_review_applicator,
             ),
         )
         components = specialists.assemble(components, include_code_artifacts=False)
@@ -116,12 +126,14 @@ async def build_central_development(engagement, *, llm, tools, settings, jobs=No
             outbound_descriptor_resolver=tools.catalog.get,
         )
         bus = InMemoryEventBus()
+        central_bus = CentralEventBus(state, bus)
+        candidate_review_applicator.bind_event_bus(central_bus)
         deps = RuntimeDeps(
             control_plane=control,
             tool_gateway=tools,
             tool_catalog=tools.catalog,
             long_job_adapter=jobs,
-            event_bus=CentralEventBus(state, bus),
+            event_bus=central_bus,
             event_history=bus,
             graph_store=graph,
             evidence_store=evidence,
@@ -137,6 +149,7 @@ async def build_central_development(engagement, *, llm, tools, settings, jobs=No
             operation_bindings=components.operation_bindings,
             execution_recipes=components.execution_recipes,
             retry_policy=components.retry_policy,
+            candidate_review_applicator=candidate_review_applicator,
             local_tools=components.local_tools,
             central_state=state,
             specialist_policy=specialists.run_policy().model_copy(

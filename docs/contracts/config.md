@@ -277,8 +277,12 @@ for first-use requirements and isolation constraints.
 ## LLM providers: `litellm` and `opencode-go`
 
 `LLMConfig` selects `provider`, `default_model`, `api_key_env_var` and optional
-`reasoning_effort` from `REDTEAM_LLM_PROVIDER` / `REDTEAM_LLM_MODEL` /
-`REDTEAM_LLM_API_KEY_ENV_VAR` / `REDTEAM_LLM_REASONING_EFFORT`.
+`reasoning_effort` and the optional `cyber_access_program` from
+`REDTEAM_LLM_PROVIDER` / `REDTEAM_LLM_MODEL` /
+`REDTEAM_LLM_API_KEY_ENV_VAR` / `REDTEAM_LLM_REASONING_EFFORT` /
+`REDTEAM_LLM_CYBER_ACCESS_PROGRAM`. The cyber access value is forwarded as
+`access_programs.cyber`; it selects an already approved provider program and
+does not grant account or project access.
 The model prefix selects a downstream provider through LiteLLM; OpenCode Go
 continues to use its existing protocol selection. No per-model allowlist is
 introduced.

@@ -11,11 +11,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 
 from redteam.app.cli._shared import EXIT_FAILURE, EXIT_OK, eprint, read_run_report
 from redteam.orchestration.diagnostics import DecisionDiagnostic
-from redteam.orchestration.reporting import MissionProjection, TerminalReportProjection
+from redteam.orchestration.reporting import (
+    FindingProjection,
+    MissionProjection,
+    TerminalReportProjection,
+    investigation_report_views,
+)
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -66,6 +72,77 @@ def _diagnostic_detail_lines(diagnostic: DecisionDiagnostic) -> list[str]:
     return lines
 
 
+def _assessment_text(value) -> str:
+    # Keep worker text as literal DATA, even when it contains Markdown headings,
+    # HTML, line breaks or backticks. JSON retains explicit newline coordinates.
+    text = json.dumps(value, ensure_ascii=False)
+    fence = "`" * (1 + max((len(run) for run in re.findall(r"`+", text)), default=0))
+    return f"{fence} {text} {fence}"
+
+
+def _assessment_draft_lines(investigation: dict, reviews=()) -> list[str]:
+    result = investigation.get("result") or {}
+    drafts = result.get("assessment_drafts") or []
+    if not drafts:
+        return []
+    reviewed = {
+        (
+            item.reviewed_detail.draft_binding.result_id,
+            item.reviewed_detail.draft_binding.draft_id,
+            item.reviewed_detail.draft_binding.content_hash,
+        ): item
+        for item in reviews
+    }
+    lines = ["", f"### Worker assessment proposals: {investigation['task_id']}", "",
+             "Worker opinions and proposed details; not verified Findings. "
+             "Independent draft review binding: unknown unless an exact receipt is listed.", ""]
+    if result.get("completion_receipt_id"):
+        lines += [f"- Task completion receipt: {_assessment_text(result['completion_receipt_id'])} "
+                  "(does not establish approval of these drafts)", ""]
+    identities = {item["draft_id"]: item for item in investigation["assessment_draft_refs"]}
+    for draft in drafts:
+        identity = identities[draft["draft_id"]]
+        review = reviewed.get((
+            identity["result_id"], identity["draft_id"], identity["content_hash"],
+        ))
+        lines += [
+            f"- **{_assessment_text(draft['name'])}**",
+            f"  - Draft identity: {_assessment_text(identity)}",
+            f"  - Proposed classification: {_assessment_text(draft['vulnclass'])}; "
+            f"proposed severity: {_assessment_text(draft['severity'])}",
+            f"  - Worker opinion: {draft['judgment']}; reason: {_assessment_text(draft['reason'])}",
+            f"  - Claim: {_assessment_text(draft['statement'])}",
+            f"  - Target: {_assessment_text(draft['target_node_id'])}; candidate: "
+            f"{_assessment_text(draft.get('hypothesis_id'))}; principals: "
+            f"{_assessment_text(draft['principal_refs'])}",
+        ]
+        lines.append(
+            "  - Independent review: unknown"
+            if review is None else
+            f"  - Independent review: receipt={review.receipt_id}; verdict={review.verdict}; "
+            f"outcome={review.outcome}; candidate outcome={review.hypothesis_outcome}"
+        )
+        if draft.get("impact"):
+            lines.append(f"  - Proposed impact: {_assessment_text(draft['impact'])}")
+        expectation = draft["expectation"]
+        lines.append(f"  - Worker-declared expectation ({expectation['source']}): "
+                     f"{_assessment_text(expectation['statement'])}")
+        for ref in expectation["evidence_refs"]:
+            lines.append("    - Expectation source: " + _assessment_text(ref))
+        for observation in draft["observations"]:
+            lines.append(f"  - Worker observation: {_assessment_text(observation['statement'])}")
+            for ref in observation["sources"]:
+                lines.append("    - Source: " + _assessment_text(ref))
+        for label, key in (
+            ("Claim evidence references", "evidence_refs"),
+            ("Limitation references", "limitation_refs"),
+            ("Limitations", "limitations"),
+            ("Alternative explanations", "alternative_explanations"),
+        ):
+            lines.append(f"  - {label}: {_assessment_text(draft[key])}")
+    return [*lines, ""]
+
+
 def _render_markdown(report: TerminalReportProjection) -> str:
     lines = [
         f"# Run Report: {report.run_id}",
@@ -92,11 +169,12 @@ def _render_markdown(report: TerminalReportProjection) -> str:
     if report.investigations or report.effective_limits:
         lines += ["## Central investigations", "",
                   f"- Applied limits: {json.dumps(report.effective_limits, ensure_ascii=False)}"]
-        for investigation in report.investigations:
+        for investigation in investigation_report_views(report.investigations):
             result = investigation.get("result") or {}
             lines += [f"- {investigation['task_id']}: {investigation['status']}; "
                       f"owner={investigation.get('occupant_owner')}; "
                       f"result={result.get('outcome')}; required={investigation['required']}"]
+            lines += _assessment_draft_lines(investigation, report.assessment_reviews)
         lines += ["", "## Criterion evidence", ""]
         for item in report.criterion_evidence:
             lines += [f"- {item['criterion']}: met={item['met']}; "
@@ -137,9 +215,36 @@ def _render_markdown(report: TerminalReportProjection) -> str:
                 f"  - supporting={candidate.supporting_evidence_ids}; "
                 f"refuting={candidate.refuting_evidence_ids}",
             ]
+            for application in candidate.review_applications:
+                lines.append(
+                    f"  - Final review application: status={application.status}; "
+                    f"revision={application.candidate_pre_verdict_revision} -> "
+                    f"{application.candidate_revision}; receipt={application.review_receipt_id}; "
+                    f"finding={application.finding_id or '-'}; "
+                    f"reason={_assessment_text(application.reason) if application.reason else '-'}"
+                )
         lines += [
             "- Candidate judgment is separate from Task completion, Finding verification, "
             "and Mission completion.",
+            "",
+        ]
+    if report.candidate_review_applications:
+        lines += ["## Final review applications", ""]
+        for application in report.candidate_review_applications:
+            lines.append(
+                f"- {application.candidate_id}: status={application.status}; "
+                f"revision={application.candidate_pre_verdict_revision} -> "
+                f"{application.candidate_revision}; receipt={application.review_receipt_id}; "
+                f"task={application.task_id or '-'}; finding={application.finding_id or '-'}"
+            )
+            if application.reason:
+                lines.append(f"  - Apply reason: {_assessment_text(application.reason)}")
+        lines += [
+            "- `promoted` means the independent final review and code-owned structural "
+            "binding gates committed together. It does not mean code re-derived the "
+            "vulnerability semantics.",
+            "- `inconclusive`, `pending_task_result`, and `refused` remain distinct "
+            "non-Finding application states.",
             "",
         ]
     if report.candidate_finding_promotions:
@@ -333,10 +438,57 @@ def _render_markdown(report: TerminalReportProjection) -> str:
     if not report.findings:
         lines.append("(none)")
     for finding in report.findings:
+        # Serialize through the same masking boundary as JSON exports before
+        # rendering possibly bypassed model_copy/assignment input.
+        finding = FindingProjection.model_validate(finding.model_dump(mode="json"))
         status = "VERIFIED" if finding.verified else "CANDIDATE"
         lines.append(
             f"- **[{status}/{finding.severity.upper()}]** {finding.title} (`{finding.finding_id}`)"
         )
+        description = (
+            "(not recorded in this report)" if finding.description is None
+            else "(empty)" if finding.description == "" else _assessment_text(finding.description)
+        )
+        lines.append(f"  - Stored description: {description}")
+        lines.append(f"  - Evidence references: {_assessment_text(finding.evidence_ids)}")
+        if finding.review_receipt_id:
+            lines.append(
+                f"  - Independent review receipt: {_assessment_text(finding.review_receipt_id)}"
+            )
+        if finding.original_evidence_ids:
+            lines.append(
+                "  - Original evidence references: "
+                f"{_assessment_text(finding.original_evidence_ids)}"
+            )
+        if finding.reviewed_detail is not None:
+            detail = finding.reviewed_detail
+            lines += [
+                f"  - Reviewed classification: {_assessment_text(detail.vulnclass)}",
+                f"  - Reviewed claim: {_assessment_text(detail.statement)}",
+                f"  - Reviewed impact: {_assessment_text(detail.impact)}",
+                f"  - Severity basis: {_assessment_text(detail.severity_reason)}",
+                f"  - Remaining limitations: {_assessment_text(detail.limitations)}",
+                "  - Draft binding: "
+                f"{_assessment_text(detail.draft_binding.model_dump(mode='json'))}",
+                f"  - Evidence roles and fields: "
+                f"{_assessment_text([item.model_dump(mode='json') for item in detail.evidence_refs])}",  # noqa: E501
+                "  - Verification meaning: independent semantic review plus code-owned "
+                "structural binding gates passed.",
+            ]
+    if report.assessment_reviews:
+        lines += ["", "## Independent assessment reviews", ""]
+        for review in report.assessment_reviews:
+            detail = review.reviewed_detail
+            lines += [
+                f"- {review.receipt_id}: verdict={review.verdict}; outcome={review.outcome}; "
+                f"candidate outcome={review.hypothesis_outcome}",
+                f"  - Candidate/revision: {_assessment_text(review.candidate_id)} / "
+                f"{_assessment_text(review.candidate_revision)}",
+                f"  - Adopted title/class/severity: {_assessment_text(detail.title)} / "
+                f"{_assessment_text(detail.vulnclass)} / {_assessment_text(detail.severity)}",
+                f"  - Exact draft binding: "
+                f"{_assessment_text(detail.draft_binding.model_dump(mode='json'))}",
+            ]
     if report.integrity_blockers:
         lines += ["", "## Integrity blockers", ""]
         lines += [f"- {item}" for item in report.integrity_blockers]

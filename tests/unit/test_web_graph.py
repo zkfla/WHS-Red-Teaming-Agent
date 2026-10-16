@@ -127,6 +127,8 @@ async def test_candidate_is_projected_separately_from_tasks_findings_and_mission
         "refuting_evidence_ids": [],
         "source_hypothesis_ids": [],
         "task_ids": [],
+        "review_applications": [],
+        "findings": [],
     }]
     assert view["origin"]["hypotheses"] == 1
     assert {"from": "planner", "to": "candidate:candidate-a", "kind": "judged"} in view[
@@ -318,9 +320,35 @@ async def test_provider_failure_details_and_interrupted_requests_are_distinct(tm
 async def test_read_is_read_only_and_never_creates_or_changes_a_database(tmp_path):
     state, _ = await bound(tmp_path)
     await owner(state)
+    application = {
+        "review_receipt_id": "ev-review-pending",
+        "candidate_id": "candidate-pending",
+        "candidate_pre_verdict_revision": 1,
+        "candidate_revision": None,
+        "task_id": "task-a",
+        "finding_id": None,
+        "status": "pending_task_result",
+        "reason": "reviewed assessment draft awaits canonical task settlement",
+        # Internal binding hashes must not be copied to the browser projection.
+        "draft_content_hash": "secret-internal-binding-hash",
+    }
+    await state.transaction(lambda tx: tx.db.execute(
+        "INSERT INTO state_requests VALUES(?,'candidate_review_application',?,?)",
+        (RUN, application["review_receipt_id"], json.dumps(application)),
+    ))
     before = state.path.read_bytes()
-    await graph(state)
+    view = await graph(state)
     assert state.path.read_bytes() == before
+    assert view["candidate_review_applications"] == [{
+        "review_receipt_id": "ev-review-pending",
+        "candidate_pre_verdict_revision": 1,
+        "candidate_revision": None,
+        "task_id": "task-a",
+        "finding_id": None,
+        "status": "pending_task_result",
+        "reason": "reviewed assessment draft awaits canonical task settlement",
+    }]
+    assert "secret-internal-binding-hash" not in json.dumps(view)
 
     missing = tmp_path / "missing" / "state.sqlite3"
     assert (await read_graph(missing, RUN))["available"] is False

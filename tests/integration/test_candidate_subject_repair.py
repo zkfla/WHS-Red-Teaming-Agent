@@ -65,6 +65,7 @@ def _plan(question_targets):
                 "description": "Access may be unguarded",
                 "target_node_ids": [TARGET],
                 "reason": "Assess the preserved response",
+                "status": "open",
             },
         }],
         "questions": [{
@@ -144,4 +145,3 @@ async def test_scope_mismatch_repairs_once_then_atomizes_once(tmp_path):
         assert candidate.revision == 1
         task = await state.get_task(ids[0])
         assert task.hypothesis_revisions == {candidate.hypothesis_id: 1}
-

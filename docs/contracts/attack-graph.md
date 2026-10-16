@@ -55,6 +55,19 @@ stores graph nodes, edges and mutation receipts in central `state.sqlite3`.
 See [the current graph guide](../agent/attack-graph.md) for the retained APIs,
 internal storage format and migration boundary.
 
+Version-3 and version-4 posthoc review receipts may retain typed, reviewer-adopted Finding
+detail bound to the exact Task result ID, draft ID and normalized draft hash.
+Version 4 additionally carries the reviewer's bounded `confidence`. A supported
+security review promotes only at `confidence >= 0.80`; lower confidence leaves
+the candidate inconclusive. Historical version-2/3 receipts retain their stored
+categorical semantics and are never rewritten.
+Central candidate admission rechecks that stored draft before promotion. The
+shared promoter then uses the adopted title, summary and severity and stores the
+complete classification, claim, impact, limitations, evidence roles and lineage
+in Finding metadata. Historical/v1/mapper Findings keep their existing fallback
+title, description and severity. Read-only JSON/Markdown reports expose typed
+detail without borrowing current Task state.
+
 ## Store Protocol
 
 ```python
@@ -126,16 +139,28 @@ does not commit independently. Confirmed/rejected judgments require the existing
 independent original-result/claim/validity proof plus a final public review receipt
 bound to `candidate_revision` and `candidate_purpose_hash` (claim, premise, targets
 and principals). `append_posthoc_claim_receipt(candidate=...)` binds the reviewed
-snapshot; v2 common recording returns the review to the planner rather than
-silently resolving the candidate or creating a Finding. When the Planner later
-commits the exact candidate as confirmed, central admission consumes that bound
-receipt in the same SQLite/graph transaction. Only a versioned security review
-with `success`, `VIOLATION` and `claim_supported=true` is passed through the
-shared `FindingPromoter`; the resulting verified Finding links both the receipt
-and its original execution evidence. A Run/candidate/target/claim identity makes
-replay idempotent. Benign success and promotion refusal remain a separate stored
-diagnostic, not a Finding. Worker observations, failed requests, missing
-prerequisites and UNKNOWN do not create a final verdict.
+snapshot. The Run-bound central review applicator consumes that final receipt
+without asking Planner to choose the verdict again. Version-3/4 reviews created
+before Task settlement remain explicitly `pending_task_result`; canonical
+`task.settle` then applies the stored draft binding. Candidate transition,
+Finding, promotion/application projections and outbox event share one SQLite
+transaction. Planner consumes the result for follow-up questions only.
+
+Only a versioned security review
+with `success`, `VIOLATION` and `claim_supported=true` is eligible for the
+shared `FindingPromoter`; version-4 review confidence must also be at least
+`0.80`. The
+resulting verified Finding links both the receipt
+and its original execution evidence. The Finding stores the reviewer-adopted
+title, statement/summary, impact, severity basis and limitations. `verified`
+means this independent semantic decision passed the code-owned structural
+binding gates; code does not parse payloads or response prose to rediscover the
+vulnerability class. A Run/candidate/target/claim identity plus legacy claim-key
+alias makes replay and old Planner-confirmed v2 Findings deduplicate. Refuted
+reviews reject the candidate without a Finding. Inconclusive, pending and
+refused applications remain distinct stored states. Worker observations, failed
+requests, mock results, missing prerequisites and UNKNOWN do not create a final
+verdict.
 
 The integrity report treats v2 held/inconclusive candidates as unresolved. Goal
 completion only requires the candidates explicitly named by v2 goal-required

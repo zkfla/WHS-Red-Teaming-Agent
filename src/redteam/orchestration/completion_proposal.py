@@ -11,8 +11,9 @@ import json
 from datetime import datetime, timezone
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_serializer
 
+from redteam.core.contracts.assessment import AssessmentDraft
 from redteam.core.contracts.evidence import EvidenceRecord
 from redteam.core.contracts.mission import redact_secret_material
 from redteam.core.enums import EvidenceSourceType
@@ -42,6 +43,24 @@ class CompletionProposal(BaseModel):
     evidence_ids: list[str] = Field(default_factory=list)
     criterion_results: list[dict[str, Any]] = Field(default_factory=list)
     gaps: list[InvestigationGap] = Field(default_factory=list)
+    observations: list[str] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+    assessment_drafts: list[AssessmentDraft] = Field(default_factory=list, max_length=32)
+
+    @field_validator("observations", "limitations")
+    @classmethod
+    def _safe_items(cls, values):
+        if any(not value.strip() for value in values):
+            raise ValueError("result observations and limitations must be nonblank")
+        return list(dict.fromkeys(redact_secret_material(value.strip()) for value in values))
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        result = handler(self)
+        for name in ("observations", "limitations", "assessment_drafts"):
+            if not getattr(self, name):
+                result.pop(name, None)
+        return result
 
     @field_validator("reason")
     @classmethod

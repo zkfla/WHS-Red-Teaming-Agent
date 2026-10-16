@@ -187,6 +187,18 @@ async def test_common_pool_stops_extra_calls_and_isolates_worker_context(tmp_pat
             "probe-worker",
         }
         assert all(payload["probe"]["candidates"] == {} for payload in payloads)
+        context = await InvestigationEngine(session.deps).context(results[0].runtime, None)
+        projected = await context_for_probe(session.deps, results[0].runtime, context)
+        history = projected["execution_history"]
+        assert history and len(history) <= 6
+        assert set(history[0]) <= {
+            "invocation_id", "tool_id", "state", "target_node_id", "wait_reason",
+            "result_evidence_id", "selection", "outcome",
+        }
+        assert not set(history[0]) & {
+            "input_digest", "approval_fingerprint", "reservation_refs", "resource_keys",
+            "ownership_version", "model_tool_call_id",
+        }
         assert await AttackGraphService(session.deps.graph_store).list_findings() == []
 
 

@@ -1,25 +1,21 @@
-"""Wrong Task completion receipt on a candidate verdict, repaired through the real planner.
+"""Only a final public candidate-review receipt can drive direct application.
 
-The default split profile and the legacy single judgment both run through the production
-planner loop. Only model answers are scripted. The observation, final public review receipt,
-canonical admission and budget are real. Each judgment's first attempt cites a real Task
-completion receipt and must be repaired before any atomizer call or state write.
+The observation, review receipt, Task completion receipt and Central State application are real.
+Only the independent meaning answer is scripted. A Task completion receipt must neither replace
+the final review nor duplicate the candidate/Finding already committed from that review.
 """
 
 import json
-
-import pytest
 
 from redteam.attack_graph.service import AttackGraphService
 from redteam.core.enums import MissionStatus
 from redteam.core.ids import EvidenceId
 from redteam.orchestration.analysis import StructuredLLMAnalysisVerifier
-from redteam.orchestration.specialist_planner import SpecialistPlanner
-from tests.integration.test_candidate_subject_repair import _atomize
+from redteam.orchestration.candidate_review_application import apply_candidate_review_receipt
 from tests.integration.test_central_development import TOOL, discover, inspect, turn
-from tests.integration.test_hypothesis_planner import candidate, held, probe
-from tests.integration.test_hypothesis_planner import selection as legacy_selection
+from tests.integration.test_hypothesis_planner import candidate, probe, selection
 from tests.integration.test_observation_candidate_chain_06d import (
+    ChainLLM,
     MeaningLLM,
     _graph_record,
     _meaning,
@@ -27,13 +23,12 @@ from tests.integration.test_observation_candidate_chain_06d import (
     _receipt,
 )
 from tests.integration.test_probe_workers import ReviewedObservationModel, drive, register
-from tests.integration.test_probe_workers import selection as split_selection
 
 REPAIR_MARKER = "\n\nPrevious attempt failed"
 
 
 class RepairLLM(ReviewedObservationModel):
-    """Scripted planner answers in either shape; observation and review keep production paths."""
+    """Shared planner fake for the remaining invalid-selection repair tests."""
 
     def __init__(self, plans, atoms=()):
         super().__init__()
@@ -62,7 +57,10 @@ class RepairLLM(ReviewedObservationModel):
             self.atom_inputs.append(payload)
             return self.atoms.pop(0)(payload)
         return await super().complete_structured(
-            messages=messages, response_schema=response_schema, system=system, **kwargs,
+            messages=messages,
+            response_schema=response_schema,
+            system=system,
+            **kwargs,
         )
 
 
@@ -88,89 +86,44 @@ def _judgment(mode, update, *, reason):
     return body
 
 
-def _hold(mode):
-    body = held("Await an independent review of the retained original")
-    if mode == "split":
-        body["questions"] = []
-    return body
-
-
-@pytest.mark.parametrize("correction", ["receipt", "held"])
-@pytest.mark.parametrize("mode", ["split", "legacy"])
-async def test_wrong_task_receipt_is_repaired_before_atomizer_or_writes(
-    tmp_path, mode, correction,
-):
-    llm = RepairLLM([_opening(mode)], atoms=[_atomize] if mode == "split" else [])
-    open_session = split_selection if mode == "split" else legacy_selection
-    async with open_session(tmp_path, llm=llm) as (session, llm, tools):
+async def test_task_completion_receipt_cannot_replace_applied_candidate_review(tmp_path):
+    opening = {"updates": [candidate()], "tasks": [probe(candidate="local")],
+               "reason": "Observe the candidate's smallest uncertainty"}
+    async with selection(tmp_path, llm=ChainLLM([opening])) as (session, llm, tools):
         state = session.deps.central_state
         service = AttackGraphService(session.deps.graph_store)
 
-        async def snapshot():
-            (current,) = await service.list_hypotheses()
-            return (len(await state.list_tasks()), current.revision, current.status,
-                    len(await service.list_findings()))
-
-        # Real observation Task, real graph.record review receipt, scripted meaning answer.
-        after_task, source = await _observe_candidate(session, llm)
+        current, source = await _observe_candidate(session, llm)
         verifier = StructuredLLMAnalysisVerifier(
             MeaningLLM([_meaning("success")]), session.deps.evidence_store, service,
         )
         public = await _receipt(session, await _graph_record(
-            session, verifier, candidate_id=after_task.hypothesis_id, source=source,
+            session, verifier, candidate_id=current.hypothesis_id, source=source,
         ))
         assert public.metadata["record_kind"] == "review_receipt"
+        promoted = await service.get_hypothesis(current.hypothesis_id)
+        assert promoted.status == "confirmed" and promoted.revision == 2
+        finding, = await service.list_findings()
 
-        # A separate settled Task produces the real Task completion receipt the model may cite.
         reviewed = await register(session, "reviewed", actions=2)
         llm.native_responses_by_task[reviewed] = [discover(TOOL), turn(inspect("reviewed"))]
-        (settled,) = await drive(session)
+        settled, = await drive(session)
         assert settled.kind == "completed", settled.error
         completion_id = (await state.get_task(reviewed)).result.completion_receipt_id
         completion = await session.deps.evidence_store.get(EvidenceId(completion_id))
-        assert completion is not None
         assert completion.metadata["record_kind"] == "task_completion_receipt"
 
-        cited = [str(source.evidence_id)]
-        wrong = candidate(current=after_task.model_dump(mode="json"), status="confirmed",
-                          evidence=cited, review=completion_id)
-        good = candidate(current=after_task.model_dump(mode="json"), status="confirmed",
-                         evidence=cited, review=str(public.evidence_id))
-        reason = "The bound independent review supports this candidate verdict"
-        llm.observer = snapshot
-        llm.plans.extend([
-            _judgment(mode, wrong, reason=reason),
-            _judgment(mode, good, reason=reason) if correction == "receipt" else _hold(mode),
-        ])
-        atoms_before = len(llm.atom_inputs)
-        spent_before = (await session.status())["usage"]["spent"]
-
-        assert await SpecialistPlanner(session.deps).advance(session.runtime) == []
-
-        # The wrong selection never reaches atomization, and it writes nothing before repair.
-        assert len(llm.atom_inputs) == atoms_before
-        assert len(llm.observed) == 2 and llm.observed[0] == llm.observed[1]
-        assert len(llm.plan_inputs) == 3 and llm.plan_feedback[1] == ""
-        feedback = llm.plan_feedback[2]
-        assert "candidate_review_receipt_invalid" in feedback
-        assert "$.updates[0].review_evidence_id" in feedback
-        diagnostic, marker, replay = feedback.partition("\n\nRejected proposal data:\n")
-        assert marker
-        assert completion_id not in diagnostic
-        assert json.loads(replay)["previous_proposal"]["updates"][0]["review_evidence_id"] == (
-            completion_id
+        wrong = await apply_candidate_review_receipt(session.deps, str(completion_id))
+        assert wrong.status == "refused"
+        assert wrong.reason == "candidate_review_receipt_kind_invalid"
+        replay = await apply_candidate_review_receipt(
+            session.deps,
+            str(public.evidence_id),
         )
-        # One wrong and one corrected or held judgment, both on the shared finite budget.
-        assert (await session.status())["usage"]["spent"] - spent_before == 2
-
-        saved = await service.get_hypothesis(after_task.hypothesis_id)
-        assert await service.list_findings() == []
+        assert replay.status == "already_applied"
+        unchanged = await service.get_hypothesis(current.hypothesis_id)
+        assert unchanged.status == "confirmed" and unchanged.revision == 2
+        assert [item.finding_id for item in await service.list_findings()] == [finding.finding_id]
+        assert len(await state.candidate_finding_promotions()) == 1
         mission = await state.get_mission(session.runtime.mission_id)
         assert mission.status is MissionStatus.ACTIVE
-        if correction == "receipt":
-            # The corrected public review passes through the original canonical gate.
-            assert saved.status == "confirmed" and saved.revision == 2
-            assert saved.metadata["candidate_review_evidence_id"] == str(public.evidence_id)
-        else:
-            assert saved.status == "open" and saved.revision == 1
-            assert "candidate_review_evidence_id" not in saved.metadata

@@ -7,7 +7,7 @@ import pytest
 
 from redteam.attack_graph.hypotheses import hypothesis_purpose
 from redteam.core.contracts.evidence import EvidenceRecord
-from redteam.core.contracts.graph import Hypothesis
+from redteam.core.contracts.graph import Finding, Hypothesis
 from redteam.core.contracts.mission import (
     InvestigationResult,
     MissionPlan,
@@ -93,7 +93,7 @@ def _receipt(identity, candidate, *, public=True, revision=None, created_at=NOW)
     )
 
 
-def _context(tasks, candidate, records):
+def _context(tasks, candidate, records, *, applications=(), promotions=(), findings=()):
     mission = MissionPlan(
         mission_id=MISSION,
         engagement_id=ENGAGEMENT,
@@ -112,6 +112,9 @@ def _context(tasks, candidate, records):
         edges=[],
         graph_roots=(),
         graph_truncated=False,
+        review_applications=tuple(applications),
+        finding_promotions=tuple(promotions),
+        findings=tuple(findings),
     )
     validity = {"evidence_validity": []}
     return PlannerPassContext(
@@ -337,3 +340,81 @@ def test_fully_visible_current_revision_context_does_not_duplicate_support():
     assert fields["original_observations"]["records"]
     assert fields["candidate_review_support"] == []
     assert fields["candidate_review_support_omitted_count"] == 0
+
+
+def test_applied_review_projects_canonical_candidate_finding_and_limitations():
+    candidate = Hypothesis(
+        contract_version=2,
+        hypothesis_id="hyp-confirmed",
+        description="A bounded authentication bypass",
+        status="confirmed",
+        revision=2,
+        target_node_ids=["node-a"],
+        reason="Independent review supported the bounded claim",
+    )
+    finding = Finding(
+        finding_id="find-confirmed",
+        title="Authentication bypass",
+        severity="high",
+        verified=True,
+        evidence_ids=["original-a", "receipt-a"],
+        metadata={"reviewed_finding_detail": {
+            "limitations": ["Only the retained endpoint and principal were reviewed."],
+        }},
+    )
+    application = {
+        "review_receipt_id": "receipt-a",
+        "candidate_id": candidate.hypothesis_id,
+        "candidate_pre_verdict_revision": 1,
+        "candidate_revision": 2,
+        "finding_id": finding.finding_id,
+        "status": "promoted",
+        "reason": "",
+        "review_receipt_hash": "not-for-the-planner",
+    }
+    promotion = {
+        "candidate_id": candidate.hypothesis_id,
+        "candidate_revision": 2,
+        "finding_id": finding.finding_id,
+        "status": "promoted",
+    }
+    fields = _context(
+        [], candidate, [], applications=[application], promotions=[promotion], findings=[finding],
+    ).base_fields()
+
+    state = fields["candidate_review_state"]
+    record, = state["records"]
+    assert record["application_status"] == "promoted"
+    assert record["canonical_candidate_status"] == "confirmed"
+    assert record["promotion_status"] == "promoted"
+    assert record["finding"]["finding_id"] == finding.finding_id
+    assert record["finding"]["limitations"] == [
+        "Only the retained endpoint and principal were reviewed.",
+    ]
+    assert "review_receipt_hash" not in str(state)
+
+
+def test_pending_review_application_is_navigation_state_without_a_verdict():
+    candidate = Hypothesis(
+        contract_version=2,
+        hypothesis_id="hyp-pending",
+        description="A bounded claim awaiting canonical settlement",
+        status="open",
+        revision=1,
+        target_node_ids=["node-a"],
+        reason="The reviewed draft has not reached its Task result",
+    )
+    fields = _context([], candidate, [], applications=[{
+        "review_receipt_id": "receipt-pending",
+        "candidate_id": candidate.hypothesis_id,
+        "candidate_pre_verdict_revision": 1,
+        "candidate_revision": None,
+        "finding_id": None,
+        "status": "pending_task_result",
+        "reason": "reviewed assessment draft awaits canonical task settlement",
+    }]).base_fields()
+
+    record, = fields["candidate_review_state"]["records"]
+    assert record["application_status"] == "pending_task_result"
+    assert record["canonical_candidate_status"] == "open"
+    assert record["finding"] is None and record["promotion_status"] is None

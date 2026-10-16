@@ -1,7 +1,7 @@
 // Right-hand detail for the selected node. Only stored or published-summary fields appear.
-import { h, replace } from "./dom.js";
+import { h } from "./dom.js";
 import { PLANNER, TASK, UNKNOWN, WAIT, WORKER } from "./labels.js";
-import { badge } from "./ui.js";
+import { badge, replaceLive } from "./ui.js";
 
 const rows = (pairs) => h("dl", { class: "gdl" }, pairs.flatMap(([k, v]) => [h("dt", { text: k }), h("dd", { text: v === null || v === undefined || v === "" ? UNKNOWN : String(v) })]));
 
@@ -101,6 +101,8 @@ function task(view, id) {
 function candidate(view, id) {
   const c = (view.candidates || []).find((item) => item.hypothesis_id === id);
   if (!c) return [h("p", { class: "note", text: "이 후보는 더 이상 목록에 없습니다." })];
+  const applications = (c.review_applications || []).map(reviewApplication);
+  const findings = (c.findings || []).map(findingDetail);
   return [badge(c.status), h("h3", { text: c.description }),
     h("p", { class: "gdetail-id", text: c.hypothesis_id }), rows([
       ["현재 판단", c.status], ["개정", c.revision], ["신뢰도", c.confidence],
@@ -112,7 +114,40 @@ function candidate(view, id) {
       ["Finding 승격", c.finding_promotion?.status],
       ["승격 거절 사유", c.finding_promotion?.reason],
       ["승격 Finding", c.finding_promotion?.finding_id],
-    ]), h("p", { class: "note", text: "후보 판단은 Task 완료, Finding, Mission 판정과 별개입니다." })];
+    ]), h("h4", { text: "독립 리뷰 적용" }),
+    applications.length ? h("div", { class: "gexchange-list" }, applications) :
+      h("p", { class: "note", text: "저장된 최종 리뷰 적용 결과가 없습니다." }),
+    h("h4", { text: "연결된 Finding" }),
+    findings.length ? h("div", { class: "gexchange-list" }, findings) :
+      h("p", { class: "note", text: "이 후보에 연결된 Finding이 없습니다." }),
+    h("p", { class: "note", text: "후보 판단은 Task 완료 및 Mission 판정과 별개입니다. verified는 독립 의미 리뷰와 코드의 구조적 결속 검사를 통과했다는 뜻입니다." })];
+}
+
+function reviewApplication(item) {
+  return h("details", { class: `gexchange ${item.status || "unknown"}`, "data-key": item.review_receipt_id || "unknown-review" },
+    h("summary", {}, h("span", { class: "gexchange-title", text: item.review_receipt_id || UNKNOWN }),
+      h("span", { class: "gexchange-state", text: item.status || UNKNOWN })),
+    h("div", { class: "gexchange-body" }, rows([
+      ["적용 상태", item.status],
+      ["후보 revision", `${item.candidate_pre_verdict_revision ?? UNKNOWN} → ${item.candidate_revision ?? UNKNOWN}`],
+      ["Review receipt", item.review_receipt_id], ["Task", item.task_id],
+      ["Finding", item.finding_id], ["사유", item.reason],
+    ])));
+}
+
+function findingDetail(item) {
+  const detail = item.reviewed_detail;
+  return h("details", { class: `gexchange ${item.verified ? "received" : "unknown"}`, "data-key": item.finding_id || "unknown-finding" },
+    h("summary", {}, h("span", { class: "gexchange-title", text: item.title || UNKNOWN }),
+      h("span", { class: "gexchange-state", text: `${item.verified ? "verified" : "unverified"} · ${item.severity || UNKNOWN}` })),
+    h("div", { class: "gexchange-body" }, rows([
+      ["Finding ID", item.finding_id], ["설명", item.description],
+      ["채택한 claim", detail?.statement], ["영향", detail?.impact],
+      ["Severity 근거", detail?.severity_reason],
+      ["한계", (detail?.limitations || []).join(" · ") || null],
+      ["Review receipt", item.review_receipt_id],
+      ["원본 증거 참조", (item.original_evidence_ids || []).join(", ") || null],
+    ]), h("p", { class: "note", text: "verified는 독립 리뷰가 제한된 claim을 지지하고 구조적 결속 검사를 통과했음을 뜻합니다. 코드가 취약점 의미를 규칙으로 재판정했다는 뜻은 아닙니다." })));
 }
 
 function execution(item) {
@@ -130,7 +165,8 @@ function execution(item) {
     h("summary", {}, h("span", { class: "gexchange-title", text: `${item.tool_id} · ${item.state}` }),
       h("span", { class: "gexchange-state", text: kind })),
     h("div", { class: "gexchange-body" }, rows([
-      ["Invocation", item.invocation_id], ["선택 route", item.route],
+      ["Invocation", item.invocation_id], ["논리 Tool ID", item.tool_id],
+      ["실행 route", item.route], ["Receipt provider", item.receipt_provider],
       ["Route readiness", `${item.route_status || UNKNOWN} · ${item.route_reason_code || UNKNOWN}`],
       ["선택/실행 program", program], ["Program 경로", programPath],
       ["실제 실행 상태", item.state], ["결과 종류", kind],
@@ -207,6 +243,7 @@ function llm(view) {
   const status = model.waiting ? `응답 대기 ${model.waiting}건` :
     model.failures || model.unknown ? "확인 필요" : "응답 처리됨";
   const history = (model.exchanges || []).map(exchange);
+  const latestResponse = (model.exchanges || []).find((item) => item.response_content);
   return [badge(status, model.waiting ? "wait" : model.failures || model.unknown ? "wait" : ""),
     h("h3", { text: "LLM 요청 · 응답" }),
     h("p", { class: "gdetail-summary", text: `제공자 전송 ${model.provider_requests || 0}건 · 응답 ${model.responses || 0}건 · 실패 ${model.failures || 0}건 · 결과 불명 ${model.unknown || 0}건` }),
@@ -216,18 +253,26 @@ function llm(view) {
       ["전송 전 취소", model.cancelled || 0], ["화면 표시", `${model.shown || 0}건${model.truncated ? " (최근 기록만)" : ""}`],
     ]),
     h("p", { class: "note", text: "프롬프트와 모델의 공개 응답은 민감정보를 마스킹하고 길이를 제한해 표시합니다. 내부 추론과 provider continuation은 저장하지 않습니다. 변경 이전 Run에는 본문이 없을 수 있습니다." }),
+    latestResponse ? h("section", { class: "gexchange-content gexchange-latest" },
+      h("h4", { text: "최근 수신한 공개 응답" }),
+      h("p", { class: "note", text: `#${latestResponse.sequence || "?"} · ${latestResponse.stage || latestResponse.purpose || latestResponse.kind || "단계 미기록"}` }),
+      h("pre", { text: latestResponse.response_content }),
+      latestResponse.response_truncated ? h("p", { class: "note", text: "저장 길이 제한으로 이후 내용이 생략되었습니다." }) : null) : null,
     h("h4", { text: "최근 요청과 응답" }),
     history.length ? h("div", { class: "gexchange-list" }, history) : h("p", { class: "note", text: "기록된 LLM 요청이 없습니다." })];
 }
 
 function origin(view) {
   const o = view.origin;
+  const findings = (view.findings || []).map(findingDetail);
   return [h("h3", { text: "증거와 발견사항" }),
     h("p", { class: "gdetail-summary", text: `증거 ${o.evidence}건 · 발견사항 ${o.findings}건 · 검증 ${o.verified_findings}건` }), rows([
     ["증거 참조", o.evidence], ["그래프 변경", o.graph_updates], ["Finding", o.findings],
     ["검증된 Finding", o.verified_findings], ["가설", o.hypotheses],
     ["남은 액션 예산", view.usage.budget_remaining],
-  ])];
+  ]), h("h4", { text: "Finding 상세" }),
+  findings.length ? h("div", { class: "gexchange-list" }, findings) :
+    h("p", { class: "note", text: "저장된 Finding이 없습니다." })];
 }
 
 export function renderDetail(root, view, selected) {
@@ -240,5 +285,5 @@ export function renderDetail(root, view, selected) {
   else if (selected && selected.startsWith("task:")) body = task(view, selected.slice(5));
   else if (selected && selected.startsWith("worker:")) body = worker(view, selected.slice(7));
   else body = [h("p", { class: "note", text: "노드를 선택하면 상세가 여기에 표시됩니다." })];
-  replace(root, body);
+  replaceLive(root, body);
 }

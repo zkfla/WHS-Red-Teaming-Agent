@@ -1,4 +1,4 @@
-"""Repeated invalid candidate review selections exhaust the planner's finite repair budget.
+"""Repeated Planner attempts to own final review exhaust the finite repair budget.
 
 The real split and legacy planners run the production validation loop. Only model answers are
 scripted. Every judgment cites a real Task completion receipt as the candidate review, so each
@@ -30,6 +30,7 @@ from tests.integration.test_probe_workers import selection as split_selection
 
 REASON = "The bound independent review supports this candidate verdict"
 LOCATION = "$.updates[0].review_evidence_id"
+OWNERSHIP_CODE = "planner_review_application_owned_by_code"
 
 
 @pytest.mark.parametrize("mode", ["split", "legacy"])
@@ -50,7 +51,7 @@ async def test_repeated_wrong_review_selection_exhausts_repair_budget_without_wr
         # Real observation Task, real graph.record review receipt, scripted meaning answer.
         after_task, source = await _observe_candidate(session, llm)
         verifier = StructuredLLMAnalysisVerifier(
-            MeaningLLM([_meaning("success")]), session.deps.evidence_store, service,
+            MeaningLLM([_meaning("unknown")]), session.deps.evidence_store, service,
         )
         public = await _receipt(session, await _graph_record(
             session, verifier, candidate_id=after_task.hypothesis_id, source=source,
@@ -84,7 +85,7 @@ async def test_repeated_wrong_review_selection_exhausts_repair_budget_without_wr
         assert diagnostic.repair_limit == repair_limit
         assert diagnostic.attempts == 1 + repair_limit
         assert diagnostic.last_cause is not None
-        assert diagnostic.last_cause.code == "candidate_review_receipt_invalid"
+        assert diagnostic.last_cause.code == OWNERSHIP_CODE
         assert diagnostic.last_cause.location == LOCATION
         assert completion_id not in diagnostic.model_dump_json()
         assert completion_id not in str(failed.value)
@@ -97,9 +98,12 @@ async def test_repeated_wrong_review_selection_exhausts_repair_budget_without_wr
         assert (await session.status())["usage"]["spent"] - spent_before == 1 + repair_limit
         feedback = llm.plan_feedback[plans_before:]
         assert len(feedback) == 1 + repair_limit and feedback[0] == ""
-        assert all("candidate_review_receipt_invalid" in item and LOCATION in item
+        assert all(OWNERSHIP_CODE in item and LOCATION in item
                    for item in feedback[1:])
-        assert all(completion_id not in item for item in feedback)
+        for item in feedback[1:]:
+            diagnostic_text, marker, replay = item.partition("\n\nRejected proposal data:\n")
+            assert marker and completion_id not in diagnostic_text
+            assert completion_id in replay
 
         # No atomizer ran on any rejection, and no candidate, Task or Finding was written.
         assert len(llm.atom_inputs) == atoms_before

@@ -37,7 +37,7 @@ and admitted candidate revisions, so old receipts cannot prove a different probe
 Result contract v2 adds structured `observations` and `limitations`; its outcome
 concerns the current probe purpose. Confirming an observation does not confirm
 the vulnerability candidate. Existing settlement/claim/original proof gates still
-apply to confirmed and refuted v2 results. The result tool descriptor is version 4.
+apply to confirmed and refuted v2 results. The result tool descriptor is version 5.
 New publication inputs default to v2 when `result.contract_version` is omitted;
 explicit v1 remains supported for legacy Tasks. The stored `InvestigationResult`
 model retains its v1 default and serialization, so reading old records does not
@@ -48,6 +48,237 @@ references and observation items. A v2 blocked probe can publish partial feedbac
 without completing the Task or releasing unresolved executions. Direct follow-ups
 may cite source Task/result without inventing a result question; when a question
 is supplied, it must still exist on the original source result.
+
+### Candidate-free initial observation (plan4a)
+
+An empty candidate inventory is valid in both the split Planner/Atomizer and
+legacy single-judgment routes. A bounded initial observation can use this
+split-stage wire shape, where `registered-target` denotes a captured target ID:
+
+```json
+{
+  "updates": [],
+  "termination": "continue",
+  "reason": "Observe the registered target before proposing a security premise",
+  "questions": [{
+    "question_id": "initial-observation",
+    "objective": "Inspect the scoped response and retain the original evidence",
+    "target_node_ids": ["registered-target"],
+    "candidate_refs": [],
+    "completion_criteria": [{"kind": "observation", "description": "Retain the response"}]
+  }]
+}
+```
+
+Binding produces `hypothesis_revisions={}`; the Atomizer preserves that purpose.
+Legacy proposals put the same empty revision map on their observation Task.
+Registration, snapshots, results, reports and storage resume retain empty
+candidate links (`related_hypothesis_ids=[]`, result `hypothesis_ids=[]`). A later
+candidate does not retroactively attach to the original Task or result. No SQL
+or persisted contract version changes are needed.
+
+`continue` still requires valid proposed questions/Tasks or referenced executable
+existing work. Subject, readiness, count, probe-limit, duplicate and CAS checks
+remain in force, as do execution scope, ROE and Control. Candidate verdict
+criteria require linked candidates; confirmed/rejected candidates still require
+exact independent review receipts. Task completion, Findings and Mission
+completion retain their separate gates. Candidate-free held/exhausted judgments
+still require reasons and resume conditions.
+
+Plan 4b introduced default profile version 32 (strategy prompt 18, atomizer prompt 10)
+and legacy version 24 (planner prompt 9), with Worker prompt 15 and conversation
+prompt 3. The current versions are recorded under **Worker delivery version** below.
+The code-owned Planner request contract change also participates in custom-profile
+planning bindings. Changed
+bindings require a new Run; historical Runs are not force-resumed with these prompts.
+
+### Evidence-grounded active progression (plan4b)
+
+Conversation preserves the operator's objective and explicit constraints. It does
+not synthesize a read-only or technique-ban clause. An explicit `non-destructive`
+constraint retains its availability, persistent-data, scope and approval meaning;
+it does not itself prohibit every bounded request, authentication-boundary check,
+input variation or principal/session comparison. Actual calls remain subject to
+the canonical scope, ROE, target action policy, approval/risk, rate, quota,
+principal/session binding and execution-budget admission.
+
+After a candidate-free observation, a new candidate can cite the preserved TOOL
+original in `supporting_evidence_ids`, keep the observed fact separate from the
+untested premise, and propose a bounded question that can distinguish positive,
+negative and execution-failure outcomes. The split Atomizer copies the captured
+candidate revision, source Task/result and completion conditions into its Task.
+It does not add policy text, tool order or payloads. Legacy single-stage planning
+uses the same evidence-grounding and constraint rules. Existing validators still
+reject unknown targets/principals/evidence, changed source results, stale candidate
+revisions and invalid completion conditions.
+
+The common Worker chooses among its assembled role view. Structured web/recon
+receipts, program discovery and target routes remain alternatives; a shell is not
+a success condition and an inventory sample is not an allowlist. Tool visibility
+does not grant execution permission. The Worker payload retains the active Task,
+related originals, bounded cards, current policy meaning and remaining limits.
+Its execution history is a maximum of six compact current/recent rows containing
+invocation, tool, state, target, wait, selection/outcome and result pointers.
+Approval fingerprints, input hashes, reservations, resource keys, ownership
+bookkeeping and settled retry history remain in the canonical ledger and reports.
+Omission counts are explicit.
+
+The offline plan4b integration uses a model double and transport double through
+the real split Planner, Atomizer, Task registration, role catalog, Control
+admission, Worker execution, evidence storage and a second Planner pass. It
+proves candidate-free observation followed by an evidence-linked candidate and
+distinguishing Task, while leaving the candidate open and creating no Finding.
+It performs no live model, MCP, shell or target call.
+
+### Worker assessment draft storage (plan3a)
+
+Result v2 optionally retains typed `assessment_drafts` owned by
+`core/contracts/assessment.py`. Each version-1 draft contains its ID, title,
+classification, complete claim, proposed judgment/severity/impact, declared
+expectation origin, observations, limitations and competing explanations. These
+are worker assertions. They do not change candidate verdicts, create Findings,
+or satisfy independent completion review. Task ownership supplies Run, author
+and Task attribution; the model cannot assign those fields on a draft.
+
+Observations and evidence-derived expectations reference preserved TOOL originals
+by evidence ID and output-relative field segments. Paths share `RecordedFact`
+resolution: try the exact path first, then optionally drop one leading `output`.
+Optional text spans use nonnegative character offsets and positive lengths in
+the redacted stored field. Missing paths, nontext spans, out-of-bounds coordinates,
+foreign Run/Engagement references and subjects outside the Task are rejected.
+Existing original action/invocation/proposal and target grounding checks apply;
+there is no new same-Task-only source restriction. Supported diagnostic/review
+records can be limitation references, never execution observations. No free-form
+excerpt is accepted as an original and no original body is copied into a draft.
+
+Publication, direct reviewed/unresolved settlement and probe yield share
+`result_for` and the existing central transaction. They retain the result ID,
+prior drafts, original references, observations, limitations and questions.
+Exact draft replay is idempotent; changing or removing a saved draft ID conflicts
+and an edited assertion needs a new ID. Repeated identical publication adds no
+outbox notification. Existing ownership, CAS, original checks and finalization
+gates still apply. There is no extra draft table or duplicate evidence ledger;
+final receipt application status uses the existing `state_requests` boundary
+described below.
+
+`AssessmentDraft.identity(result_id)` binds result ID, draft ID and SHA-256 of the
+entire normalized draft. Claim text is explicitly limited to 4000 characters
+and is stored and hashed without shortening. The explicit legacy `FindingDraft`
+adapter refuses claims longer than 500 characters, preserving the historical
+receipt contract. The versioned `graph.record.assessment_findings` input instead
+routes the same complete draft through posthoc review. A pre-settlement review
+predicts the code-owned result ID; later candidate promotion requires the stored
+Task result to contain the exact draft ID and normalized hash.
+
+Empty draft fields are omitted from old v1/v2 result dumps and old completion
+payloads; result and completion-purpose hashes retain their prior meaning.
+Drafts require result v2, without reinterpreting historical result versions.
+The legacy `graph_recording.FindingDraft` type address/schema remains readable
+for SDK checkpoints, with shared claim fields owned by core. Normal save/load
+redaction also applies to nested drafts and bypassed `model_copy` input.
+`task.publish_result` is version 5, `task.settle` version 6 and `goal.settle`
+version 4 (shared completion schema). This draft contract was introduced with
+default profile version 30 and compatibility profile version 22; current delivery
+versions are listed below. Old data stays readable; normal selection checks reject
+incompatible execution resumes without rewriting historical fingerprints.
+
+### Assessment review, Planner and report views
+
+The existing report `investigations[].result.assessment_drafts` retains the core
+typed draft payload. `investigation_report_views` validates nonempty draft
+results with `InvestigationResult` and reapplies the existing redaction before
+report construction, serialization and Markdown rendering, including bypassed
+`model_copy`/assignment input. Each investigation with drafts also exposes
+derived `assessment_draft_refs`: result ID, draft ID, draft contract version and
+the complete normalized content hash. These are report navigation fields, not
+another stored result or review ledger. Existing reports without drafts stay
+readable, with no observation inferred from their old summary.
+
+The Markdown report shows proposed title/classification/severity/impact, complete
+claim, worker opinion, declared expectation origin, observation source paths and
+text spans, limitation references and alternative explanations. Draft detail is
+not clipped into an apparent complete review. It contains worker-authored text
+and original references, without copying raw original bodies. Worker text is
+rendered as literal JSON text so headings, HTML and backticks do not create report
+structure; canonical draft content and hashes remain unchanged. Candidate status
+and final Findings remain separate; draft entries never enter Finding counts or
+verified-Finding effectiveness. The result's Task completion receipt is labeled
+separately and does not establish review of draft details.
+
+Version-3/4 public review receipts and the report's typed `assessment_reviews`
+projection expose exact result/draft/hash linkage and reviewer-adopted detail.
+Version 4 also exposes the review confidence used by the `0.80` Finding threshold.
+Markdown correlates that binding with the Worker proposal. Task cards expose
+bounded proposal summaries/counts and an exact result lookup reference even when
+the full Task does not fit automatic hydration. Worker, Planner and evidence
+prompts distinguish proposal, receipt, candidate verdict and verified Finding.
+Read-only reporting never resumes a Run or rewrites originals/checkpoints.
+
+### Reviewed Finding details in reports
+
+`FindingProjection.description` now carries the stored graph Finding description
+into JSON reports, saved report exports and `findings list --json`. Markdown
+reports show the complete masked description and the report's scoped evidence
+references beneath each Finding. Description text uses the same literal display
+as worker proposals: it cannot create Markdown headings or close its own code
+span. No prefix slice replaces the description. The normal compact Finding list
+and web graph view are unchanged.
+
+This is an additive field. Missing descriptions in historical report
+payloads remain `None`/unknown and are omitted when reserialized; a stored empty
+description stays an explicit empty string. Input, serialization and Markdown
+rendering reuse existing redaction, including bypassed `model_copy` input.
+Descriptions are never populated from a current Task draft or arbitrary Finding
+metadata. Reporting does not rewrite the graph Finding, its ID/hash, original
+evidence, source receipt, candidate, counts or stored severity/verified flag.
+
+For a version-3/4 receipt, `ReviewedFindingDetail` carries the reviewer-adopted
+title, complete claim, summary, classification, severity and basis, impact,
+limitations and evidence field roles. Candidate promotion accepts it only after
+the exact stored draft binding, source set, claim identity, revision and purpose
+checks. The Finding stores this typed structure and reports reopen it directly;
+they do not re-synthesize it from current Tasks. Missing detail retains the prior
+generic promotion fallback. Profile fingerprints changed for new Runs; historical
+data remains read-only and is never rewritten.
+
+### Final review application and recovery
+
+The Evidence Store first durably records the immutable final public review receipt.
+Central State then applies that receipt through the Run-bound
+`CandidateReviewApplicationService`. These are two explicit persistence boundaries;
+the system does not claim one transaction across the filesystem Evidence Store and
+SQLite. The existing `state_requests` row kind `candidate_review_application` is the
+idempotency and recovery ledger. No second review database or schema table is used.
+
+For a version-3/4 assessment review submitted before canonical Task settlement,
+`graph.record` stores `pending_task_result` with the exact receipt, candidate
+pre-verdict revision, Task/result/draft identities and content hash. `task.settle`
+stores the canonical result and applies each prepared pending receipt in the same
+Central SQLite transaction. Candidate CAS, one revision increment, Finding storage,
+`candidate_finding_promotion`, application status and `FINDING_CREATED` outbox event
+therefore commit or roll back together. Resume/worker readiness retries only explicit
+`pending_task_result` rows for the current Run whose canonical Task result now exists.
+It never scans historical review evidence for possible promotion.
+
+Terminal application states are `promoted`, `candidate_rejected`, `inconclusive` and
+`refused`; preparation/storage failures may be `retryable_error`. Reapplying the same
+receipt returns the stored result and does not increment the candidate, duplicate the
+Finding or enqueue another event. Existing claim keys and legacy aliases prevent a
+new v2 application from duplicating an older Planner-confirmed Finding.
+
+Inspection, reports and the web graph open Central State read-only. They project the
+stored application status, pre/post revision, receipt and Finding references without
+running apply, recovery or migration. Opening an old Run never promotes its historical
+`reviewed` receipt. Legacy v1 sequential graph resolution and existing Planner-confirmed
+v2 Findings retain their stored meaning. Incompatible current prompt/runtime bindings
+remain subject to the normal resume rejection instead of rewriting the Run.
+
+Reports connect the application to the candidate and reviewer-adopted Finding detail.
+`verified=true` means an independent semantic review supported the bounded claim and
+the code-owned provenance, scope, origin, revision, purpose, principal, source and
+draft-binding gates passed. It does not mean code recognized or re-derived the
+vulnerability semantics. Findings remain visible alongside a later `planning_error`;
+the diagnostic describes follow-up planning and does not erase committed graph state.
 
 The Planner may receive an ephemeral `candidate_review_support` projection when its ordinary bounded
 Task/original views omit current-revision context. It joins only displayed current candidates to Tasks
@@ -153,8 +384,11 @@ projection. `selection` comes from the provider descriptor's optional
 `execution_route` plus the Run-bound program environment; the descriptor value
 is display/planning metadata and never grants execution. `outcome` is derived
 from the preserved original and mapper evidence, so generic stdout cannot be
-reported as a canonical protocol receipt. Older rows omit both fields and stay
-`unknown`; readers must not fill them from the current machine's inventory.
+reported as a canonical protocol receipt. A provider-declared, bounded
+`receipt_provider` may be retained in the outcome so read-only views can distinguish the
+logical Tool ID from the provider that produced the receipt. Rows predating the projection omit
+selection and outcome; newer historical outcomes may omit only `receipt_provider`. Readers keep
+those values unknown and must not fill them from the current machine's inventory.
 There are no TaskClaim, independent question, Path/Step or candidate scheduler
 tables. Legacy Task dependency/parent/priority fields are rejected on registration
 and omitted from central persisted Task JSON.
@@ -1137,10 +1371,12 @@ must pass before resuming an existing Run; incompatible Runs are not migrated.
 
 ## Worker delivery version
 
-The default split schema-3 profile is `native-probes` version 28, with
-`worker.md` prompt version 13, `hypothesis-strategy.md` version 15 and
-`probe-atomizer.md` version 8. The retained single-stage profile is version 21
-with planner prompt version 7 and the same worker prompt version. Planner/atomizer responsibilities
+The default split schema-3 profile is `native-probes` version 35, with
+`worker.md` prompt version 17, `hypothesis-strategy.md` version 21 and
+`probe-atomizer.md` version 13. The retained single-stage profile is version 27
+with planner prompt version 12 and the same worker prompt version. Both use common
+prompt version 4, conversation prompt version 4 and evidence prompt version 8.
+Planner/atomizer responsibilities
 and independent completion review remain separate. Both profiles allow 64 Task model
 requests and 16 target actions, with repair subcap 16 and consecutive-provider-failure subcap 6;
 these share the existing Task/Run ledger. Prompt
@@ -1160,7 +1396,8 @@ and atomic registration validation. Duplicate, invented or other-question IDs
 are rejected; every original condition must remain covered and a paired
 comparison remains one condition on a task with all its principals.
 
-The profile is version 9 and `probe-atomizer.md` is version 3. The single-stage
+This atomizer-selection contract was introduced with profile version 9 and
+`probe-atomizer.md` version 3. The single-stage
 profile's proposal shape and saved canonical Task conditions are unchanged.
 Historical split Runs/results remain readable, but old selection fingerprints
 cannot execute with the new atomizer contract. No stored Run is migrated.

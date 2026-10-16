@@ -284,6 +284,7 @@ def public_receipt_metadata(metadata):
         "reason", "action_id", "invocation_id", "target_node_id", "claimed_principals",
         "covered_principals", "source_evidence_ids", "source_origins",
         "supporting_evidence_ids", "refuting_evidence_ids",
+        "reviewed_finding_detail",
     ) if key in metadata}
 
 
@@ -409,6 +410,7 @@ class PlannerPassContext:
         receipts = self._receipts({item["hypothesis_id"] for item in fields["candidates"]})
         fields["review_receipts"] = receipts
         shown.update(item["evidence_id"] for item in receipts)
+        fields["candidate_review_state"] = self._candidate_review_state(fields["candidates"])
         fields["candidate_review_support"], fields["candidate_review_support_omitted_count"] = (
             self._candidate_review_support(
                 fields["candidates"], receipts,
@@ -434,6 +436,78 @@ class PlannerPassContext:
                     "task_id/hypothesis_id/record_kind filters and bounded windows.",
         }
         return fields
+
+    def _candidate_review_state(self, displayed_candidates):
+        """Bounded canonical application/Finding view; never a Planner verdict surface."""
+        visible = {str(item.get("hypothesis_id")) for item in displayed_candidates}
+        candidates = self.canonical.candidates
+        findings = {
+            str(item.finding_id): item for item in getattr(self.canonical, "findings", ())
+        }
+        promotions = {
+            (str(item.get("candidate_id")), item.get("candidate_revision")): item
+            for item in getattr(self.canonical, "finding_promotions", ())
+        }
+        applications = list(getattr(self.canonical, "review_applications", ()))
+        applications.sort(key=lambda item: (
+            str(item.get("candidate_id")) not in visible,
+            str(item.get("review_receipt_id") or ""),
+        ))
+        records: list[dict[str, Any]] = []
+        remaining = 8192
+        omitted = 0
+        for item in applications:
+            candidate_id = str(item.get("candidate_id") or "")
+            candidate = candidates.get(candidate_id)
+            finding_id = str(item.get("finding_id") or "") or None
+            finding = findings.get(finding_id or "")
+            detail = (
+                finding.metadata.get("reviewed_finding_detail", {})
+                if finding is not None and isinstance(finding.metadata, dict)
+                else {}
+            )
+            limitations = detail.get("limitations", []) if isinstance(detail, dict) else []
+            if not isinstance(limitations, list):
+                limitations = []
+            promotion = promotions.get((candidate_id, item.get("candidate_revision")))
+            card = {
+                "review_receipt_id": item.get("review_receipt_id"),
+                "application_status": item.get("status"),
+                "application_reason": item.get("reason") or None,
+                "candidate_id": candidate_id,
+                "candidate_pre_verdict_revision": item.get("candidate_pre_verdict_revision"),
+                "candidate_revision": item.get("candidate_revision"),
+                "canonical_candidate_status": candidate.status if candidate is not None else None,
+                "finding_id": finding_id,
+                "promotion_status": promotion.get("status") if promotion is not None else None,
+                "finding": ({
+                    "finding_id": str(finding.finding_id),
+                    "title": finding.title,
+                    "description": finding.description,
+                    "severity": finding.severity,
+                    "verified": finding.verified,
+                    "evidence_ids": list(finding.evidence_ids),
+                    "limitations": list(limitations),
+                } if finding is not None else None),
+            }
+            size = context_bytes(card)
+            if size > remaining:
+                omitted += 1
+                continue
+            records.append(card)
+            remaining -= size
+        return {
+            "contract_version": 1,
+            "records": records,
+            "captured_count": len(applications),
+            "omitted_count": omitted,
+            "note": (
+                "Canonical DATA applied by central final-review handling. Planner consumes these "
+                "candidate/Finding outcomes and may propose separate follow-up questions; it "
+                "must not select a receipt or repeat a terminal verdict. pending_task_result is "
+                "owned by the application retry path."
+            ),
+        }
 
     @staticmethod
     def _related_evidence(tasks, candidates):
@@ -561,8 +635,9 @@ class PlannerPassContext:
                                                   "same-revision Tasks may be omitted.",
                 "note": "Navigation DATA only. Task outcomes and original references do not "
                         "prove candidate purpose, evidence validity, or a candidate verdict. "
-                        "A summary identity is not a full read; use context_request before "
-                        "citing an unpresented Task as reviewed.",
+                        "Central candidate_review_state owns final receipt application. A summary "
+                        "identity is not a full read; use context_request before citing an "
+                        "unpresented Task as reviewed.",
             }
             size = context_bytes(card)
             if size > remaining:

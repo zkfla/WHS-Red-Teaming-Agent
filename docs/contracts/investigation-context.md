@@ -81,6 +81,14 @@ scope requires an explicitly new snapshot; old continuation pages cannot be
 mixed with it. Raw evidence remains accessible through the existing bounded
 EvidenceReader contract, which is not duplicated here.
 
+Task cards expose a bounded assessment-draft count, up to four proposal cards,
+their complete content hashes, omitted count and an exact Task-result detail
+lookup reference. Full Task hydration and `section=result` reads retain the typed
+draft bodies. The existing 32 KiB hydration, lookup budget, snapshot and consumed
+read rules are unchanged. Public version-3 review receipts expose only their typed
+`reviewed_finding_detail`, including exact result/draft/hash binding; a card or
+draft proposal is still not proof of independent approval.
+
 ## Overview and mandatory information
 
 `reader.overview(active_task_id=..., feedback_task_ids=..., target_node_ids=...,
@@ -262,8 +270,8 @@ uses bounded conflict/wait cards, not full contracts or an omissions-based gate.
 The existing split coverage, paired comparison, source/revision validation, empty
 and update-only skips and single atomic admission remain in place.
 
-Default profile version 21 (strategy 9 / atomizer 4 / worker 13) and single-stage
-compatibility version 18 (planner 5 / worker 13) bind the current prompts.
+Default profile version 32 (strategy 18 / atomizer 10 / worker 15) and single-stage
+compatibility version 24 (planner 9 / worker 15) bind the current prompts.
 The [10b request contract](planner-request.md) keeps independent Planner prefixes
 stable and samples current accounting for each lookup/repair attempt. Existing profile
 fingerprint/resume checks reject silent changes; no stored Run or checkpoint

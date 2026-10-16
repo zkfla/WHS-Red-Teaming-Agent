@@ -148,6 +148,7 @@ def _execution_record(
     }
     return SimpleNamespace(
         evidence_id=evidence_id,
+        digest=f"digest-{evidence_id}",
         run_id="run-1",
         engagement_id="engagement-1",
         source_type=EvidenceSourceType.TOOL,
@@ -216,6 +217,7 @@ async def test_posthoc_account_proof_gates_meaning_review(
         "proposal": {"arguments": arguments},
     })
     record = SimpleNamespace(
+        digest="digest-evidence-1",
         run_id="run-1",
         engagement_id="engagement-1",
         action_id="action-1",
@@ -245,6 +247,7 @@ async def test_posthoc_account_proof_gates_meaning_review(
         "meaning": "The evidence supports the claim.",
         "outcome": "success",
         "reason": "Measured response.",
+        "confidence": 0.9,
         "claim_supported": True,
     })
     monkeypatch.setattr(verifier._decider, "ask", cast(Any, meaning_call))
@@ -287,6 +290,7 @@ async def test_invalid_comparison_source_cannot_borrow_runwide_alias_proof(
         "meaning": "The evidence supports the claim.",
         "outcome": "success",
         "reason": "Measured response.",
+        "confidence": 0.9,
         "claim_supported": True,
     })
     monkeypatch.setattr(verifier._decider, "ask", cast(Any, meaning_call))
@@ -318,6 +322,7 @@ async def test_consistent_comparison_can_use_real_runwide_alias_proof(monkeypatc
         "meaning": "The evidence supports the claim.",
         "outcome": "success",
         "reason": "Measured response.",
+        "confidence": 0.9,
         "claim_supported": True,
     })
     monkeypatch.setattr(verifier._decider, "ask", cast(Any, meaning_call))
@@ -352,6 +357,7 @@ async def test_alias_candidate_must_match_its_original_proposal_target(
         "meaning": "The evidence supports the claim.",
         "outcome": "success",
         "reason": "Measured response.",
+        "confidence": 0.9,
         "claim_supported": True,
     })
     monkeypatch.setattr(verifier._decider, "ask", cast(Any, meaning_call))
@@ -394,6 +400,7 @@ async def test_posthoc_anonymous_claim_accepts_only_an_explicit_anonymous_unit(
         "meaning": "The evidence supports the claim.",
         "outcome": "success",
         "reason": "The original anonymous request measured the target.",
+        "confidence": 0.9,
         "claim_supported": True,
     })
     monkeypatch.setattr(verifier._decider, "ask", cast(Any, meaning_call))
@@ -461,6 +468,7 @@ async def test_posthoc_anonymous_claim_rejects_missing_or_untrusted_receipts(
         "meaning": "The evidence supports the claim.",
         "outcome": "success",
         "reason": "Should not be reached without an original anonymous receipt.",
+        "confidence": 0.9,
         "claim_supported": True,
     })
     monkeypatch.setattr(verifier._decider, "ask", cast(Any, meaning_call))

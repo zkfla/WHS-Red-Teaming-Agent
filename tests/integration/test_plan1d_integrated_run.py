@@ -211,18 +211,6 @@ async def test_one_run_recovers_records_reviews_promotes_and_reopens(tmp_path):
         assert receipt is not None
         assert receipt.metadata["candidate_revision"] == 1
         assert receipt.metadata["hypothesis_outcome"] == "success"
-        assert await service.list_findings() == []
-
-        llm.decisions.append({
-            "updates": [candidate(
-                current=current.model_dump(mode="json"), status="confirmed",
-                evidence=[str(source.evidence_id)], review=receipt_id,
-            )],
-                "questions": [],
-            "termination": "replan",
-            "reason": "The exact independent receipt supports the candidate verdict",
-        })
-        assert await planner.advance(session.runtime) == []
         saved = await service.get_hypothesis(current.hypothesis_id)
         findings = await service.list_findings()
         promotions = await session.deps.central_state.candidate_finding_promotions()
@@ -247,16 +235,16 @@ async def test_one_run_recovers_records_reviews_promotes_and_reopens(tmp_path):
         assert task_accounting["unknown_usage"] == 2
         assert accounting["provider_cooldown"]["state"] == "open"
         assert accounting["provider_cooldown"]["consecutive"] == 0
-        assert accounting["spent"] == 10
+        assert accounting["spent"] == 9
         assert accounting["known_tokens"] == 40
-        assert accounting["unknown_usage"] == 6
+        assert accounting["unknown_usage"] == 5
         assert accounting["repairs"] == 0
-        assert accounting["usage"]["total_tokens"] == {"known": 40, "unknown": 6}
+        assert accounting["usage"]["total_tokens"] == {"known": 40, "unknown": 5}
         for field in (
             "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
         ):
-            assert accounting["usage"][field] == {"known": 0, "unknown": 10}
-        assert accounting["by_stage"]["hypothesis_planning"]["spent"] == 2
+            assert accounting["usage"][field] == {"known": 0, "unknown": 9}
+        assert accounting["by_stage"]["hypothesis_planning"]["spent"] == 1
         assert accounting["by_stage"]["task_atomization"]["spent"] == 1
         assert accounting["by_stage"]["native_action"]["spent"] == 5
         assert accounting["by_stage"]["task_completion_review"]["spent"] == 1
@@ -271,9 +259,9 @@ async def test_one_run_recovers_records_reviews_promotes_and_reopens(tmp_path):
         assert report.candidates[0].status == "confirmed"
         assert report.candidate_finding_promotions == promotions
         assert report.actions_executed == 1
-        assert report.model_requests_used == 10
+        assert report.model_requests_used == 9
         assert report.model_tokens_used == 40
-        assert report.model_usage_unknown == 6
+        assert report.model_usage_unknown == 5
         assert report.ready_for_release is False
         task_usage, = report.task_request_effectiveness
         assert task_usage["model_requests"] == 6
@@ -308,7 +296,7 @@ async def test_one_run_recovers_records_reviews_promotes_and_reopens(tmp_path):
     fresh_client = RunMeteredLLM(llm, reopened.request_ledger())
     reopened_accounting = await fresh_client.ledger.snapshot(run_id)
     _assert_reconciled(reopened_accounting)
-    assert reopened_accounting["spent"] == 10
+    assert reopened_accounting["spent"] == 9
     assert len(await reopened_graph.list_findings()) == 1
     assert len(await reopened.candidate_finding_promotions()) == 1
 

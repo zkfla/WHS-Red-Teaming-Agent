@@ -43,6 +43,26 @@ def test_termination_receipt_trust_comes_only_from_verified_role_metadata(monkey
     assert bootstrap._trusted_termination_servers(verified) == ("web-http",)
 
 
+def test_prepared_target_removes_host_side_deployment_tools_and_stale_trust():
+    from types import SimpleNamespace
+
+    verified = SimpleNamespace(
+        spec=SimpleNamespace(roles=("web-http", "recon-passive")),
+    )
+    route_backed_web = SimpleNamespace(server_id="web-http")
+
+    servers = bootstrap._prepared_target_external_servers(
+        ["web-http", "recon-passive", "remote-research"], verified,
+    )
+
+    assert servers == ["remote-research"]
+    assert bootstrap._registered_termination_servers(
+        ("web-http", "recon-passive", "remote-research"),
+        servers,
+        [route_backed_web],
+    ) == ("web-http", "remote-research")
+
+
 async def test_default_capability_passes_verified_termination_trust(monkeypatch):
     sentinel = object()
     build = AsyncMock(return_value=sentinel)

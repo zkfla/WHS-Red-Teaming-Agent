@@ -382,9 +382,9 @@ def task_is_claimable(
 async def ready_workers(deps, base, *, max_instances=None):
 
     from redteam.orchestration.agents.tool_access import ready_role_ids
-
     state = deps.central_state
     await process_controls(deps)
+    await deps.candidate_review_applicator.retry_pending()
     eligible = await ready_role_ids(deps)
     limit = min(worker_limit(deps), max_instances or worker_limit(deps))
     candidates = await state.list_tasks()

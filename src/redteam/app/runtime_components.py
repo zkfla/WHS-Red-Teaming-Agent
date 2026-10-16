@@ -53,6 +53,7 @@ class ComponentFactoryContext:
     evidence_store: Any
     graph_store: Any
     settings: Any = None
+    candidate_review_applicator: Any = None
 
 
 @dataclass(frozen=True)

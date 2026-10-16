@@ -8,7 +8,6 @@ import pytest
 from redteam.attack_graph.service import AttackGraphService
 from redteam.core.enums import Verdict
 from redteam.orchestration.analysis import VerificationAssessment, append_posthoc_claim_receipt
-from redteam.orchestration.cognition import DecisionFailure
 from redteam.orchestration.coordination import CandidateAdmissionConflict
 from redteam.orchestration.specialist_planner import SpecialistPlanner
 from tests.integration.test_central_development import TARGET, TOOL, discover, inspect, turn
@@ -68,7 +67,7 @@ def _verdict(review, evidence):
     return decide
 
 
-async def test_stale_review_verdict_keeps_review_and_candidate_in_planner_diagnostic(tmp_path):
+async def test_stale_review_verdict_is_rejected_before_semantic_receipt_selection(tmp_path):
     llm = PlannerDouble([FIRST])
     async with selection(tmp_path, llm=llm) as (session, llm, tools):
         first_id = await _observe(session, llm)
@@ -78,16 +77,14 @@ async def test_stale_review_verdict_keeps_review_and_candidate_in_planner_diagno
         stale = await _review(session, current, source, "First review")
         await _review(session, current, source, "Second review supersedes the first")
         llm.decisions.append(_verdict(stale, [str(source.evidence_id)]))
-        with pytest.raises(DecisionFailure) as failed:
-            await SpecialistPlanner(session.deps).advance(session.runtime)
-        diagnostic = failed.value.diagnostic
-        assert diagnostic.stage == "hypothesis_planning"
-        assert diagnostic.code == "completion_stale_review_receipt"
-        assert stale in diagnostic.evidence_ids
-        assert {"candidate_id": current.hypothesis_id,
-                "review_evidence_id": stale} in diagnostic.trace
-        assert diagnostic.owner == "orchestration.completion"
-        assert diagnostic.retryable is False
+        assert await SpecialistPlanner(session.deps).advance(session.runtime) == []
+        feedback = llm.requests[-1]["messages"][-1]["content"].partition(
+            "Previous attempt failed"
+        )[2]
+        diagnostic, marker, replay = feedback.partition("\n\nRejected proposal data:\n")
+        assert marker
+        assert "planner_review_application_owned_by_code" in diagnostic
+        assert stale not in diagnostic and stale in replay
         assert (await service.get_hypothesis(current.hypothesis_id)).status == "open"
 
 
@@ -104,9 +101,12 @@ async def test_unsafe_missing_review_reference_does_not_reach_durable_diagnostic
         assert await SpecialistPlanner(session.deps).advance(session.runtime) == []
         prompt = llm.requests[-1]["messages"][-1]["content"]
         feedback = prompt.partition("Previous attempt failed")[2]
-        assert "candidate_review_receipt_invalid" in feedback
-        assert "$.updates[0].review_evidence_id" in feedback
-        assert "hunter2" not in feedback and "ev missing" not in feedback
+        diagnostic, marker, replay = feedback.partition("\n\nRejected proposal data:\n")
+        assert marker
+        assert "planner_review_application_owned_by_code" in diagnostic
+        assert "$.updates[0].review_evidence_id" in diagnostic
+        assert "hunter2" not in feedback
+        assert "ev missing" not in diagnostic and "ev missing" in replay
         assert (await service.get_hypothesis(current.hypothesis_id)).status == "open"
         assert await service.list_findings() == []
         # Final admission keeps the unknown reference out of its durable diagnostic.
@@ -132,8 +132,9 @@ async def test_well_formed_missing_review_reference_is_kept_as_identifier(tmp_pa
         # The well-formed but unknown identifier is rejected in repair and never echoed back.
         assert await SpecialistPlanner(session.deps).advance(session.runtime) == []
         feedback = llm.requests[-1]["messages"][-1]["content"]
-        assert "candidate_review_receipt_invalid" in feedback
-        assert "ev_missing_review" not in feedback
+        diagnostic, marker, replay = feedback.partition("\n\nRejected proposal data:\n")
+        assert marker and "planner_review_application_owned_by_code" in diagnostic
+        assert "ev_missing_review" not in diagnostic and "ev_missing_review" in replay
         assert (await service.get_hypothesis(current.hypothesis_id)).status == "open"
         # The final admission keeps the identifier in its diagnostic for the canonical record.
         update = candidate(current=current.model_dump(mode="json"), status="confirmed",

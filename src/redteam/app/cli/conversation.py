@@ -43,36 +43,43 @@ from redteam.orchestration.state import RuntimeState
 
 logger = logging.getLogger(__name__)
 
-_SYSTEM_PROMPT = """당신은 승인된 보안 테스트 에이전트의 대화형 프런트엔드입니다.
-요청된 JSON 객체만 반환합니다. 비공개 chain-of-thought를 공개하지 않습니다. 사용자에게
-보여 줄 결정 요약은 간결하게 작성하고, 가정과 짧은 계획을 명시합니다. 도구가 이미
-실행되었다고 주장하지 않습니다. 범위 적용, 실행 가능한 MCP 도구 선택, 승인 요청과
-작업 수행은 당신이 아니라 runtime이 담당합니다.
+_CONVERSATION_RUNTIME_CONTRACT = """이 호출은 최신 운영자 발화를 대화 결정 JSON으로 변환합니다.
+요청된 JSON 객체만 반환하고 사용자에게 보일 문장은 간결하게 작성합니다.
 
-response, objective, guidance, assumptions, plan, success_criteria는 사용자의 최신 메시지와
-같은 언어로 작성합니다. 사용자가 한국어로 쓰면 이 필드들은 반드시 자연스러운 한국어로 작성합니다.
-번역하면 의미가 달라지는 command, tool, policy, target, error 식별자는 그대로 둡니다.
+response, objective, guidance, assumptions, plan, success_criteria는 최신 사용자 메시지와 같은
+언어로 작성합니다. 번역하면 의미가 달라지는 command, tool, policy, target, error 식별자는
+그대로 둡니다.
 
-mode를 선택합니다:
-- execute: 새로운 조사를 구체적으로 요청함; investigation="new"로 설정합니다.
+mode와 investigation을 다음과 같이 사용합니다.
+- execute: 구체적인 새 조사 요청이며 investigation="new"입니다.
 - answer: 제공된 세션 문맥으로 답할 수 있는 질문입니다.
-- clarify: 필수 대상 정보 또는 의도가 빠져 있습니다.
-- guidance: 도구를 직접 호출하지 않고 현재 실행 중인 에이전트의 행동에 반영할 조언입니다;
-  investigation="current"로 설정합니다.
-다른 조사를 요청하는 내용과 현재 실행에 대한 guidance를 결합하지 않습니다.
-질문은 읽기 전용입니다. 종료된 조사에 관한 지시라면 후속 조사를 원하는지 확인합니다.
-새 조사를 묵시적으로 시작하지 않습니다.
-제공된 입력 binding이 기준입니다. run ID를 지어내거나 변경하지 않습니다.
-새 조사를 시작할 때 success_criteria에는 사용자가 원하는 최종 산출물이나 관찰 가능한
-완료 조건을 각각 적습니다. 도구, 기법, 조사 순서 같은 실행 단계를 완료 기준으로 쓰지 않습니다.
-각 조건은 최신 사용자 요청이나 명시된 기존 기준에 근거해야 합니다. 목표·산출물·수용 조건이
-불명확하면 새로운 기준을 만들어 execute하지 말고 mode="clarify"로 필요한 사실을 질문합니다.
-새 기준을 덧붙여 대상, 기법, 권한 또는 scope를 넓히지 않습니다.
-도구의 사용 가능 여부와 실행 권한은 서로 다릅니다. 설정된 서버나 Run 시작 시 준비된
-shell은 발견된 활성 도구가 아닙니다. availability 상태가 configured_unverified 또는
-not_inspected인 빈 도구 목록은 MCP가 없다는 뜻이 아니라 아직 discovery가 이루어지지
-않았다는 뜻입니다. 제공된 policy 제약을 따르고 연결이나 권한이 있다고 주장하지 않습니다.
+- clarify: 필수 목표나 대상 정보가 빠진 요청입니다.
+- guidance: 현재 실행 중인 조사에 반영할 조언이며 investigation="current"입니다.
+
+execute의 objective와 success_criteria에는 최신 사용자 요청에 근거한 최종 결과와 관찰 가능한
+완료 조건을 적습니다. 도구, 기법과 조사 순서를 완료 조건으로 쓰지 않습니다. 제공된 binding과
+run ID를 그대로 사용합니다. tool_availability의 configured_unverified와 not_inspected는 아직
+discovery가 끝나지 않았다는 뜻이며 연결이나 실행 권한을 증명하지 않습니다.
 """
+
+_FALLBACK_ROLE_PROMPT = """당신은 운영자와 승인된 보안 조사 런타임 사이의 대화 담당자입니다.
+최신 발화를 답변, clarification, 현재 조사 guidance 또는 새 조사 요청으로만 해석합니다. 도구를
+실행하거나 scope·승인·성공을 추측하지 않습니다. 필수 목표나 대상이 없으면 만들어내지 말고
+질문합니다. 사용자가 말하지 않은 실행 제한이나 권한을 추가하지 않습니다. non-destructive는
+영속 데이터 파괴, 가용성 저하, 범위 밖 영향과 승인되지 않은 위험 동작을 피한다는 뜻입니다.
+"""
+
+# Direct pre-Run conversation has no profile snapshot, so it needs one small role fallback.
+# A RunMeteredLLM with profile prompts receives the role from PromptSnapshot.compose instead.
+_SYSTEM_PROMPT = _FALLBACK_ROLE_PROMPT + "\n" + _CONVERSATION_RUNTIME_CONTRACT
+
+
+def _conversation_system(llm: LLMClient) -> str:
+    return (
+        _CONVERSATION_RUNTIME_CONTRACT
+        if getattr(llm, "prompts", None) is not None
+        else _SYSTEM_PROMPT
+    )
 
 SuccessCriterionText = Annotated[str, Field(max_length=MAX_INTERPRETED_CRITERION_CHARS)]
 
@@ -295,8 +302,9 @@ class ConversationAssistant:
         try:
             # Request-local override: concurrent inputs never swap the shared
             # assistant's client or leak a previous Run's accounting context.
+            selected_llm = self._llm if llm_override is None else llm_override
             client = self._client if llm_override is None else StructuredDecisionClient(
-                llm_override,
+                selected_llm,
                 max_attempts=self._max_attempts,
                 transport_limit=self._transport_limit,
             )
@@ -309,7 +317,7 @@ class ConversationAssistant:
                     stage="conversation_decide",
                     payload=payload,
                     response_schema=ConversationDecision.model_json_schema(),
-                    system=_SYSTEM_PROMPT,
+                    system=_conversation_system(selected_llm),
                     budget=budget,
                 ),
                 timeout=self._timeout_seconds,

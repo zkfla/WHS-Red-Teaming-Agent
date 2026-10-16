@@ -25,6 +25,7 @@ from redteam.orchestration.hypothesis_planner import (
     planner_candidate_wire_schema,
     validate_candidate_review_selections,
     validate_candidate_status_presence,
+    validate_planner_candidate_authority,
 )
 from redteam.orchestration.probe_atomization import HypothesisPlanSelection
 
@@ -176,6 +177,12 @@ def test_active_planner_wire_schema_requires_candidate_status(model, split):
 
     assert "status" in candidate_schema["required"]
     assert "default" not in candidate_schema["properties"]["status"]
+    assert "read-only canonical outcomes" in candidate_schema["properties"]["status"][
+        "description"
+    ]
+    assert "must leave this null" in schema["$defs"]["HypothesisUpdate"]["properties"][
+        "review_evidence_id"
+    ]["description"]
     assert "confidence" not in candidate_schema["required"]
 
 
@@ -215,3 +222,24 @@ def test_nonterminal_update_cannot_cite_a_review_receipt(status):
     assert diagnostic.retryable is True and diagnostic.cause_scope == "model_input"
     rendered = json.dumps(diagnostic.model_dump(mode="json"))
     assert SECRET not in rendered and RECEIPT not in rendered
+
+
+def test_planner_cannot_select_final_review_or_repeat_terminal_verdict():
+    terminal = update(candidate(status="confirmed")).model_dump(mode="json")
+    with pytest.raises(HypothesisProposalError) as selected:
+        validate_planner_candidate_authority({"updates": [terminal]})
+    assert selected.value.code == "planner_review_application_owned_by_code"
+    assert selected.value.diagnostic.location == "$.updates[0].review_evidence_id"
+
+    terminal["review_evidence_id"] = None
+    with pytest.raises(HypothesisProposalError) as verdict:
+        validate_planner_candidate_authority({"updates": [terminal]})
+    assert verdict.value.code == "planner_terminal_candidate_owned_by_review_application"
+    assert verdict.value.diagnostic.location == "$.updates[0].hypothesis.status"
+
+
+def test_planner_nonterminal_premise_update_keeps_existing_responsibility():
+    raw = HypothesisUpdate(
+        hypothesis=candidate(status="open"), expected_revision=1,
+    ).model_dump(mode="json")
+    validate_planner_candidate_authority({"updates": [raw]})

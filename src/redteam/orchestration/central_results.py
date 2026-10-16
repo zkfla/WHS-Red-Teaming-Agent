@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from redteam.core.contracts.events import EventType
 from redteam.core.contracts.mission import InvestigationResult, ResultQuestion
 from redteam.core.ids import EvidenceId
+from redteam.orchestration.assessment_drafts import merge_assessments, validate_assessments
 from redteam.orchestration.central_runtime import event, runtime_token
 from redteam.orchestration.central_state import check_evidence
 from redteam.orchestration.completion import (
@@ -84,7 +85,7 @@ class OriginTaskChangedConflict(StateConflict):
 
 def result_for(
     task, *, outcome, summary, evidence_ids, questions=(), receipt_id=None, hypothesis_ids=(),
-    observations=(), limitations=(),
+    observations=(), limitations=(), assessment_drafts=(),
 ):
     """Retain durable investigation assertions and stable source references.
 
@@ -112,6 +113,9 @@ def result_for(
         contract_version=task.investigation_contract_version,
         observations=list(dict.fromkeys([*(prior.observations if prior else []), *observations])),
         limitations=list(dict.fromkeys([*(prior.limitations if prior else []), *limitations])),
+        assessment_drafts=merge_assessments(
+            prior.assessment_drafts if prior else (), assessment_drafts,
+        ),
     )
 
 
@@ -119,6 +123,11 @@ async def commit_result(
     deps, runtime, task, result, token, *, final, validity_read=None, graph_proof=None,
     edge_proof=None, origin_proofs: tuple[OriginProof, ...] = (),
 ):
+    pending_reviews = ()
+    if final:
+        pending_reviews = await deps.candidate_review_applicator.prepare_pending(
+            str(task.task_id),
+        )
     checked = await check_evidence(
         deps.evidence_store,
         run_id=str(runtime.run_id),
@@ -126,9 +135,11 @@ async def commit_result(
         evidence_ids=[
             *map(str, result.evidence_ids),
             *(str(ref) for q in result.questions for ref in q.evidence_ids),
+            *result.assessment_evidence_ids(),
             *([str(result.completion_receipt_id)] if result.completion_receipt_id else []),
         ],
     )
+    await validate_assessments(deps, runtime, task, result, checked=checked)
     notification = event(
         deps.central_state,
         EventType.TASK_COMPLETED if final else RESULT_UPDATED,
@@ -182,7 +193,14 @@ async def commit_result(
                 expected_hash=content_hash(task),
                 checked=checked,
             )
-        tx.queue(notification)
+        if saved != current:
+            tx.queue(notification)
+        for prepared in pending_reviews:
+            deps.candidate_review_applicator.apply_in_transaction(
+                tx,
+                prepared,
+                task_id=str(task.task_id),
+            )
         return saved
 
     saved = await deps.central_state.transaction(commit)
@@ -223,6 +241,7 @@ async def publish_result_handler(tool_input, context):
         hypothesis_ids=result.hypothesis_ids,
         observations=result.observations,
         limitations=result.limitations,
+        assessment_drafts=result.assessment_drafts,
     )
     if result.result_id != merged.result_id:
         # The producer chooses the first result identity; thereafter it is stable.
@@ -242,7 +261,7 @@ def register_result_tool(registry):
         LocalToolDescriptor(
             tool_id="task.publish_result",
             contribution_id="central-investigation-result",
-            version="4", initial_exposure=True,
+            version="5", initial_exposure=True,
             description="Publish an intermediate investigation result and its follow-up questions "
             "while retaining the task. The result contract defaults to v2; explicitly use v1 "
             "only for a legacy Task. Cite preserved originals. Confirmed results require "
@@ -266,6 +285,8 @@ async def complete_reviewed_result(
         summary=proposal.reason or receipt.summary,
         evidence_ids=proposal.evidence_ids,
         receipt_id=receipt.evidence_id,
+        observations=proposal.observations, limitations=proposal.limitations,
+        assessment_drafts=proposal.assessment_drafts,
     )
     await commit_result(deps, runtime, task, result, token, final=True,
                         validity_read=validity_read, graph_proof=graph_proof,
@@ -280,6 +301,12 @@ async def complete_unresolved_result(deps, runtime, task, token, proposal):
     )
     if errors:
         return errors
+    result_for_validation = result_for(
+        task, outcome=proposal.outcome, summary=proposal.reason,
+        evidence_ids=proposal.evidence_ids, observations=proposal.observations,
+        limitations=proposal.limitations, assessment_drafts=proposal.assessment_drafts,
+    )
+    await validate_assessments(deps, runtime, task, result_for_validation)
     gap_id = await record_unresolved(
         evidence_store=deps.evidence_store, runtime=runtime, proposal=proposal,
         path=None, task_id=str(task.task_id),
@@ -291,6 +318,8 @@ async def complete_unresolved_result(deps, runtime, task, token, proposal):
     result = result_for(
         task, outcome=proposal.outcome, summary=proposal.reason,
         evidence_ids=[*map(EvidenceId, proposal.evidence_ids), gap_id], questions=questions,
+        observations=proposal.observations, limitations=proposal.limitations,
+        assessment_drafts=proposal.assessment_drafts,
     )
     await commit_result(deps, runtime, task, result, token, final=True)
     runtime.unresolved_evidence_ids = list(dict.fromkeys([
@@ -330,7 +359,13 @@ async def settle_central(scope, proposal: CompletionProposal, context):
             return await completion_rejection(errors, proposal, task, deps, runtime)
     return LocalToolResult(
         ok=True,
-        payload={"scope": scope, "outcome": proposal.outcome},
+        payload={
+            "scope": scope,
+            "outcome": proposal.outcome,
+            "review_applications": await deps.central_state.candidate_review_applications(
+                task_id=str(task.task_id),
+            ),
+        },
         refs=tuple(proposal.evidence_ids),
         runtime_outcome="task_completed",
     )

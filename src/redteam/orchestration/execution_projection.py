@@ -35,6 +35,11 @@ def _program(arguments: Mapping[str, Any]) -> tuple[str | None, str | None]:
     )
 
 
+def _receipt_provider(metadata: Mapping[str, Any]) -> str | None:
+    value = metadata.get("receipt_provider")
+    return value if isinstance(value, str) and 0 < len(value) <= 128 else None
+
+
 def execution_selection(
     descriptor: ToolDescriptor | None,
     invocation: ToolInvocation,
@@ -182,6 +187,7 @@ def _failure_projection(
     return ExecutionOutcomeProjection(
         result_kind="provider_failure",
         success=False,
+        receipt_provider=_receipt_provider(metadata),
         executed_program=(
             executed_program
             if isinstance(executed_program, str) and 0 < len(executed_program) <= 256
@@ -230,6 +236,7 @@ def execution_outcome(
     return ExecutionOutcomeProjection(
         result_kind=kind,
         success=True,
+        receipt_provider=_receipt_provider(result.metadata),
         executed_program=executed_program,
         program_executable=program_executable,
     )
@@ -241,6 +248,7 @@ def unknown_outcome(result: ToolResult | None = None) -> ExecutionOutcomeProject
     return ExecutionOutcomeProjection(
         result_kind="unknown",
         success=None,
+        receipt_provider=_receipt_provider(metadata),
         diagnostic_category="detach_unknown" if detach else "execution_unknown",
         diagnostic_code=(
             "direct_target_disconnect_failed" if detach else "execution_outcome_unknown"

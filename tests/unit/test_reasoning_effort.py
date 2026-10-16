@@ -59,6 +59,8 @@ def _stub_sdk(monkeypatch, calls, provider="openai", drop_params=False):
         get_llm_provider=lambda model: (model, provider, None, None),
         acompletion=_acompletion,
         aresponses=_aresponses,
+        model_cost={},
+        register_model=lambda models: None,
     )
     if drop_params:
         stub.drop_params = True
@@ -136,6 +138,31 @@ def test_shared_preflight_litellm_effort_change_alters_binding():
         effort_mod.llm_connection_fingerprint(low)
     )
     assert effort_mod.llm_connection_fingerprint(unset) is None
+
+
+def test_shared_preflight_litellm_cyber_program_alters_binding():
+    blue = LLMConfig(
+        provider="litellm", default_model="chatgpt/m", cyber_access_program="daybreak_blue"
+    )
+    standard = blue.model_copy(update={"cyber_access_program": "standard"})
+    assert effort_mod.llm_connection_fingerprint(blue) is not None
+    assert effort_mod.llm_connection_fingerprint(blue) != (
+        effort_mod.llm_connection_fingerprint(standard)
+    )
+
+
+def test_llm_config_reads_and_validates_cyber_program_environment():
+    config = LLMConfig.from_environment({
+        "REDTEAM_LLM_PROVIDER": "litellm",
+        "REDTEAM_LLM_MODEL": "chatgpt/m",
+        "REDTEAM_LLM_CYBER_ACCESS_PROGRAM": "DAYBREAK_BLUE",
+    })
+    assert config.cyber_access_program == "daybreak_blue"
+    with pytest.raises(ValueError, match="REDTEAM_LLM_CYBER_ACCESS_PROGRAM"):
+        LLMConfig.from_environment({
+            "REDTEAM_LLM_PROVIDER": "litellm",
+            "REDTEAM_LLM_CYBER_ACCESS_PROGRAM": "blue",
+        })
 
 
 def test_shared_preflight_go_and_other_providers():
@@ -247,6 +274,31 @@ async def test_responses_structured_forwards_effort(monkeypatch):
     _, kwargs = calls[0]
     assert kwargs["reasoning_effort"] == "medium"
     assert kwargs["text"]["format"]["type"] == "json_schema"
+
+
+@pytest.mark.asyncio
+async def test_chatgpt_subscription_forwards_pinned_cyber_program(monkeypatch):
+    calls = []
+    _stub_sdk(monkeypatch, calls, provider="chatgpt")
+    client = LiteLLMClient(
+        "chatgpt/unit-model", cyber_access_program="daybreak_blue",
+        extra_body={"existing": True},
+    )
+    await client.complete_with_usage(
+        messages=[{"role": "user", "content": "go"}], stream=False
+    )
+    _, kwargs = calls[0]
+    assert kwargs["extra_body"] == {
+        "existing": True,
+        "access_programs": {"cyber": "daybreak_blue"},
+    }
+
+
+def test_cyber_program_rejects_non_chatgpt_provider(monkeypatch):
+    calls = []
+    _stub_sdk(monkeypatch, calls, provider="openai")
+    with pytest.raises(ValueError, match="chatgpt/"):
+        LiteLLMClient("openai/unit-model", cyber_access_program="daybreak_blue")
 
 
 @pytest.mark.asyncio
@@ -467,12 +519,37 @@ def test_build_llm_client_threads_litellm_effort(monkeypatch):
     module.LiteLLMClient = _Client
     monkeypatch.setitem(sys.modules, "redteam.llm.litellm", module)
     monkeypatch.setenv("LLM_API_KEY", "sk-litellm")
-    build_llm_client(LLMConfig(provider="litellm", default_model="m", reasoning_effort="high"))
+    build_llm_client(LLMConfig(
+        provider="litellm", default_model="m", reasoning_effort="high"
+    ))
     assert calls["model"] == "m"
     assert calls["kwargs"]["reasoning_effort"] == "high"
     assert calls["kwargs"]["api_key_env_var"] == "LLM_API_KEY"
     build_llm_client(LLMConfig(provider="litellm", default_model="m"))
     assert calls["kwargs"]["reasoning_effort"] is None
+    assert calls["kwargs"]["cyber_access_program"] is None
+
+
+def test_build_llm_client_threads_litellm_cyber_program(monkeypatch):
+    import types as _types
+
+    from redteam.app.bootstrap import build_llm_client
+
+    module = _types.ModuleType("redteam.llm.litellm")
+    calls = {}
+
+    class _Client:
+        def __init__(self, model=None, api_key=None, **kwargs):
+            calls.update(model=model, api_key=api_key, kwargs=kwargs)
+
+    module.LiteLLMClient = _Client
+    monkeypatch.setitem(sys.modules, "redteam.llm.litellm", module)
+    build_llm_client(LLMConfig(
+        provider="litellm",
+        default_model="chatgpt/m",
+        cyber_access_program="daybreak_blue",
+    ))
+    assert calls["kwargs"]["cyber_access_program"] == "daybreak_blue"
 
 
 @pytest.mark.asyncio

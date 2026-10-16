@@ -47,9 +47,11 @@ class _ScriptedLLM:
     def __init__(self, actions: list[dict[str, Any]]) -> None:
         self._actions = actions
         self.last_prompt = ""
+        self.last_system = ""
 
     async def complete_structured(self, **kwargs: Any) -> dict[str, Any]:
         self.last_prompt = kwargs["messages"][0]["content"]
+        self.last_system = kwargs.get("system") or ""
         return {"actions": self._actions}
 
 
@@ -89,6 +91,8 @@ async def test_model_generates_a_novel_action_not_in_any_playbook() -> None:
     assert step.capability == "web"
     assert step.operation == "http_request"
     assert step.arguments == {"path": "/api/accounts/bob"}
+    assert "다음 Action candidate를 제안하는 Generator" in llm.last_system
+    assert llm.last_system.count("당신은") == 1
 
 
 async def test_executable_target_uses_graph_observed_path_not_model_word() -> None:

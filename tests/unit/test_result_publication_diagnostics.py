@@ -137,7 +137,7 @@ def test_result_publication_schema_fields_and_v1_serialization_stay_compatible()
     assert set(result_schema["properties"]) == {
         "result_id", "outcome", "summary", "evidence_ids", "hypothesis_ids",
         "finding_node_ids", "completion_receipt_id", "questions", "contract_version",
-        "observations", "limitations",
+        "observations", "limitations", "assessment_drafts",
     }
     assert result_schema["properties"]["contract_version"]["enum"] == [1, 2]
     assert result_schema["properties"]["contract_version"]["default"] == 2
@@ -188,4 +188,3 @@ def test_probe_wire_schema_pins_v2_without_dropping_publication_fields():
         publication_schema["properties"]["completion_receipt_id"]
     )
     assert "enum" not in probe_schema["properties"]["contract_version"]
-

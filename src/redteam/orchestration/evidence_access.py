@@ -30,11 +30,18 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from redteam.core.contracts.assessment import AssessmentTextSpan
 from redteam.core.contracts.mission import redact_secret_material
 from redteam.core.contracts.network import WINDOW_EGRESS_RECORD_KIND, WINDOW_EGRESS_SOURCE_ID
 from redteam.core.contracts.tool import execution_outcome_uncertain
 from redteam.core.convert import digest_payload
 from redteam.core.enums import EvidenceSourceType
+from redteam.core.evidence_paths import (
+    EVIDENCE_FIELD_CONTRACT_VERSION,
+    REVIEW_FIELD_RULE,
+    resolve_output_field,
+    validate_raw_path,
+)
 from redteam.orchestration.observations.shell_execution import shell_execution_accounting
 from redteam.orchestration.observations.window_egress_admission import validate_admission_companion
 
@@ -62,6 +69,7 @@ __all__ = [
     "read_raw_record",
     "locate_raw",
     "raw_from_metadata",
+    "project_review_output",
 ]
 
 # Default context window (characters) when the caller passes no limit.
@@ -126,6 +134,99 @@ def raw_from_metadata(metadata: Any) -> Any | None:
         if raw is not None:
             return raw
     return None
+
+
+def project_review_output(
+    output: Any, *, total_limit: int = 8000, max_fields: int = 8
+) -> dict[str, Any]:
+    """Project stored output as valid, bounded scalar fields for review.
+
+    The complete value is masked before any field is selected or sliced.
+    Selecting both ends keeps long leading metadata from silently hiding a
+    later body or status field, and every omission is explicit.
+    """
+    safe_output = redact_secret_material(output, drop_secret_keys=True)
+    field_limit = max(0, int(max_fields))
+    head_limit = field_limit // 2
+    tail_limit = field_limit - head_limit
+    first: list[tuple[list[str | int], Any]] = []
+    tail: list[tuple[list[str | int], Any]] = []
+    field_count = 0
+
+    def walk(value: Any, path: list[str | int]) -> None:
+        nonlocal field_count
+        if isinstance(value, dict):
+            for key, child in value.items():
+                walk(child, [*path, str(key)])
+            return
+        if isinstance(value, (list, tuple)):
+            for index, child in enumerate(value):
+                walk(child, [*path, index])
+            return
+        field_count += 1
+        if len(first) < head_limit:
+            first.append((path, value))
+        elif tail_limit:
+            tail.append((path, value))
+            if len(tail) > tail_limit:
+                tail.pop(0)
+
+    walk(safe_output, [])
+    selected = [*first, *tail]
+    budget = max(0, int(total_limit))
+    per_field = budget // max(1, len(selected))
+    fields: list[dict[str, Any]] = []
+    for path, value in selected:
+        text = (
+            value
+            if isinstance(value, str)
+            else json.dumps(value, ensure_ascii=False, default=str)
+        )
+        if len(text) <= per_field:
+            windows = [{
+                "text": text,
+                "displayed_range": {"start": 0, "end": len(text)},
+            }]
+        elif per_field:
+            head_chars = per_field // 2
+            tail_chars = per_field - head_chars
+            windows = []
+            if head_chars:
+                windows.append({
+                    "text": text[:head_chars],
+                    "displayed_range": {"start": 0, "end": head_chars},
+                })
+            if tail_chars:
+                windows.append({
+                    "text": text[-tail_chars:],
+                    "displayed_range": {
+                        "start": len(text) - tail_chars,
+                        "end": len(text),
+                    },
+                })
+        else:
+            windows = []
+        displayed_chars = sum(len(window["text"]) for window in windows)
+        fields.append(
+            {
+                "raw_path": path,
+                "total_chars": len(text),
+                "windows": windows,
+                "displayed_chars": displayed_chars,
+                "truncated": displayed_chars < len(text),
+                "omitted_chars": len(text) - displayed_chars,
+            }
+        )
+    return {
+        "contract_version": 1,
+        "fields": fields,
+        "field_count": field_count,
+        "shown_field_count": len(fields),
+        "omitted_field_count": max(0, field_count - len(fields)),
+        "selection": "all_or_first_and_last_scalar_fields",
+        "total_text_limit": budget,
+        "note": "Bounded display DATA; omitted or truncated content is unknown.",
+    }
 
 
 def locate_raw(
@@ -407,6 +508,121 @@ class EvidenceReader:
 
     def __init__(self, evidence_store: Any) -> None:
         self._store = evidence_store
+
+    async def read_field(
+        self, evidence_id: str, run_id: str, raw_path: list[str | int], *,
+        engagement_id: str, offset: int = 0, limit: int = 4000,
+        query: str | None = None, target_node_id: str | None = None,
+        text_span: AssessmentTextSpan | None = None,
+    ) -> dict:
+        """Inspect one output field for review or offline/operator diagnostics.
+
+        This API is not registered as an agent tool. Claim review uses the same resolver.
+        Coordinates apply after redaction and, when requested, line filtering.
+        A query miss or a partial window makes no claim about the whole original.
+        Structured fields use bounded scalar leaves, never partial serialized JSON.
+        Reads do not validate execution or integrity.
+        """
+        if type(offset) is not int or offset < 0:
+            raise ValueError("field offset must be a nonnegative integer")
+        if type(limit) is not int or limit < 0:
+            raise ValueError("field limit must be a nonnegative integer")
+        validate_raw_path(raw_path)
+        if query is not None and (not isinstance(query, str) or len(query) > 512):
+            raise ValueError("invalid field query")
+        effective = min(limit, ABSOLUTE_MAX_CHARS)
+        base = {
+            "contract_version": EVIDENCE_FIELD_CONTRACT_VERSION, "evidence_id": str(evidence_id),
+            "requested_run_id": str(run_id), "raw_path": list(raw_path),
+            "path_base": "tool_result.output", "path_rule": REVIEW_FIELD_RULE,
+            "offset": offset, "limit": effective,
+            "text": "", "truncated": False, "execution_verified": False,
+            "coordinates": "redacted_field_then_line_filter", "filtered": bool(query),
+            "note": "Display DATA only. Absence in a filtered or partial window does not "
+                    "establish absence in the original. No integrity or verdict authority.",
+        }
+        record = await self._store.get(evidence_id)
+        status, raw = locate_raw(record, run_id, engagement_id)
+        if status in {"missing", "other_run"}:
+            base["status"] = "not_found" if status == "missing" else "run_mismatch"
+            return redact_secret_material(base)
+        if record.source_type != EvidenceSourceType.TOOL:
+            base.update(status="non_tool_source", view_kind=record_view(record)[0])
+            return redact_secret_material(base)
+        if target_node_id is not None and record.metadata.get("target_node_id") != target_node_id:
+            base["status"] = "target_mismatch"
+            return redact_secret_material(base)
+        base.update(provenance=provenance_of(record), source_digest=record.digest,
+                    target_node_id=record.metadata.get("target_node_id"))
+        if status == "no_raw":
+            base["status"] = "no_raw"
+            return redact_secret_material(base)
+        if not isinstance(raw, dict) or "output" not in raw:
+            base["status"] = "output_unavailable"
+            return redact_secret_material(base)
+        # Mask the complete value before filtering/slicing: a partial credential
+        # token must not escape merely because its key falls outside the window.
+        safe_output = redact_secret_material(raw["output"])
+        field = resolve_output_field(
+            safe_output, raw_path,
+            text_offset=text_span.offset if text_span else None,
+            text_length=text_span.length if text_span else None,
+        )
+        value = field.value
+        metadata = raw.get("metadata") or {}
+        base.update(
+            source_success=raw.get("success"),
+            execution_uncertain=(execution_outcome_uncertain(metadata)
+                                 if isinstance(metadata, dict) else None),
+        )
+        if field.status != "ok":
+            # A missing path may also be a key removed by redaction. Do not expose
+            # the removed value or infer an empty body from a digest-only record.
+            base["status"] = field.status
+            return redact_secret_material(base)
+        if isinstance(value, (dict, list, tuple)):
+            if offset or query:
+                raise ValueError("structured field windows require a scalar path for offset/query")
+            projected = project_review_output(value, total_limit=effective, max_fields=8)
+            for leaf in projected["fields"]:
+                leaf["raw_path"] = [*raw_path, *leaf["raw_path"]]
+            result = redact_secret_material(base)
+            result.update(
+                status="ok", field_kind="structured", item_count=len(value),
+                output_fields=projected, redaction_applied=True,
+                truncated=bool(projected["omitted_field_count"] or any(
+                    leaf["truncated"] for leaf in projected["fields"]
+                )),
+            )
+            return result
+        is_text = isinstance(value, str)
+        full = value if is_text else json.dumps(value, ensure_ascii=False, default=str)
+        total = len(full)
+        matches = None
+        if query:
+            hits = [line for line in full.splitlines() if query.lower() in line.lower()]
+            matches = len(hits)
+            full = "\n".join(hits)
+        if text_span is not None:
+            if query or offset:
+                raise ValueError("text_span cannot be combined with offset/query")
+            offset = text_span.offset
+            effective = min(effective, text_span.length)
+            base.update(text_span=text_span.model_dump(mode="json"), offset=offset, limit=effective)
+        start = min(offset, len(full))
+        end = min(start + effective, len(full))
+        result = redact_secret_material(base)
+        result.update(
+            status="ok", field_kind="text" if is_text else "scalar",
+            text=full[start:end], total_chars=total, filtered_chars=len(full),
+            displayed_range={"start": start, "end": end}, match_count=matches,
+            omitted_before_chars=start, omitted_after_chars=len(full) - end,
+            truncated=start > 0 or end < len(full), filtered=bool(query),
+            redaction_applied=True,
+        )
+        # The field was already masked in full. Re-masking a partial redaction
+        # marker here could expand the text and invalidate its size/coordinates.
+        return result
 
     async def read(
         self,

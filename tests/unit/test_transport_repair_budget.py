@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from redteam.core.ports.llm import LLMProviderFailure
 from redteam.orchestration.cognition import (
     DecisionBudget,
     DecisionFailure,
@@ -24,6 +25,12 @@ SCHEMA = {
 }
 
 BLOCK = object()
+
+
+def server_failure() -> LLMProviderFailure:
+    return LLMProviderFailure(
+        kind="server", http_status=500, provider_code="unknown", retryable=True,
+    )
 
 
 class FakeProvider:
@@ -99,6 +106,49 @@ async def test_transport_retry_keeps_existing_repair_feedback_unchanged():
     assert third_prompt == second_prompt
     assert "private transport text" not in third_prompt
     assert (budget.normal_used, budget.transport_used, budget.repair_used) == (1, 1, 1)
+
+
+async def test_provider_server_retries_use_exponential_backoff_without_changing_limits():
+    provider = FakeProvider([server_failure(), server_failure(), {"answer": "ok"}])
+    delays: list[float] = []
+
+    async def record_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    client = StructuredDecisionClient(provider, retry_sleep=record_sleep)
+    budget = DecisionBudget.reasoning_chain(
+        2, 2, transport_limit=2, total_limit=3,
+    )
+
+    assert await ask(client, budget) == {"answer": "ok"}
+
+    assert delays == [1.0, 2.0]
+    assert budget.used == 3
+    assert (budget.normal_used, budget.transport_used, budget.repair_used) == (1, 2, 0)
+    assert len(provider.calls) == 3
+
+
+async def test_native_provider_server_retries_use_same_backoff_and_limits():
+    provider = FakeProvider(native_responses=[
+        server_failure(), server_failure(), SimpleNamespace(tool_calls=[], total_tokens=1),
+    ])
+    delays: list[float] = []
+
+    async def record_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    client = StructuredDecisionClient(provider, retry_sleep=record_sleep)
+    budget = DecisionBudget.reasoning_chain(
+        2, 2, transport_limit=2, total_limit=3,
+    )
+
+    result = await client.ask_native(messages=[], tools=[], budget=budget)
+
+    assert result.tool_calls == []
+    assert delays == [1.0, 2.0]
+    assert budget.used == 3
+    assert (budget.normal_used, budget.transport_used, budget.repair_used) == (1, 2, 0)
+    assert len(provider.native_calls) == 3
 
 
 async def test_semantic_rejection_uses_repair_counter():

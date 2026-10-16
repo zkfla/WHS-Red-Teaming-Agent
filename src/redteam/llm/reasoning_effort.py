@@ -83,31 +83,38 @@ def apply_messages_effort(
 
 
 def litellm_connection_fingerprint_for_config(llm_config: Any) -> str | None:
-    """Secret-free identity for explicit LiteLLM effort; None when unset.
+    """Secret-free identity for explicit LiteLLM request options.
 
-    ``None`` for any non-``litellm`` provider and for unset effort, so the
-    historical unpinned identity is byte-identical. An explicit effort
-    yields a stable hash over provider, model, credential REFERENCE (never
-    the value), and effort -- a changed effort alters the binding and
-    refuses resume, while key-value rotation under the same reference
-    still rebuilds.
+    ``None`` for any non-``litellm`` provider and when both options are unset,
+    so the historical unpinned identity is byte-identical. The legacy effort-only
+    identity remains v1; an explicit cyber program uses v2 and therefore refuses
+    resume when request access semantics change.
     """
     provider = getattr(llm_config, "provider", None) or ""
     if not isinstance(provider, str) or provider.strip() != _LITELLM_PROVIDER:
         return None
     effort = normalize_reasoning_effort(getattr(llm_config, "reasoning_effort", None))
-    if effort is None:
+    from redteam.core.contracts.llm_config import normalize_cyber_access_program
+
+    cyber_program = normalize_cyber_access_program(
+        getattr(llm_config, "cyber_access_program", None)
+    )
+    if effort is None and cyber_program is None:
         return None
     model = getattr(llm_config, "default_model", "") or ""
     credential = getattr(llm_config, "api_key_env_var", "") or ""
+    identity = {
+        "v": "v1",
+        "provider": _LITELLM_PROVIDER,
+        "model": model.strip(),
+        "credential": credential,
+        "reasoning_effort": effort,
+    }
+    if cyber_program is not None:
+        identity["v"] = "v2"
+        identity["cyber_access_program"] = cyber_program
     canonical = json.dumps(
-        {
-            "v": "v1",
-            "provider": _LITELLM_PROVIDER,
-            "model": model.strip(),
-            "credential": credential,
-            "reasoning_effort": effort,
-        },
+        identity,
         sort_keys=True,
         separators=(",", ":"),
     )

@@ -187,7 +187,10 @@ async def test_padded_admitted_candidate_reaches_existing_review(tmp_path):
         receipt = await _receipt(session, result)
         finding = result.payload["findings"][0]
         assert receipt.metadata["record_kind"] == "review_receipt"
-        assert finding["candidate_revision"] == receipt.metadata["candidate_revision"]
+        assert finding["application"]["candidate_pre_verdict_revision"] == (
+            receipt.metadata["candidate_revision"]
+        )
+        assert finding["candidate_revision"] == 2
         assert finding["candidate_purpose_hash"] == receipt.metadata["candidate_purpose_hash"]
         assert meaning.review_calls == 1
 
@@ -216,11 +219,14 @@ async def test_v2_receipt_return_uses_the_exact_reviewed_snapshot_after_candidat
         finding, = result.payload["findings"]
         receipt = await _receipt(session, result)
         expected_purpose = content_hash(hypothesis_purpose(snapshot))
-        assert finding["status"] == "reviewed"
-        assert finding["candidate_revision"] == snapshot.revision
+        assert finding["status"] == "promoted"
+        assert finding["application"]["candidate_pre_verdict_revision"] == snapshot.revision
+        assert finding["candidate_revision"] == snapshot.revision + 1
         assert finding["candidate_purpose_hash"] == expected_purpose
         assert receipt.metadata["candidate_revision"] == snapshot.revision
         assert receipt.metadata["candidate_purpose_hash"] == expected_purpose
+        canonical = await service.get_hypothesis(snapshot.hypothesis_id)
+        assert canonical.status == "confirmed" and canonical.revision == snapshot.revision + 1
         assert meaning.review_calls == 1
 
 

@@ -17,37 +17,14 @@ from redteam.orchestration.engine import DecisionRuleError
 from redteam.orchestration.state import TerminationReason
 
 PROBE_SYSTEM = """
-선택된 역할의 등록 도구를 사용해 이 제한된 probe 목적만 수행합니다.
-완료 진단에는 cause_scope, owner, repair_condition이 설명되어 있습니다.
-가능하면 model_input을 바로잡습니다. 고칠 수 없는 runtime_contract 또는
-알 수 없는 지원 문제는 원본과 진단 참조를 보존해 미해결 결과로 반환합니다.
-대상 호출이나 반복 읽기로 runtime contract를 고칠 수는 없습니다. 현재 변경은
-새 tool 응답과 worker_updates에서 확인합니다. 최초 execution_history와 과거
-진단 메시지는 이력이며 현재 권한을 부여하지 않습니다.
-방법은 직접 선택합니다. 필수 도구 순서나 도메인 간 인계는 없습니다.
-관련 후보는 변경할 수 없는 승인된 스냅샷이며, 권한이나 검증된 finding이 아닙니다.
-관측과 제한 사항은 task.settle (inconclusive/blocked)로 일찍 반환하거나,
-result contract_version=2를 사용해 task.publish_result로 중간 피드백을
-게시합니다.
-관측 probe를 끝내기 위해 완전한 취약점 증명을 요구하지 않습니다.
-확인/기각된 probe 결과에는 기존 정산 검토가 필요합니다. 검토된 probe 결과가
-자동으로 후보의 판정이나 Mission 완료가 되는 것은 아닙니다.
-목적을 이미 충분히 시험했다면 남은 공유 한도 내에서 기존 검토 helper가 이를
-검증할 수 있습니다. 한도가 끝났다는 이유로 검토를 건너뛰지 않습니다.
-probe.physical_cap.budget_available이 false이면 대상에 새 요청을 보내지
-않습니다. 이후 물리 호출은 실행되지 않고 거부됩니다. budget_available은
-한도 대비 물리 작업 횟수만 나타내며, 권한, 승인, 범위 또는 준비 상태를
-뜻하지 않습니다. 로컬 도구는 보존된 원본을 읽고, 근거 있는 관측을 기록하고,
-남은 모델 요청 예산 안에서 정산할 수 있습니다. 따라서 검토된 관측은 대상에
-추가 요청을 보내지 않고도 목적을 마칠 수 있습니다. 모델 요청 예산이 소진되면
-코드가 중단하고 추가 모델 요청 없이 보존된 원본을 반환하며, 대기 중인
-승인/작업/UNKNOWN과 원래 실행 식별자를 유지합니다.
-다른 유용하고 승인된 probe에 증거를 재사용할 수 있습니다. 결과가 불명확한
-물리 호출은 반복하지 않습니다. 예상하지 못한 방향은 새 조사를 시작하는 대신
-planner에 보고합니다.
-물리 한도 이후 로컬로 계속 진행하는 것은 대기 중이거나 실행을 기다리거나,
-UNKNOWN이거나, 작업 또는 자원에 묶인 원본이 없고 작업이 BLOCKED 상태도
-아닐 때만 허용됩니다.
+이 호출은 active Task의 probe result contract v2를 사용한다. `probe.remaining`과
+`probe.physical_cap`은 현재 ledger에서 계산된 한도이며 권한이나 성공 상태가 아니다.
+physical_cap.budget_available=false이면 새 대상 호출을 제안하지 말고, 남은 local 조회·기록·검토·
+settlement만 수행한다. pending/running/UNKNOWN invocation은 원래 ID를 보존한다.
+
+`probe.candidates`는 변경할 수 없는 admitted snapshot이다. `return_conditions`는 현재 Task의 완료
+조건이다. 완료 또는 미해결 결과는 task.settle, 유효한 중간 결과는 task.publish_result를 사용한다.
+runtime 진단은 cause_scope, owner, repair_condition으로 반환한다.
 """
 
 
@@ -109,6 +86,40 @@ async def original_records(deps, task):
     return [record for record in records
             if record.metadata.get("mission_task_id") == str(task.task_id)
             and isinstance(record.metadata.get("tool_result"), dict)]
+
+
+def project_worker_executions(executions, *, count: int = 6) -> list[dict]:
+    """Expose current blockers and recent outcomes without replaying the audit ledger.
+
+    Admission fingerprints, reservations, resource keys and ownership bookkeeping remain
+    code-owned. The worker needs only the invocation pointer, current state, selected route,
+    result pointer and a bounded diagnostic that can change its next decision.
+    """
+    unresolved = [item for item in executions if unsafe(item)]
+    settled = [item for item in executions if not unsafe(item)]
+    selected = [*unresolved[-4:], *settled[-2:]]
+    selected = sorted(
+        {str(item.invocation_id): item for item in selected}.values(),
+        key=lambda item: executions.index(item),
+    )[-count:]
+    result = []
+    for item in selected:
+        row = {
+            "invocation_id": str(item.invocation_id),
+            "tool_id": str(item.tool_id),
+            "state": item.state.value,
+            "target_node_id": item.target_node_id,
+            "wait_reason": item.wait_reason,
+            "result_evidence_id": (
+                str(item.result_evidence_id) if item.result_evidence_id else None
+            ),
+        }
+        if item.selection is not None:
+            row["selection"] = item.selection.model_dump(mode="json")
+        if item.outcome is not None:
+            row["outcome"] = item.outcome.model_dump(mode="json")
+        result.append(row)
+    return result
 
 
 async def context_for_probe(deps, runtime, context):
@@ -181,9 +192,11 @@ async def context_for_probe(deps, runtime, context):
         ref for fact in knowledge.get("facts", []) for ref in fact.get("fact_refs", [])
     })
     executions = await deps.central_state.list_executions(task_id=str(task.task_id))
-    filtered["execution_history"] = [item.model_dump(mode="json") for item in executions[-20:]]
+    filtered["execution_history"] = project_worker_executions(executions)
     filtered["execution_history_count"] = len(executions)
-    filtered["execution_history_omitted_count"] = max(len(executions) - 20, 0)
+    filtered["execution_history_omitted_count"] = max(
+        len(executions) - len(filtered["execution_history"]), 0,
+    )
     filtered["evidence_index"] = [ref for ref in context.get("evidence_index", [])
                                   if str(ref) in allowed_evidence]
     filtered["evidence_count"] = len(filtered["evidence_index"])

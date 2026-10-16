@@ -176,7 +176,11 @@ def test_generic_stdout_and_mapper_validated_protocol_receipt_are_distinct():
     )
     canonical = execution_outcome(
         result(
-            metadata={"program_name": "python3", "program_executable": "/usr/bin/python3"},
+            metadata={
+                "program_name": "python3",
+                "program_executable": "/usr/bin/python3",
+                "receipt_provider": "kali-http-v1",
+            },
             output={"http_receipt": {"response": {"status_code": 200}}},
         ),
         selection=target_selection(),
@@ -190,6 +194,7 @@ def test_generic_stdout_and_mapper_validated_protocol_receipt_are_distinct():
     assert generic.executed_program == "curl"
     assert canonical.result_kind == "canonical_protocol_receipt"
     assert canonical.executed_program == "python3"
+    assert canonical.receipt_provider == "kali-http-v1"
     assert unvalidated.result_kind == "tool_result"
 
 
