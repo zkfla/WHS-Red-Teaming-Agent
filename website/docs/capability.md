@@ -1,5 +1,7 @@
 # Capability 계층
 
+Control Plane을 통과한 행동은 결국 실제 도구로 실행된다. 그 도구들이 어떻게 등록되고 실행 환경에 연결되는지가 이 장이다.
+
 Capability는 도구를 만드는 곳이 아니라 어댑터로 연결하는 곳이다. `ToolGateway → MCPToolRegistry → MCPAdapter → MCP Server`로 이어진다. 각 도구는 `ToolDescriptor`로 등록되고 operator 정책이 target, method, path 단위로 허용 목록을 건다.
 
 - **실연결과 검증.** Web/API와 Recon 도구(`send_http_request`, `mutate_request`, `replay_request`, `resolve_host`, `probe_http`, `fetch_openapi`, `enumerate_routes` 등). 외부 바이너리 없이 동작하는 범위 제한 HTTP와 recon, proxy를 포함한다.

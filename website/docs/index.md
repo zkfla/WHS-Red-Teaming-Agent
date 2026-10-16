@@ -21,7 +21,7 @@ WHS Red Teaming Agent는 허가된 대상과 범위 안에서 보안 점검을 �
 
 - **통제된 자율성.** 에이전트는 자유롭게 가설을 세우되, 모든 도구 호출은 operator가 소유한 정책으로 target, method, path 단위까지 허용 목록에 올라야 하고 Control Plane이 게이트한다.
 - **병렬 개발 가능한 경계.** `redteam.core`의 Pydantic 계약과 Protocol 포트만 알면 각 팀이 서로를 깨뜨리지 않고 개발한다.
-- **하지 않는 것.** payload 데이터베이스, 범용 exploit 라이브러리, 무제한 도구 호출, 자동 공격 승격은 설계에서 제외했다.
+- **하지 않는 것.** payload 데이터베이스, 범용 exploit 라이브러리, 무제한 도구 호출, 승인 없이 공격 수위를 스스로 높이는 것(자동 escalation)은 설계에서 제외했다.
 
 ![작업 인스턴스 실행 루프](assets/model-tools-settle.png)
 

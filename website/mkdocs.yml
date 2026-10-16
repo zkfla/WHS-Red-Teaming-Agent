@@ -27,6 +27,7 @@ theme:
   features:
     - navigation.instant
     - navigation.tracking
+    - navigation.sections
     - navigation.top
     - navigation.footer
     - toc.follow
@@ -50,15 +51,19 @@ markdown_extensions:
       permalink: true
 
 nav:
-  - 개요: index.md
-  - 배경: background.md
-  - 들어가기 전에: concepts.md
-  - 한 번의 점검 따라가기: walkthrough.md
-  - 아키텍처: architecture.md
-  - 도메인 계약: contracts.md
-  - 실행 모델: orchestration.md
-  - 실행 통제 (Control Plane): control-plane.md
-  - Capability 계층: capability.md
-  - 상태와 운영자 개입: state.md
-  - 증거와 검증: evidence.md
-  - 레퍼런스: reference.md
+  - 시작하기:
+    - 개요: index.md
+    - 배경: background.md
+    - 핵심 개념: concepts.md
+    - 한 번의 점검 따라가기: walkthrough.md
+  - 동작 원리:
+    - 아키텍처: architecture.md
+    - 실행 모델: orchestration.md
+    - 실행 통제 (Control Plane): control-plane.md
+    - Capability 계층: capability.md
+    - 상태와 재개: state.md
+  - 결과와 검증:
+    - 증거와 결과 해석: evidence.md
+  - 레퍼런스:
+    - 도메인 계약: contracts.md
+    - 설정과 CLI, 용어집: reference.md

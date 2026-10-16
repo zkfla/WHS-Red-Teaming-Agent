@@ -1,5 +1,7 @@
 # 상태 관리와 중단, 재개
 
+지금까지가 "한 번의 행동"이 흐르는 길이었다면, 이 장은 그 행동들이 쌓이는 상태와, 멈췄다가 안전하게 다시 이어가는 방법이다.
+
 중앙 상태는 SQLite(schema 3)로 목표와 실행, 작업 소유권, 도구 호출, 자원 사용을 관리한다. 공유 공격 그래프도 같은 DB를 쓰고, Evidence와 Audit, Approval, SDK 체크포인트는 각자 저장소를 유지한다.
 
 ![STATE, EXECUTION, EVIDENCE 분리](assets/state-execution-evidence.png)
@@ -19,7 +21,7 @@
 
 Run 바인딩은 `state.bind_run(mission_id, scope=..., binding_hash=...)`로 묶으며 불변이고, Mission은 한 Run에 속한다. 바인딩이나 scope가 바뀌면 새 Run이 필요하다.
 
-멱등성과 미확정 실행을 구분한다. `input_digest`는 정확한 proposal을 식별하며 의미적 중복이 아니고, 같은 요청이 다시 들어오면 기존 처리 결과를 식별한다. 결과가 불명확한 실행은 단순 실패와 구분하며, 취소나 타임아웃만으로 실행이 없었던 것으로 처리하지 않는다.
+멱등성(같은 요청을 여러 번 보내도 한 번 처리한 것과 같은 결과)과 미확정 실행을 구분한다. `input_digest`는 정확한 proposal을 식별하며 의미적 중복이 아니고, 같은 요청이 다시 들어오면 기존 처리 결과를 식별한다. 결과가 불명확한 실행은 단순 실패와 구분하며, 취소나 타임아웃만으로 실행이 없었던 것으로 처리하지 않는다.
 
 ```python
 class ExecutionRecoveryAnswer(BaseModel):   # frozen

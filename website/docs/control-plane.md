@@ -1,5 +1,7 @@
 # 실행 통제: Control Plane
 
+실행 모델에서 워커가 `ActionProposal`을 만든다고 했다. 그 제안이 실제 도구 호출로 바뀌기 전에 반드시 통과하는 관문이 이 장의 주제다.
+
 에이전트의 모든 공격 행동은 실행 전에 Control Plane을 반드시 통과한다. 포트는 두 메서드로 요약된다.
 
 ```python
@@ -23,7 +25,7 @@ class ControlPlane(Protocol):
 | 1 Scope | 대상 host, IP, 도메인이 `allowed_*`에 있고 거절목록에 없어야 함. 허용목록이 없으면 기본 거절. IP는 CIDR, 도메인은 서픽스 매칭 |
 | 2 ROE | 능력(recon, web, mobile, analysis)과 작업, 시각. `denied_capabilities`, `denied_operations`(canonical `<capability>.<operation>`), 허용 시간대 검사 |
 | 3 Policy | `require_approval_for` 매칭으로 ALLOW 또는 REQUIRE_APPROVAL. 여기선 거절하지 않고 승인 게이트만 담당 |
-| 4 RateLimit | 최근 60초 실행 횟수가 `max_actions_per_minute` 미만 (sliding window) |
+| 4 RateLimit | 최근 60초 실행 횟수가 `max_actions_per_minute` 미만 (최근 60초 구간을 계속 밀며 세는 방식) |
 | 5 Budget | `max_actions`, `max_tool_calls`, `max_duration_seconds`를 모두 넘지 않아야 함 |
 | 6 Approval | 3이 승인 필요라 했을 때만. 승인 요청 생성, 승인ID 발급, 사람이 CLI로 승인하거나 거절 |
 
@@ -33,7 +35,7 @@ ALLOW가 아닌 결정은 실행 명령으로 변환 자체가 불가능하다. 
 
 ## 두 번 심사하는 이유 (TOCTOU)
 
-행동 하나는 통제를 두 번 통과한다. 제안 시점의 `evaluate`와 실행 직전의 `admit_invocation`이다. 왜 두 번인가. `evaluate`의 ALLOW는 proposal을 만든 그 시점의 판단이고, 그 결정이 곧바로 실행으로 이어지지 않을 수 있다. 특히 REQUIRE_APPROVAL이면 사람이 승인을 누를 때까지 기다리는데, 그 사이에 허용 시간대가 끝나거나 예산이 소진되거나 대상 상태가 바뀔 수 있다. 검사 시점과 사용 시점 사이의 이 간극(TOCTOU, time-of-check to time-of-use)을 메우려고, 실행 직전 `admit_invocation`이 현재 상태로 scope, time, target, outbound, duration을 다시 본다. 따라서 ALLOW는 "지금 실행해도 된다"가 아니라 "지금 admission 심사를 받을 자격이 있다"는 뜻이고, 마지막 관문은 admission이다.
+행동 하나는 통제를 두 번 통과한다. 제안 시점의 `evaluate`와 실행 직전의 `admit_invocation`이다. 왜 두 번인가. `evaluate`의 ALLOW는 proposal을 만든 그 시점의 판단이고, 그 결정이 곧바로 실행으로 이어지지 않을 수 있다. 특히 REQUIRE_APPROVAL이면 사람이 승인을 누를 때까지 기다리는데, 그 사이에 허용 시간대가 끝나거나 예산이 소진되거나 대상 상태가 바뀔 수 있다. 검사 시점과 사용 시점 사이의 이 간극(TOCTOU, time-of-check to time-of-use)을 메우려고, 실행 직전 `admit_invocation`이 현재 상태로 범위(scope), 시간(time), 대상(target), 외부 전송(outbound), 지속시간(duration)을 다시 본다. 따라서 ALLOW는 "지금 실행해도 된다"가 아니라 "지금 admission 심사를 받을 자격이 있다"는 뜻이고, 마지막 관문은 admission이다.
 
 ## 위험 등급 승인
 

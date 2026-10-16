@@ -1,4 +1,4 @@
-# 들어가기 전에: 전제 개념
+# 핵심 개념
 
 이 문서를 읽고 분석하려면 아래 용어를 먼저 알아두는 게 좋다. 이후 모든 장에서 같은 뜻으로 쓴다.
 
@@ -23,9 +23,9 @@
 
 ## 자주 혼동되는 두 쌍
 
-- **`binding_mode` (`selected_tool` vs `legacy_action`).** 행동이 도구에 묶이는 방식이다. `selected_tool`은 오케스트레이션이 구체 `tool_id`를 직접 지정한 상태이고(이때 `operation`은 비운다), `legacy_action`은 `capability.operation`이라는 정준 의도만 두고 실제 도구는 나중에 `tool_id`로부터 해석한다.
+- **`binding_mode` (`selected_tool` vs `legacy_action`).** 행동이 도구에 묶이는 방식이다. `selected_tool`은 오케스트레이션이 구체 `tool_id`를 직접 지정한 상태이고(이때 `operation`은 비운다), `legacy_action`은 `capability.operation`이라는 표준 형태의 의도(어떤 능력으로 무슨 동작)만 두고 실제 도구는 나중에 `tool_id`로부터 해석한다.
 - **`input_digest` vs `execution_fingerprint`.** `input_digest`는 "정확히 이 proposal"을 식별하는 해시로, 멱등성과 재개의 기준이 된다. `execution_fingerprint`는 `(tool_id, target, arguments)`를 정규화해 만든 해시로, 사람이 승인한 행동과 실제 실행이 같은지를 보증한다(인자를 문자열로 바꿔치기해 승인을 위조하지 못하게 정규화한다).
 
-## 두 번 심사하는 이유 (미리 보기)
+## 행동은 두 번 심사된다
 
 행동 하나는 통제를 두 번 통과한다. 제안 시점의 `evaluate`와 실행 직전의 `admission`이다. 승인을 사람이 누르는 사이에 허용 시간대가 끝나거나 예산이 소진될 수 있으므로, 실행 직전에 현재 상태로 범위, 시간, 대상, 외부 전송, 지속시간을 다시 본다. 자세한 내용은 [실행 통제](control-plane.md) 장에서 다룬다.

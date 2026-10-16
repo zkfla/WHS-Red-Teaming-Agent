@@ -1,5 +1,7 @@
 # 실행 모델
 
+아키텍처가 "무엇이 있는지"를 보여줬다면, 실행 모델은 "그것들이 한 번의 Run에서 어떻게 움직이는지"를 다룬다.
+
 플래너가 공격 경로를 제안하고, 원자화 역할이 가설을 검증 가능한 작업으로 분해하며, 워커가 실행한다. LangGraph는 워크플로 런타임으로만 쓴다.
 
 ## RuntimeState와 GraphState
@@ -31,11 +33,11 @@
 | 리서치와 증거 (research_evidence) | 관측과 증거 유효성, 완료 판정 검토 | analysis_verify, task_completion_review, goal_completion_review 등 |
 | 코드 (code_artifact) | 근거를 참조하는 재현 코드 산출 | 코드 산출 단계 |
 
-중요한 구분이 하나 있다. 이 중 동시성 한도 아래 여러 인스턴스로 실제로 도는 것은 **Web 실행(web_execution)뿐**이다(schedulable). 나머지는 특정 단계에서 호출되는 전문 역할이라, 앞에서 말한 "두 워커"는 사실상 두 개의 Web 실행 인스턴스를 뜻한다. 전체 프로필은 여기에 Mobile 실행이 더해져 7개이지만 Mobile 역량은 아직 후보다.
+중요한 구분이 하나 있다. 이 중 동시성 한도 아래 여러 인스턴스로 실제로 도는 것은 **Web 실행(web_execution)뿐**이다(스케줄링 대상, 즉 계속 돌며 작업을 받는 워커). 나머지는 특정 단계에서 호출되는 전문 역할이라, 앞에서 말한 "두 워커"는 사실상 두 개의 Web 실행 인스턴스를 뜻한다. 전체 프로필은 여기에 Mobile 실행이 더해져 7개이지만 Mobile 역량은 아직 후보다.
 
 ## 진행 보증과 종료 조건
 
-런타임은 무한 루프와 자원 낭비를 막기 위해 진행 상태를 추적한다. `RuntimeState`는 `step_count`, `retry_count`, `consecutive_failures`, `no_progress_turns`, `last_progress_fingerprint`, `remaining_budget`을 들고 다닌다. 같은 지문이 반복되면 진행 없음으로 간주하고, 연속 실패와 무진행 턴이 한도를 넘거나 예산이 소진되면 `termination_reason`을 남기고 종료한다. 종료 사유는 보고와 감사 소비자가 읽는다.
+런타임은 무한 루프와 자원 낭비를 막기 위해 진행 상태를 추적한다. `RuntimeState`는 `step_count`, `retry_count`, `consecutive_failures`, `no_progress_turns`, `last_progress_fingerprint`, `remaining_budget`을 들고 다닌다. 진행 상황을 요약한 값(지문)이 똑같이 반복되면 더 나아가지 못한 것으로 간주하고, 연속 실패와 무진행 턴이 한도를 넘거나 예산이 소진되면 `termination_reason`을 남기고 종료한다. 종료 사유는 보고와 감사 소비자가 읽는다.
 
 ## 모델 사용량 회계
 
