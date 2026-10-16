@@ -11,7 +11,7 @@ from typing import Literal, cast
 
 from redteam.app.cli import interactive_commands
 from redteam.app.cli.commands.validate import check_roe, check_scope
-from redteam.app.cli.conversation import ConversationAssistant
+from redteam.app.cli.conversation import ConversationAssistant, ConversationDecision
 from redteam.app.cli.display import safe_text
 from redteam.app.cli.session_controller import SessionController
 from redteam.app.cli.session_types import RunResult
@@ -55,6 +55,14 @@ async def run_session(
             frontend = TerminalFrontend()
 
     async def runner(request, controller):
+        # Capture the source classifier decision before any await or queued
+        # input can move the controller to another request.
+        active_receipt = controller.active_receipt
+        source_decision = active_receipt.decision if active_receipt is not None else None
+        success_criteria = (
+            list(source_decision.success_criteria)
+            if isinstance(source_decision, ConversationDecision) else None
+        )
         current = config
         if (built is None or single_run) and not session.engagement_path.exists():
             return RunResult(exit_code=2, error="Engagement 설정 파일이 없어 실행하지 않았습니다.")
@@ -118,6 +126,7 @@ async def run_session(
                     on_event=projection,
                     echo=controller.output.emit,
                     objective=request,
+                    success_criteria=success_criteria,
                     session_channel=controller,
                 )
                 return RunResult(final, 1 if final.phase.value == "failed" else 0)

@@ -961,6 +961,7 @@ async def execute(
     on_event: EventHandler,
     echo: Echo,
     objective: str | None = None,
+    success_criteria: list[str] | None = None,
     allow_operator_input: bool = False,
     wait_for_external_approval: bool = False,
     conversation: ConversationAssistant | None = None,
@@ -1055,7 +1056,8 @@ async def execute(
                 operator_console=operator_console, session_channel=session_channel,
             )
         final = await run_central_engagement(
-            engagement, deps=deps, objective=objective, watch=watch,
+            engagement, deps=deps, objective=objective,
+            success_criteria=success_criteria, watch=watch,
         )
     finally:
         if session_channel is not None:

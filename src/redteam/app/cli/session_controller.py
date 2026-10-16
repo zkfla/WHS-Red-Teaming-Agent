@@ -13,7 +13,7 @@ from uuid import uuid4
 from rich.markdown import Markdown
 from rich.text import Text
 
-from redteam.app.cli.conversation import conversation_failure_label
+from redteam.app.cli.conversation import ConversationDecision, conversation_failure_label
 from redteam.app.cli.display import safe_text
 from redteam.app.cli.input_router import CONTROL_COMMANDS, InputRouter, command
 from redteam.app.cli.output_coordinator import OutputCoordinator
@@ -518,7 +518,11 @@ class SessionController:
             if self.clarification:
                 self._receipt(self.clarification, "handled", f"후속 확인: {env.input_id}")
                 self.clarification = None
-            await self._new_run(receipt, decision.objective or env.text)
+            await self._new_run(
+                receipt,
+                decision.objective or env.text,
+                classifier_decision=decision,
+            )
 
     async def _command(self, receipt: InputReceipt, name: str, rest: str) -> None:
         if name == "exit":
@@ -605,13 +609,22 @@ class SessionController:
         else:
             self._receipt(receipt, "not_applied", "알 수 없는 명령입니다. /help")
 
-    async def _new_run(self, receipt: InputReceipt, objective: str) -> None:
+    async def _new_run(
+        self,
+        receipt: InputReceipt,
+        objective: str,
+        *,
+        classifier_decision: ConversationDecision | None = None,
+    ) -> None:
+        # A classified request carries final-criteria metadata into the new
+        # Mission. Direct `/new` requests stay plain strings and retain their
+        # deterministic objective fallback.
         if self.single_run and self.last_binding:
             self._receipt(
                 receipt, "not_applied", "단일 실행 모드: 별도 조사는 새 CLI에서 시작하세요."
             )
             return
-        receipt.decision = objective
+        receipt.decision = classifier_decision or objective
         async with self.gate:
             if self.closing.is_set():
                 self._receipt(receipt, "not_applied", "세션 종료로 새 조사를 시작하지 않았습니다.")
@@ -728,7 +741,15 @@ class SessionController:
             while self.deferred:
                 next_receipt = self.deferred.popleft()
                 if next_receipt.state == "deferred":
-                    await self._new_run(next_receipt, next_receipt.decision)
+                    decision = next_receipt.decision
+                    if isinstance(decision, ConversationDecision):
+                        await self._new_run(
+                            next_receipt,
+                            decision.objective or next_receipt.envelope.text,
+                            classifier_decision=decision,
+                        )
+                    else:
+                        await self._new_run(next_receipt, str(decision or ""))
                     break
 
     async def _resume_run(self, receipt, kind, value):

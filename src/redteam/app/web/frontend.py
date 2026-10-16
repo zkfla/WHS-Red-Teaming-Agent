@@ -44,6 +44,11 @@ def _decision_data(decision: Any) -> dict[str, Any] | None:
         return {
             "mode": str(decision.mode),
             "investigation": getattr(decision, "investigation", None),
+            "objective": safe_text(getattr(decision, "objective", "") or "", limit=1000),
+            "success_criteria": [
+                safe_text(item, limit=1000)
+                for item in list(getattr(decision, "success_criteria", []) or [])[:8]
+            ],
             "response": safe_text(decision.response, limit=_DECISION_TEXT),
             "plan": [safe_text(item, limit=500) for item in list(decision.plan)[:6]],
             "assumptions": [safe_text(item, limit=500) for item in list(decision.assumptions)[:5]],
@@ -254,6 +259,10 @@ class WebFrontend:
                 receipt.state, receipt.reason,
                 decision.get("mode") if decision else None,
                 decision.get("response") if decision else None,
+                json.dumps({
+                    "objective": decision.get("objective"),
+                    "success_criteria": decision.get("success_criteria"),
+                }, sort_keys=True) if decision else None,
                 # Immutable snapshot of every bounded view field: a changed
                 # rule/location/status republishes even when the truncated
                 # label text is identical.

@@ -39,6 +39,10 @@ class Conversation:
             mode=self.mode,
             response="공개 답변",
             objective=text,
+            success_criteria=(
+                ["허용된 결과를 원본 근거와 함께 요약합니다"]
+                if self.mode == "execute" else []
+            ),
             guidance=text,
             investigation="new" if self.mode == "execute" else None,
         )
@@ -77,9 +81,12 @@ async def session():
     started, end = asyncio.Event(), asyncio.Event()
     operator = Operator(end)
     calls = []
+    source_decisions = []
 
     async def runner(objective, controller):
         calls.append(objective)
+        receipt = controller.active_receipt
+        source_decisions.append(receipt.decision if receipt is not None else None)
         controller.attach(operator)
         controller.observe(SimpleNamespace(run_id="run-A"))
         started.set()
@@ -113,6 +120,7 @@ async def session():
             conversation=conversation,
             operator=operator,
             calls=calls,
+            source_decisions=source_decisions,
             started=started,
             end=end,
             buffer=buffer,
@@ -160,6 +168,26 @@ async def test_routing_questions_guidance_and_new_investigation_have_distinct_ef
         assert len(s.calls) == 1
         assert len(s.c.deferred) == 1
         assert len(s.operator.calls) == 1
+
+
+async def test_deferred_classified_goal_keeps_criteria_until_its_new_run():
+    async with session() as s:
+        await start(s)
+        s.conversation.mode = "execute"
+        s.c.submit("별도로 localhost의 응답 결과를 평가해")
+        await s.c.queue.join()
+        assert len(s.c.deferred) == 1
+
+        s.end.set()
+        for _ in range(100):
+            if len(s.calls) == 2:
+                break
+            await asyncio.sleep(0.01)
+
+        assert s.calls == ["localhost 조사", "별도로 localhost의 응답 결과를 평가해"]
+        source_decision = s.source_decisions[-1]
+        assert isinstance(source_decision, ConversationDecision)
+        assert source_decision.success_criteria == ["허용된 결과를 원본 근거와 함께 요약합니다"]
 
 
 @pytest.mark.parametrize("mode", ["answer", "guidance"])

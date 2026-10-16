@@ -7,6 +7,7 @@ import pytest
 
 from redteam.app.cli.conversation import (
     ConversationAssistant,
+    ConversationDecision,
     ConversationError,
 )
 from redteam.core.enums import AgentPhase
@@ -66,6 +67,7 @@ async def test_scripted_conversation_explains_plan_before_execution() -> None:
                 "mode": "execute",
                 "response": "허용된 범위 안에서 조사를 시작하겠습니다.",
                 "objective": "localhost:5000을 조사해",
+                "success_criteria": ["등록된 계정의 응답 차이를 근거와 함께 요약합니다"],
                 "assumptions": ["선언된 대상만 허용 범위로 간주합니다."],
                 "plan": ["사용 가능한 MCP 도구를 후보로 비교합니다."],
             }
@@ -83,11 +85,61 @@ async def test_scripted_conversation_explains_plan_before_execution() -> None:
 
     assert decision.mode == "execute"
     assert decision.objective == "localhost:5000을 조사해"
+    assert decision.success_criteria == ["등록된 계정의 응답 차이를 근거와 함께 요약합니다"]
     assert decision.assumptions
     assert any("MCP" in item for item in decision.plan)
     assert len(llm.structured_calls) == 1
     assert llm.structured_calls[0].get("num_retries") == 0
     assert llm.complete_calls == []
+
+
+async def test_execute_without_success_criteria_keeps_legacy_optional_contract() -> None:
+    llm = _ScriptedDecisionLLM([
+        {"mode": "execute", "response": "조사를 시작합니다.", "objective": "인증을 확인해"}
+    ])
+    assistant = ConversationAssistant(llm, max_attempts=1, transport_limit=0)
+
+    decision = await assistant.decide(
+        "인증을 확인해",
+        engagement_name="local",
+        scope=["localhost"],
+    )
+
+    assert decision.mode == "execute"
+    assert decision.success_criteria == []
+
+
+async def test_success_criteria_schema_publishes_list_and_item_bounds() -> None:
+    schema = ConversationDecision.model_json_schema()
+    criteria = schema["properties"]["success_criteria"]
+
+    assert "success_criteria" not in schema["required"]
+    assert criteria["maxItems"] == 8
+    assert criteria["items"]["maxLength"] == 1000
+
+
+async def test_success_criteria_are_redacted_and_duplicate_items_collapsed() -> None:
+    llm = _ScriptedDecisionLLM([{
+        "mode": "execute",
+        "response": "등록된 대상만 확인합니다.",
+        "objective": "인증 응답을 확인해",
+        "success_criteria": [
+            " 허용된 계정별 응답 결과를 비교합니다 ",
+            "허용된 계정별 응답 결과를 비교합니다",
+            "token=hidden",
+        ],
+    }])
+
+    decision = await ConversationAssistant(llm).decide(
+        "인증 응답을 확인해",
+        engagement_name="local",
+        scope=["localhost"],
+    )
+
+    assert decision.success_criteria == [
+        "허용된 계정별 응답 결과를 비교합니다",
+        "token=***REDACTED***",
+    ]
 
 
 async def test_real_conversation_can_answer_without_starting_work() -> None:

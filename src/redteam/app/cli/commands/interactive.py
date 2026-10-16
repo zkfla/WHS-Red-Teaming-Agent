@@ -672,13 +672,13 @@ async def _execute_scoped(
     effective_objective = sanitize_objective(objective or "").strip() or default_objective(
         full_config.engagement.name, full_config.engagement.metadata
     )
+    decision = prepared_decision
     if conversation is not None and (user_message or objective):
         # Initial objective normalization through the dialogue model. Only
         # an execute decision proceeds; answer/clarify/guidance are displayed
         # and stop with no execution (prefer_execute is only a wording hint
         # inside decide, never a mode conversion).
         scope = _scope_values(full_config.engagement)
-        decision = prepared_decision
         try:
             if decision is None:
                 with console.status("Understanding your request...", spinner="dots"):
@@ -736,6 +736,7 @@ async def _execute_scoped(
             on_event=event_renderer,
             echo=lambda line: console.print(line),
             objective=effective_objective,
+            success_criteria=decision.success_criteria if decision is not None else None,
             # PROMPT 4+5: keep a persistent operator channel live for the
             # whole run (pause/resume/stop/focus/exclude/status and in-session
             # approve/deny at the approval suspension). This is the

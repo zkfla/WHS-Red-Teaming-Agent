@@ -45,6 +45,10 @@ class Conversation:
             mode=self.mode,
             response="공개 답변",
             objective=text,
+            success_criteria=(
+                ["허용된 결과를 원본 근거와 함께 요약합니다"]
+                if self.mode == "execute" else []
+            ),
             guidance=text,
             investigation="new" if self.mode == "execute" else None,
         )
@@ -75,6 +79,7 @@ class FakeLauncher:
         self.started = asyncio.Event()
         self.operator = Operator(self.end)
         self.objectives: list[str] = []
+        self.success_criteria: list[list[str] | None] = []
         self.launches = 0
         self.frontend = None
         self.verifier = None
@@ -91,6 +96,12 @@ class FakeLauncher:
 
         async def runner(objective, controller):
             self.objectives.append(objective)
+            receipt = controller.active_receipt
+            decision = receipt.decision if receipt is not None else None
+            self.success_criteria.append(
+                list(decision.success_criteria)
+                if isinstance(decision, ConversationDecision) else None
+            )
             controller.attach(self.operator)
             controller.observe(SimpleNamespace(run_id="run-A"))
             frontend.event_sink(
@@ -257,6 +268,11 @@ async def test_new_investigation_runs_and_runtime_events_are_masked(stack):
     assert events[0]["data"]["payload"]["operation"] == "http_request"
     assert events[0]["data"]["payload"]["api_key"] == "***REDACTED***"
     assert stack.launcher.objectives == ["localhost 점검"]
+    assert stack.launcher.success_criteria == [["허용된 결과를 원본 근거와 함께 요약합니다"]]
+    recorded_input = [item for item in inputs(stack.host) if item["text"] == "localhost 점검"][-1]
+    assert recorded_input["decision"]["success_criteria"] == [
+        "허용된 결과를 원본 근거와 함께 요약합니다",
+    ]
 
 
 async def test_settings_cannot_change_while_a_run_is_active(stack):

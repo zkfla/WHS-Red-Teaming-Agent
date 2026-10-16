@@ -24,9 +24,10 @@ from tests.unit.test_cli_runtime_config import _engagement
 
 
 class ConversationModel:
-    def __init__(self, response, mutate=None):
+    def __init__(self, response, mutate=None, *, include_criteria=True):
         self.response = response
         self.mutate = mutate
+        self.include_criteria = include_criteria
         self.payloads = []
 
     async def complete_structured(self, *, messages, **kwargs):
@@ -37,7 +38,14 @@ class ConversationModel:
         if isinstance(self.response, Exception):
             raise self.response
         mode = self.response[min(len(self.payloads) - 1, len(self.response) - 1)]
-        return {"mode": mode, "response": "정리했습니다.", "objective": "assess scope"}
+        decision = {
+            "mode": mode,
+            "response": "정리했습니다.",
+            "objective": "assess scope",
+        }
+        if self.include_criteria and mode == "execute":
+            decision["success_criteria"] = ["등록된 응답 결과를 근거와 함께 요약합니다"]
+        return decision
 
     async def complete(self, **kwargs):
         raise AssertionError("structured decision required")
@@ -88,6 +96,20 @@ async def test_model_failure_never_becomes_an_execution(tmp_path, monkeypatch):
     assert len(model.payloads) == 6
 
 
+async def test_execute_without_interpreted_criteria_uses_existing_objective_fallback(
+    tmp_path, monkeypatch,
+):
+    execute, _ = await session_run(
+        tmp_path,
+        monkeypatch,
+        ConversationModel(["execute"], include_criteria=False),
+    )
+
+    assert execute.await_count == 1
+    assert execute.call_args.kwargs["objective"] == "assess scope"
+    assert execute.call_args.kwargs["success_criteria"] == []
+
+
 @pytest.mark.parametrize("new_mode,executions", [("answer", 0), ("execute", 1)])
 async def test_changed_scope_requires_a_new_model_decision(
     tmp_path, monkeypatch, new_mode, executions
@@ -104,6 +126,9 @@ async def test_changed_scope_requires_a_new_model_decision(
     if executions:
         assert execute.call_args.kwargs["config"].engagement == new
         assert execute.call_args.kwargs["objective"] == "assess scope"
+        assert execute.call_args.kwargs["success_criteria"] == [
+            "등록된 응답 결과를 근거와 함께 요약합니다",
+        ]
 
 
 @pytest.mark.parametrize("case", ["foreign", "resolved", "pending"])

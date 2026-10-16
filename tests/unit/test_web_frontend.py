@@ -12,7 +12,7 @@ from redteam.app.cli.conversation import ConversationDecision
 from redteam.app.cli.session_controller import SessionController
 from redteam.app.cli.session_types import RunResult
 from redteam.app.web.events import EventLog
-from redteam.app.web.frontend import WebFrontend
+from redteam.app.web.frontend import WebFrontend, _decision_data
 
 
 class Conversation:
@@ -38,6 +38,24 @@ def controller_for(frontend):
 
 def kinds(log):
     return [item["kind"] for item in log.tail()]
+
+
+def test_decision_projection_includes_bounded_redacted_goal_criteria():
+    decision = ConversationDecision(
+        mode="execute",
+        response="새 조사를 시작합니다.",
+        objective="등록된 응답을 평가합니다.",
+        success_criteria=["token=private-value", "허용된 응답 결과를 요약합니다"],
+    )
+
+    projected = _decision_data(decision)
+
+    assert projected is not None
+    assert projected["objective"] == "등록된 응답을 평가합니다."
+    assert projected["success_criteria"] == [
+        "token=***REDACTED***",
+        "허용된 응답 결과를 요약합니다",
+    ]
 
 
 def test_binding_publishes_the_initial_state_once():

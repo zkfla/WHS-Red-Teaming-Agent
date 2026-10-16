@@ -16,9 +16,9 @@ import asyncio
 import json
 import logging
 import math
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from redteam.core.ports.llm import LLMClient
 from redteam.core.redaction import redact_sensitive_text
@@ -33,7 +33,12 @@ from redteam.orchestration.diagnostics import (
     error_type_for,
     exception_chain_for,
 )
-from redteam.orchestration.engagement_planner import sanitize_objective
+from redteam.orchestration.engagement_planner import (
+    MAX_INTERPRETED_CRITERION_CHARS,
+    MAX_INTERPRETED_SUCCESS_CRITERIA,
+    normalize_success_criteria,
+    sanitize_objective,
+)
 from redteam.orchestration.state import RuntimeState
 
 logger = logging.getLogger(__name__)
@@ -44,8 +49,8 @@ _SYSTEM_PROMPT = """당신은 승인된 보안 테스트 에이전트의 대화�
 실행되었다고 주장하지 않습니다. 범위 적용, 실행 가능한 MCP 도구 선택, 승인 요청과
 작업 수행은 당신이 아니라 runtime이 담당합니다.
 
-response, objective, guidance, assumptions, plan은 사용자의 최신 메시지와 같은 언어로
-작성합니다. 사용자가 한국어로 쓰면 이 필드들은 반드시 자연스러운 한국어로 작성합니다.
+response, objective, guidance, assumptions, plan, success_criteria는 사용자의 최신 메시지와
+같은 언어로 작성합니다. 사용자가 한국어로 쓰면 이 필드들은 반드시 자연스러운 한국어로 작성합니다.
 번역하면 의미가 달라지는 command, tool, policy, target, error 식별자는 그대로 둡니다.
 
 mode를 선택합니다:
@@ -58,20 +63,37 @@ mode를 선택합니다:
 질문은 읽기 전용입니다. 종료된 조사에 관한 지시라면 후속 조사를 원하는지 확인합니다.
 새 조사를 묵시적으로 시작하지 않습니다.
 제공된 입력 binding이 기준입니다. run ID를 지어내거나 변경하지 않습니다.
+새 조사를 시작할 때 success_criteria에는 사용자가 원하는 최종 산출물이나 관찰 가능한
+완료 조건을 각각 적습니다. 도구, 기법, 조사 순서 같은 실행 단계를 완료 기준으로 쓰지 않습니다.
+각 조건은 최신 사용자 요청이나 명시된 기존 기준에 근거해야 합니다. 목표·산출물·수용 조건이
+불명확하면 새로운 기준을 만들어 execute하지 말고 mode="clarify"로 필요한 사실을 질문합니다.
+새 기준을 덧붙여 대상, 기법, 권한 또는 scope를 넓히지 않습니다.
 도구의 사용 가능 여부와 실행 권한은 서로 다릅니다. 설정된 서버나 Run 시작 시 준비된
 shell은 발견된 활성 도구가 아닙니다. availability 상태가 configured_unverified 또는
 not_inspected인 빈 도구 목록은 MCP가 없다는 뜻이 아니라 아직 discovery가 이루어지지
 않았다는 뜻입니다. 제공된 policy 제약을 따르고 연결이나 권한이 있다고 주장하지 않습니다.
 """
 
+SuccessCriterionText = Annotated[str, Field(max_length=MAX_INTERPRETED_CRITERION_CHARS)]
+
 
 class ConversationDecision(BaseModel):
     """Safe, displayable result of interpreting one chat message."""
+
+    model_config = ConfigDict(hide_input_in_errors=True)
 
     mode: Literal["execute", "answer", "clarify", "guidance"]
     investigation: Literal["current", "new"] | None = None
     response: str = Field(min_length=1, max_length=2000)
     objective: str | None = Field(default=None, max_length=1000)
+    success_criteria: list[SuccessCriterionText] = Field(
+        default_factory=list,
+        max_length=MAX_INTERPRETED_SUCCESS_CRITERIA,
+        description=(
+            "가능한 경우 최종 산출물이나 관찰 가능한 완료 조건을 적습니다. "
+            "실행 단계, 도구, 기법 순서는 적지 않습니다."
+        ),
+    )
     guidance: str | None = Field(default=None, max_length=1000)
     assumptions: list[str] = Field(default_factory=list, max_length=5)
     plan: list[str] = Field(default_factory=list, max_length=6)
@@ -90,6 +112,12 @@ class ConversationDecision(BaseModel):
             redact_sensitive_text(str(item)).strip()[:500] for item in value if str(item).strip()
         ]
 
+    @field_validator("success_criteria", mode="before")
+    @classmethod
+    def _clean_success_criteria(cls, value: Any) -> list[str]:
+        if value is None:
+            return []
+        return normalize_success_criteria(value)
 
 _CONVERSATION_STAGE = "conversation_decide"
 _DECISION_SCHEMA = ConversationDecision.model_json_schema()

@@ -195,6 +195,10 @@ def test_atomizer_explicit_handoff_omits_unrelated_candidates_and_budget_history
     )
     output = build_atomizer_input({
         "candidates": [item.model_dump(mode="json") for item in snapshot.candidates.values()],
+        "mission": {
+            "objective": "Assess the registered response",
+            "success_criteria": ["Compare the registered outcomes"],
+        },
         "model_usage": {"history": ["unrelated"] * 100},
         "review_receipts": [{"metadata": {"private_reasoning": "Do not forward"}}],
         "arbitrary_planner_field": "Must not leak into the handoff",
@@ -202,5 +206,6 @@ def test_atomizer_explicit_handoff_omits_unrelated_candidates_and_budget_history
     assert versions == {"cand-a": 1, "unrelated": 1}  # Full validation authority is intact.
     assert output["candidate_revisions"] == {"cand-a": 1}
     assert [item["hypothesis_id"] for item in output["candidates"]] == ["cand-a"]
+    assert output["mission"]["success_criteria"] == ["Compare the registered outcomes"]
     assert "model_usage" not in output and "review_receipts" not in output
     assert "arbitrary_planner_field" not in output

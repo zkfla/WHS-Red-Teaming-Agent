@@ -42,6 +42,9 @@ _INLINE_SECRET = re.compile(
     re.IGNORECASE,
 )
 
+MAX_INTERPRETED_SUCCESS_CRITERIA = 8
+MAX_INTERPRETED_CRITERION_CHARS = 1000
+
 
 def sanitize_objective(text: str) -> str:
     """Strip common inline credentials before LLM input or durable Mission state."""
@@ -71,11 +74,38 @@ def default_objective(name: str, metadata: Mapping[str, Any]) -> str:
     return f"Assess the declared scope of {sanitize_objective(name)}"
 
 
+def normalize_success_criteria(value: Any) -> list[str]:
+    """Normalize explicit final outcomes without turning malformed input into a goal.
+
+    The stored Mission contract remains a list of strings. Empty entries are
+    rejected, while exact duplicates are collapsed in first-seen order so
+    every final review sees one canonical condition.
+    """
+    if not isinstance(value, list) or len(value) > MAX_INTERPRETED_SUCCESS_CRITERIA:
+        raise ValueError("invalid_success_criteria")
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, str):
+            raise ValueError("invalid_success_criteria")
+        text = sanitize_objective(item).strip()
+        if not text:
+            raise ValueError("blank_success_criterion")
+        if len(text) > MAX_INTERPRETED_CRITERION_CHARS:
+            raise ValueError("success_criterion_too_long")
+        if text in seen:
+            continue
+        seen.add(text)
+        normalized.append(text)
+    return normalized
+
+
 def plan_mission(
     engagement: Engagement,
     mission_id: MissionId,
     *,
     objective: str | None = None,
+    success_criteria: list[str] | None = None,
     focus_areas: tuple[str, ...] = (),
     now: datetime,
 ) -> MissionPlan:
@@ -96,18 +126,23 @@ def plan_mission(
     )
     priorities = [str(item) for item in focus]
     supplied_criteria = engagement.metadata.get("success_criteria")
-    success_criteria = (
-        [str(item) for item in supplied_criteria]
-        if isinstance(supplied_criteria, list) and supplied_criteria
-        else [objective_text]
-    )
+    if isinstance(supplied_criteria, list) and supplied_criteria:
+        # Preserve the existing metadata contract and keep operator-authored
+        # criteria authoritative over a model interpretation.
+        criteria = [str(item) for item in supplied_criteria]
+    elif success_criteria:
+        criteria = normalize_success_criteria(success_criteria)
+    else:
+        # This is the pre-existing deterministic fallback. It intentionally
+        # does not inherit the tighter bounds for newly interpreted criteria.
+        criteria = [objective_text]
 
     return MissionPlan(
         mission_id=mission_id,
         engagement_id=engagement.engagement_id,
         objective=objective_text,
         priorities=priorities,
-        success_criteria=success_criteria,
+        success_criteria=criteria,
         initial_workstreams=priorities,
         status=MissionStatus.ACTIVE,
         provenance=Provenance(source="engagement:planner"),

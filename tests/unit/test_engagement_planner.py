@@ -3,6 +3,8 @@
 from datetime import datetime, timezone
 from typing import Any
 
+import pytest
+
 from redteam.core.contracts.engagement import (
     ApprovalPolicy,
     Engagement,
@@ -77,6 +79,65 @@ def test_saved_goal_reaches_mission_and_explicit_request_overrides_it() -> None:
         engagement, MissionId("override"), objective="정찰만 수행", now=_now()
     )
     assert overridden.objective == "정찰만 수행"
+
+
+def test_explicit_metadata_criteria_precede_interpreted_criteria() -> None:
+    mission = plan_mission(
+        _engagement(success_criteria=["Compare the registered account outcomes"]),
+        MissionId("metadata-criteria"),
+        objective="Inspect account access",
+        success_criteria=["Return a concrete access-control assessment"],
+        now=_now(),
+    )
+
+    assert mission.success_criteria == ["Compare the registered account outcomes"]
+
+
+def test_interpreted_criteria_are_normalized_and_used_without_metadata() -> None:
+    mission = plan_mission(
+        _engagement(),
+        MissionId("interpreted-criteria"),
+        objective="Inspect the registered response",
+        success_criteria=[
+            " Confirm the response matches the registered account ",
+            "Confirm the response matches the registered account",
+            "Inspect token=private-value only as redacted text",
+        ],
+        now=_now(),
+    )
+
+    assert mission.success_criteria == [
+        "Confirm the response matches the registered account",
+        "Inspect token=***REDACTED*** only as redacted text",
+    ]
+
+
+def test_missing_interpreted_criteria_keep_existing_objective_fallback() -> None:
+    mission = plan_mission(
+        _engagement(),
+        MissionId("objective-fallback"),
+        objective="Assess the declared scope",
+        success_criteria=[],
+        now=_now(),
+    )
+
+    assert mission.success_criteria == ["Assess the declared scope"]
+
+
+@pytest.mark.parametrize("criteria", [
+    ["   "], ["x" * 1001], ["criterion"] * 9, ["criterion", 4],
+])
+def test_invalid_interpreted_criteria_fail_without_falling_back_to_objective(
+    criteria: Any,
+) -> None:
+    with pytest.raises(ValueError):
+        plan_mission(
+            _engagement(),
+            MissionId("invalid-criteria"),
+            objective="Inspect the target",
+            success_criteria=criteria,
+            now=_now(),
+        )
 
 
 async def test_parse_objective_ignores_a_secret_looking_llm_rewrite() -> None:

@@ -31,6 +31,10 @@ function inputEntry(entry) {
   if (decision?.response) {
     nodes.push(h("div", { class: "msg" }, author(entry.received_at),
       h("p", { class: "agent-text", text: decision.response }),
+      decision.success_criteria?.length ? disclosure(
+        `criteria:${entry.key}`, `최종 결과 기준 · ${decision.success_criteria.length}개`,
+        h("ul", { class: "plan-list" }, decision.success_criteria.map((criterion) =>
+          h("li", { text: criterion })))) : null,
       decision.plan?.length ? disclosure(`plan:${entry.key}`, `응답 계획 · ${decision.plan.length}개 항목`,
         h("ol", { class: "plan-list" }, decision.plan.map((step) => h("li", { text: step })))) : null));
   }

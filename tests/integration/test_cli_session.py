@@ -86,7 +86,12 @@ class _ConversationLLM:
                 "mode": "answer",
                 "response": "[Agent] Run summary because " + payload["session_context"],
             }
-        return {"mode": "execute", "response": "등록된 범위를 조사합니다.", "objective": message}
+        return {
+            "mode": "execute",
+            "response": "등록된 범위에서 결과를 확인합니다.",
+            "objective": message,
+            "success_criteria": ["등록된 응답 결과를 근거와 함께 요약합니다"],
+        }
 
     async def complete(self, **kwargs):
         raise AssertionError("conversation uses structured decisions only")

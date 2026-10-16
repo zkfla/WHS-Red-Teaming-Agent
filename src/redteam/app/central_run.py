@@ -823,7 +823,8 @@ async def central_root_runtime(deps):
 
 
 async def run_central_engagement(
-    engagement, *, deps, objective=None, run_id=None, instance_id=None, watch=None,
+    engagement, *, deps, objective=None, success_criteria=None, run_id=None, instance_id=None,
+    watch=None,
 ):
     from redteam.orchestration.central_runtime import event
     from redteam.orchestration.coordination import CoordinationError, content_hash
@@ -838,7 +839,8 @@ async def run_central_engagement(
         except CoordinationError:
             now = datetime.now(timezone.utc)
             mission = plan_mission(engagement, MissionId(new_id("mission")),
-                                   objective=objective, now=now)
+                                   objective=objective, success_criteria=success_criteria,
+                                   now=now)
             await state.create_mission(mission)
             await state.bind_run(
                 str(mission.mission_id), scope=engagement.scope,
