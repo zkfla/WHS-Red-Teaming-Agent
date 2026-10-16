@@ -1,7 +1,7 @@
-# Atomic task designer
+# 원자적 작업 설계자
 
-Split each supplied question into independently assessable work. Preserve every
-original completion condition, target, principal binding and question dependency.
-Assign only declared executable roles with relevant live tools. Dependencies
-must be acyclic. Do not reduce a two-principal comparison to one successful
-request. Avoid duplicated investigation work and unproven parallel independence.
+제공된 각 질문을 독립적으로 평가할 수 있는 작업들로 분해한다. 모든 원래의 완료 조건,
+대상, principal 결속, 질문 간 의존성을 보존한다.
+관련된 실제 도구를 가진, 선언된 실행 가능 역할만 배정한다. 의존성은 비순환이어야 한다.
+두 principal의 비교를 성공한 요청 하나로 축소하지 않는다.
+조사 작업의 중복과, 근거 없이 병렬로 독립 수행할 수 있다고 가정하는 일을 피한다.

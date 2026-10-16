@@ -1,8 +1,8 @@
 # Explicit selection, not automatic "latest" profile discovery.
 schema_version: '2'
 profile_id: native-specialists
-version: '3'
-common: {path: prompts/common.md, version: '2', contract_version: '1'}
+version: '4'
+common: {path: prompts/common.md, version: '3', contract_version: '1'}
 max_instances: 2
 max_activations: 8
 max_tasks_per_strategy: 8
@@ -17,7 +17,7 @@ roles:
       capabilities: []
       tool_selection: {}
       context_profile: {profile_id: conversation}
-    prompt: {path: prompts/conversation.md, version: '1'}
+    prompt: {path: prompts/conversation.md, version: '2'}
   - definition:
       agent_id: planner
       role: strategy
@@ -27,7 +27,7 @@ roles:
       capabilities: []
       tool_selection: {}
       context_profile: {profile_id: strategy}
-    prompt: {path: prompts/planner.md, version: '1'}
+    prompt: {path: prompts/planner.md, version: '2'}
   - definition:
       agent_id: atomizer
       role: atomization
@@ -37,7 +37,7 @@ roles:
       capabilities: []
       tool_selection: {}
       context_profile: {profile_id: atomization}
-    prompt: {path: prompts/atomizer.md, version: '1'}
+    prompt: {path: prompts/atomizer.md, version: '2'}
   - definition:
       agent_id: web-executor
       role: web_execution
@@ -46,7 +46,7 @@ roles:
       capabilities: [web, api, recon]
       tool_selection: {capability_tags: [web, api, recon]}
       context_profile: {profile_id: web_execution}
-    prompt: {path: prompts/web.md, version: '1'}
+    prompt: {path: prompts/web.md, version: '2'}
   - definition:
       agent_id: mobile-executor
       role: mobile_execution
@@ -55,7 +55,7 @@ roles:
       capabilities: [mobile, analysis]
       tool_selection: {capability_tags: [mobile, analysis]}
       context_profile: {profile_id: mobile_execution}
-    prompt: {path: prompts/mobile.md, version: '1'}
+    prompt: {path: prompts/mobile.md, version: '2'}
   - definition:
       agent_id: research-evidence
       role: research_evidence
@@ -65,7 +65,7 @@ roles:
       capabilities: []
       tool_selection: {}
       context_profile: {profile_id: research_evidence}
-    prompt: {path: prompts/evidence.md, version: '3'}
+    prompt: {path: prompts/evidence.md, version: '4'}
   - definition:
       agent_id: code-author
       role: code_artifact
@@ -75,7 +75,7 @@ roles:
       capabilities: []
       tool_selection: {}
       context_profile: {profile_id: code_artifact}
-    prompt: {path: prompts/code.md, version: '2'}
+    prompt: {path: prompts/code.md, version: '3'}
 stages:
   attack_path_proposal: planner
   task_atomization: atomizer

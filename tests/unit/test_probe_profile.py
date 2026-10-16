@@ -32,7 +32,7 @@ def test_probe_profile_uses_one_common_executor_and_split_atomizer():
     assert len(executors) == 1
     assert loaded.run_policy().probe_limits == ProbeLimits(max_actions=4, max_model_requests=16)
 
-    assert loaded.profile.version == "24"
+    assert loaded.profile.version == "25"
     atomizer_id = loaded.profile.stages.get("task_atomization")
     assert atomizer_id == "probe-atomizer"
     assert atomizer_id != loaded.profile.stages["hypothesis_planning"]
@@ -43,7 +43,7 @@ def test_probe_profile_uses_one_common_executor_and_split_atomizer():
     assert not atomizer.definition.schedulable
     assert loaded.run_policy().probe_atomization is True
     assert loaded.run_policy().model_dump()["probe_atomization"] is True
-    assert "Common probe worker" in loaded.prompts.compose("native_action", "native contract")
+    assert "공통 검증 작업자" in loaded.prompts.compose("native_action", "native contract")
     assert loaded.prompts.compose("hypothesis_planning", "native contract")
     assert loaded.prompts.compose("task_atomization", "native contract")
     assert loaded.code_artifacts_enabled
@@ -60,7 +60,7 @@ def test_probe_profile_uses_one_common_executor_and_split_atomizer():
 
 def test_legacy_single_stage_profile_has_no_atomizer():
     loaded = load_specialist_profile(LEGACY)
-    assert loaded.profile.version == "17"
+    assert loaded.profile.version == "18"
     assert "task_atomization" not in loaded.profile.stages
     assert loaded.run_policy().probe_atomization is False
     assert "probe_atomization" not in loaded.run_policy().model_dump()
