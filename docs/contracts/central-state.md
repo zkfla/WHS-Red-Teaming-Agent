@@ -450,7 +450,7 @@ the profile/tool fingerprints and the `central-development` version marker;
 the ordinary runtime cannot silently interpret this binding as its own.
 
 `CentralDevelopment.run()` uses `SpecialistPlanner`, the existing native
-`MODEL → TOOLS → SETTLE` loop and `InstanceDriver`. Plan2a established a single
+`PREPARE → MODEL → TOOLS → SETTLE` loop and `InstanceDriver`. Plan2a established a single
 worker; Plan2b connects parallel ready Tasks on the same driver.
 `central_runtime.ready_workers` atomically claims ready Tasks and records
 the original instance/owner/generation. The runner checks that minimal launch
@@ -853,7 +853,8 @@ owner directly. Goal/task review no longer reads or normalizes a path as part of
 the central decision pipeline. Missing central wiring cannot be hidden by an
 empty compatibility store.
 
-The SDK graph registers only `model`, `tools` and `settle`. Legacy
+The SDK graph registers `prepare`, `model`, `tools` and `settle`. `prepare`
+checkpoints the frozen Task input before model dispatch. Legacy
 startup/policy/worker/aggregate recovery nodes and their backend are removed.
 A checkpoint carrying a legacy action continuation is refused. Central model
 context also omits empty legacy path/delegation display fields.
@@ -1148,6 +1149,16 @@ counts from those rows. Stage counts sum to the existing totals; undispatched
 release still refunds only the same reservation. Old/direct requests lacking a
 stage remain in `unknown`, without guessing from owner or method. No table,
 cost ledger or historical backfill is added.
+
+Request rows also accept optional normalized `usage` counts for input, output,
+total, cache read and cache write. Run/stage/Task/owner snapshots expose a known
+sum and unknown request count for each field, retaining the previous total-token
+keys. Cache subsets are never added to input/total or subtracted from admission.
+Old rows have unknown details. See [the session and usage contract](worker-session.md)
+for adapter semantics, streaming settlement, SDK limitations and the current
+multi-turn input baseline. [Worker conversation lifecycle](worker-conversation.md)
+is connected to the actual loop and original-call recovery, with archived display
+generations in the existing instance checkpoint.
 
 Terminal/CLI reports display that breakdown. The read-only web graph recognizes
 both candidate and compatibility planning ownership, displays the recorded live

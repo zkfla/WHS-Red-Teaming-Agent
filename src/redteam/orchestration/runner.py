@@ -6,6 +6,7 @@ Rationale: ``docs/agent/orchestration.md``.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, cast
@@ -296,7 +297,19 @@ class AgentLoopRunner:
             return False
         if checkpoint is not None:
             saved = checkpoint.values.get("runtime") if checkpoint.values else None
-            return isinstance(saved, RuntimeState) and saved == runtime
+            if not isinstance(saved, RuntimeState) or saved != runtime:
+                return False
+            from redteam.orchestration.worker_conversation import validate_checkpoint_session
+
+            try:
+                await validate_checkpoint_session(self._deps, runtime, checkpoint.values)
+            except (ValueError, TypeError) as exc:
+                from redteam.orchestration.engine import DecisionRuleError
+
+                code = (exc.diagnostic.code if isinstance(exc, DecisionRuleError)
+                        else "worker_session_invalid")
+                raise CoordinationError(code) from None
+            return True
         return True
 
     async def recover_delivery(self, runtime: RuntimeState) -> int:
@@ -325,6 +338,12 @@ class AgentLoopRunner:
         """Run the OBSERVE..REPLAN loop until a terminal phase."""
         if not await self._binding_for(runtime, fresh=True):
             raise CoordinationError("run_binding_missing_or_mismatched")
+        self._thread_id = self._thread_id or self._bind_runtime(runtime.run_id, runtime.instance_id)
+        snapshot = await self._latest_snapshot()
+        if snapshot and any(snapshot.values.get(key) for key in (
+            "worker_session", "native_messages", "native_calls",
+        )):
+            raise CoordinationError("worker_session_requires_original_resume")
         return await self._run_state(
             runtime, initial_graph_state(runtime, last_event_id=initial_event_id)
         )
@@ -673,6 +692,36 @@ class AgentLoopRunner:
             return outcome.runtime
         task = await self._deps.central_state.get_task(str(runtime.active_task_id))
         if task is None or task.status not in {TaskStatus.RUNNING, TaskStatus.BLOCKED}:
+            if task is not None and task.status in {TaskStatus.COMPLETED, TaskStatus.CANCELLED}:
+                from redteam.orchestration.nodes.react import (
+                    append_completed_results,
+                    restore_completed_calls,
+                )
+                from redteam.orchestration.worker_session import WorkerSession
+
+                recovered = dict(snapshot.values)
+                await restore_completed_calls(recovered, deps=self._deps)
+                await append_completed_results(recovered, deps=self._deps)
+                raw = recovered.get("worker_session")
+                from redteam.orchestration.central_completion import unsafe
+
+                executions = await self._deps.central_state.list_executions(
+                    task_id=str(task.task_id),
+                )
+                if (raw is not None and not recovered.get("native_calls")
+                        and not any(unsafe(item) for item in executions)):
+                    session = WorkerSession.model_validate_json(json.dumps(raw))
+                    recovered["worker_session"] = session.model_copy(update={
+                        "status": "closed", "wait_reason": None,
+                    }).checkpoint()
+                    recovered["runtime"] = outcome.runtime.model_copy(update={
+                        "phase": AgentPhase.FINISHED,
+                        "termination_reason": (outcome.runtime.termination_reason
+                                               or TerminationReason.INVESTIGATION_HELD),
+                    })
+                assert self._graph is not None
+                await self._graph.aupdate_state(self.config(), recovered, as_node="settle")
+                return recovered["runtime"]
             return outcome.runtime
         resumed = outcome.runtime.model_copy(update={
             "phase": AgentPhase.OBSERVE, "termination_reason": None,

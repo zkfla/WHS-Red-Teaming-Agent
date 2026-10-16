@@ -110,6 +110,8 @@ class FakeLLMClient:
             except (TypeError, ValueError):
                 continue
             task_id = (context.get("active_task") or {}).get("task_id")
+            if task_id is None:
+                continue  # Later DATA notices do not replace the initial Task identity.
             if task_id in self.native_responses_by_task:
                 script = self.native_responses_by_task[task_id]
                 return (

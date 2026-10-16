@@ -381,6 +381,26 @@ class DecisionBudget:
         self.stage_attempts[stage] = self.stage_attempts.get(stage, 0) + 1
         return self.remaining
 
+    def release_unstarted(
+        self, *, stage: str, repair: bool = False, transport: bool = False,
+    ) -> None:
+        """Undo a provisional attempt when request DATA fails before provider dispatch."""
+        repair, transport = self._effective_stage(repair=repair, transport=transport)
+        count = self.stage_attempts.get(stage, 0)
+        if self._used < 1 or count < 1:
+            raise RuntimeError("no unstarted decision attempt to release")
+        self._used -= 1
+        if transport:
+            self.transport_used -= 1
+        elif repair:
+            self.repair_used -= 1
+        else:
+            self.normal_used -= 1
+        if count == 1:
+            del self.stage_attempts[stage]
+        else:
+            self.stage_attempts[stage] = count - 1
+
     def __repr__(self) -> str:
         return (
             f"DecisionBudget(max_attempts={self._max_attempts}, "
@@ -625,6 +645,11 @@ class StructuredDecisionClient:
     return an extra dict merged into the payload without overwriting
     explicit keys. When absent (default) no extra lookup is attempted;
     a payload key named evidence_context is passed through as-is.
+
+    request_context is a caller-owned sync/async telemetry supplier, sampled
+    before each structured attempt, including repairs. Its public fields replace
+    those fields in a request-local copy only; canonical captured state is never
+    mutated. It must not perform model/target calls or supply conversation history.
     """
 
     def __init__(
@@ -671,6 +696,7 @@ class StructuredDecisionClient:
         budget: DecisionBudget | None = None,
         before_call: Callable[..., Any] | None = None,
         validate_response: Callable[[dict[str, Any]], None] | None = None,
+        request_context: Callable[[], Any] | None = None,
     ) -> dict[str, Any]:
         if budget is None:
             budget = DecisionBudget(
@@ -684,11 +710,15 @@ class StructuredDecisionClient:
         for key, value in extra.items():
             working.setdefault(key, value)
         _prompt_json(working)
+        # Output contracts precede changing user DATA in the provider's logical
+        # input. Freeze their ordering once, including optional reads/repairs.
+        response_schema = json.loads(json.dumps(response_schema, sort_keys=True, allow_nan=False))
         from redteam.orchestration.prompts import instruction_scope
 
         with instruction_scope(stage):
             return await self._ask_with_tenacity(
-                stage, working, response_schema, system, budget, before_call, validate_response
+                stage, working, response_schema, system, budget, before_call, validate_response,
+                request_context,
             )
 
     async def _resolve_extra_context(self, stage: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -876,6 +906,9 @@ class StructuredDecisionClient:
         attempt_timeout: float | None,
         guard: Callable[..., Any] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
+        # A single current-data message, never the preceding response/assistant
+        # transcript. Request-local telemetry and the bounded rejected proposal
+        # both remain user DATA; neither changes the frozen schema or system text.
         messages = [{
             "role": "user",
             "content": self._prompt_for(working, feedback, kind, replay_envelope),
@@ -1036,6 +1069,7 @@ class StructuredDecisionClient:
         budget: DecisionBudget,
         before_call: Callable[..., Any] | None = None,
         validate_response: Callable[[dict[str, Any]], None] | None = None,
+        request_context: Callable[[], Any] | None = None,
     ) -> dict[str, Any]:
         is_repair = False
         is_transport = False
@@ -1108,6 +1142,21 @@ class StructuredDecisionClient:
                 await run_guard()
                 attempt_timeout = self._timeout_for_attempt(stage, budget)
                 budget.consume(stage=stage, repair=is_repair, transport=is_transport)
+                current = dict(working)
+                try:
+                    if request_context is not None:
+                        extra = request_context()
+                        if inspect.isawaitable(extra):
+                            extra = await extra
+                        if not isinstance(extra, dict):
+                            raise ValueError("request_context must return a dict")
+                        current.update(extra)
+                    _prompt_json(current)
+                except BaseException:
+                    budget.release_unstarted(
+                        stage=stage, repair=is_repair, transport=is_transport,
+                    )
+                    raise
                 replay_details = {}
                 if replay_envelope is not None:
                     replay_details["rejected_proposal_replay"] = {
@@ -1121,7 +1170,7 @@ class StructuredDecisionClient:
                     try:
                         result, metrics = await self._attempt_once(
                             stage=stage,
-                            working=working,
+                            working=current,
                             response_schema=response_schema,
                             system=system,
                             feedback=feedback,

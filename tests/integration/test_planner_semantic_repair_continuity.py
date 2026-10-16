@@ -15,6 +15,13 @@ from tests.integration.test_central_development import TARGET
 from tests.integration.test_probe_workers import selection as probe_selection
 
 REPLAY_MARKER = "\n\nRejected proposal data:\n"
+_REQUEST_CONTEXT_FIELDS = frozenset({"model_usage", "decision_budget", "remaining_budget"})
+
+
+def _captured_planner_inputs(payload):
+    """Remove only telemetry sampled for each actual attempt, not captured context."""
+    return {key: value for key, value in payload.items()
+            if key not in _REQUEST_CONTEXT_FIELDS}
 
 
 class CorrectingPlannerLLM(ScriptedPlannerLLM):
@@ -69,9 +76,23 @@ async def test_rejected_local_references_survive_correction_before_atomic_commit
         assert len(task_ids) == 1
         assert llm.replayed == [rejected]
         assert len(llm.plan_inputs) == 2
-        assert llm.plan_inputs[0] == llm.plan_inputs[1]
+        first, repaired = llm.plan_inputs
+        assert _captured_planner_inputs(first) == _captured_planner_inputs(repaired)
+        assert first["model_usage"]["spent"] == 0
+        assert repaired["model_usage"]["spent"] == 1
+        assert first["model_usage"]["unknown_usage"] == 0
+        assert repaired["model_usage"]["unknown_usage"] == 1
+        assert first["decision_budget"]["used"] == 1
+        assert repaired["decision_budget"]["used"] == 2
+        assert first["decision_budget"]["normal_used"] == 1
+        assert first["decision_budget"]["repair_used"] == 0
+        assert repaired["decision_budget"]["normal_used"] == 1
+        assert repaired["decision_budget"]["repair_used"] == 1
         assert llm.observed_before_plan == [(0, 0), (0, 0)]
         assert len(llm.atom_inputs) == 1
+        assert llm.replayed[0]["updates"][0]["hypothesis"]["hypothesis_id"] == (
+            "proposal-local-candidate-73"
+        )
         assert llm.corrected[0]["questions"][0]["candidate_refs"] == [
             "proposal-local-candidate-73"
         ]

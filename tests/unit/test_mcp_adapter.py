@@ -279,6 +279,23 @@ async def test_mobile_and_analysis_adapters_have_independent_namespaces(
     assert tools[0].capability_tags == expected_tags
 
 
+async def test_adapter_retains_structured_network_diagnostic_in_error_message():
+    transport = FakeTransport(
+        tools=[RemoteTool(name="request", description="", input_schema={})],
+        result=RemoteCallResult(is_error=True, output={"diagnostic": {
+            "code": "target_http_connect_timeout", "message": "target HTTP request failed",
+            "repair_condition": "Use the prepared container-network route.",
+        }}),
+    )
+    adapter = WebAPIMCPAdapter(server_id="web-server", transport=transport)
+    tool = (await adapter.discover_tools())[0]
+    result = await adapter.invoke(tool, {})
+    assert not result.success and result.error is not None
+    assert "target_http_connect_timeout" in result.error.message
+    assert "container-network route" in result.error.message
+    assert result.output == transport.result.output
+
+
 async def test_adapter_normalizes_remote_tool_error() -> None:
     transport = FakeTransport(
         tools=[RemoteTool(name="request", description="", input_schema={})],

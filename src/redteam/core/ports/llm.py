@@ -18,12 +18,46 @@ from typing import Any, Protocol, runtime_checkable
 
 
 @dataclass(frozen=True)
+class LLMUsage:
+    """One request's reported counts; None means unreported, including caches.
+
+    Input includes cached/read and cache/write subsets. Never add those subsets
+    to input or total. Adapters own provider naming and inclusion differences.
+    """
+
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    total_tokens: int | None = None
+    cache_read_tokens: int | None = None
+    cache_write_tokens: int | None = None
+
+    def __post_init__(self) -> None:
+        for name, value in vars(self).items():
+            if value is not None and (type(value) is not int or value < 0):
+                raise ValueError(f"invalid usage count: {name}")
+
+
+def _completion_total(total: Any, usage: LLMUsage | None) -> int | None:
+    if usage is not None and not isinstance(usage, LLMUsage):
+        raise ValueError("usage must be LLMUsage")
+    total = total if type(total) is int and total >= 0 else None
+    measured = usage.total_tokens if usage else None
+    if total is not None and measured is not None and total != measured:
+        raise ValueError("completion usage total mismatch")
+    return measured if measured is not None else total
+
+
+@dataclass(frozen=True)
 class StructuredCompletion:
     """Request-local model value and measured total tokens, when the provider reports it."""
 
     #: Raw text is allowed so format errors retain their measured request cost.
     value: dict[str, Any] | str
     total_tokens: int | None = None
+    usage: LLMUsage | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "total_tokens", _completion_total(self.total_tokens, self.usage))
 
 
 _PROVIDER_KINDS = frozenset(
@@ -157,6 +191,15 @@ class LLMClient(Protocol):
         ...
 
 
+@runtime_checkable
+class MeteredTextLLMClient(Protocol):
+    """Optional request-local telemetry; complete() continues to return text."""
+
+    async def complete_with_usage(
+        self, *, messages: list[dict[str, Any]], system: str | None = None, **kwargs: Any,
+    ) -> StructuredCompletion: ...
+
+
 # Native tool-calling contract (ReAct loop). Existing structured APIs are
 # kept for explicit review flows; new model/tool-loop code uses
 # ``complete_native`` and the frozen records below.
@@ -189,14 +232,6 @@ def _clean_native_text(value: Any) -> str:
     if len(value) > NATIVE_MAX_TEXT_CHARS:
         return value[:NATIVE_MAX_TEXT_CHARS]
     return value
-
-
-def _clean_native_total_tokens(value: Any) -> int | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int) and value >= 0:
-        return value
-    return None
 
 
 def _clean_native_protocol_error(value: Any) -> str | None:
@@ -311,6 +346,7 @@ class NativeCompletion:
     total_tokens: int | None = None
     protocol_error: str | None = None
     continuation: tuple[dict[str, Any], ...] = field(default=(), repr=False)
+    usage: LLMUsage | None = None
 
     def __post_init__(self) -> None:
         calls = self.tool_calls
@@ -323,7 +359,7 @@ class NativeCompletion:
             raise ValueError("NativeCompletion.tool_calls must be a tuple of NativeToolCall")
         object.__setattr__(self, "text", _clean_native_text(self.text))
         object.__setattr__(
-            self, "total_tokens", _clean_native_total_tokens(self.total_tokens)
+            self, "total_tokens", _completion_total(self.total_tokens, self.usage)
         )
         object.__setattr__(
             self, "protocol_error", _clean_native_protocol_error(self.protocol_error)

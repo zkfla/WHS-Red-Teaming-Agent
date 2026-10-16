@@ -18,8 +18,9 @@ PROBE_SYSTEM = """
 완료 진단에는 cause_scope, owner, repair_condition이 설명되어 있습니다.
 가능하면 model_input을 바로잡습니다. 고칠 수 없는 runtime_contract 또는
 알 수 없는 지원 문제는 원본과 진단 참조를 보존해 미해결 결과로 반환합니다.
-대상 호출이나 반복 읽기로 runtime contract를 고칠 수는 없습니다. 현재 실행의
-대기 상태는 과거 진단 메시지가 아니라 execution_history에서 확인합니다.
+대상 호출이나 반복 읽기로 runtime contract를 고칠 수는 없습니다. 현재 변경은
+새 tool 응답과 worker_updates에서 확인합니다. 최초 execution_history와 과거
+진단 메시지는 이력이며 현재 권한을 부여하지 않습니다.
 방법은 직접 선택합니다. 필수 도구 순서나 도메인 간 인계는 없습니다.
 관련 후보는 변경할 수 없는 승인된 스냅샷이며, 권한이나 검증된 finding이 아닙니다.
 관측과 제한 사항은 task.settle (inconclusive/blocked)로 일찍 반환하거나,
@@ -230,7 +231,8 @@ async def yield_probe(deps, state, reason):
     originals = await deps.central_state.list_executions(task_id=str(task.task_id))
     records = await original_records(deps, task)
     refs = [str(record.evidence_id) for record in records]
-    pending = any(unsafe(item) for item in originals) or task.status is TaskStatus.BLOCKED
+    pending = (any(unsafe(item) for item in originals) or task.status is TaskStatus.BLOCKED
+               or any(not call.completed for call in state.get("native_calls", [])))
     waiting = any(item.wait_reason for item in originals)
     summary = "Probe returned preserved observations: " + reason
     proposal = CompletionProposal(

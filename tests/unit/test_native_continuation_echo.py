@@ -9,11 +9,10 @@ import redteam.core.ports.llm as llm_module
 from redteam.core.contracts.mission import redact_secret_material
 from redteam.core.ports.llm import NativeCompletion, NativeToolCall
 from redteam.orchestration.nodes.react import (
-    _compact_context_messages,
     _echo_provider_continuation,
-    _message_history,
     _result_messages,
 )
+from redteam.orchestration.worker_session import FrozenMessage
 
 CIPHER = "enc-abc-123-signature-ciphertext"
 
@@ -123,7 +122,8 @@ def test_checkpoint_reopen_replays_exact_ciphertext(tmp_path):
         recovered = saver.get_tuple(saved_config)
     assert recovered is not None
     messages = recovered.checkpoint["channel_values"]["native_messages"]
-    reopened = _message_history(_compact_context_messages(messages))
+    reopened = [FrozenMessage.capture(message, max_content_chars=10000).message()
+                for message in messages]
     found = [m for m in reopened if m.get("role") == "assistant"][0]
     assert found["provider_continuation"] == [_thinking_block()]
     assert found["provider_continuation"][0]["signature"] == CIPHER
@@ -131,14 +131,15 @@ def test_checkpoint_reopen_replays_exact_ciphertext(tmp_path):
     assert "signature" not in json.dumps({"content": found["content"]})
 
 
-def test_compact_and_history_preserve_field_untouched():
+def test_frozen_displays_preserve_user_text_and_continuation_untouched():
     assistant = {"role": "assistant", "content": "t", "provider_continuation": [_thinking_block()]}
     messages = [{"role": "user", "content": "old"}, assistant]
-    compacted = _compact_context_messages(messages)
-    assert compacted[1]["provider_continuation"] == [_thinking_block()]
-    assert compacted[0]["content"] != "old"
-    trimmed = _message_history(messages + [{"role": "user", "content": "new"}])
-    kept = [m for m in trimmed if m.get("role") == "assistant"]
+    frozen = [FrozenMessage.capture(message, max_content_chars=10000) for message in messages]
+    assert frozen[0].message()["content"] == "old"
+    appended = [*frozen, FrozenMessage.capture({"role": "user", "content": "new"},
+                                              max_content_chars=10000)]
+    assert appended[:len(frozen)] == frozen
+    kept = [m.message() for m in appended if m.message().get("role") == "assistant"]
     assert kept and kept[0]["provider_continuation"] == [_thinking_block()]
 
 
@@ -178,6 +179,13 @@ def test_signed_sdk_call_id_echoed_exactly_unchanged():
     checkpointed = json.loads(json.dumps([{"role": "assistant", "tool_calls":
         [{"id": completion.tool_calls[0].call_id}]}]))
     assert checkpointed[0]["tool_calls"][0]["id"] == signed_id
+    declaration = FrozenMessage.capture({"role": "assistant", "content": None, "tool_calls": [{
+        "id": signed_id, "type": "function", "function": {"name": "lookup", "arguments": "{}"},
+    }]}, max_content_chars=10000)
+    answer = FrozenMessage.capture({"role": "tool", "tool_call_id": signed_id,
+                                   "content": "Public result"}, max_content_chars=10000)
+    assert declaration.message()["tool_calls"][0]["id"] == signed_id
+    assert answer.message()["tool_call_id"] == signed_id
     # No Google plaintext reasoning is retained alongside the signed id.
     assert not hasattr(completion, "thought")
     assert not hasattr(completion, "reasoning")

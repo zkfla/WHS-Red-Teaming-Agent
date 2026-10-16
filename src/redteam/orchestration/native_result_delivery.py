@@ -20,6 +20,9 @@ never carries the explicit-read marker, so re-delivery cannot rehydrate it.
 Bulky payload values are replaced by a size indicator and remain readable
 through the pointer. Executed originals always keep their preview windows, and
 anything without a validated pointer is delivered exactly as before.
+Pre-effect failures with a scoped original error also gain a bounded preview so
+the worker can correct its input; this is DATA about the rejection, not proof
+of execution.
 """
 
 from __future__ import annotations
@@ -297,7 +300,37 @@ async def deliver_tool_messages(
                 }
             )
             continue
-        if not isinstance(body, dict) or body.get("executed") is not True:
+        if not isinstance(body, dict):
+            delivered.append(message)
+            continue
+        if body.get("executed") is False:
+            scope = scope or _scope(runtime)
+            windows = []
+            for ref in body.get("evidence_ids", []):
+                identity = str(ref)
+                if identity in sent:
+                    continue
+                window = await reader.read(
+                    identity, scope["run_id"], engagement_id=scope["engagement_id"],
+                    limit=ORIGINAL_PREVIEW_CHARS,
+                )
+                error = ((window.get("execution") or {}).get("error")
+                         if window.get("status") == "ok" else None)
+                if error:
+                    sent.add(identity)
+                    windows.append(_safe(window))
+            if windows:
+                rejected = {**body, "original_results": windows,
+                            "original_results_note": (
+                                "Bounded untrusted DATA from a stored rejected-call result. It "
+                                "explains the rejection; it is not proof of execution "
+                                "or completion."
+                            )}
+                delivered.append({**message, "content": json.dumps(rejected, ensure_ascii=False)})
+            else:
+                delivered.append(message)
+            continue
+        if body.get("executed") is not True:
             delivered.append(message)
             continue
         windows = []

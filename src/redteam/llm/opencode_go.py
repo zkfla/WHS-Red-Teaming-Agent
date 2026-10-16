@@ -203,6 +203,11 @@ class OpenCodeGoClient:
             messages=messages, system=system, **self._call_kwargs(kwargs)
         )
 
+    async def complete_with_usage(self, *, messages, system=None, **kwargs) -> StructuredCompletion:
+        return await self._client.complete_with_usage(
+            messages=messages, system=system, **self._call_kwargs(kwargs)
+        )
+
     async def complete_structured_with_usage(
         self, *, messages, response_schema, system=None, **kwargs
     ) -> StructuredCompletion:

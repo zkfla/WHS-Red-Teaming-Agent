@@ -27,6 +27,8 @@ from redteam.orchestration.local_tools import LocalToolContext
 from redteam.orchestration.metered_llm import llm_request_scope
 from redteam.orchestration.probes import context_for_probe
 from redteam.orchestration.specialist_tasks import HypothesisProbeProposal, register_probe_tasks
+from redteam.orchestration.worker_session import WorkerSession
+from tests.fakes.worker_input import worker_input
 from tests.integration.test_central_completion import OriginalProtocolDouble
 from tests.integration.test_central_development import (
     HOST,
@@ -146,6 +148,15 @@ async def test_common_pool_stops_extra_calls_and_isolates_worker_context(tmp_pat
         results = await drive(session)
         assert len(results) == 2 and all(item.kind == "completed" for item in results)
         assert len({item.runtime.instance_id for item in results}) == 2
+        sessions = []
+        for outcome in results:
+            runner = session.driver.runner_for(outcome.runtime)
+            snapshot = await runner._graph.aget_state(runner.config())
+            saved = WorkerSession.model_validate_json(json.dumps(snapshot.values["worker_session"]))
+            assert saved.binding.task_id == str(outcome.runtime.active_task_id)
+            assert saved.binding.instance_id == str(outcome.runtime.instance_id)
+            sessions.append(saved.binding.identity)
+        assert sessions[0] != sessions[1]
         executions = await session.deps.central_state.list_executions()
         assert len(executions) == 2
         assert {item.model_tool_call_id for item in executions} == {"first"}
@@ -158,7 +169,7 @@ async def test_common_pool_stops_extra_calls_and_isolates_worker_context(tmp_pat
             )
             assert usage["actions"] == 1 and usage["model_requests"] == 3
         assert len(llm.requests) == 6
-        payloads = [json.loads(item["messages"][-1]["content"]) for item in llm.requests]
+        payloads = [worker_input(item["messages"]) for item in llm.requests]
         assert all(len(payload["investigation_tasks"]) == 1 for payload in payloads)
         assert {payload["active_task"]["assigned_agent"] for payload in payloads} == {
             "probe-worker",
@@ -282,7 +293,7 @@ class ReviewedObservationModel(FakeLLMClient):
     """Scripted review; the production origin/conditions checker still runs."""
 
     async def complete_native(self, messages, tools, system=None, **kwargs):
-        payload = json.loads(messages[-1]["content"])
+        payload = worker_input(messages)
         if payload["probe"]["usage"]["actions"]:
             evidence = payload["probe"]["original_evidence_ids"]
             self._canned_structured = {

@@ -48,6 +48,7 @@ from redteam.core.ports.llm import (
     NATIVE_PROTOCOL_MISSING_CALL_ID,
     NATIVE_PROTOCOL_MISSING_TOOL_NAME,
     LLMProviderFailure,
+    LLMUsage,
     NativeCompletion,
     NativeToolCall,
     NativeToolSpec,
@@ -173,37 +174,42 @@ def _responses_output_text(response: Any) -> str | None:
     return "".join(parts) or None
 
 
-def _extract_total_tokens(response: Any) -> int | None:
-    """Read the provider-reported total tokens for one request, if present.
+def _extract_usage(response: Any) -> LLMUsage | None:
+    """Read LiteLLM's normalized Chat/Responses usage, not raw Anthropic usage.
 
-    Returns None when the SDK response carries no usable total: the
-    request cost is unknown, never zero. Only non-negative integers
-    count; anything else (missing, bool, negative, non-numeric) is
-    unknown.
+    LiteLLM includes cache read/creation in prompt_tokens. Responses input_tokens
+    also includes cached_tokens. Details are subsets, never additional tokens.
+    Missing fields remain unknown; no model-dependent estimates/defaults here.
     """
     usage = _chunk_field(response, "usage")
     if usage is None:
         return None
-    total = _chunk_field(usage, "total_tokens")
-    if type(total) is int and total >= 0:
-        return total
-    # LiteLLM/provider SDK combinations do not always populate total_tokens.
-    # Accept the two public usage shapes only when both halves are present;
-    # a partial count remains unknown rather than silently under-counting.
-    for input_key, output_key in (
-        ("input_tokens", "output_tokens"),
-        ("prompt_tokens", "completion_tokens"),
-    ):
-        input_tokens = _chunk_field(usage, input_key)
-        output_tokens = _chunk_field(usage, output_key)
-        if (
-            type(input_tokens) is int
-            and input_tokens >= 0
-            and type(output_tokens) is int
-            and output_tokens >= 0
-        ):
-            return input_tokens + output_tokens
-    return None
+
+    def count(obj: Any, *keys: str) -> int | None:
+        for key in keys:
+            value = _chunk_field(obj, key)
+            if type(value) is int and value >= 0:
+                return value
+        return None
+
+    input_tokens = count(usage, "input_tokens", "prompt_tokens")
+    output_tokens = count(usage, "output_tokens", "completion_tokens")
+    total = count(usage, "total_tokens")
+    if total is None and input_tokens is not None and output_tokens is not None:
+        total = input_tokens + output_tokens
+    details = _chunk_field(usage, "input_tokens_details")
+    if details is None:
+        details = _chunk_field(usage, "prompt_tokens_details")
+    return LLMUsage(
+        input_tokens=input_tokens, output_tokens=output_tokens, total_tokens=total,
+        cache_read_tokens=count(details, "cached_tokens"),
+        cache_write_tokens=count(details, "cache_write_tokens", "cache_creation_tokens"),
+    )
+
+
+def _extract_total_tokens(response: Any) -> int | None:
+    usage = _extract_usage(response)
+    return usage.total_tokens if usage else None
 
 
 # Native tool-calling normalization. Both transports (plain ``acompletion``
@@ -382,10 +388,11 @@ def _build_native_completion(
     *,
     calls: list[NativeToolCall],
     text: Any,
-    total_tokens: Any,
+    total_tokens: Any = None,
     missing_call_id: bool = False,
     missing_tool_name: bool = False,
     continuation: tuple[dict[str, Any], ...] = (),
+    usage: LLMUsage | None = None,
 ) -> NativeCompletion:
     protocol_error: str | None = None
     if missing_call_id:
@@ -401,6 +408,7 @@ def _build_native_completion(
         total_tokens=total_tokens,
         protocol_error=protocol_error,
         continuation=continuation,
+        usage=usage,
     )
 
 
@@ -881,6 +889,12 @@ class LiteLLMClient:
         system: str | None = None,
         **kwargs: Any,
     ) -> str:
+        response = await self.complete_with_usage(messages=messages, system=system, **kwargs)
+        return str(response.value)
+
+    async def complete_with_usage(
+        self, *, messages: list[dict[str, Any]], system: str | None = None, **kwargs: Any,
+    ) -> StructuredCompletion:
         if self._is_chatgpt_subscription or self._use_responses_api:
             return await self._responses_text(
                 messages,
@@ -908,7 +922,9 @@ class LiteLLMClient:
             raise
         except Exception as exc:
             raise _normalize_provider_error(exc) from exc
-        return response.choices[0].message.content or ""
+        return StructuredCompletion(
+            value=response.choices[0].message.content or "", usage=_extract_usage(response),
+        )
 
     async def complete_structured_with_usage(
         self,
@@ -921,8 +937,8 @@ class LiteLLMClient:
         """Structured call plus this request's provider-reported usage.
 
         Mirrors complete_structured exactly (same subscription/standard
-        paths, same JSON parsing) and additionally returns total_tokens:
-        None when the SDK response carries no usable total. No shared
+        paths, same JSON parsing) and additionally returns reported usage:
+        None for counts the SDK does not expose. No shared
         last_usage state is kept; usage travels with this request's
         result for the caller to record on its own budget.
         """
@@ -935,16 +951,13 @@ class LiteLLMClient:
             # `json.loads()` call fails. `response_schema` was already an
             # argument here; it was just never used until now.
             augmented_system = _schema_json_system(system, response_schema)
-            text = await self._responses_text(
+            return await self._responses_text(
                 messages,
                 system=augmented_system,
                 kwargs=kwargs,
                 text_format=_native_responses_format(response_schema),
                 default_stream=True,
             )
-            # The subscription streaming route surfaces text only, so the
-            # request cost is unknown rather than zero.
-            return StructuredCompletion(value=text, total_tokens=None)
 
         if self._use_responses_api:
             return await self._responses_structured_single_shot(
@@ -954,6 +967,10 @@ class LiteLLMClient:
         import litellm
 
         call_kwargs = self._call_kwargs(kwargs)
+        # Structured decisions are self-contained, including lookup and repair.
+        # A configured response/conversation chain must not supply hidden memory.
+        call_kwargs.pop("previous_response_id", None)
+        call_kwargs.pop("conversation", None)
         if "response_format" not in call_kwargs:
             if _supports_native_json_schema(self._model):
                 call_kwargs["response_format"] = _native_chat_completion_format(response_schema)
@@ -981,7 +998,7 @@ class LiteLLMClient:
         content = response.choices[0].message.content or "{}"
         return StructuredCompletion(
             value=content,
-            total_tokens=_extract_total_tokens(response),
+            usage=_extract_usage(response),
         )
 
     async def complete_structured(
@@ -1048,6 +1065,7 @@ class LiteLLMClient:
         ]
         call_kwargs = self._call_kwargs(kwargs)
         call_kwargs.pop("previous_response_id", None)
+        call_kwargs.pop("conversation", None)
         call_kwargs.pop("tools", None)
         tools_param = _chat_tools_param(tools)
         if tools_param is not None:
@@ -1073,7 +1091,7 @@ class LiteLLMClient:
         return _build_native_completion(
             calls=calls,
             text=content,
-            total_tokens=_extract_total_tokens(response),
+            usage=_extract_usage(response),
             missing_call_id=missing_id,
             missing_tool_name=missing_name,
             continuation=_encrypted_continuation(message),
@@ -1093,6 +1111,7 @@ class LiteLLMClient:
         call_kwargs: dict[str, Any] = self._call_kwargs(kwargs)
         call_kwargs.pop("messages", None)
         call_kwargs.pop("previous_response_id", None)
+        call_kwargs.pop("conversation", None)
         call_kwargs.pop("tools", None)
         call_kwargs.pop("response_format", None)
         call_kwargs.pop("text", None)
@@ -1135,7 +1154,7 @@ class LiteLLMClient:
                 return _build_native_completion(
                     calls=calls,
                     text=text,
-                    total_tokens=_extract_total_tokens(response),
+                    usage=_extract_usage(response),
                     missing_call_id=missing_id,
                     missing_tool_name=missing_name,
                     continuation=_encrypted_reasoning_items(
@@ -1172,6 +1191,7 @@ class LiteLLMClient:
         call_kwargs.pop("response_format", None)
         call_kwargs.pop("text", None)
         call_kwargs.pop("text_format", None)
+        call_kwargs.pop("conversation", None)
         call_kwargs.setdefault("stream", False)
         call_kwargs["text"] = {"format": _native_responses_format(response_schema)}
         try:
@@ -1199,7 +1219,7 @@ class LiteLLMClient:
             raise _normalize_provider_error(exc) from exc
         return StructuredCompletion(
             value=text,
-            total_tokens=_extract_total_tokens(response),
+            usage=_extract_usage(response),
         )
 
     async def _accumulate_responses_stream_native(self, response: Any) -> NativeCompletion:
@@ -1208,6 +1228,7 @@ class LiteLLMClient:
         pending: dict[Any, dict[str, Any]] = {}
         completed = False
         continuation: tuple[dict[str, Any], ...] = ()
+        usage: LLMUsage | None = None
 
         def _pending_key(output_index: Any, item_id: Any) -> Any:
             if isinstance(output_index, int) and not isinstance(output_index, bool):
@@ -1221,6 +1242,7 @@ class LiteLLMClient:
             if event_type == "response.completed":
                 completed = True
                 final = _chunk_field(chunk, "response")
+                usage = _extract_usage(final)
                 final_output = _chunk_field(final, "output") or _chunk_field(chunk, "output")
                 continuation = _encrypted_reasoning_items(
                     final_output, required=self._reasoning_effort is not None
@@ -1317,6 +1339,7 @@ class LiteLLMClient:
             calls=calls,
             text="".join(text_parts),
             total_tokens=None,
+            usage=usage,
             missing_call_id=missing_id,
             missing_tool_name=missing_name,
             continuation=continuation,
@@ -1330,7 +1353,7 @@ class LiteLLMClient:
         kwargs: dict[str, Any],
         text_format: dict[str, Any] | None = None,
         default_stream: bool = True,
-    ) -> str:
+    ) -> StructuredCompletion:
         """``chatgpt/`` subscription models only — see the module docstring
         for why this bypasses ``acompletion()``. ``system`` becomes the
         Responses API's top-level ``instructions``, not an in-``input``
@@ -1348,6 +1371,8 @@ class LiteLLMClient:
         call_kwargs.setdefault("stream", default_stream)
         streaming = bool(call_kwargs.get("stream"))
         if text_format is not None:
+            call_kwargs.pop("previous_response_id", None)
+            call_kwargs.pop("conversation", None)
             call_kwargs["text"] = {"format": text_format}
 
         try:
@@ -1375,14 +1400,16 @@ class LiteLLMClient:
                 text = _responses_output_text(response)
                 if not text:
                     raise _stream_protocol_failure()
-                return text
+                return StructuredCompletion(value=text, usage=_extract_usage(response))
 
             text_parts: list[str] = []
             completed = False
+            usage: LLMUsage | None = None
             async for chunk in cast(AsyncIterator[Any], response):
                 event_type = _chunk_field(chunk, "type")
                 if event_type == "response.completed":
                     completed = True
+                    usage = _extract_usage(_chunk_field(chunk, "response"))
                 elif event_type in ("response.failed", "error"):
                     raise _stream_protocol_failure()
                 elif event_type == "response.incomplete":
@@ -1396,7 +1423,7 @@ class LiteLLMClient:
                 raise _stream_protocol_failure()
             if not text:
                 raise _stream_protocol_failure()
-            return text
+            return StructuredCompletion(value=text, usage=usage)
         except LLMProviderFailure:
             raise
         except Exception as exc:

@@ -123,17 +123,15 @@ class NetworkExecutionPolicy(Protocol):
     ) -> MCPCallResult: ...
 
 
+class ShellExecutionPolicy(NetworkExecutionPolicy, Protocol):
+    """Compatibility view of the shared execution seam."""
+
+
 class GatedExecutionPolicy(NetworkExecutionPolicy, Protocol):
     # Provider-side structural view of the TASK-005 gated policy.
     # The concrete class lives with 005; it must structurally conform
     # so this seam binds without importing an unpublished module.
     # execute() routes through policy enforcement, then the delegate.
-    async def execute(
-        self,
-        invocation: ToolInvocation,
-        parsed: Any,
-        delegate: GatedExecutionDelegate,
-    ) -> MCPCallResult: ...
     # Install-route seam (TASK-005/007): the provider asks the policy
     # for the operator-pinned route of one mirror name, then seeds the
     # install exec env from the forward-proxy variables. Structural so

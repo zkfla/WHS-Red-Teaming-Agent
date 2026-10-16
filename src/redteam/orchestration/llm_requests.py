@@ -11,11 +11,12 @@ import asyncio
 import math
 import time
 from collections.abc import Awaitable, Callable, Coroutine, MutableMapping
+from dataclasses import asdict
 from typing import Any, Protocol
 
 from redteam.core.contracts.llm_policy import LLMRequestPolicy
 from redteam.core.ids import new_id
-from redteam.core.ports.llm import LLMProviderFailure
+from redteam.core.ports.llm import LLMProviderFailure, LLMUsage, StructuredCompletion
 from redteam.orchestration.cognition import ReasoningHalted
 from redteam.orchestration.coordination import CoordinationError, Coordinator
 
@@ -82,23 +83,38 @@ def _unknown_outcome_counts(rows) -> dict[str, int]:
     return dict(sorted(counts.items()))
 
 
-def request_stage_usage(rows) -> dict[str, dict[str, int]]:
-    """Derived attribution from recorded stages; never infer stages from owners/methods."""
-    grouped: dict[str, dict[str, int]] = {}
+def request_usage(rows) -> dict[str, Any]:
+    """Known sums plus unknown counts; cache subsets never change token charges."""
+    rows = list(rows)
+    spent = [row for row in rows if row["state"] in {"settled", "unknown"}]
+    fields = asdict(LLMUsage())
+    usage = {}
+    for name in fields:
+        values = [(row.get("usage") or {}).get(name) for row in spent]
+        if name == "total_tokens":
+            values = [row.get("total_tokens") for row in spent]
+        usage[name] = {"known": sum(value for value in values if value is not None),
+                       "unknown": sum(value is None for value in values)}
+    return {
+        "spent": len(spent),
+        "reserved": sum(row["state"] in {"reserved", "dispatched"} for row in rows),
+        "known_tokens": sum(row.get("total_tokens") or 0 for row in spent),
+        "unknown_usage": sum(row.get("total_tokens") is None for row in spent),
+        "unknown_dispatch": sum(row["state"] == "unknown" for row in spent),
+        "usage": usage,
+    }
+
+
+def _group_usage(rows, field: str) -> dict[str, dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
-        stage = row.get("stage") or "unknown"
-        bucket = grouped.setdefault(stage, {
-            "spent": 0, "reserved": 0, "known_tokens": 0,
-            "unknown_usage": 0, "unknown_dispatch": 0,
-        })
-        if row["state"] in {"settled", "unknown"}:
-            bucket["spent"] += 1
-            bucket["known_tokens"] += row["total_tokens"] or 0
-            bucket["unknown_usage"] += row["total_tokens"] is None
-            bucket["unknown_dispatch"] += row["state"] == "unknown"
-        elif row["state"] in {"reserved", "dispatched"}:
-            bucket["reserved"] += 1
-    return dict(sorted(grouped.items()))
+        grouped.setdefault(row.get(field) or "unknown", []).append(row)
+    return {key: request_usage(value) for key, value in sorted(grouped.items())}
+
+
+def request_stage_usage(rows) -> dict[str, dict[str, Any]]:
+    """Derived attribution from recorded stages, never inferred from owners/methods."""
+    return _group_usage(rows, "stage")
 
 
 class RequestSession(Protocol):
@@ -229,10 +245,11 @@ class RunRequestLedger:
                 or "total_tokens" not in row):
             raise RequestAdmissionError("llm_request_record_invalid")
         tokens = row["total_tokens"]
-        if row.get("stage") is not None and (
-            not isinstance(row["stage"], str) or not row["stage"].strip()
-        ):
-            raise RequestAdmissionError("llm_request_record_invalid")
+        for field in ("stage", "task_id"):
+            if row.get(field) is not None and (
+                not isinstance(row[field], str) or not row[field].strip()
+            ):
+                raise RequestAdmissionError("llm_request_record_invalid")
         if (tokens is not None and (type(tokens) is not int or tokens < 0
                                     or row["state"] not in {"settled", "unknown"})):
             raise RequestAdmissionError("llm_request_record_invalid")
@@ -242,6 +259,15 @@ class RunRequestLedger:
                                or not math.isfinite(row[key]) or row[key] < 0)
                for key in _TIME_FIELDS):
             raise RequestAdmissionError("llm_request_record_invalid")
+        if row.get("usage") is not None:
+            try:
+                if not isinstance(row["usage"], dict) or row["state"] not in {"settled", "unknown"}:
+                    raise ValueError("usage outside settlement")
+                usage = LLMUsage(**row["usage"])
+                if usage.total_tokens is not None and usage.total_tokens != tokens:
+                    raise ValueError("usage total mismatch")
+            except (TypeError, ValueError) as exc:
+                raise RequestAdmissionError("llm_request_record_invalid") from exc
         return row
 
     @classmethod
@@ -298,6 +324,8 @@ class RunRequestLedger:
         if any(not isinstance(value, str) or not value.strip() for value in (run_id, owner, kind)):
             raise RequestAdmissionError("llm_request_scope_invalid")
         if stage is not None and (not isinstance(stage, str) or not stage.strip()):
+            raise RequestAdmissionError("llm_request_scope_invalid")
+        if task_id is not None and (not isinstance(task_id, str) or not task_id.strip()):
             raise RequestAdmissionError("llm_request_scope_invalid")
         request_id = new_id("llm_request")
 
@@ -371,19 +399,28 @@ class RunRequestLedger:
     async def settle(
         self, run_id: str, request_id: str, *, unknown: bool = False,
         total_tokens: int | None = None, outcome: dict[str, Any] | None = None,
+        usage: LLMUsage | None = None,
     ) -> None:
+        measured = StructuredCompletion(value="", total_tokens=total_tokens, usage=usage)
+        tokens = measured.total_tokens
+        details = asdict(usage) if usage is not None else None
+
         async def change(tx: RequestSession) -> None:
             row = self._get(tx, run_id, request_id)
             state = "unknown" if unknown else "settled"
-            tokens = total_tokens if type(total_tokens) is int and total_tokens >= 0 else None
             if outcome is not None and (not unknown or not _valid_outcome(outcome, state)):
                 raise RequestAdmissionError("llm_request_outcome_invalid")
-            if row["state"] == state and row["total_tokens"] == tokens:
+            if (row["state"] == state and row["total_tokens"] == tokens
+                    and row.get("usage") == details
+                    and (outcome is None or row.get("outcome") == outcome)):
                 return
             if row["state"] != "dispatched":
                 raise RequestAdmissionError("llm_request_settlement_conflict")
-            row.update(state=state, total_tokens=tokens, settled_at=self.clock(),
-                       **({"outcome": dict(outcome)} if outcome is not None else {}))
+            row.update(state=state, total_tokens=tokens, settled_at=self.clock())
+            if details is not None:
+                row["usage"] = details
+            if outcome is not None:
+                row["outcome"] = dict(outcome)
         await self._change(run_id, change)
 
     async def release_undispatched(self, run_id: str, request_id: str) -> None:
@@ -397,17 +434,14 @@ class RunRequestLedger:
     async def snapshot(self, run_id: str) -> dict[str, Any]:
         async def read(tx: RequestSession) -> dict[str, Any]:
             rows = self._rows(tx, run_id)
-            spent = [r for r in rows if r["state"] in {"settled", "unknown"}]
             return {
                 "policy": tx.records.get(("llm_request_policy", run_id)),
-                "spent": len(spent),
-                "reserved": sum(r["state"] in {"reserved", "dispatched"} for r in rows),
-                "known_tokens": sum(r["total_tokens"] or 0 for r in spent),
-                "unknown_usage": sum(r["total_tokens"] is None for r in spent),
-                "unknown_dispatch": sum(r["state"] == "unknown" for r in spent),
+                **request_usage(rows),
                 "provider_cooldown": tx.records.get(("llm_provider_cooldown", run_id)),
                 "by_stage": request_stage_usage(rows),
                 "unknown_outcomes": _unknown_outcome_counts(rows),
+                "by_task": _group_usage(rows, "task_id"),
+                "by_owner": _group_usage(rows, "owner"),
             }
         return await self._change(run_id, read)
 

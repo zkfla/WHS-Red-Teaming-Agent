@@ -1403,11 +1403,13 @@ def validate_argument_target(
         )
         ref_binding = target_ref_binding if target_ref_binding is not None else target_binding
         if getattr(ref_binding, "target_ref_source", "mcp_ref") == "logical_host":
-            # Logical selectors are derived from the approved target identity;
-            # engagement deployment aliases are a separate source and must not
-            # be unioned into this accepted form.
+            # Logical selectors come from the approved target identity, not deployment aliases.
             allowed = {identity.host} if identity is not None else set()
-        if arguments.get("target_ref") is not None and str(arguments["target_ref"]) not in allowed:
+        if (
+            (argument_bindings or {}).get("target_ref", "target_ref") == "target_ref"
+            and arguments.get("target_ref") is not None
+            and str(arguments["target_ref"]) not in allowed
+        ):
             raise DecisionRuleError(
                 "target_ref does not match the descriptor-declared source for the selected target.",
                 code="target_ref_source_mismatch",

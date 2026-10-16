@@ -30,6 +30,7 @@ from redteam.core.contracts.tool import (
 )
 from redteam.core.enums import RiskLevel, ToolHealthStatus
 from redteam.core.ids import ToolId
+from redteam.core.redaction import redact_sensitive_text
 
 
 class MCPServerAdapter:
@@ -187,6 +188,12 @@ def _safe_error_message(output: dict[str, Any] | str | None) -> str:
         return output[:500]
     if output is None:
         return "MCP tool reported an error"
+    diagnostic = output.get("diagnostic")
+    if isinstance(diagnostic, dict):
+        parts = [value for key in ("code", "message", "repair_condition")
+                 if isinstance(value := diagnostic.get(key), str) and value]
+        if parts:
+            return redact_sensitive_text(": ".join(value[:500] for value in parts))[:500]
     return "MCP tool reported an error; structured details are available in output"
 
 

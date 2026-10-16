@@ -262,11 +262,14 @@ uses bounded conflict/wait cards, not full contracts or an omissions-based gate.
 The existing split coverage, paired comparison, source/revision validation, empty
 and update-only skips and single atomic admission remain in place.
 
-Default profile version 13 (strategy 6 / atomizer 4 / worker 6) and single-stage
-compatibility version 10 (planner 4 / worker 6) bind the changed prompts
-(plan8c added `context.query` guidance to `worker.md`). Existing profile
+Default profile version 18 (strategy 9 / atomizer 4 / worker 10) and single-stage
+compatibility version 15 (planner 5 / worker 10) bind the current prompts.
+The [10b request contract](planner-request.md) keeps independent Planner prefixes
+stable and samples current accounting for each lookup/repair attempt. Existing profile
 fingerprint/resume checks reject silent changes; no stored Run or checkpoint
-is rewritten.
+is rewritten. [Worker sessions](worker-conversation.md) carry the initial Task
+context once, then append new results/changes; explicit input-limit or purpose
+generations retain old displays in the existing checkpoint.
 
 ## Offline baseline and consumer measurements
 

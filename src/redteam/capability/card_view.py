@@ -14,7 +14,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from copy import deepcopy
 
-from redteam.core.contracts.tool import ToolDescriptor
+from redteam.core.contracts.tool import ToolDescriptor, model_input_schema
 from redteam.core.ports.tool_catalog import (
     ToolCard,
     ToolCardKind,
@@ -58,15 +58,17 @@ def tool_card_from_descriptor(
 
 
 def tool_detail_from_descriptor(descriptor: ToolDescriptor) -> ToolDetail:
+    schema = model_input_schema(descriptor.input_schema)
+    required = list(schema.get("required", []))
     return ToolDetail(
         card=tool_card_from_descriptor(descriptor),
         description=descriptor.description or "",
-        input_schema=deepcopy(descriptor.input_schema),
+        input_schema=schema,
         output_schema=deepcopy(descriptor.output_schema),
         target_types=list(descriptor.target_types),
         operations=list(descriptor.operations),
-        required_arguments=list(descriptor.required_arguments),
-        optional_arguments=list(descriptor.optional_arguments),
+        required_arguments=required,
+        optional_arguments=[name for name in schema.get("properties", {}) if name not in required],
     )
 
 

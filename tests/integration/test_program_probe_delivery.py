@@ -33,6 +33,7 @@ from redteam.orchestration.coordination import StateConflict
 from redteam.orchestration.native_binding import exposed_tool_name
 from redteam.orchestration.specialist_planner import SpecialistPlanner
 from redteam.orchestration.tool_discovery import NATIVE_INPUT_LIMIT
+from tests.fakes.worker_input import worker_input
 from tests.integration.test_central_development import HOST, call, turn
 from tests.integration.test_central_parallel import limits
 from tests.integration.test_probe_workers import PROFILE, drive, register
@@ -102,7 +103,7 @@ class SchemaSensitiveProgramProbe(FakeLLMClient):
 
     async def complete_native(self, messages, tools, system=None, **kwargs):
         self.envelopes.append({"messages": messages, "tools": tools, "system": system})
-        payload = json.loads(messages[-1]["content"])
+        payload = worker_input(messages)
         originals = payload["probe"]["original_evidence_ids"]
         if originals and self.extra_read and not self.read_issued:
             self.read_issued = True
@@ -211,10 +212,11 @@ async def test_program_original_reaches_worker_and_planner_with_one_original_exe
         assert raw.metadata["tool_result"]["metadata"]["gated_evidence_id"]
         if extra_read:
             read_result, = [item for item in records
-                           if item.metadata.get("tool_id") == "evidence.read"]
+                           if item.metadata.get("tool_id") == "evidence.read"
+                           and item.metadata.get("record_kind") == "runtime_tool_result"]
             retained = read_result.metadata["result"]["payload"]
-            assert retained["program_output_omitted"] and "program_output" not in retained
-            assert "program-observation" not in json.dumps(read_result.metadata)
+            assert retained["program_output"]["stderr"] == "connection refused"
+            assert retained["text"] and retained["limit"] == 500
         tool_bodies = [json.loads(item["content"]) for item in llm.envelopes[-1]["messages"]
                        if item["role"] == "tool"]
         worker, = [view for body in tool_bodies for view in body.get("original_results", [])]
@@ -260,7 +262,10 @@ async def test_changed_worker_prompt_rejects_original_run_resume_before_any_mode
     async with open_central_run(config, **kwargs) as session:
         run_id, engagement_id = session.runtime.run_id, session.runtime.engagement_id
     prompt = selected_profile.parent / "prompts/worker.md"
-    prompt.write_text(prompt.read_text() + "\nChanged trusted execution instructions.\n")
+    prompt.write_text(
+        prompt.read_text(encoding="utf-8") + "\nChanged trusted execution instructions.\n",
+        encoding="utf-8",
+    )
     with pytest.raises(StateConflict, match="run_binding_changed_new_run_required"):
         async with open_central_run(
             config, resume=True, run_id=run_id, engagement_id=engagement_id, **kwargs,

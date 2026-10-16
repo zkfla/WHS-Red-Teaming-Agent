@@ -252,7 +252,14 @@ async def reconcile_originals(deps, runtime, *, snapshot=None):
                 evidence_ids=[str(execution.proposal_evidence_id)],
             )
             submission = checked[0].record
-            check_execution_receipt(execution, submission, result=False, task=task)
+            receipt_task = task
+            if snapshot is not None and execution.state in {
+                ExecutionState.SUCCEEDED, ExecutionState.FAILED, ExecutionState.CANCELLED,
+            }:
+                from redteam.orchestration.worker_conversation import original_purpose_task
+
+                receipt_task = original_purpose_task(snapshot.values, submission, task)
+            check_execution_receipt(execution, submission, result=False, task=receipt_task)
             if execution.state in {ExecutionState.SUCCEEDED, ExecutionState.FAILED,
                                     ExecutionState.CANCELLED}:
                 if execution.result_evidence_id:

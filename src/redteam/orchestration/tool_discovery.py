@@ -43,6 +43,7 @@ from typing import Any, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from redteam.core.contracts.tool import model_input_schema
 from redteam.core.enums import RiskLevel, ToolHealthStatus
 from redteam.core.ids import ToolId
 from redteam.core.ports.llm import NativeToolSpec
@@ -681,7 +682,9 @@ async def tool_get_detail_handler(
         for descriptor in registry.descriptors():
             if str(descriptor.tool_id) != wanted:
                 continue
-            schema = descriptor.input_schema if isinstance(descriptor.input_schema, dict) else {}
+            schema = model_input_schema(
+                descriptor.input_schema if isinstance(descriptor.input_schema, dict) else {}
+            )
             props = schema.get("properties")
             properties = props if isinstance(props, dict) else {}
             required = [str(item) for item in schema.get("required") or []]

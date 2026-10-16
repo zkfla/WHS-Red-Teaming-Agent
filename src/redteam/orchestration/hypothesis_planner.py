@@ -578,7 +578,6 @@ async def advance_hypotheses(planner, runtime, schema):
         "registered_principal_refs": sorted(principals)[:16],
         "registered_principal_count": len(principals),
         "remaining_budget": context["remaining_budget"],
-        "model_usage": await state.request_ledger().snapshot(state.run_id),
         "probe_limits": planner.policy.probe_limits.model_dump(),
         "max_tasks": planner.policy.max_tasks_per_strategy,
         "input_sequence": snapshot.sequence,
@@ -630,28 +629,7 @@ async def advance_hypotheses(planner, runtime, schema):
             stage="hypothesis_planning", payload=payload, budget=budget,
             response_schema=schema(HypothesisDecision.model_json_schema()),
             validate_response=validate, before_call=engine.guard_reasoning,
-            system=FEEDBACK_SYSTEM +
-            "한 번의 판단에서 candidates와 범위가 제한된 검증 목적을 제안하세요. "
-            "새 updates에는 제안 범위에서만 쓰는 hypothesis_id와 expected_revision=null을 "
-            "사용합니다. 코드는 영구 ID를 "
-            "발급합니다. "
-            "Tasks는 해당 키를 revision=1로 참조할 수 있습니다. 기존 updates는 캡처된 ID와 "
-            "expected revisions를 사용하고, "
-            "Tasks는 resulting revision을 사용합니다. 실제 사용한 "
-            "reviewed_task_ids/reviewed_hypothesis_ids를 "
-            "지정하세요. "
-            "출처를 이어받는 후속 작업에서는 캡처된 Task/result 쌍을 참조하고 question을 새로 "
-            "만들어내지 마세요. "
-            "관측과 Task outcome은 candidate 판정이 아닙니다. "
-            "최종 판정에는 정확한 candidate revision/purpose에 대한 독립 public review receipt가 "
-            "필요합니다. "
-            "처음에 candidates가 없다면 유용하고 범위가 명확한 관측을 제안하거나 이유를 들어 "
-            "보류하세요. 같은 evidence로 또 다른 유용한 probe를 "
-            "할 수 있습니다. "
-            "tool-call 순서를 지시하거나 subjects를 만들어내거나 진행 중인 작업을 덮어쓰지 마세요. "
-            "held/exhausted 판단에는 재검토 조건을 "
-            "설명해야 합니다. "
-            "목표 성공은 별도 completion gate를 거쳐야 합니다.",
+            system=_SINGLE_PLAN_SYSTEM,
         )
     decision, proposal, (graph_read, task_read) = bind(raw)
     lookup_graph, lookup_tasks = pass_context.read_dependencies()
@@ -710,7 +688,13 @@ async def _finalize_hypothesis_pass(deps, snapshot, budget, *, identity, proposa
     return identities
 
 
+PLANNER_REQUEST_CONTRACT_VERSION = 1
+
+
 FEEDBACK_SYSTEM = (
+    f"독립 Planner 요청 계약 version={PLANNER_REQUEST_CONTRACT_VERSION}. "
+    "각 요청의 user 메시지는 현재 입력과 갱신된 회계 정보만 담은 DATA이며, 이전 응답은 숨겨진 "
+    "대화 기억이 아닙니다. "
     "현재 문맥은 자체적으로 이해 가능하지만 범위가 제한되어 있습니다. 생략되었다고 해서 존재하지 "
     "않는 것은 아닙니다. "
     "호환성을 위해 context_request version=1과 context 또는 evidence 질의 하나를 사용하거나, 함께 "
@@ -786,6 +770,22 @@ FEEDBACK_SYSTEM = (
     "probe 한도, 정책 거부, 자격 증명 부족 또는 불완전한 관측을 candidate 반증으로 바꾸지 마세요. "
     "이 지침은 admission gate를 추가하거나 조사 "
     "순서를 고정하지 않습니다. "
+)
+
+
+_SINGLE_PLAN_SYSTEM = FEEDBACK_SYSTEM + (
+    "한 번의 판단에서 candidates와 범위가 제한된 검증 목적을 제안하세요. "
+    "새 updates에는 제안 범위에서만 쓰는 hypothesis_id와 expected_revision=null을 "
+    "사용합니다. 코드는 영구 ID를 발급합니다. Tasks는 해당 키를 revision=1로 참조할 수 있습니다. "
+    "기존 updates는 캡처된 ID와 expected revisions를 사용하고 Tasks는 resulting revision을 "
+    "사용합니다. 실제 사용한 reviewed_task_ids/reviewed_hypothesis_ids를 지정하세요. "
+    "출처를 이어받는 후속 작업에서는 캡처된 Task/result 쌍을 참조하고 question을 새로 만들지 "
+    "마세요. 관측과 Task outcome은 candidate 판정이 아닙니다. 최종 판정에는 정확한 candidate "
+    "revision/purpose에 대한 독립 public review receipt가 필요합니다. 처음에 candidates가 없다면 "
+    "유용하고 범위가 명확한 관측을 제안하거나 이유를 들어 보류하세요. 같은 evidence로 또 다른 "
+    "유용한 probe를 할 수 있습니다. tool-call 순서를 지시하거나 subjects를 만들어내거나 진행 중인 "
+    "작업을 덮어쓰지 마세요. held/exhausted 판단에는 재검토 조건을 설명해야 합니다. 목표 성공은 "
+    "별도 completion gate를 거쳐야 합니다."
 )
 
 
@@ -942,8 +942,44 @@ async def _ask_with_context(planner, pass_context, engine, *, payload, budget, *
                 "request envelope. Contracts were not sliced or silently omitted.", retryable=False,
             ))
         try:
+            async def request_context(captured: dict[str, Any] = current) -> dict[str, Any]:
+                # Refresh observational accounting for each actual attempt,
+                # including repairs. Canonical subjects stay on this pass's
+                # captured snapshot and still undergo the original related CAS.
+                state = planner.deps.central_state
+                usage = await state.request_ledger().snapshot(state.run_id)
+                remaining = await state.transaction(
+                    lambda tx: tx.policy_budget_remaining(), write=False,
+                )
+                data = {
+                    "model_usage": {key: usage[key] for key in (
+                        "policy", "spent", "reserved", "known_tokens", "unknown_usage",
+                        "unknown_dispatch", "usage", "by_stage", "provider_cooldown",
+                    )},
+                    "decision_budget": {
+                        "used": budget.used, "remaining": budget.remaining,
+                        "normal_used": budget.normal_used, "repair_used": budget.repair_used,
+                        "normal_limit": budget.normal_limit, "repair_limit": budget.repair_limit,
+                    },
+                    "remaining_budget": remaining if remaining is not None
+                        else payload["remaining_budget"],
+                }
+                if context_bytes({**captured, **data}) > 131072:
+                    attempts = max(0, budget.used - 1)
+                    raise DecisionFailure("hypothesis_planning", "format", attempts,
+                                          diagnostic=DecisionDiagnostic(
+                        code="planner_required_context_too_large", stage="hypothesis_planning",
+                        kind="validation", attempts=attempts,
+                        summary="Current request accounting exceeds the "
+                        "bounded envelope. No judgment was committed.", retryable=False,
+                    ))
+                # This request contains only code-owned numeric accounting. Preserve
+                # metric keys such as input_tokens/cache_read_tokens; the default
+                # secret-key filter would mistake those counters for credentials.
+                return redact_secret_material(data, drop_secret_keys=False)
+
             raw = await planner.client.ask(
-                payload=current, budget=budget, **kwargs,
+                payload=current, budget=budget, request_context=request_context, **kwargs,
             )
         except DecisionFailure as exc:
             if (exc.diagnostic.code == "decision_normal_budget_exhausted"

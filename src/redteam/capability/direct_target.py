@@ -585,6 +585,7 @@ def _descriptor(policy: ShellWorkroomPolicy, network: DirectTargetConfig) -> Too
             "properties": {
                 "workroom_key": {
                     "type": "string", "minLength": 1, "maxLength": 128,
+                    "readOnly": True,
                     "pattern": WORKROOM_KEY_PATTERN,
                 },
                 "language": {"type": "string", "enum": list(SHELL_LANGUAGES)},
@@ -614,6 +615,7 @@ def _descriptor(policy: ShellWorkroomPolicy, network: DirectTargetConfig) -> Too
         risk_level=RiskLevel.MEDIUM,
         retry_safe=False,
         target_binding=ToolTargetBinding(binds_target_arguments=True),
+        argument_bindings={"target_ref": "host"},
         requires_target=True,
         command_fields=["language", "script"],
         availability_impact=False,

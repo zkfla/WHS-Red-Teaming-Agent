@@ -20,6 +20,23 @@ input/output schema가 유효한 JSON Schema인지 검사하고, required 인자
 실제로 존재하는지도 확인한다. `operations`는 중복 없는 lower_snake_case이며
 `core.action_semantics`의 공통 지원 목록에 포함되어야 한다.
 형식만 맞는 미지원 연결은 서버·도구·작업 이름을 명시한 설정 오류로 등록 전에 거부한다.
+
+제공자가 최상위 인자에 JSON Schema `readOnly: true`를 선언하면 모델용 schema와
+도구 상세 조회에서는 해당 인자를 제외한다. 실행 schema와 검증은 원본 그대로다.
+예를 들어 shell의 `workroom_key`는 실행 문맥에서 서버가 주입하며 모델이 추측하지 않는다.
+다른 작업실 ID를 제출하면 실행을 차단하고 오류 결과를 반환한다. 이 경우 recovery
+reference는 생성하지 않으며, 잘못된 입력만으로 Worker 전체를 종료하지 않는다.
+
+대상 통신용 Kali 도구의 `target_ref`는 제공자가 `argument_bindings`에서 선언한
+host selector다. MCP 정책의 opaque target ID와 혼동하지 않고 실제 host·port로 검증한다.
+opaque reference를 쓰는 다른 도구의 기존 바인딩 검사는 그대로 유지한다.
+
+HTTP MCP의 대상 연결 실패는 MCP transport 연결 실패와 구분한다. 대상 HTTP 요청이
+실패하면 응답은 `is_error`이며 `diagnostic`에 실패 단계·원인 코드·수정 조건을 담는다.
+원본 예외·요청 자격증명은 노출하지 않고 자동 재시도하지 않는다. Docker 내부 IP에 대한
+호스트 MCP의 연결 실패는 다른 호스트 HTTP 도구로 전환해도 해결되지 않는다. 준비된
+Kali 대상 네트워크 경로는 별도 실행 경로이며, MCP 호스트에 경로를 자동 생성하거나
+대상 IP·port를 다른 주소로 치환하지 않는다.
 환경 설정의 `TOOL_OPERATIONS_JSON`/profile 또는 discovery가 명시한 연결만 Agent에 노출한다.
 운영자 연결이 discovery의 비어 있지 않은 operations와 다르면 등록을 거부한다.
 설정이 없는 일반 discovery 도구와 빈 연결 `[]`의 관리용 도구는 저장 가능하지만

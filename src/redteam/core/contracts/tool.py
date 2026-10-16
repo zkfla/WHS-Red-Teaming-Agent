@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
+from copy import deepcopy
 from datetime import datetime
 from typing import Any, Literal
 
@@ -89,6 +90,24 @@ PROVIDER_METADATA_COMMAND_FIELDS = "redteam.command_fields"
 PROVIDER_METADATA_AVAILABILITY_IMPACT = "redteam.availability_impact"
 PROVIDER_METADATA_RESOURCE_BINDINGS = "redteam.resource_bindings"
 PROVIDER_METADATA_RESOURCE_EFFECTS = "redteam.resource_effects"
+
+
+def model_input_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Expose caller inputs, excluding top-level JSON Schema readOnly fields.
+
+    Providers may retain server-bound fields in their execution schema. This
+    detached display never changes binding, validation, or execution authority.
+    """
+    projected = deepcopy(schema)
+    properties = projected.get("properties")
+    if isinstance(properties, dict):
+        hidden = {name for name, spec in properties.items()
+                  if isinstance(spec, dict) and spec.get("readOnly") is True}
+        for name in hidden:
+            del properties[name]
+        if hidden and isinstance(projected.get("required"), list):
+            projected["required"] = [name for name in projected["required"] if name not in hidden]
+    return projected
 
 # Providers attach this when execution may have produced effects but its
 # terminal outcome cannot be established. This is independent of success,

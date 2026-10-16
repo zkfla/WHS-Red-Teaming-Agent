@@ -14,6 +14,8 @@ from redteam.orchestration.nodes.react import model_node
 from redteam.orchestration.specialist_planner import SpecialistPlanner
 from redteam.orchestration.state import initial_graph_state
 from redteam.orchestration.tool_discovery import NATIVE_INPUT_LIMIT, NativeInputLimit
+from redteam.orchestration.worker_session import WorkerSession
+from tests.fakes.worker_input import worker_input
 from tests.integration.test_central_completion import OriginalProtocolDouble
 from tests.integration.test_central_development import TOOL, call, gateway, inspect, turn
 from tests.integration.test_probe_workers import drive, register, selection
@@ -30,7 +32,7 @@ class SchemaSensitiveProbe(FakeLLMClient):
 
     async def complete_native(self, messages, tools, system=None, **kwargs):
         self.envelopes.append({"messages": messages, "tools": tools, "system": system})
-        payload = json.loads(messages[-1]["content"])
+        payload = worker_input(messages)
         originals = payload["probe"]["original_evidence_ids"]
         names = {item.name for item in tools}
         if originals and exposed_tool_name("task.settle") not in names:
@@ -113,6 +115,9 @@ async def test_size_based_whole_catalog_or_lazy_schema_reaches_review_and_measur
                            if str(item.tool_id) not in {"cloud.hidden", "web.unhealthy"}}
         assert (first_names & expected_remote) == (set() if large else expected_remote)
         assert all(NATIVE_INPUT_LIMIT.fits(**envelope) for envelope in llm.envelopes)
+        for previous, current in zip(llm.envelopes, llm.envelopes[1:], strict=False):
+            assert current["tools"][:len(previous["tools"])] == previous["tools"]
+            assert current["messages"][:len(previous["messages"])] == previous["messages"]
         await SpecialistPlanner(session.deps).advance(session.runtime)
         ledger = await session.deps.central_state.request_ledger().snapshot(session.runtime.run_id)
         native_calls = len(llm.envelopes)
@@ -162,6 +167,32 @@ async def test_overlarge_mandatory_input_stops_before_provider_dispatch(tmp_path
         assert state["runtime"].planning_diagnostic.code == "native_input_limit_exceeded"
         ledger = await session.deps.central_state.request_ledger().snapshot(session.runtime.run_id)
         assert ledger["spent"] == 0 and not llm.requests
+
+
+async def test_growing_signed_conversation_holds_without_evicting_or_rewriting(
+    tmp_path, monkeypatch,
+):
+    from redteam.orchestration.nodes import react
+
+    class BoundedProbe(SchemaSensitiveProbe):
+        async def complete_native(self, messages, tools, system=None, **kwargs):
+            result = await super().complete_native(messages, tools, system=system, **kwargs)
+            size = NATIVE_INPUT_LIMIT.size(messages=messages, tools=tools, system=system)
+            monkeypatch.setattr(react, "NATIVE_INPUT_LIMIT", NativeInputLimit(max_bytes=size + 1))
+            return replace(result, continuation=({"type": "thinking", "thinking": "",
+                                                 "signature": "opaque-boundary-fixture"},))
+
+    async with selection(tmp_path, tools=provider(), llm=BoundedProbe()) as (session, llm, tools):
+        await register(session, "context-boundary", actions=2)
+        outcome, = await drive(session)
+        assert len(llm.envelopes) == len(tools.inner.invocations) == 1
+        assert outcome.runtime.planning_diagnostic.code == "worker_session_compaction_held"
+        runner = session.driver.runner_for(outcome.runtime)
+        snapshot = await runner._graph.aget_state(runner.config())
+        saved = WorkerSession.model_validate_json(json.dumps(snapshot.values["worker_session"]))
+        assert saved.conversation()[0] == llm.envelopes[0]["messages"][0]
+        assert saved.tools() == llm.envelopes[0]["tools"]
+        assert saved.generation == 0  # No silent compaction, eviction or extra summary call.
 
 
 async def test_same_probe_compares_prior_lazy_preconditions_and_current_delivery(
@@ -223,7 +254,7 @@ async def test_same_probe_compares_prior_lazy_preconditions_and_current_delivery
     print({"same_probe_comparison": measured})
 
 
-async def test_extra_reader_window_is_delivered_but_checkpoint_keeps_only_its_request(tmp_path):
+async def test_extra_reader_window_is_delivered_and_checkpoint_keeps_exact_display(tmp_path):
     async with selection(tmp_path, tools=provider(), llm=SchemaSensitiveProbe(read_extra=True)) \
             as (session, llm, _):
         await register(session, "extra-window", actions=2)
@@ -236,7 +267,9 @@ async def test_extra_reader_window_is_delivered_but_checkpoint_keeps_only_its_re
         assert read["payload"]["provenance"]["invocation_id"]
         runner = session.driver.runner_for(outcome.runtime)
         snapshot = await runner._graph.aget_state(runner.config())
-        messages = snapshot.values["native_messages"]
+        messages = WorkerSession.model_validate_json(json.dumps(
+            snapshot.values["worker_session"],
+        )).conversation()
         assert messages[0]["role"] == "user"
         calls = {call["id"] for message in messages for call in message.get("tool_calls", [])}
         answers = {message["tool_call_id"] for message in messages if message["role"] == "tool"}
@@ -244,9 +277,9 @@ async def test_extra_reader_window_is_delivered_but_checkpoint_keeps_only_its_re
         bodies = [json.loads(message["content"]) for message in messages
                   if message["role"] == "tool"]
         saved, = [body for body in bodies if body.get("evidence_read_request")]
-        assert "text" not in saved["payload"] and saved["payload"]["text_omitted"]
+        assert saved["payload"]["text"] == read["payload"]["text"]
         assert saved["evidence_read_request"] == read["evidence_read_request"]
         for message in messages:
             if message["role"] == "user" and message["content"].startswith("{"):
                 context = json.loads(message["content"])
-                assert all("text" not in view for view in context.get("requested_evidence", []))
+                assert len(context.get("investigation_tasks", [])) <= 1
