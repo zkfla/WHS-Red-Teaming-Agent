@@ -328,7 +328,7 @@ def test_web_mapper_models_a_session_reference_and_observed_access() -> None:
         },
         result=_result(
             tool_id="web.http_request",
-            output={**_GOOD_OUTPUT, "session_ref": "alice"},
+            output={**_GOOD_OUTPUT, "session_ref": "alice", "actual_session_ref": "alice"},
         ),
     )
 
@@ -341,6 +341,36 @@ def test_web_mapper_models_a_session_reference_and_observed_access() -> None:
         GraphEdgeType.RELATED_TO,
         GraphEdgeType.CAN_ACCESS,
     }
+    endpoint = next(node for node in mutation.nodes if node.node_type is GraphNodeType.ENDPOINT)
+    assert endpoint.observations[0]["actual_session_ref"] == "alice"
+
+
+@pytest.mark.parametrize("receipt", [None, "bob"])
+def test_web_request_echo_without_matching_actual_receipt_does_not_assert_identity(receipt) -> None:
+    from redteam.orchestration.observations.web_http import map_web_http_request
+
+    output = {**_GOOD_OUTPUT, "session_ref": "alice"}
+    if receipt is not None:
+        output["actual_session_ref"] = receipt
+    mutation = map_web_http_request(
+        target=EndpointTarget(host="a.local", path="/private"),
+        arguments={
+            "target_ref": "x",
+            "path": "/private",
+            "method": "GET",
+            "session_ref": "alice",
+        },
+        result=_result(tool_id="web.http_request", output=output),
+    )
+
+    endpoint = next(node for node in mutation.nodes if node.node_type is GraphNodeType.ENDPOINT)
+    assert endpoint.observations[0]["session_ref"] == "alice"
+    assert "actual_session_ref" not in endpoint.observations[0]
+    assert not any(
+        node.node_type in {GraphNodeType.PRINCIPAL, GraphNodeType.CREDENTIAL}
+        for node in mutation.nodes
+    )
+    assert not any(edge.edge_type is GraphEdgeType.CAN_ACCESS for edge in mutation.edges)
 
 
 def test_web_mapper_preserves_only_normalized_response_metadata() -> None:

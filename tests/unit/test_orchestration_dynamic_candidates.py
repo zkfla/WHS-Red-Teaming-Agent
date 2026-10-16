@@ -213,8 +213,14 @@ async def test_web_provider_drops_an_explicitly_unallowlisted_endpoint() -> None
 def comparison_result(**overrides) -> ToolResult:
     output = {
         "target_ref": HOST,
-        "anonymous": {"status_code": 401, "body_sha256": "a" * 64, "redirect": False},
-        "authenticated": {"status_code": 200, "body_sha256": "b" * 64, "redirect": False},
+        "anonymous": {
+            "status_code": 401, "body_sha256": "a" * 64, "redirect": False,
+            "actual_session_ref": None,
+        },
+        "authenticated": {
+            "status_code": 200, "body_sha256": "b" * 64, "redirect": False,
+            "actual_session_ref": "alice",
+        },
         "same_status": False,
         "same_body": False,
         "verdict": "observation_only",
@@ -260,12 +266,61 @@ def test_the_comparison_mapper_records_what_the_tool_actually_measured() -> None
     assert observation["same_status"] is False
     assert observation["same_body"] is False
     assert observation["session_ref"] == "alice"
+    assert observation["anonymous_actual_session_ref"] is None
+    assert observation["authenticated_actual_session_ref"] == "alice"
     # The tool is explicit that a status/body difference is not proof of a
     # bypass; the mapper must not upgrade it into one.
     assert observation["verdict"] == "observation_only"
     assert "violation" not in observation
     assert "vulnerable" not in observation
     assert "location" not in observation
+
+
+def test_anonymous_comparison_without_actual_receipts_preserves_status_without_identity() -> None:
+    result = comparison_result(
+        anonymous={"status_code": 401, "body_sha256": "a" * 64, "redirect": False},
+        authenticated={"status_code": 200, "body_sha256": "b" * 64, "redirect": False},
+    )
+    mutation = map_web_compare_anonymous(
+        target=EndpointTarget(host=HOST, path=PATH),
+        arguments={"target_ref": HOST, "path": PATH, "session_ref": "alice"},
+        result=result,
+    )
+
+    endpoint = next(node for node in mutation.nodes if node.node_type is GraphNodeType.ENDPOINT)
+    observation = endpoint.observations[0]
+    assert (observation["anonymous_status"], observation["authenticated_status"]) == (401, 200)
+    assert observation["session_ref"] == "alice"
+    assert "anonymous_actual_session_ref" not in observation
+    assert "authenticated_actual_session_ref" not in observation
+    assert len(mutation.nodes) == 1
+    assert mutation.edges == []
+
+
+def test_anonymous_comparison_receipt_mismatch_is_gated_per_side() -> None:
+    result = comparison_result(
+        anonymous={
+            "status_code": 401, "body_sha256": "a" * 64, "redirect": False,
+            "actual_session_ref": None,
+        },
+        authenticated={
+            "status_code": 200, "body_sha256": "b" * 64, "redirect": False,
+            "actual_session_ref": "bob",
+        },
+    )
+    mutation = map_web_compare_anonymous(
+        target=EndpointTarget(host=HOST, path=PATH),
+        arguments={"target_ref": HOST, "path": PATH, "session_ref": "alice"},
+        result=result,
+    )
+
+    observation = mutation.nodes[0].observations[0]
+    assert observation["anonymous_status"] == 401
+    assert observation["authenticated_status"] == 200
+    assert observation["anonymous_actual_session_ref"] is None
+    assert "authenticated_actual_session_ref" not in observation
+    assert len(mutation.nodes) == 1
+    assert mutation.edges == []
 
 
 def test_the_comparison_mapper_ignores_malformed_output() -> None:

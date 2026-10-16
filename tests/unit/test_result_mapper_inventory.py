@@ -181,11 +181,13 @@ def test_session_comparison_models_scoped_principals_and_observed_access() -> No
             "principal_ref": "alice",
             "status_code": 403,
             "body_sha256": "1" * 64,
+            "actual_session_ref": "alice-session",
         },
         "second": {
             "principal_ref": "bob",
             "status_code": 200,
             "body_sha256": "2" * 64,
+            "actual_session_ref": "bob-session",
         },
         "same_status": False,
         "same_body": False,
@@ -217,15 +219,18 @@ def test_session_comparison_models_scoped_principals_and_observed_access() -> No
 
 
 def test_security_posture_stores_fixed_flags_without_cookie_identity() -> None:
+    output = _security_output()
+    output["actual_session_ref"] = "alice"
     mutation = _map(
         "web.http_security_posture",
         {"target_ref": "bank", "path": "/", "session_ref": "alice"},
-        _security_output(),
+        output,
     )
 
     endpoint = next(node for node in mutation.nodes if node.node_type is GraphNodeType.ENDPOINT)
     observation = endpoint.observations[0]
     assert observation["verdict"] == "observation_only"
+    assert observation["actual_session_ref"] == "alice"
     assert observation["cookies"] == [
         {
             "parse_status": "parsed",
@@ -248,6 +253,29 @@ def test_security_posture_stores_fixed_flags_without_cookie_identity() -> None:
         GraphEdgeType.RELATED_TO,
         GraphEdgeType.CAN_ACCESS,
     }
+
+
+@pytest.mark.parametrize("receipt", [None, "bob"])
+def test_security_posture_requested_session_without_matching_receipt_has_no_identity(
+    receipt,
+) -> None:
+    output = _security_output()
+    if receipt is not None:
+        output["actual_session_ref"] = receipt
+    mutation = _map(
+        "web.http_security_posture",
+        {"target_ref": "bank", "path": "/", "session_ref": "alice"},
+        output,
+    )
+
+    endpoint = next(node for node in mutation.nodes if node.node_type is GraphNodeType.ENDPOINT)
+    assert endpoint.observations[0]["session_ref"] == "alice"
+    assert "actual_session_ref" not in endpoint.observations[0]
+    assert not any(
+        node.node_type in {GraphNodeType.PRINCIPAL, GraphNodeType.CREDENTIAL}
+        for node in mutation.nodes
+    )
+    assert not any(edge.edge_type is GraphEdgeType.CAN_ACCESS for edge in mutation.edges)
 
 
 @pytest.mark.parametrize(

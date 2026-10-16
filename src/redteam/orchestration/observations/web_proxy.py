@@ -22,6 +22,7 @@ from redteam.orchestration.observations.mapper import (
     is_http_status,
 )
 from redteam.orchestration.observations.web_http import _session_identity_mutations
+from redteam.orchestration.session_proof import original_session_receipt_matches
 
 _FLOW_REF = re.compile(r"^flow_[0-9a-f]{16}$")
 _REFERENCE = re.compile(r"^[A-Za-z0-9_.:@/-]{1,128}$")
@@ -66,7 +67,7 @@ def _response_summary(value: Any) -> dict[str, Any] | None:
         or value.get("body_omitted") is not True
     ):
         return None
-    return {
+    summary = {
         "status_code": status,
         "body_bytes": body_bytes,
         "body_sha256": f"sha256:{digest.lower()}",
@@ -74,6 +75,13 @@ def _response_summary(value: Any) -> dict[str, Any] | None:
         "security_headers_present": dict(sorted(headers.items())),
         "body_omitted": True,
     }
+    # Preserve only bounded opaque references. Identity and access claims
+    # separately require a matching receipt on the original tool result.
+    if "actual_session_ref" in value:
+        actual_session_ref = value["actual_session_ref"]
+        if actual_session_ref is None or _safe_reference(actual_session_ref) is not None:
+            summary["actual_session_ref"] = actual_session_ref
+    return summary
 
 
 def _flow_summary(value: Any, *, expected_target_ref: str | None) -> dict[str, Any] | None:
@@ -348,6 +356,7 @@ def _flow_execution_mutation(
     target: AnyTarget,
     arguments: dict[str, Any],
     output: dict[str, Any],
+    result: ToolResult,
     source_tool: str,
     mutated: bool,
 ) -> GraphMutation:
@@ -414,7 +423,9 @@ def _flow_execution_mutation(
     edges = [
         EdgeMutation(GraphEdgeType.OBSERVED, node_id_for_target(target), resource_id)
     ]
-    if isinstance(session_ref, str):
+    if isinstance(session_ref, str) and original_session_receipt_matches(
+        {}, result.model_dump(), expected_session_ref=session_ref
+    ):
         identity_nodes, identity_edges = _session_identity_mutations(
             target_ref=target_ref,
             session_ref=session_ref,
@@ -435,6 +446,7 @@ def map_web_proxy_replay_flow(
         target=target,
         arguments=arguments,
         output=result.output,
+        result=result,
         source_tool="web.proxy_replay_flow",
         mutated=False,
     )
@@ -449,6 +461,7 @@ def map_web_proxy_mutate_json(
         target=target,
         arguments=arguments,
         output=result.output,
+        result=result,
         source_tool="web.proxy_mutate_json",
         mutated=True,
     )
@@ -480,20 +493,33 @@ def map_web_proxy_compare_sessions(
         or output.get("request_count") != 2
     ):
         return GraphMutation()
-    first_principal = _safe_reference(first.get("principal_ref"))
-    second_principal = _safe_reference(second.get("principal_ref"))
+    first_actual = original_session_receipt_matches(
+        {}, result.model_dump(mode="json"), unit="first", expected_session_ref=first_ref
+    )
+    second_actual = original_session_receipt_matches(
+        {}, result.model_dump(mode="json"), unit="second", expected_session_ref=second_ref
+    )
+    first_principal = _safe_reference(first.get("principal_ref")) if first_actual else None
+    second_principal = _safe_reference(second.get("principal_ref")) if second_actual else None
     first_response = _response_summary(first)
     second_response = _response_summary(second)
     if (
-        first_principal is None
-        or second_principal is None
-        or first_principal == second_principal
-        or first_response is None
+        first_response is None
         or second_response is None
         or output["same_status"]
         != (first_response["status_code"] == second_response["status_code"])
         or output["same_body"]
         != (first_response["body_sha256"] == second_response["body_sha256"])
+    ):
+        return GraphMutation()
+    if (
+        first_actual
+        and second_actual
+        and (
+            first_principal is None
+            or second_principal is None
+            or first_principal == second_principal
+        )
     ):
         return GraphMutation()
     target_scope = str(node_id_for_target(target))
@@ -507,28 +533,42 @@ def map_web_proxy_compare_sessions(
         "flow_ref": flow_ref,
         "first_session_ref": first_ref,
         "second_session_ref": second_ref,
-        "first_principal_ref": first_principal,
-        "second_principal_ref": second_principal,
         "first_response": first_response,
         "second_response": second_response,
         "same_status": output["same_status"],
         "same_body": output["same_body"],
         "verdict": "observation_only",
     }
+    if first_principal is not None:
+        observation["first_principal_ref"] = first_principal
+    if second_principal is not None:
+        observation["second_principal_ref"] = second_principal
+    nodes = [
+        NodeMutation(
+            GraphNodeType.RESOURCE,
+            resource_id,
+            attrs={"session_comparison_observed": True},
+            facts={"flow_ref": flow_ref, "target_scope_node_id": target_scope},
+            labels=["observed-by:web.proxy_compare_sessions"],
+            observations=[observation],
+        )
+    ]
+    edges = [
+        EdgeMutation(GraphEdgeType.OBSERVED, node_id_for_target(target), resource_id)
+    ]
+    # Preserve each actual-use receipt inside its corresponding response
+    # summary. Comparison observations never create access or identity claims.
+    for unit, session_ref, response in (
+        ("first", first_ref, first_response),
+        ("second", second_ref, second_response),
+    ):
+        if original_session_receipt_matches(
+            {}, result.model_dump(mode="json"), unit=unit, expected_session_ref=session_ref
+        ):
+            observation[f"{unit}_actual_session_ref"] = response["actual_session_ref"]
     return GraphMutation(
-        nodes=[
-            NodeMutation(
-                GraphNodeType.RESOURCE,
-                resource_id,
-                attrs={"session_comparison_observed": True},
-                facts={"flow_ref": flow_ref, "target_scope_node_id": target_scope},
-                labels=["observed-by:web.proxy_compare_sessions"],
-                observations=[observation],
-            )
-        ],
-        edges=[
-            EdgeMutation(GraphEdgeType.OBSERVED, node_id_for_target(target), resource_id)
-        ],
+        nodes=nodes,
+        edges=edges,
     )
 
 
@@ -596,18 +636,4 @@ def map_web_nuclei_response_check(
             observations=[observation],
         )
     ]
-    edges: list[EdgeMutation] = []
-    session_ref = arguments.get("session_ref")
-    if session_ref is not None:
-        session_ref = _safe_reference(session_ref)
-        if session_ref is None:
-            return GraphMutation()
-        identity_nodes, identity_edges = _session_identity_mutations(
-            target_ref=target_ref,
-            session_ref=session_ref,
-            endpoint_id=endpoint_id,
-            status=status,
-        )
-        nodes.extend(identity_nodes)
-        edges.extend(identity_edges)
-    return GraphMutation(nodes=nodes, edges=edges)
+    return GraphMutation(nodes=nodes)

@@ -24,6 +24,7 @@ from redteam.orchestration.observations.mapper import (
     NodeMutation,
     is_http_status,
 )
+from redteam.orchestration.session_proof import original_session_receipt_matches
 
 _REFERENCE = re.compile(r"^[A-Za-z0-9_.:@/-]{1,128}$")
 _SECURITY_HEADERS = frozenset(
@@ -158,20 +159,33 @@ def map_web_compare_sessions(
         return GraphMutation()
     first_status = first.get("status_code")
     second_status = second.get("status_code")
-    first_principal = _safe_reference(first.get("principal_ref"))
-    second_principal = _safe_reference(second.get("principal_ref"))
+    raw = result.model_dump(mode="json")
+    first_receipt_matches = original_session_receipt_matches(
+        metadata={}, raw=raw, unit="first", expected_session_ref=first_ref
+    )
+    second_receipt_matches = original_session_receipt_matches(
+        metadata={}, raw=raw, unit="second", expected_session_ref=second_ref
+    )
+    first_principal = (
+        _safe_reference(first.get("principal_ref")) if first_receipt_matches else None
+    )
+    second_principal = (
+        _safe_reference(second.get("principal_ref")) if second_receipt_matches else None
+    )
     first_digest = first.get("body_sha256")
     second_digest = second.get("body_sha256")
     if (
         not is_http_status(first_status)
         or not is_http_status(second_status)
-        or first_principal is None
-        or second_principal is None
-        or first_principal == second_principal
         or not is_hex64(first_digest)
         or not is_hex64(second_digest)
         or output["same_status"] != (first_status == second_status)
         or output["same_body"] != (first_digest == second_digest)
+    ):
+        return GraphMutation()
+    if (
+        first_receipt_matches and second_receipt_matches
+        and first_principal is not None and first_principal == second_principal
     ):
         return GraphMutation()
 
@@ -185,31 +199,42 @@ def map_web_compare_sessions(
         "target_ref": target_ref,
         "first_session_ref": first_ref,
         "second_session_ref": second_ref,
-        "first_principal_ref": first_principal,
-        "second_principal_ref": second_principal,
         "first_status": first_status,
         "second_status": second_status,
         "same_status": output["same_status"],
         "same_body": output["same_body"],
         "verdict": "observation_only",
     }
+    if first_principal is not None:
+        observation["first_principal_ref"] = first_principal
+    if second_principal is not None:
+        observation["second_principal_ref"] = second_principal
+    raw_output = raw.get("output")
+    if first_receipt_matches and isinstance(raw_output, dict):
+        first_actual = raw_output.get("first")
+        if isinstance(first_actual, dict) and "actual_session_ref" in first_actual:
+            observation["first_actual_session_ref"] = first_actual["actual_session_ref"]
+    if second_receipt_matches and isinstance(raw_output, dict):
+        second_actual = raw_output.get("second")
+        if isinstance(second_actual, dict) and "actual_session_ref" in second_actual:
+            observation["second_actual_session_ref"] = second_actual["actual_session_ref"]
     observation["first_body_sha256"] = f"sha256:{first_digest.lower()}"
     observation["second_body_sha256"] = f"sha256:{second_digest.lower()}"
 
-    first_nodes, first_edges = _session_identity_mutations(
-        target_ref=target_ref,
-        session_ref=first_ref,
-        endpoint_id=endpoint_id,
-        status=first_status,
-        principal_ref=first_principal,
-    )
-    second_nodes, second_edges = _session_identity_mutations(
-        target_ref=target_ref,
-        session_ref=second_ref,
-        endpoint_id=endpoint_id,
-        status=second_status,
-        principal_ref=second_principal,
-    )
+    first_nodes: list[NodeMutation] = []
+    first_edges: list[EdgeMutation] = []
+    if first_receipt_matches and first_principal is not None:
+        first_nodes, first_edges = _session_identity_mutations(
+            target_ref=target_ref, session_ref=first_ref, endpoint_id=endpoint_id,
+            status=first_status, principal_ref=first_principal,
+        )
+    second_nodes: list[NodeMutation] = []
+    second_edges: list[EdgeMutation] = []
+    if second_receipt_matches and second_principal is not None:
+        second_nodes, second_edges = _session_identity_mutations(
+            target_ref=target_ref, session_ref=second_ref, endpoint_id=endpoint_id,
+            status=second_status, principal_ref=second_principal,
+        )
     endpoint_facts: dict[str, Any] = {
         "host": host,
         "path": path,
@@ -341,6 +366,11 @@ def map_web_http_security_posture(
         "cookie_names_and_values_omitted": True,
         "verdict": "observation_only",
     }
+    if original_session_receipt_matches(
+        metadata={}, raw=result.model_dump(mode="json"), unit="request",
+        expected_session_ref=session_ref,
+    ) and "actual_session_ref" in output:
+        observation["actual_session_ref"] = output["actual_session_ref"]
     endpoint_facts: dict[str, Any] = {
         "host": host,
         "path": path,
@@ -362,7 +392,7 @@ def map_web_http_security_posture(
         )
     ]
     edges: list[EdgeMutation] = []
-    if session_ref is not None:
+    if session_ref is not None and "actual_session_ref" in observation:
         identity_nodes, identity_edges = _session_identity_mutations(
             target_ref=target_ref,
             session_ref=session_ref,
@@ -404,6 +434,14 @@ def map_web_compare_anonymous(
         or output.get("request_count") != 2
     ):
         return GraphMutation()
+
+    raw = result.model_dump(mode="json")
+    anonymous_receipt_matches = original_session_receipt_matches(
+        metadata={}, raw=raw, unit="anonymous", expected_session_ref=None
+    )
+    authenticated_receipt_matches = original_session_receipt_matches(
+        metadata={}, raw=raw, unit="authenticated", expected_session_ref=session_ref
+    )
     anonymous_status = anonymous.get("status_code")
     authenticated_status = authenticated.get("status_code")
     anonymous_digest = anonymous.get("body_sha256")
@@ -435,12 +473,24 @@ def map_web_compare_anonymous(
         "authenticated_body_sha256": f"sha256:{authenticated_digest.lower()}",
         "verdict": "observation_only",
     }
-    identity_nodes, identity_edges = _session_identity_mutations(
-        target_ref=target_ref,
-        session_ref=session_ref,
-        endpoint_id=endpoint_id,
-        status=authenticated_status,
-    )
+    raw_output = raw.get("output")
+    if anonymous_receipt_matches and isinstance(raw_output, dict):
+        anonymous_output = raw_output.get("anonymous")
+        if isinstance(anonymous_output, dict) and "actual_session_ref" in anonymous_output:
+            comparison["anonymous_actual_session_ref"] = anonymous_output["actual_session_ref"]
+    if authenticated_receipt_matches and isinstance(raw_output, dict):
+        authenticated_output = raw_output.get("authenticated")
+        if isinstance(authenticated_output, dict) and "actual_session_ref" in authenticated_output:
+            comparison["authenticated_actual_session_ref"] = authenticated_output[
+                "actual_session_ref"
+            ]
+    identity_nodes: list[NodeMutation] = []
+    identity_edges: list[EdgeMutation] = []
+    if authenticated_receipt_matches:
+        identity_nodes, identity_edges = _session_identity_mutations(
+            target_ref=target_ref, session_ref=session_ref, endpoint_id=endpoint_id,
+            status=authenticated_status,
+        )
     return GraphMutation(
         nodes=[
             NodeMutation(
@@ -476,7 +526,6 @@ def map_web_http_request(
     method = arguments.get("method", "GET")
     status = output.get("status_code")
     redirect = output.get("redirect")
-    output_session_ref = output.get("session_ref")
     argument_session_ref = arguments.get("session_ref")
     if (
         context is None
@@ -485,7 +534,6 @@ def map_web_http_request(
         or not is_http_status(status)
         or type(redirect) is not bool
         or redirect != (300 <= status < 400)
-        or output_session_ref != argument_session_ref
         or (
             argument_session_ref is not None
             and _safe_reference(argument_session_ref) is None
@@ -534,6 +582,12 @@ def map_web_http_request(
     observation = http_observation(arguments, result)
     if isinstance(observation, dict):
         observation["body_sha256"] = f"sha256:{digest.lower()}"
+        observation.pop("actual_session_ref", None)
+        if original_session_receipt_matches(
+            metadata={}, raw=result.model_dump(mode="json"), unit="request",
+            expected_session_ref=argument_session_ref,
+        ) and "actual_session_ref" in output:
+            observation["actual_session_ref"] = output["actual_session_ref"]
         for metadata_key in ("redirect_metadata", "auth_challenge", "cookie_metadata"):
             if metadata_key in observation:
                 facts[metadata_key] = observation[metadata_key]
@@ -568,7 +622,11 @@ def map_web_http_request(
                 "target_node_id": str(endpoint_id),
             }},
         ))
-    if isinstance(argument_session_ref, str):
+    if (
+        isinstance(argument_session_ref, str)
+        and isinstance(observation, dict)
+        and "actual_session_ref" in observation
+    ):
         identity_nodes, identity_edges = _session_identity_mutations(
             target_ref=target_ref,
             session_ref=argument_session_ref,

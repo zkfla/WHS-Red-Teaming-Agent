@@ -18,6 +18,7 @@ from typing import Any
 
 import pytest
 
+from redteam.attack_graph.identity import session_principal_node_id
 from redteam.core.contracts.target import EndpointTarget
 from redteam.core.contracts.tool import ToolResult
 from redteam.core.ids import ActionId, InvocationId, ToolId
@@ -37,8 +38,14 @@ def _output(**overrides: Any) -> dict[str, Any]:
     """A well-formed two-principal comparison (alice 200 vs bob 403)."""
     output = {
         "target_ref": "bank",
-        "first": {"principal_ref": "alice-principal", "status_code": 200, "body_sha256": "a" * 64},
-        "second": {"principal_ref": "bob-principal", "status_code": 403, "body_sha256": "b" * 64},
+        "first": {
+            "principal_ref": "alice-principal", "status_code": 200,
+            "body_sha256": "a" * 64, "actual_session_ref": "alice",
+        },
+        "second": {
+            "principal_ref": "bob-principal", "status_code": 403,
+            "body_sha256": "b" * 64, "actual_session_ref": "bob",
+        },
         "same_status": False,
         "same_body": False,
         "verdict": "observation_only",
@@ -75,6 +82,8 @@ def test_valid_comparison_records_an_observation_only_signal() -> None:
     assert observation is not None
     assert observation["verdict"] == "observation_only"
     assert (observation["first_status"], observation["second_status"]) == (200, 403)
+    assert observation["first_actual_session_ref"] == "alice"
+    assert observation["second_actual_session_ref"] == "bob"
     # A status/body difference is a measurement, never a vulnerability verdict.
     assert "vulnerable" not in observation and "violation" not in observation
 
@@ -98,13 +107,58 @@ def test_rejects_a_summary_that_contradicts_the_raw_values(overrides: dict[str, 
 def test_rejects_a_principal_compared_against_itself() -> None:
     # Same principal on both sides proves nothing about cross-account access.
     same = _output(
-        first={"principal_ref": "alice-principal", "status_code": 200, "body_sha256": "a" * 64},
-        second={"principal_ref": "alice-principal", "status_code": 200, "body_sha256": "a" * 64},
+        first={
+            "principal_ref": "alice-principal",
+            "status_code": 200,
+            "body_sha256": "a" * 64,
+            "actual_session_ref": "alice",
+        },
+        second={
+            "principal_ref": "alice-principal",
+            "status_code": 200,
+            "body_sha256": "a" * 64,
+            "actual_session_ref": "bob",
+        },
         same_status=True,
         same_body=True,
     )
     mutation = map_web_compare_sessions(target=TARGET, arguments=ARGS, result=_result(same))
     assert mutation.nodes == []
+
+
+@pytest.mark.parametrize("first_receipt", [None, "mallory"])
+def test_comparison_receipt_gates_each_identity_side_independently(first_receipt) -> None:
+    first = {
+        "principal_ref": "alice-principal",
+        "status_code": 200,
+        "body_sha256": "a" * 64,
+    }
+    if first_receipt is not None:
+        first["actual_session_ref"] = first_receipt
+    output = _output(
+        first=first,
+        second={
+            "principal_ref": "bob-principal",
+            "status_code": 200,
+            "body_sha256": "b" * 64,
+            "actual_session_ref": "bob",
+        },
+        same_status=True,
+    )
+
+    mutation = map_web_compare_sessions(target=TARGET, arguments=ARGS, result=_result(output))
+    observation = _observation(mutation)
+    assert observation is not None
+    assert (observation["first_status"], observation["second_status"]) == (200, 200)
+    assert observation["first_session_ref"] == "alice"
+    assert "first_principal_ref" not in observation
+    assert observation["second_principal_ref"] == "bob-principal"
+    assert "first_actual_session_ref" not in observation
+    assert observation["second_actual_session_ref"] == "bob"
+    principal_ids = {node.node_id for node in mutation.nodes if node.node_type.value == "principal"}
+    assert session_principal_node_id("bank", "alice") not in principal_ids
+    assert session_principal_node_id("bank", "bob") in principal_ids
+    assert len([edge for edge in mutation.edges if edge.edge_type.value == "can_access"]) == 1
 
 
 @pytest.mark.parametrize(

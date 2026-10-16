@@ -199,7 +199,12 @@ def test_proxy_replay_links_only_successful_session_access_to_the_flow() -> None
     mutation = _map(
         "web.proxy_replay_flow",
         {"flow_ref": FLOW_REF, "session_ref": "alice"},
-        {"flow_ref": FLOW_REF, "target_ref": "bank", **_response()},
+        {
+            "flow_ref": FLOW_REF,
+            "target_ref": "bank",
+            **_response(),
+            "actual_session_ref": "alice",
+        },
     )
 
     assert session_principal_node_id("bank", "alice") in {
@@ -217,9 +222,51 @@ def test_proxy_replay_links_only_successful_session_access_to_the_flow() -> None
     denied = _map(
         "web.proxy_replay_flow",
         {"flow_ref": FLOW_REF, "session_ref": "alice"},
-        {"flow_ref": FLOW_REF, "target_ref": "bank", **_response(403)},
+        {
+            "flow_ref": FLOW_REF,
+            "target_ref": "bank",
+            **_response(403),
+            "actual_session_ref": "alice",
+        },
     )
     assert all(edge.edge_type is not GraphEdgeType.CAN_ACCESS for edge in denied.edges)
+
+
+@pytest.mark.parametrize("receipt", [None, "bob"])
+def test_proxy_replay_without_matching_actual_receipt_keeps_observation_only(
+    receipt: str | None,
+) -> None:
+    output = {"flow_ref": FLOW_REF, "target_ref": "bank", **_response()}
+    output["actual_session_ref"] = receipt
+    mutation = _map(
+        "web.proxy_replay_flow",
+        {"flow_ref": FLOW_REF, "session_ref": "alice"},
+        output,
+    )
+
+    assert len(mutation.nodes) == 1
+    assert mutation.nodes[0].node_type is GraphNodeType.RESOURCE
+    assert mutation.nodes[0].observations[0]["verdict"] == "observation_only"
+    assert all(
+        node.node_id not in {
+            session_principal_node_id("bank", "alice"),
+            session_credential_node_id("bank", "alice"),
+        }
+        for node in mutation.nodes
+    )
+    assert all(edge.edge_type is not GraphEdgeType.CAN_ACCESS for edge in mutation.edges)
+
+
+def test_proxy_replay_missing_receipt_does_not_infer_identity_from_requested_session() -> None:
+    mutation = _map(
+        "web.proxy_replay_flow",
+        {"flow_ref": FLOW_REF, "session_ref": "alice"},
+        {"flow_ref": FLOW_REF, "target_ref": "bank", **_response()},
+    )
+
+    assert len(mutation.nodes) == 1
+    assert "actual_session_ref" not in mutation.nodes[0].observations[0]["response"]
+    assert all(edge.edge_type is not GraphEdgeType.CAN_ACCESS for edge in mutation.edges)
 
 
 def test_proxy_mutation_stores_field_names_but_never_argument_values() -> None:
@@ -235,12 +282,17 @@ def test_proxy_mutation_stores_field_names_but_never_argument_values() -> None:
             "target_ref": "bank",
             "mutated_fields": ["card_number"],
             **_response(),
+            "actual_session_ref": "alice",
         },
     )
 
     encoded = repr(mutation)
     assert "card_number" in encoded
     assert "4111111111111111" not in encoded
+    assert session_principal_node_id("bank", "alice") in {
+        node.node_id for node in mutation.nodes
+    }
+    assert any(edge.edge_type is GraphEdgeType.CAN_ACCESS for edge in mutation.edges)
 
 
 def test_proxy_session_comparison_remains_an_observation() -> None:
@@ -253,8 +305,16 @@ def test_proxy_session_comparison_remains_an_observation() -> None:
         },
         {
             "flow_ref": FLOW_REF,
-            "first": {"principal_ref": "user-a", **_response(403, "a" * 64)},
-            "second": {"principal_ref": "user-b", **_response(200, "b" * 64)},
+            "first": {
+                "principal_ref": "user-a",
+                **_response(403, "a" * 64),
+                "actual_session_ref": "alice",
+            },
+            "second": {
+                "principal_ref": "user-b",
+                **_response(200, "b" * 64),
+                "actual_session_ref": "bob",
+            },
             "same_status": False,
             "same_body": False,
             "verdict": "observation_only",
@@ -264,6 +324,43 @@ def test_proxy_session_comparison_remains_an_observation() -> None:
 
     assert [node.node_type for node in mutation.nodes] == [GraphNodeType.RESOURCE]
     assert mutation.nodes[0].observations[0]["verdict"] == "observation_only"
+    assert mutation.nodes[0].observations[0]["first_actual_session_ref"] == "alice"
+    assert mutation.nodes[0].observations[0]["second_actual_session_ref"] == "bob"
+    assert all(edge.edge_type is not GraphEdgeType.CAN_ACCESS for edge in mutation.edges)
+
+
+def test_proxy_session_comparison_keeps_mismatched_receipt_without_identity_attribution() -> None:
+    mutation = _map(
+        "web.proxy_compare_sessions",
+        {
+            "flow_ref": FLOW_REF,
+            "first_session_ref": "alice",
+            "second_session_ref": "bob",
+        },
+        {
+            "flow_ref": FLOW_REF,
+            "first": {
+                "principal_ref": "user-a",
+                **_response(403, "a" * 64),
+                "actual_session_ref": "wrong-session",
+            },
+            "second": {
+                "principal_ref": "user-b",
+                **_response(200, "b" * 64),
+                "actual_session_ref": "bob",
+            },
+            "same_status": False,
+            "same_body": False,
+            "verdict": "observation_only",
+            "request_count": 2,
+        },
+    )
+
+    observation = mutation.nodes[0].observations[0]
+    assert observation["first_response"]["actual_session_ref"] == "wrong-session"
+    assert "first_principal_ref" not in observation
+    assert observation["second_principal_ref"] == "user-b"
+    assert all(edge.edge_type is not GraphEdgeType.CAN_ACCESS for edge in mutation.edges)
     assert all(node.node_type is not GraphNodeType.FINDING for node in mutation.nodes)
 
 
@@ -294,6 +391,8 @@ def test_passive_nuclei_match_does_not_create_a_finding() -> None:
     assert endpoint.observations[0]["matched"] is True
     assert endpoint.observations[0]["verdict"] == "observation_only"
     assert all(node.node_type is not GraphNodeType.FINDING for node in mutation.nodes)
+    assert all(node.node_type is not GraphNodeType.PRINCIPAL for node in mutation.nodes)
+    assert all(edge.edge_type is not GraphEdgeType.CAN_ACCESS for edge in mutation.edges)
 
 
 @pytest.mark.parametrize(
