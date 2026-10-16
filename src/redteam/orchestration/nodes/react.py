@@ -751,13 +751,21 @@ async def tools_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 continue
             state = await run_call(call, state, deps)
             if call.completed:
-                unchanged = await _has_unchanged_task_result(call, state, deps=deps)
-                if unchanged:
+                if call.made_progress is False:
+                    # A prior UNKNOWN receipt already fixed this request's
+                    # progress disposition; later recovery must remain
+                    # idempotent with that immutable ledger entry.
+                    continue
+                if not call.feedback.get("ok"):
                     call.made_progress = False
                 else:
-                    # Keep the existing completed-dispatch disposition when an
-                    # optional history read cannot prove an exact duplicate.
-                    call.made_progress = True
+                    unchanged = await _has_unchanged_task_result(call, state, deps=deps)
+                    if unchanged:
+                        call.made_progress = False
+                    else:
+                        # Keep the existing completed-dispatch disposition when an
+                        # optional history read cannot prove an exact duplicate.
+                        call.made_progress = True
     for call in calls:
         if call.completed:
             call.arguments, call.dispatch = None, None
@@ -955,30 +963,30 @@ async def restore_completed_calls(state, *, deps):
                     })
                 call.evidence_ids = ([str(prior.result_evidence_id)]
                                      if prior.result_evidence_id else [])
-                call.made_progress = True
+                if call.made_progress is not False:
+                    call.made_progress = prior.state is ExecutionState.SUCCEEDED
                 call.completed, call.arguments, call.dispatch = True, None, None
     return state
 
 
 async def append_completed_results(state, *, deps):
     calls = state.get("native_calls", [])
-    if calls and all(call.completed for call in calls):
-        valid_calls = [call for call in calls if call.decision_valid]
-        request_ids = {
-            call.decision_request_id for call in valid_calls if call.decision_request_id
-        }
-        if len(request_ids) == 1:
-            request_id = request_ids.pop()
-            dispositions = [call.made_progress for call in valid_calls]
-            progress = (
-                True if any(value is True for value in dispositions) else
-                False if dispositions and all(value is False for value in dispositions) else
-                None
+    # A physical UNKNOWN result remains open for recovery, but its immutable
+    # no-progress disposition can settle the originating model request. Batch
+    # accounting waits until every call tied to that request has a disposition
+    # so a later useful sibling can still make the request count as progress.
+    valid_by_request = {}
+    for call in calls:
+        if call.decision_valid and call.decision_request_id:
+            valid_by_request.setdefault(call.decision_request_id, []).append(call)
+    for request_id, request_calls in valid_by_request.items():
+        dispositions = [call.made_progress for call in request_calls]
+        if dispositions and all(value is not None for value in dispositions):
+            await deps.central_state.request_ledger().mark_progress(
+                str(state["runtime"].run_id), request_id,
+                made_progress=any(value is True for value in dispositions),
             )
-            if progress is not None:
-                await deps.central_state.request_ledger().mark_progress(
-                    str(state["runtime"].run_id), request_id, made_progress=progress,
-                )
+    if calls and all(call.completed for call in calls):
         new_results = [
             *({"role": "tool", "tool_call_id": call.call_id,
                "content": json.dumps({

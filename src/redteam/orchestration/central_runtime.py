@@ -798,6 +798,11 @@ async def _finish_call(deps, state, call, local, item):
         "evidence_ids": call.evidence_ids,
         "unknown": unknown,
     }
+    # The original result is immutable even when it cannot settle the physical
+    # execution. Account for this decision's no-progress outcome independently
+    # of whether the call is safe to close or replay.
+    if unknown or not result.success:
+        call.made_progress = False
     call.completed = not unknown
     state["runtime"] = local["runtime"]
     if unknown:
