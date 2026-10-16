@@ -158,7 +158,7 @@ async def test_input_limit_checked_before_creating_workroom():
 
 @pytest.mark.parametrize("value,reason", [
     (float("nan"), "fixture_json_invalid"), ("x" * 65536, "fixture_request_oversized"),
-])
+], ids=["non-finite-json", "oversized-request"])
 def test_request_json_and_total_byte_bound(value, reason):
     with pytest.raises(ValueError, match=reason):
         request(cases=[{"name": "bounded", "input": {"value": value}, "expected": {}}])
