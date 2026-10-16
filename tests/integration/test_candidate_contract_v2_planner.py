@@ -49,6 +49,7 @@ def _plan_with_candidate():
                 "contract_version": 2,
                 "hypothesis_id": "local-candidate",
                 "description": "Access may be unguarded",
+                "status": "open",
                 "target_node_ids": [TARGET],
                 "reason": "Assess the preserved response",
             },
@@ -150,6 +151,7 @@ async def test_default_v3_rejects_non_v2_candidate_at_nested_contract_field(
     hypothesis = {
         "hypothesis_id": "local-candidate",
         "description": "Access may be unguarded",
+        "status": "open",
         "target_node_ids": [TARGET],
         "reason": "Assess the preserved response",
     }
@@ -161,8 +163,11 @@ async def test_default_v3_rejects_non_v2_candidate_at_nested_contract_field(
         "reason": "Do not admit a candidate without the active contract version",
         "termination": "replan",
     }
-    llm = CapturingPlannerLLM(plans=[response] * 7)  # decision_max_attempts (6) + initial
+    llm = CapturingPlannerLLM()
     async with probe_selection(tmp_path, llm=llm) as (session, _, _):
+        llm.responses["plan"].extend(
+            [response] * (session.deps.settings.decision_max_attempts + 1)
+        )
         with pytest.raises(DecisionFailure) as rejected:
             await SpecialistPlanner(session.deps).advance(session.runtime)
 

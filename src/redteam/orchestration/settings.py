@@ -123,9 +123,9 @@ class OrchestrationSettings(BaseModel):
     #: placeholder behaviour (the ratio is carried but inert) is preserved.
     #: One runtime mode; frozen legacy core flags do not select it.
     llm_candidate_generation: Literal[True] = True
-    decision_max_attempts: int = Field(default=6, ge=1, le=6)
+    decision_max_attempts: int = Field(default=12, ge=1, le=32)
     # Normal plan/review decisions are not malformed-response retries.
-    decision_normal_limit: int = Field(default=12, ge=1, le=32)
+    decision_normal_limit: int = Field(default=24, ge=1, le=64)
     #: Separately counted transport-error retries inside the same chain
     #: total and deadline. 0 disables transport retries; never above 5.
     #: Scope note: ConversationAssistant keeps its own constructor limits

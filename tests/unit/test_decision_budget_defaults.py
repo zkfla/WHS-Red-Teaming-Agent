@@ -7,15 +7,33 @@ from redteam.orchestration.settings import OrchestrationSettings
 
 
 def test_orchestration_decision_budget_defaults_and_identity_payloads():
+    config = OrchestrationConfig()
     settings = OrchestrationSettings()
 
-    assert settings.decision_max_attempts == 6
-    assert settings.decision_normal_limit == 12
+    assert config.decision_max_attempts == settings.decision_max_attempts == 12
+    assert config.decision_normal_limit == settings.decision_normal_limit == 24
     assert settings.decision_timeout_seconds == 900.0
     assert settings.llm_attempt_timeout_seconds == 180.0
     for payload in (settings.central_payload(), settings.durable_payload()):
+        assert payload["decision_max_attempts"] == 12
+        assert payload["decision_normal_limit"] == 24
         assert payload["decision_timeout_seconds"] == 900.0
         assert payload["llm_attempt_timeout_seconds"] == 180.0
+
+
+def test_explicit_previous_defaults_roundtrip_through_config_and_saved_identity():
+    config = OrchestrationConfig.from_environment({
+        "REDTEAM_DECISION_NORMAL_LIMIT": "12",
+        "REDTEAM_DECISION_MAX_ATTEMPTS": "6",
+    })
+    settings = OrchestrationSettings.from_config(config)
+
+    assert (config.decision_normal_limit, config.decision_max_attempts) == (12, 6)
+    for serializer in ("central_payload", "durable_payload"):
+        payload = getattr(settings, serializer)()
+        assert (payload["decision_normal_limit"], payload["decision_max_attempts"]) == (12, 6)
+        restored = OrchestrationSettings.model_validate(payload)
+        assert getattr(restored, serializer)() == payload
 
 
 def test_from_config_copies_validated_decision_budget():

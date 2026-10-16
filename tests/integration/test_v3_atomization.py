@@ -332,8 +332,9 @@ async def test_split_loop_atomizer_failure_commits_nothing(tmp_path):
             "objective": "Probe", "title": "Probe", "role_id": "probe-worker",
             "target_node_ids": [TARGET],
             "completion_criterion_ids": [_condition_id("Inspect")]}]}
-    llm = SplitDouble([_new_candidate_plan()], [bad] * 7)  # decision_max_attempts (6) + initial
+    llm = SplitDouble([_new_candidate_plan()], [])
     async with probe_selection(tmp_path, llm=llm) as (session, llm, tools):
+        llm.atoms.extend([bad] * (session.deps.settings.decision_max_attempts + 1))
         state = session.deps.central_state
         with pytest.raises(DecisionFailure) as failed:
             await SpecialistPlanner(session.deps).advance(session.runtime)

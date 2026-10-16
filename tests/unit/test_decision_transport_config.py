@@ -82,10 +82,10 @@ def test_value_is_in_settings_identity_payloads() -> None:
     assert OrchestrationSettings().central_payload()["decision_transport_max_attempts"] == 5
 
 
-def test_existing_totals_unchanged() -> None:
+def test_default_reasoning_totals_are_separately_bounded() -> None:
     settings = OrchestrationSettings()
-    assert settings.decision_normal_limit == 12
-    assert settings.decision_max_attempts == 6
+    assert settings.decision_normal_limit == 24
+    assert settings.decision_max_attempts == 12
 
 
 def _engine_deps(settings):
@@ -97,8 +97,10 @@ def test_engine_default_path_lands_five_in_client_and_chain_budget() -> None:
     assert engine.client._transport_limit == 5
     budget = engine._decision_budget()
     assert budget.transport_limit == 5
-    assert budget.max_attempts == 18
-    assert engine.client._max_attempts == 6
+    assert budget.normal_limit == 24
+    assert budget.repair_limit == 12
+    assert budget.max_attempts == 36
+    assert engine.client._max_attempts == 12
 
 
 def test_engine_non_default_value_lands() -> None:
@@ -106,7 +108,7 @@ def test_engine_non_default_value_lands() -> None:
     engine = InvestigationEngine(_engine_deps(settings))
     assert engine.client._transport_limit == 2
     assert engine._decision_budget().transport_limit == 2
-    assert engine._decision_budget().max_attempts == 18
+    assert engine._decision_budget().max_attempts == 36
 
 
 def test_engine_zero_disables_transport_retries() -> None:
