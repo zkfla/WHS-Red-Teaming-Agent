@@ -50,8 +50,9 @@ Tasks, although model requests already made remain charged. Update-only and held
 planner judgments do not require an atomizer request.
 
 Existing v2 planner/atomizer code and the original single-planner v3 code remain
-available. `config/agents/native-probes-legacy.yaml` retains the previous v3 profile
-and prompt identity. Existing Runs require their original selection and fingerprint;
+available. `config/agents/native-probes-legacy.yaml` retains the single-stage v3 role
+and prompt identities, with the current profile-owned finite Task budgets (16 actions,
+64 model requests, 16 repairs). Existing Runs require their original selection and fingerprint;
 changing an old Run to the new default does not force a resume.
 
 ## Parallel execution and replanning

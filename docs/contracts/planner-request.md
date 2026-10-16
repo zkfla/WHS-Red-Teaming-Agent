@@ -46,6 +46,11 @@ schema·의미 오류의 repair는 bounded public diagnostic만 user 메시지 �
 pass-local 조회 cache를 다음 pass의 기억으로 재사용하지 않는다. lookup과 commit을 섞은
 답은 기존 validator에서 repair 대상이며 최종 유효 판단 전에는 후보/Task/cursor를 기록하지 않는다.
 
+조회가 없으면 `context_request=null` 또는 필드 생략을 사용한다. 조회 객체는 version 1의
+단일 context/evidence 질의 또는 version 2의 1~4개 queries 중 하나를 포함해야 한다.
+version만 있는 빈 객체, 질의가 둘인 단일 항목, version과 맞지 않는 혼합 형태는 모델에
+전달되는 JSON schema에서도 거절한다. 런타임의 기존 같은 조건과 조회 권한은 유지한다.
+
 canonical `capture_snapshot`, related reads, exact source/result·후보 revision/purpose 검증,
 독립 public receipt, final CAS 및 종료 inventory/pending gate는 유지한다. 문맥에서 안 보인다는
 이유로 작업이 없다고 판단하지 않는다. 관련 source drift는 거부하고 무관 형제 변경은 기존
@@ -87,10 +92,10 @@ HTTP JSON 필드 순서는 모델이 해석하는 prompt 순서와 같은 개념
 
 ## version과 resume
 
-10b 도입 당시 profile은 16/13이었다. 현재 `native-probes`는 profile 27 / strategy prompt 15,
-single-stage 호환 profile은 20 / planner prompt 7이다. Worker prompt는 13이며 atomizer는 8이다.
+10b 도입 당시 profile은 16/13이었다. 현재 `native-probes`는 profile 28 / strategy prompt 15,
+single-stage 호환 profile은 21 / planner prompt 7이다. Worker prompt는 13이며 atomizer는 8이다.
 기존 prompt SHA와 profile fingerprint가 달라지며, `specialist_planning_inputs`에도
-`planner_request_contract_version=5`를 포함한다. 활성 Planner의 candidate update는 상태를
+`planner_request_contract_version=6`를 포함한다. 활성 Planner의 candidate update는 상태를
 명시하고, review 참조는 terminal 판정에서만 소비한다. 따라서 prompt bytes가 그대로인 custom
 profile도 기존 코드 계약의 Run으로 조용히 재개되지 않는다. 기존 planning binding 검사에서
 다른 입력으로 거부하고 새 Run을 사용한다. 과거 DB/보고서/checkpoint를 수정하거나 backfill하지 않는다.

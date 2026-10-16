@@ -137,3 +137,33 @@ freshness 수정은 `4ded8c0a`, 실제 context lookup 뒤 format repair가 모�
 Gateway 독립 감사는 진입 직전 callback과 core 계약을 확인해 `execution_started` 덮어쓰기 결함 주장을 기각했다. 출력 검증 실패 경로에서 adapter metadata가 빠지는 것은 사실이나, 실제로 필요한 소비자나 안전한 복구 계약이 입증되지 않아 변경하지 않았다. 별도 읽기 전용 원장 감사는255개 정산 응답에서 공개 도구 호출160건 중 graph 관련30건(정확한 `graph.record`4건 포함)을 확인했다. 따라서 graph 호출0건을 근거로 initial exposure를 바꾸자는 원인 설명은 성립하지 않는다. 호출 이름의 존재와 handler 수락·최종 Finding 생성은 구분하며 이 Run의 Finding은 여전히0이다.
 
 완료 거절 진단은 Luna 독립 검토에서도 추가 결함 없이 `0fe740e3`에 커밋했다. `CompletionIssues.add`의 메시지/typed 진단 대응, 미형식 오류 개수만 노출, 새 wake 후 과거 재계획 소진 판정 무효화, 자동 재시도 없음이 검토됐다. Root는 실제 checkout의 `.venv/Scripts/python.exe`로 새184824 fixture의 Docker/config·provider-reference 사전점검을 다시 실행해 둘 다 통과했다. 다른 워커에서 해당 인터프리터가 보이지 않았던 관측은 별도 환경 차이로 분리하며 그 워커의 새 preflight 성공으로 세지 않는다.
+
+## 수정본 실제 재검증 — Run04c51
+
+`7aeb2d40`을 정상 push하고 동결한561개 runtime 파일로184824 fixture를 실행했다. 첫 시도는 root가 prepared-only 표시를 너무 일찍 바꿔 CLI 전에 거절됐다. Run/모델/대상 호출이 없고 lock/프로세스가 없음을 확인한 뒤 실패 로그를 보존했다. 상태를 바로잡은 실제 실행은20:06:48 KST에 시작한 `run_04c51ceb92fc`다. 기존30분/300요청/3워커/모델 동시1·같은 prompt/승인·증명을 유지했다.
+
+20:19:28 KST에 ReportProjected와 RunFinished가 기록됐다. 결과는 `failed / planning_error / unresolved`, 최종 진단은 hypothesis_planning의 `decision_repair_budget_exhausted`다. mission active/release false/Finding0이다.119개 모델 요청 모두 정산됐고 알려진 총 토큰3,520,015, Task6개는 confirmed1/inconclusive4/blocked1이다. 실행15건은 성공11/실패4이며 실패는 recon timeout이다. Kali HTTP 영수증8개에 Alice/Bob 계정 요청의 실제 세션 일치 원본2개가 포함된다. 계정 요청 둘 다200이지만 이 사실만으로 Finding을 만들지 않는다.
+
+이번에는 현재 후보 revision2와 purpose가 일치하는 public/final security-check receipt가 생겼다. verdict/outcome은 unknown이고 후보는 open으로 남았다. 검토 선택→원본 검토 경로가 실제로 연결된 관측이며, 충분한 입증이나 모델 성능 목표 달성은 아니다. 세션 목록 원본2건에는 공급자의 빈 resource_effects가 보존됐다. Task/저장 결과6개 모두v2이고 `result_v1_extensions_forbidden` 재발0이다. 다만 버전을 생략하고 확장 필드를 넣은 실제 게시가 저장됐다는 사례는 이 Run에서 입증되지 않았다.
+
+증거 JSONL/index241개와 DB 증거 참조64개의 무결성 문제0, 승인 대기/미전달 사건0, 소유 프로세스4개 종료를 확인했다. launcher는 완료됐지만 exit code는 unknown이다. Root는 동결 해제 전에561개 runtime hash 변경0을 확인했다. 독립 observer의 후속 hash 검사는 동결 해제 이후 수정된 파일을 별도로 기록한다. 안전한 최종 근거는184824 fixture의 `safeobserver-report.json`이다. 과거 Run을 새 코드·예산으로 재개하지 않는다.
+
+### 마지막 거절 재현과 보정 여유 상향
+
+최종 판단은 정상 요청12개 중1개, 보정6개 중6개를 사용했고 transport 실패는 없다. 마지막7회 중6회는 내용 없이 version만 있는 context_request였으며 `planner_lookup_needs_exactly_one_query`를 반복했다. 마지막1회는 조회를 null로 고친 뒤 question principal이 후보 범위를 벗어나 거절됐다. 유효한 제안이 버려진 근거는 없다. 저장된 요청 preview가 잘려 실제 제공자 schema 전체를 복구할 수는 없지만, 동결 commit의 생성 schema와 실제 parser 간 불일치는 재현됐다.
+
+`c8b80031`은 조회 소유 모델의 JSON schema에 v1 단일 query/v2 1~4개 batch의 기존 조건을 표현한다. unused lookup은 null/생략, version-only/혼합 query는 거절한다. parser·조회 권한·저장 의미는 유지하며 Planner request 계약6에 결속한다. Root는 실제 실패 입력6개를 메모리에서 재검사했다. 동결 commit의 생성 schema는6/6을 허용했고 수정 schema는6/6을 거절했다. 이 재현은 형식 계약 검증이며 실제 모델이 다음에 올바르게 출력한다는 성능 보장은 아니다.
+
+사용자는 이후 예산을 다른 에이전트와 비교해 여유 있게 맞추도록 명시적으로 요청했다. Strix pin의500 SDK turns/run과32 tool calls/turn, ARTEX의 agent turn 무제한+run1200초, PentestGPT pin의20 accepted Supervisor decisions와 task별 provider turns는 단위가 다르다. 같은 숫자나 동일 성능을 주장하지 않고 기존 원장/설정으로 유한한 여유를 늘렸다.
+
+| 범위 | 이전 | 새 값 |
+| --- | --- | --- |
+| 판단 normal / repair | 12 / 6 | 24 / 12 (총36, transport 최대5는 이 총량 안에서 소비) |
+| native/legacy Task 모델 요청 | 16 / 8 | 둘 다64 |
+| Task 대상 실행 / 보정 | 4 / 6 | 16 / 16 (보정은64에 포함) |
+| 연속 provider 실패 | 6 | 6 |
+| 새 검증 fixture 전체 요청 / 시간 | 300 / 1800초 | 600 / 3600초 |
+
+`aefe9749`는 config/settings와 기존 env 경로에 새 기본값을 연결하고 명시적인 과거12/6 직렬화·재개 identity를 유지한다. `374a628b`는 prompt를 바꾸지 않고 native28/legacy21 프로필에 Task 한도를 둔다. 과거 저장 ProbeLimits의 기본값을 바꾸지 않는다. 전체 Control/승인·증명, provider transport/실제 요청 원장,900초 판단/180초 시도 clock은 유지한다. 새 fixture203407은 별도 저장소·명시적인600/3600·24/12 설정으로 준비하며 이전 Run을 재개하지 않는다.
+
+설정/원장 집중95 passed, profile21 passed, lookup schema·진단41 passed를 확인했다. Root의 Planner/atomizer/candidate/lookup 통합31개 중30개가 통과한 뒤 JSON Schema가 선택하는 오류 leaf에 의존하던1개 assertion을 수정해 해당1개도 통과했다. 경계가 달라진 admission fixture는 실제 profile 상한+1을 사용하고, 후보 fixture는 다른 조건인 status를 명시해 계약 버전 거절만 검사한다. 보정 반복 입력 수는 실제 설정에서 얻는다. 단일 영어 단어를 요구하던 오래된 설명 assertion도 현재 context_request 계약에 맞췄다. 전체 Ruff와 캐시 없는 Linux 대상 source+tests mypy913파일이 통과했다. 독립 Luna 소스 리뷰에서 새 계약/예산 결함은 없었으며, 지적된 기존 fixture와 문서 불일치를 반영했다. 개별 테스트 범위는 겹치며 전체 pytest 통과로 표현하지 않는다.

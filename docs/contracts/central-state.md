@@ -940,9 +940,9 @@ Tests may also register v2 probes directly through the existing central admissio
 Schema-2 profiles retain their original serialized policy and prompt fingerprints.
 
 The selected profile provides each Task's `probe_limits`: the default split
-profile allows four original action submissions and sixteen model request
-reservations; the legacy profile retains four and eight. Both selected profiles
-bind six format/semantic repairs and six consecutive provider failures per Task
+profile and legacy profile allow sixteen original action submissions and sixty-four model request
+reservations. Both selected profiles bind sixteen format/semantic repairs and
+six consecutive provider failures per Task
 purpose. The provider threshold retains headroom for an initial failure plus the
 existing five transport retries; these sub-limits share the original Task and Run
 ledgers and never create another request pool. Historical Tasks whose optional
@@ -1132,12 +1132,12 @@ must pass before resuming an existing Run; incompatible Runs are not migrated.
 
 ## Worker delivery version
 
-The default split schema-3 profile is `native-probes` version 27, with
+The default split schema-3 profile is `native-probes` version 28, with
 `worker.md` prompt version 13, `hypothesis-strategy.md` version 15 and
-`probe-atomizer.md` version 8. The retained single-stage profile is version 20
+`probe-atomizer.md` version 8. The retained single-stage profile is version 21
 with planner prompt version 7 and the same worker prompt version. Planner/atomizer responsibilities
-and independent completion review remain separate. Default/legacy Task request limits
-remain 16/8, with explicit repair and consecutive-provider-failure subcaps of 6;
+and independent completion review remain separate. Both profiles allow 64 Task model
+requests and 16 target actions, with repair subcap 16 and consecutive-provider-failure subcap 6;
 these share the existing Task/Run ledger. Prompt
 content hashes and versioned read/settlement contributions change the existing
 selection fingerprints. Historical Runs/results stay readable; an incompatible

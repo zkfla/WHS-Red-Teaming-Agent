@@ -64,8 +64,8 @@ explicit `OrchestrationConfig` without reading the environment.
 ### Model decision recovery budgets
 
 The decision chain separates normal calls, output correction and transport
-retries. The configured normal allowance is 12 and output-correction allowance
-is 6; their sum remains the total 18-request ceiling for that chain. Transport
+retries. The configured normal allowance is 24 and output-correction allowance
+is 12; their sum remains the total 36-request ceiling for that chain. Transport
 retries have a separate cap of 5, consumed inside the same total rather than
 added to it. The Run request/token ledger and absolute 900-second chain clock
 also apply; each SDK call is bounded at 180 seconds, clipped by remaining time.
@@ -75,8 +75,8 @@ model-output correction feedback. Target tools are not automatically replayed.
 
 | Environment variable | Default | Validation |
 |---|---|---|
-| `REDTEAM_DECISION_NORMAL_LIMIT` | 12 | 1–32 |
-| `REDTEAM_DECISION_MAX_ATTEMPTS` | 6 | 1–6, output-correction allowance |
+| `REDTEAM_DECISION_NORMAL_LIMIT` | 24 | 1–64 |
+| `REDTEAM_DECISION_MAX_ATTEMPTS` | 12 | 1–32, output-correction allowance |
 | `REDTEAM_DECISION_TRANSPORT_MAX_ATTEMPTS` | 5 | 0–5, zero disables transport retries |
 | `REDTEAM_DECISION_TIMEOUT_SECONDS` | 900 | finite, greater than 0, at most 3600 |
 | `REDTEAM_LLM_ATTEMPT_TIMEOUT_SECONDS` | 180 | finite, greater than 0, at most 900 |
@@ -390,10 +390,10 @@ Already-supplied execution schemas need no discovery round. No per-program
 wrappers, title-based tool switch, extra registry or model approval polling is
 introduced; the native input bound and shared model-request ledger remain.
 
-`native-probes` is version 27 (worker prompt 13, strategy prompt 15, atomizer prompt 8).
-The explicit single-stage compatibility profile is version 20 (planner prompt 7,
+`native-probes` is version 28 (worker prompt 13, strategy prompt 15, atomizer prompt 8).
+The explicit single-stage compatibility profile is version 21 (planner prompt 7,
 shared worker prompt 13). The code contracts additionally bind
-`planner_request_contract_version=5` and `worker_conversation_version=4`, including
+`planner_request_contract_version=6` and `worker_conversation_version=4`, including
 for custom profiles. Worker checkpoints use session version 2; see
 [Worker lifecycle](worker-conversation.md) and
 [Planner request and resume semantics](planner-request.md).
@@ -402,3 +402,10 @@ hashes, role/tool and extension fingerprints continue to reject incompatible
 execution resume rather than changing historical Run selections. See
 [program evidence](evidence.md#program-originals-and-protected-network-linkage)
 for original-output delivery and the boundary between attempts and claims.
+
+Both profiles now provide 16 target actions, 64 model requests and at most 16 output
+corrections per Task; the provider-failure circuit remains 6. Corrections count inside
+the Task's 64 requests. These are profile-owned ceilings, not new per-role pools:
+the shared Run request ledger, Control, deadline and operator configuration still bind.
+Historical explicit budgets and stored Task limits retain their values. New defaults
+change the profile/settings fingerprint and cannot silently replace a saved Run's limits.
