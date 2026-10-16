@@ -215,7 +215,7 @@ class OrchestrationConfig(BaseModel):
         default=DEFAULT_SPECIALIST_PROFILE_PATH, min_length=1, max_length=4096
     )
     code_fixture_policy_path: str | None = Field(default=None, min_length=1, max_length=4096)
-    tool_timeout_seconds: float = Field(default=10.0, gt=0, le=600)
+    tool_timeout_seconds: float = Field(default=20.0, gt=0, le=600)
     resource_wait_timeout_seconds: float = Field(default=30.0, gt=0, le=600)
     decision_normal_limit: int = Field(default=24, ge=1, le=64)
     decision_max_attempts: int = Field(default=12, ge=1, le=32)

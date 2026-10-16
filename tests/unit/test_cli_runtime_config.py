@@ -47,7 +47,17 @@ async def test_runtime_environment_reaches_both_cli_entrypoints(tmp_path, monkey
     settings = OrchestrationSettings.for_durable_run(config.orchestration)
     assert settings.llm_candidate_generation is True
     assert settings.max_steps == 17
+    assert settings.tool_timeout_seconds == 20
     assert OrchestrationSettings.for_durable_run(config.orchestration, max_steps=9).max_steps == 9
+
+
+def test_new_tool_timeout_does_not_change_a_saved_run():
+    current = OrchestrationSettings.for_durable_run(OrchestrationConfig())
+    assert current.tool_timeout_seconds == 20
+
+    earlier = current.with_overrides(tool_timeout_seconds=10)
+    restored = OrchestrationSettings.model_validate(earlier.durable_payload())
+    assert restored.tool_timeout_seconds == 10
 
 
 @pytest.mark.parametrize(
