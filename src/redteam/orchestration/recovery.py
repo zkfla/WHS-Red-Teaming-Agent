@@ -39,7 +39,11 @@ from redteam.orchestration.analysis import (
 )
 from redteam.orchestration.completion import check_record_linkage, preserved_target_is_absent
 from redteam.orchestration.evidence_access import locate_raw, raw_from_metadata
-from redteam.orchestration.findings import FindingPromoter, PromotionRequest
+from redteam.orchestration.findings import (
+    FindingPromoter,
+    PromotionRequest,
+    claim_keys_from_findings,
+)
 from redteam.orchestration.service_status import severity_for
 
 __all__ = [
@@ -784,11 +788,7 @@ async def reprocess_evidence(
         verdict is Verdict.VIOLATION and proposal.hypothesis_id is not None
         and proposal.target is not None
     ):
-        existing_claims = {
-            str(item.metadata.get("claim_key"))
-            for item in await graph_service.list_findings()
-            if item.metadata.get("claim_key")
-        }
+        existing_claims = claim_keys_from_findings(await graph_service.list_findings())
         assessment_kind = step.assessment_kind if step is not None else "observation"
         severity = severity_for(step) if step is not None else "medium"
         promotion = FindingPromoter().promote(

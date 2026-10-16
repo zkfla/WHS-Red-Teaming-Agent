@@ -177,7 +177,7 @@ async def test_actual_input_boundary_archives_displays_or_holds_opaque_state(
 
     model = BoundedConversation(executions=3, reads=1, opaque=opaque)
     async with shell_session(tmp_path, model) as (session, manager):
-        task_id = await register(session, "bounded", actions=4, requests=16)
+        task_id = await register(session, "bounded", actions=4, requests=8)
         outcome, = await drive(session)
         assert outcome.kind == "completed", outcome.error
         saved = await saved_session(session, outcome.runtime)
@@ -219,7 +219,7 @@ async def test_actual_input_boundary_archives_displays_or_holds_opaque_state(
 async def test_changed_owned_purpose_gets_explicit_generation_and_keeps_original_budget(tmp_path):
     model = ConversationModel(executions=3, reads=1, opaque=False)
     async with shell_session(tmp_path, model) as (session, manager):
-        identity = await register(session, "purpose", actions=4, requests=16)
+        identity = await register(session, "purpose", actions=4, requests=8)
 
         async def change_purpose():
             state = session.deps.central_state
@@ -350,7 +350,7 @@ async def test_crash_after_original_before_display_restores_without_reexecution(
 
     monkeypatch.setattr(react, "_result_messages", interrupt)
     async with shell_session(tmp_path, model) as (session, manager):
-        identity = await register(session, "crash", actions=4, requests=16)
+        identity = await register(session, "crash", actions=4, requests=8)
         outcome, = await drive(session)
         assert outcome.kind == "failed" and failed
         before = await saved_session(session, outcome.runtime)
@@ -375,7 +375,7 @@ async def test_crash_after_original_before_display_restores_without_reexecution(
 async def test_unknown_local_submission_stays_pending_without_replay(tmp_path, monkeypatch):
     model = ConversationModel(executions=3, reads=1)
     async with shell_session(tmp_path, model) as (session, manager):
-        await register(session, "local-unknown", actions=4, requests=16)
+        await register(session, "local-unknown", actions=4, requests=8)
         original = session.deps.local_tools.call
         submissions = []
 
@@ -476,6 +476,10 @@ async def test_original_job_or_unknown_survives_process_reopen_without_new_submi
         saved = await saved_session(session, outcome.runtime)
         assert saved.status == "waiting"
         execution, = await session.deps.central_state.list_executions()
+        if wait == "unknown":
+            assert execution.outcome.diagnostic_category == "execution_unknown"
+            assert execution.outcome.result_kind == "unknown"
+            assert "Do not submit" in execution.outcome.resume_condition
         run_id, engagement_id = session.runtime.run_id, session.runtime.engagement_id
     async with open_central_run(
         config, directory=root, settings=settings, resume=True,
@@ -497,6 +501,8 @@ async def test_original_job_or_unknown_survives_process_reopen_without_new_submi
             assert len(jobs.submissions) == 1 and not tools.inner.invocations
         else:
             assert len(tools.inner.invocations) == 1
-            assert (await session.deps.central_state.get_execution(
+            reopened = await session.deps.central_state.get_execution(
                 str(execution.invocation_id),
-            )).state is ExecutionState.UNKNOWN
+            )
+            assert reopened.state is ExecutionState.UNKNOWN
+            assert reopened.outcome == execution.outcome

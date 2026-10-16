@@ -127,8 +127,15 @@ independent original-result/claim/validity proof plus a final public review rece
 bound to `candidate_revision` and `candidate_purpose_hash` (claim, premise, targets
 and principals). `append_posthoc_claim_receipt(candidate=...)` binds the reviewed
 snapshot; v2 common recording returns the review to the planner rather than
-silently resolving the candidate or creating a Finding. Worker observations,
-failed requests, missing prerequisites and UNKNOWN do not create a final verdict.
+silently resolving the candidate or creating a Finding. When the Planner later
+commits the exact candidate as confirmed, central admission consumes that bound
+receipt in the same SQLite/graph transaction. Only a versioned security review
+with `success`, `VIOLATION` and `claim_supported=true` is passed through the
+shared `FindingPromoter`; the resulting verified Finding links both the receipt
+and its original execution evidence. A Run/candidate/target/claim identity makes
+replay idempotent. Benign success and promotion refusal remain a separate stored
+diagnostic, not a Finding. Worker observations, failed requests, missing
+prerequisites and UNKNOWN do not create a final verdict.
 
 The integrity report treats v2 held/inconclusive candidates as unresolved. Goal
 completion only requires the candidates explicitly named by v2 goal-required

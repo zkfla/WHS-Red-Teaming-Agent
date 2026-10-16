@@ -50,7 +50,11 @@ from redteam.orchestration.events import (
     HYPOTHESIS_RESOLVED,
     OBSERVATION_RECORDED,
 )
-from redteam.orchestration.findings import FindingPromoter, PromotionRequest
+from redteam.orchestration.findings import (
+    FindingPromoter,
+    PromotionRequest,
+    claim_keys_from_findings,
+)
 from redteam.orchestration.nodes._support import advance, graph_service, publisher_for
 from redteam.orchestration.runtime_observation import (
     RuntimeObservation,
@@ -630,11 +634,7 @@ async def verify_node(
             )
             last_event_id = settled.event_id
 
-    existing_claims = {
-        str(item.metadata["claim_key"])
-        for item in await service.list_findings()
-        if item.metadata.get("claim_key")
-    }
+    existing_claims = claim_keys_from_findings(await service.list_findings())
     decision = FindingPromoter().promote(
         PromotionRequest(
             verdict=verdict,

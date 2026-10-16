@@ -92,6 +92,13 @@ class HypothesisProposalError(ValueError):
 
 
 def _proposal_repair_summary(exc: BaseException, fallback: str) -> str:
+    if getattr(exc, "code", None) == "candidate_inventory_empty_requires_new_candidate":
+        return (
+            "The current candidate inventory is empty. Propose at least one new tentative "
+            "candidate tied to a captured target, with explicit untested premises and an open, "
+            "inconclusive, or held status. This creates a hypothesis for investigation, not a "
+            "confirmed Finding."
+        )
     if getattr(exc, "code", None) != "continue_requires_proposed_or_existing_work":
         return fallback
     return (
@@ -238,7 +245,10 @@ def capture_snapshot(tx):
     )
 
 
-def bind_decision(decision, snapshot, *, issued, targets, principals, roles, max_tasks, limits):
+def bind_decision(
+    decision, snapshot, *, issued, targets, principals, roles, max_tasks, limits,
+    require_initial_candidate=False,
+):
     """Resolve local references and validate purpose inputs without mutating originals."""
     tasks = []
     names = [update.hypothesis.hypothesis_id for update in decision.updates]
@@ -255,6 +265,8 @@ def bind_decision(decision, snapshot, *, issued, targets, principals, roles, max
         principals=principals, resume_conditions=decision.resume_conditions,
         error=HypothesisProposalError,
     )
+    if require_initial_candidate and not snapshot.candidates and not updates:
+        raise HypothesisProposalError("candidate_inventory_empty_requires_new_candidate")
     versions = {identity: candidate.revision for identity, candidate in snapshot.candidates.items()}
     versions.update({update.hypothesis.hypothesis_id: (update.expected_revision or 0) + 1
                      for update in updates})
@@ -285,6 +297,17 @@ def bind_decision(decision, snapshot, *, issued, targets, principals, roles, max
         if draft.probe_limits is not None and (
             draft.probe_limits.max_actions > limits.max_actions
             or draft.probe_limits.max_model_requests > limits.max_model_requests
+            or (
+                draft.probe_limits.max_repair_requests is not None
+                and limits.max_repair_requests is not None
+                and draft.probe_limits.max_repair_requests > limits.max_repair_requests
+            )
+            or (
+                draft.probe_limits.max_consecutive_provider_failures is not None
+                and limits.max_consecutive_provider_failures is not None
+                and draft.probe_limits.max_consecutive_provider_failures
+                > limits.max_consecutive_provider_failures
+            )
         ):
             raise HypothesisProposalError("probe_limits_exceed_profile")
         tasks.append(draft.model_copy(update={
@@ -451,7 +474,7 @@ async def advance_hypotheses(planner, runtime, schema):
         proposal = bind_decision(
             decision, snapshot, issued=issued, targets=targets, principals=principals,
             roles=roles, max_tasks=planner.policy.max_tasks_per_strategy,
-            limits=planner.policy.probe_limits,
+            limits=planner.policy.probe_limits, require_initial_candidate=True,
         )
         return decision, proposal, related_reads(
             decision, proposal, snapshot, records, eligible_roles=roles,
@@ -542,7 +565,7 @@ async def _finalize_hypothesis_pass(deps, snapshot, budget, *, identity, proposa
     return identities
 
 
-PLANNER_REQUEST_CONTRACT_VERSION = 1
+PLANNER_REQUEST_CONTRACT_VERSION = 3
 
 
 FEEDBACK_SYSTEM = (
@@ -564,8 +587,11 @@ FEEDBACK_SYSTEM = (
     "refutation still require exact revision/purpose independent review. HTTP success or a "
     "discovered path alone is no vulnerability. UNKNOWN security review does not forbid a new "
     "hypothesis; unbound means no reuse binding, not validity or falsehood. If information is "
-    "insufficient, explain which security uncertainty another scoped observation would narrow; "
-    "candidate-free followups are allowed. Read previous questions, source results, changed "
+    "insufficient, explain which security uncertainty another scoped observation would narrow. "
+    "When the candidate inventory is empty, the final judgment must create at least one new "
+    "tentative candidate tied to a registered target, with explicit untested premises and an "
+    "open, inconclusive, or held status; this is a hypothesis, never a confirmed finding. "
+    "Read previous questions, source results, changed "
     "premises, newly available observations and remaining budgets before proposing more work. "
     "For diagnostics, use cause_scope, owner and repair_condition. A proven runtime_contract "
     "requiring source correction cannot be repaired by target requests or rereading unchanged "
@@ -586,7 +612,8 @@ _SINGLE_PLAN_SYSTEM = FEEDBACK_SYSTEM + (
     "followups cite the captured Task/result pair, without inventing a question. "
     "Observations and Task outcome are not candidate verdicts. Final verdicts require "
     "an independent public review receipt for that exact candidate revision/purpose. "
-    "No candidates initially means a useful scoped observation or reasoned hold. "
+    "No candidates initially means proposing at least one tentative candidate plus useful "
+    "scoped work or a reasoned hold. "
     "Same evidence can support another useful probe. Never prescribe tool-call order, "
     "invent subjects or overwrite active work. Held/exhausted judgments must explain "
     "reconsideration conditions; goal success remains a separate completion gate."
@@ -604,8 +631,9 @@ _SPLIT_PLAN_SYSTEM = FEEDBACK_SYSTEM + (
     "reviewed_task_ids/reviewed_hypothesis_ids actually consumed. Source followups cite the "
     "captured Task/result pair, without inventing a question. Observations and Task outcome are "
     "not candidate verdicts. Final verdicts require an independent public review receipt for "
-    "that exact candidate revision/purpose. No candidates initially means a useful scoped "
-    "observation or reasoned hold. Same evidence can support another useful probe. Never "
+    "that exact candidate revision/purpose. No candidates initially means proposing at least "
+    "one tentative candidate plus useful scoped work or a reasoned hold. Same evidence can "
+    "support another useful probe. Never "
     "prescribe tool-call order, invent subjects or overwrite active work. Held/exhausted "
     "judgments must explain reconsideration conditions; goal success remains a separate "
     "completion gate."
@@ -725,6 +753,7 @@ async def _advance_split(planner, runtime, schema, snapshot, engine, budget, pay
             draft, snapshot, issued=issued, targets=targets, principals=principals,
             max_tasks=planner.policy.max_tasks_per_strategy,
             existing_work_validator=validate_existing_work,
+            require_initial_candidate=True,
         )
         return draft, updates, questions, versions
 
@@ -734,10 +763,12 @@ async def _advance_split(planner, runtime, schema, snapshot, engine, budget, pay
         except (ValueError, SpecialistProposalError) as exc:
             raise DecisionValidationError(_proposal_validation_diagnostic(
                 exc, stage="hypothesis_planning",
-                summary="Use captured subjects, candidate revisions and original "
-                "source results. A new candidate key is local to this proposal; questions carry "
-                "purpose only, never worker tasks. Empty judgments need a termination reason "
-                "and resume_conditions.",
+                summary=_proposal_repair_summary(exc, (
+                    "Use captured subjects, candidate revisions and original source results. "
+                    "A new candidate key is local to this proposal; questions carry purpose "
+                    "only, never worker tasks. Empty judgments need a termination reason and "
+                    "resume_conditions."
+                )),
                 schema=HypothesisPlanDraft.model_json_schema(),
             )) from exc
 
@@ -814,7 +845,7 @@ async def _advance_split(planner, runtime, schema, snapshot, engine, budget, pay
         proposal = bind_decision(
             decision, snapshot, issued=issued, targets=targets, principals=principals,
             roles=roles, max_tasks=planner.policy.max_tasks_per_strategy,
-            limits=planner.policy.probe_limits,
+            limits=planner.policy.probe_limits, require_initial_candidate=True,
         )
         coverage = {
             question.question_id: [task.task_key for task in parsed.tasks

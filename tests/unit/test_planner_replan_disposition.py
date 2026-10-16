@@ -168,6 +168,41 @@ def test_continue_accepts_new_tasks_or_questions():
     assert updates == [] and len(questions) == 1
 
 
+def test_empty_inventory_requires_one_tentative_candidate_at_runtime_boundary():
+    snapshot = _snapshot()
+    legacy = HypothesisDecision(reason="No candidate was proposed", termination="held")
+    with pytest.raises(HypothesisProposalError) as legacy_error:
+        bind_decision(
+            legacy, snapshot, issued={}, targets={TARGET}, principals=set(), roles={ROLE},
+            max_tasks=4, limits=ProbeLimits(), require_initial_candidate=True,
+        )
+    assert legacy_error.value.code == "candidate_inventory_empty_requires_new_candidate"
+
+    split = _plan_draft(reason="No candidate was proposed", termination="held")
+    with pytest.raises(AtomizationProposalError) as split_error:
+        bind_plan(
+            split, snapshot, issued={}, targets={TARGET}, principals=set(), max_tasks=4,
+            existing_work_validator=_witness_validator(snapshot),
+            require_initial_candidate=True,
+        )
+    assert split_error.value.code == "candidate_inventory_empty_requires_new_candidate"
+
+    new_candidate = _candidate("proposal-local")
+    update = HypothesisUpdate(hypothesis=new_candidate, expected_revision=None)
+    accepted = bind_decision(
+        legacy.model_copy(update={"updates": [update]}),
+        snapshot,
+        issued={},
+        targets={TARGET},
+        principals=set(),
+        roles={ROLE},
+        max_tasks=4,
+        limits=ProbeLimits(),
+        require_initial_candidate=True,
+    )
+    assert accepted is not None and len(accepted.updates) == 1
+
+
 @pytest.mark.parametrize("status,owner", [
     (TaskStatus.READY, None),
     (TaskStatus.RUNNING, "run-a:instance:worker-a"),
@@ -330,6 +365,13 @@ def test_replan_related_reads_stay_candidate_local_and_diagnostic_names_disposit
 
 class _FakeRuntime:
     run_id = "run-a"
+    engagement_id = "engagement-a"
+    mission_id = "mission-a"
+    current_goal = None
+    started_at = NOW
+    component_binding = None
+    llm_request_policy = None
+    remaining_budget = None
 
     def model_copy(self, *, deep=False, update=None):
         return SimpleNamespace(**(update or {}))

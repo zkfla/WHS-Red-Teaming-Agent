@@ -12,7 +12,7 @@ from redteam.orchestration.coordination import StateConflict
 from redteam.orchestration.operator_intents.models import IntentRecord
 from redteam.orchestration.specialist_planner import SpecialistPlanner
 from tests.integration.test_central_development import TOOL, discover, inspect, turn
-from tests.integration.test_hypothesis_planner import PlannerDouble, held
+from tests.integration.test_hypothesis_planner import PlannerDouble, candidate, held
 from tests.integration.test_planner_context_lookup import lookup
 from tests.integration.test_probe_workers import PROFILE, drive, register, selection
 
@@ -36,11 +36,17 @@ class RequestDouble(PlannerDouble):
         return StructuredCompletion(value=value, usage=usage)
 
 
+def initial_held(reason="Await prerequisites"):
+    return {**held(reason), "updates": [candidate()]}
+
+
 @pytest.mark.parametrize("profile", [PROFILE, PROFILE.with_name("native-probes-legacy.yaml")])
 async def test_independent_passes_keep_prefix_and_receive_current_worker_and_operator_data(
     tmp_path, profile,
 ):
-    llm = RequestDouble([held("First public judgment"), held("Later public judgment")])
+    llm = RequestDouble([
+        initial_held("First public judgment"), held("Later public judgment"),
+    ])
     async with selection(tmp_path, llm=llm, profile=profile) as (session, _, tools):
         planner = SpecialistPlanner(session.deps)
         for index in range(2):
@@ -96,7 +102,7 @@ async def test_lookup_and_mixed_reply_repair_preserve_prefix_and_refresh_request
 ):
     request = lookup(kind="task", mode="list")
     mixed = {**request, "reviewed_task_ids": ["not-read"]}
-    llm = RequestDouble([request, mixed, held()])
+    llm = RequestDouble([request, mixed, initial_held()])
     async with selection(tmp_path, llm=llm, profile=profile) as (session, _, tools):
         assert await SpecialistPlanner(session.deps).advance(session.runtime) == []
         first, queried, repair = llm.envelopes
@@ -126,7 +132,7 @@ async def test_changed_code_request_contract_refuses_execution_but_preserves_ori
         state = session.deps.central_state
         original = await state.get_mission(session.runtime.mission_id)
         # Same profile/prompt, changed code contract: custom profiles are covered too.
-        monkeypatch.setattr(hypothesis_planner, "PLANNER_REQUEST_CONTRACT_VERSION", 2)
+        monkeypatch.setattr(hypothesis_planner, "PLANNER_REQUEST_CONTRACT_VERSION", 4)
         with pytest.raises(StateConflict, match="central_runtime_original_binding_mismatch"):
             await runtime_token(session.deps, session.runtime, require_task=False)
         assert await state.get_mission(session.runtime.mission_id) == original

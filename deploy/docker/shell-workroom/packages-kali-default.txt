@@ -1,0 +1,5 @@
+# Explicit broad profile. kali-linux-default is the Kali-owned standard
+# metapackage; the manifest generator inventories its installed dependency
+# closure from the resulting immutable image. This profile is never selected
+# implicitly and no package installation happens at investigation runtime.
+kali-linux-default

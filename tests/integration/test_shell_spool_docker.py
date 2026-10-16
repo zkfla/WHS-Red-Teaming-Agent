@@ -197,7 +197,7 @@ async def _launch_detached(manager: ShellWorkroomManager, key: str, script: str,
             seen_dash_i = True
             continue
         (env_parts if not seen_dash_i else rest).append(part)
-    supervisor = policy.workdir.rstrip("/") + "/.whs-supervisor-v2.py"
+    supervisor = policy.workdir.rstrip("/") + "/.whs-supervisor-v3.py"
     assert rest[0] == name
     assert rest[1:4] == ["python3", "-I", "-u"]
     assert rest[4] == supervisor

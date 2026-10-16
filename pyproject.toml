@@ -89,6 +89,8 @@ redteam = ["capability/reference_data/*.json", "capability/reference_data/*.yaml
 "share/redteam/shell-workroom" = [
     "deploy/docker/shell-workroom/Dockerfile",
     "deploy/docker/shell-workroom/packages.txt",
+    "deploy/docker/shell-workroom/packages-kali-default.txt",
+    "deploy/docker/shell-workroom/profiles.json",
     "deploy/docker/shell-workroom/generate-manifest.py",
 ]
 

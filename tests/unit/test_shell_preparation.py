@@ -316,6 +316,52 @@ async def test_expected_fingerprint_restores_exact_record(
     assert len(build_calls) == 1
 
 
+async def test_broad_profile_identity_is_complete_and_profile_drift_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _ready_docker(monkeypatch)
+    cache = _patch_cache(monkeypatch, tmp_path)
+    asset_dir = shell_image.resolve_asset_dir()
+    from redteam.capability.shell_profiles import (
+        package_input_sha256,
+        resolve_shell_image_profile,
+    )
+
+    broad = resolve_shell_image_profile(asset_dir, "kali-default")
+
+    async def fake_build(policy, cache_dir, progress, *, profile_name="baseline"):
+        assert profile_name == "kali-default"
+        manifest = cache_dir / "manifests" / "broad.json"
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        manifest.write_text(json.dumps({
+            "inventory_schema_version": 2,
+            "profile": broad.name,
+            "package_input": broad.package_input,
+            "package_input_sha256": package_input_sha256(asset_dir, broad),
+            "image_digest": IMAGE_ID,
+            "programs": [],
+        }), encoding="utf-8")
+        return IMAGE_ID, str(manifest)
+
+    monkeypatch.setattr(shell_image, "build_default_image", fake_build)
+    prepared = await shell_preparation.prepare_shell_policy(
+        None, image_profile="kali-default"
+    )
+    record = json.loads(
+        (cache / "records" / f"{prepared.fingerprint}.json").read_text(encoding="utf-8")
+    )
+    identity = record["identity"]
+    assert identity["image_profile"] == "kali-default"
+    assert identity["package_input_sha256"] == package_input_sha256(asset_dir, broad)
+    assert identity["image_id"] == IMAGE_ID
+    assert len(identity["manifest_sha256"]) == 64
+    assert identity["runtime_policy"]["image"] == IMAGE_ID
+    with pytest.raises(MCPConfigurationError, match="profile has changed"):
+        await shell_preparation.prepare_shell_policy(
+            None, expected_fingerprint=prepared.fingerprint, image_profile="baseline"
+        )
+
+
 async def test_missing_record_refuses(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -69,6 +69,12 @@ results local; cite targeted output as observations or hypothesis support with
 its tested scope and limitations, not as measured remote graph facts. Exit zero
 is neither a verified vulnerability nor Task/Mission success. Return short
 observations, original references and remaining uncertainty to the Planner.
+Execution history preserves selection.route/readiness separately from outcome.
+Use outcome.diagnostic_category, diagnostic_code, cause_scope and resume_condition
+for route, privilege, scope, approval, timeout, detach, missing-program and
+missing-response failures. A repeated unchanged prerequisite is not new work.
+Only result_kind=canonical_protocol_receipt denotes mapper-validated protocol
+evidence; generic_program_output remains a stdout observation.
 
 Read the admitted candidate snapshot, its premise, the probe's original evidence,
 subjects and return conditions. Test the smallest useful uncertainty and return
@@ -81,6 +87,8 @@ Mission success are separate judgments. Credential gaps, tool failures, policy
 denials and unknown execution are limitations, not refutations. Preserve pending
 original actions, approvals and jobs. Never replace their IDs to retry an unknown
 physical call. A different useful probe may reuse the same evidence.
+An independent review receipt is still not a Finding: exact Planner confirmation
+and the code-owned evidence/security promotion gate must both accept it.
 
 For web/API work, keep the Task's registered target and principal/session
 bindings, inspect live tool schemas, and preserve the actual request/response
@@ -94,6 +102,17 @@ purpose is tested or a new direction needs planner judgment; do not start anothe
 long investigation. Code enforces cumulative Task/Run limits and returns partial
 originals if the probe boundary ends. Do not invent final findings or bypass
 review to satisfy a limit or a completion condition.
+
+The probe context reports the remaining external-action, model-request and repair
+allowances. Use them to choose the next useful decision; they are informational
+and never replace code admission. One model decision is expected before execution,
+after each genuinely new tool result or bounded read that changes what is known,
+and for final settlement. Do not repeat an unchanged context.query/evidence.read,
+retry the same provider failure through a cloned Task, or spend repair requests on
+unchanged input. If provider access repeatedly fails, preserve the Task's originals
+and return its prerequisite for Planner reconsideration. A text-only answer holds
+the investigation; it is distinct from provider failure, an empty protocol reply,
+and task.settle.
 
 For completion/runtime diagnostics, use cause_scope, owner and repair_condition.
 Correct model_input using registered contracts when possible. When a proven

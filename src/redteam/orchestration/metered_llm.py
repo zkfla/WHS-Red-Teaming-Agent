@@ -7,20 +7,93 @@ import json
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import asdict, is_dataclass
 from typing import Any
 
 from redteam.core.ports.agent_prompts import AgentPrompts
 from redteam.core.ports.llm import LLMProviderFailure, StructuredCompletion
-from redteam.core.request_scope import RequestScope, current_request_scope, llm_request_scope
+from redteam.core.request_scope import (
+    RequestPurpose,
+    RequestScope,
+    clear_completed_request,
+    current_request_metadata,
+    current_request_scope,
+    llm_request_scope,
+    mark_completed_request,
+)
 from redteam.orchestration.llm_requests import RequestAdmissionError, RunRequestLedger
 
 __all__ = ["RequestScope", "current_request_scope", "llm_request_scope", "RunMeteredLLM",
            "configure_request_metering", "llm_request_guard", "current_request_guard"]
 
 
+def _purpose_for(stage: str | None) -> RequestPurpose:
+    """Classify from the code-owned call stage, never provider text."""
+    if stage == "task_atomization":
+        return "atomization"
+    if stage == "native_action":
+        return "worker_decision"
+    if stage and ("planning" in stage or stage == "attack_path_proposal"):
+        return "planning"
+    if stage and ("review" in stage or "completion" in stage or "verify" in stage):
+        return "review"
+    if stage and "conversation" in stage:
+        return "conversation"
+    return "other"
+
+
 _guard: ContextVar[Callable[[], Awaitable[None]] | None] = ContextVar(
     "llm_request_guard", default=None,
 )
+
+_PRIVATE_MODEL_KEYS = frozenset({
+    "continuation", "encrypted_content", "reasoning", "signature", "thinking",
+})
+
+
+def _public_value(value: Any) -> Any:
+    """Return JSON-shaped public material without provider-private state."""
+    if is_dataclass(value) and not isinstance(value, type):
+        value = asdict(value)
+    elif callable(getattr(value, "model_dump", None)):
+        value = value.model_dump(mode="json")
+    if isinstance(value, dict):
+        return {
+            str(key): _public_value(item)
+            for key, item in value.items()
+            if str(key).lower() not in _PRIVATE_MODEL_KEYS
+        }
+    if isinstance(value, (list, tuple)):
+        return [_public_value(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _request_payload(method: str, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Whitelisted public prompt fields; transport credentials never enter it."""
+    payload: dict[str, Any] = {
+        "method": method,
+        "system": _public_value(kwargs.get("system")),
+        "messages": _public_value(kwargs.get("messages", [])),
+    }
+    for name in ("response_schema", "tools"):
+        if name in kwargs:
+            payload[name] = _public_value(kwargs[name])
+    return payload
+
+
+def _response_payload(method: str, response: Any) -> Any:
+    """Only public text/JSON/tool calls; never hidden continuation data."""
+    if method == "complete_native":
+        return {
+            "text": _public_value(getattr(response, "text", "")),
+            "tool_calls": _public_value(getattr(response, "tool_calls", ())),
+            "protocol_error": _public_value(getattr(response, "protocol_error", None)),
+        }
+    if isinstance(response, StructuredCompletion):
+        return _public_value(response.value)
+    return _public_value(response)
 
 
 @contextmanager
@@ -64,6 +137,16 @@ class RunMeteredLLM:
         self.sleep = sleep
         self.prompts = prompts
         self.request_semaphore = request_semaphore
+        self._completed_request_ids: dict[int, str] = {}
+
+    def _remember_request(self, value: Any, request_id: str) -> None:
+        self._completed_request_ids[id(value)] = request_id
+        while len(self._completed_request_ids) > 256:
+            self._completed_request_ids.pop(next(iter(self._completed_request_ids)))
+
+    def request_id_for(self, value: Any) -> str | None:
+        """Consume the row identity paired with this exact response/exception object."""
+        return self._completed_request_ids.pop(id(value), None)
 
     async def _call(self, method: str, **kwargs: Any) -> Any:
         if self.request_semaphore is None:
@@ -72,6 +155,7 @@ class RunMeteredLLM:
             return await self._call_admitted(method, **kwargs)
 
     async def _call_admitted(self, method: str, **kwargs: Any) -> Any:
+        clear_completed_request()
         scope = current_request_scope()
         if scope is None:
             raise RequestAdmissionError("llm_request_run_scope_missing")
@@ -110,29 +194,81 @@ class RunMeteredLLM:
         if guard is not None:
             await guard()
         kwargs["num_retries"] = 0
-        request = await self.ledger.reserve(scope.run_id, owner=scope.owner, kind=method,
-                                            task_id=scope.task_id, stage=stage)
-        # A failed durable dispatch update never starts the external request.
-        # A possibly committed update is left reserved for explicit recovery.
-        await self.ledger.dispatch(scope.run_id, request)
+        metadata = current_request_metadata()
+        purpose = metadata.purpose if metadata is not None else _purpose_for(stage)
+        attempt_kind = metadata.attempt_kind if metadata is not None else "normal"
+        request = await self.ledger.reserve(
+            scope.run_id, owner=scope.owner, kind=method,
+            task_id=scope.task_id, stage=stage, purpose=purpose,
+            attempt_kind=attempt_kind,
+            request_payload=_request_payload(method, kwargs),
+        )
+        if metadata is not None:
+            metadata.request_id = request
+        # The attempt timeout wraps this facade as well as the provider. If it
+        # interrupts the durable dispatch boundary, atomically release a row
+        # that never crossed dispatch or charge a committed dispatch as unknown.
+        # In either case, do not let later decision classification mask the
+        # original timeout with a row-state conflict.
+        try:
+            await self.ledger.dispatch(scope.run_id, request)
+        except BaseException as exc:
+            charged: bool | None = None
+            try:
+                charged = await self.ledger.settle_interrupted_dispatch(
+                    scope.run_id, request,
+                )
+            except BaseException:
+                pass
+            if charged:
+                self._remember_request(exc, request)
+                mark_completed_request(scope.run_id, request)
+            elif metadata is not None:
+                metadata.request_id = None
+            raise
         try:
             response = await call(**kwargs)
         except BaseException as exc:
-            # If settlement itself fails, the durable dispatched reservation
-            # remains charged. Do not mask the original exception/cancellation.
+            # Provider failures atomically settle the request and advance the
+            # shared cooldown generation. Other failures/cancellation retain
+            # the original unknown-settlement behavior.
             try:
-                await self.ledger.settle(scope.run_id, request, unknown=True)
+                if isinstance(exc, LLMProviderFailure):
+                    await self.ledger.settle_provider_outcome(
+                        scope.run_id, request, failure=exc,
+                    )
+                else:
+                    await self.ledger.settle(scope.run_id, request, unknown=True)
             except BaseException:
                 pass
-            if isinstance(exc, LLMProviderFailure):
-                await self.ledger.record_provider_outcome(scope.run_id, exc)
+            self._remember_request(exc, request)
+            mark_completed_request(scope.run_id, request)
             raise
-        await self.ledger.settle(
+        await self.ledger.settle_provider_outcome(
             scope.run_id, request, total_tokens=getattr(response, "total_tokens", None),
             usage=getattr(response, "usage", None),
+            response_payload=_response_payload(method, response),
         )
-        await self.ledger.record_provider_outcome(scope.run_id)
+        self._remember_request(response, request)
+        mark_completed_request(scope.run_id, request)
         return response
+
+    async def classify_request(
+        self,
+        request_id: str,
+        *,
+        purpose: RequestPurpose | None = None,
+        outcome: str,
+        valid: bool,
+        made_progress: bool | None = None,
+    ) -> None:
+        scope = current_request_scope()
+        if scope is None:
+            raise RequestAdmissionError("llm_request_run_scope_missing")
+        await self.ledger.classify_decision(
+            scope.run_id, request_id, purpose=purpose, outcome=outcome,
+            valid=valid, made_progress=made_progress,
+        )
 
     async def complete(self, *, messages, system=None, **kwargs) -> str:
         if callable(getattr(self.client, "complete_with_usage", None)):

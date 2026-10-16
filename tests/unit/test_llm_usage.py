@@ -228,4 +228,7 @@ async def test_provider_failure_reaches_persisted_report_without_remote_material
     assert restored.run_outcome == "failed" and not restored.ready_for_release
     markdown = _render_markdown(restored)
     assert cause.code in markdown
+    if status is not None:
+        assert f"Provider status: {status}" in markdown
+    assert f"Provider retryable: {retryable}" in markdown
     assert sentinel not in restored.model_dump_json() + markdown

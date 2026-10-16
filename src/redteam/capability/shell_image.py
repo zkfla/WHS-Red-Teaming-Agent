@@ -11,9 +11,22 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from redteam.capability.shell_policy import ShellWorkroomPolicy
+from redteam.capability.shell_profiles import (
+    DEFAULT_SHELL_IMAGE_PROFILE,
+    PROFILE_REGISTRY_FILENAME,
+    ShellImageProfile,
+    package_input_sha256,
+    resolve_shell_image_profile,
+)
 from redteam.capability.windows_process_job import WindowsProcessJob
 
-RECIPE_FILES = ("Dockerfile", "packages.txt", "generate-manifest.py")
+RECIPE_FILES = (
+    "Dockerfile",
+    "packages.txt",
+    "packages-kali-default.txt",
+    PROFILE_REGISTRY_FILENAME,
+    "generate-manifest.py",
+)
 IMAGE_TAG_PREFIX = "whs-shell-workroom"
 MANIFESTS_DIRNAME = "manifests"
 GENERATOR_FILENAME = "generate-manifest.py"
@@ -77,18 +90,27 @@ def resolve_asset_dir() -> Path:
     return default_data
 
 
-def recipe_hash(asset_dir: Path) -> str:
+def recipe_hash(
+    asset_dir: Path, profile_name: str = DEFAULT_SHELL_IMAGE_PROFILE
+) -> str:
+    profile = resolve_shell_image_profile(asset_dir, profile_name)
     digest = hashlib.sha256()
     base = Path(asset_dir)
-    for name in RECIPE_FILES:
+    # A broad profile input does not invalidate the baseline cache and vice versa.
+    for name in ("Dockerfile", PROFILE_REGISTRY_FILENAME, "generate-manifest.py",
+                 profile.package_input):
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
         digest.update((base / name).read_bytes())
         digest.update(b"|")
     return digest.hexdigest()
 
 
-def image_tag_for(recipe_digest: str) -> str:
+def image_tag_for(
+    recipe_digest: str, profile_name: str = DEFAULT_SHELL_IMAGE_PROFILE
+) -> str:
     short = recipe_digest[:16]
-    return f"{IMAGE_TAG_PREFIX}:{short}"
+    return f"{IMAGE_TAG_PREFIX}-{profile_name}:{short}"
 
 
 def _terminate_tree(proc, job: WindowsProcessJob | None = None) -> None:
@@ -221,14 +243,76 @@ def manifest_command(
     asset_dir: Path,
     image_id: str,
     output: Path,
+    profile_name: str = DEFAULT_SHELL_IMAGE_PROFILE,
 ) -> tuple[str, ...]:
     gen = str(_generator_path_for(asset_dir))
     cmd: list[str] = [sys.executable, gen, "--offline", "--image", image_id]
     cmd.extend(["--output", str(output)])
+    cmd.extend(["--profile", profile_name])
     cmd.extend(["--docker-binary", policy.docker_binary])
     if policy.docker_context is not None:
         cmd.extend(["--docker-context", policy.docker_context])
     return tuple(cmd)
+
+
+def validate_generated_manifest(
+    data: object,
+    *,
+    image_id: str,
+    profile: ShellImageProfile,
+    package_sha256: str,
+) -> None:
+    """Validate the v2 live-image inventory before it can be published."""
+    if not isinstance(data, dict) or data.get("image_digest") != image_id:
+        raise ShellImageError("manifest image digest mismatch")
+    if data.get("inventory_schema_version") != 2:
+        raise ShellImageError("manifest inventory schema mismatch")
+    if data.get("profile") != profile.name:
+        raise ShellImageError("manifest image profile mismatch")
+    if data.get("package_input") != profile.package_input:
+        raise ShellImageError("manifest package input mismatch")
+    if data.get("package_input_sha256") != package_sha256:
+        raise ShellImageError("manifest package input digest mismatch")
+    programs = data.get("programs")
+    if not isinstance(programs, list):
+        raise ShellImageError("manifest program inventory is invalid")
+    identities: set[tuple[str, str]] = set()
+    for program in programs:
+        if not isinstance(program, dict):
+            raise ShellImageError("manifest program inventory is invalid")
+        executables = program.get("executables")
+        status = program.get("inventory_status")
+        if not isinstance(executables, list):
+            raise ShellImageError("manifest program inventory is invalid")
+        if status != ("enumerated" if executables else "no_executable"):
+            raise ShellImageError("manifest package executable status mismatch")
+        for executable in executables:
+            if not isinstance(executable, dict):
+                raise ShellImageError("manifest executable inventory is invalid")
+            command = executable.get("command")
+            path = executable.get("path")
+            path_status = executable.get("path_status")
+            resolved = executable.get("resolved_path")
+            if (
+                not isinstance(command, str)
+                or not command
+                or not isinstance(path, str)
+                or not path.startswith("/")
+                or path_status not in {"effective", "shadowed", "off_path"}
+            ):
+                raise ShellImageError("manifest executable inventory is invalid")
+            identity = (command, path)
+            if identity in identities:
+                raise ShellImageError("manifest duplicate executable identity")
+            identities.add(identity)
+            if path_status == "effective" and resolved != path:
+                raise ShellImageError("manifest effective path mismatch")
+            if path_status == "shadowed" and (
+                not isinstance(resolved, str) or not resolved or resolved == path
+            ):
+                raise ShellImageError("manifest shadowing status mismatch")
+            if path_status == "off_path" and resolved is not None:
+                raise ShellImageError("manifest off-path status mismatch")
 
 
 async def build_default_image(
@@ -236,13 +320,16 @@ async def build_default_image(
     cache_dir: Path,
     progress: Callable[[str], None] | None = None,
     runner: Callable[[tuple[str, ...], float], Awaitable[tuple[int, str, str]]] | None = None,
+    profile_name: str = DEFAULT_SHELL_IMAGE_PROFILE,
 ) -> tuple[str, str]:
     asset_dir = resolve_asset_dir()
     for name in RECIPE_FILES:
         if not (asset_dir / name).is_file():
             raise ShellImageError("canonical recipe file missing")
-    digest = recipe_hash(asset_dir)
-    tag = image_tag_for(digest)
+    profile = resolve_shell_image_profile(asset_dir, profile_name)
+    package_sha256 = package_input_sha256(asset_dir, profile)
+    digest = recipe_hash(asset_dir, profile.name)
+    tag = image_tag_for(digest, profile.name)
     run = runner if runner is not None else _default_runner
     if progress is not None:
         progress("Checking cached image")
@@ -255,7 +342,12 @@ async def build_default_image(
     else:
         if progress is not None:
             progress("Building workroom image")
-        build_cmd = policy.docker_command("build", "-t", tag, str(asset_dir))
+        build_cmd = policy.docker_command(
+            "build",
+            "--build-arg", f"SHELL_IMAGE_PROFILE={profile.name}",
+            "--build-arg", f"PACKAGE_INPUT={profile.package_input}",
+            "-t", tag, str(asset_dir),
+        )
         bcode, _bout, _berr = await run(build_cmd, BUILD_TIMEOUT_SECONDS)
         if bcode != 0:
             raise ShellImageError("docker build failed")
@@ -268,7 +360,9 @@ async def build_default_image(
     manifest_path = _manifest_path_for(cache_dir, digest)
     if progress is not None:
         progress("Generating program manifest")
-    gen_cmd = manifest_command(policy, asset_dir, image_id, manifest_path)
+    gen_cmd = manifest_command(
+        policy, asset_dir, image_id, manifest_path, profile.name
+    )
     gcode, _gout, _gerr = await run(gen_cmd, MANIFEST_TIMEOUT_SECONDS)
     if gcode != 0:
         raise ShellImageError("manifest generation failed")
@@ -280,13 +374,9 @@ async def build_default_image(
         data = json.loads(raw)
     except ValueError as exc:
         raise ShellImageError("manifest is not valid JSON") from exc
-    found = ""
-    if isinstance(data, dict):
-        value = data.get("image_digest")
-        if isinstance(value, str):
-            found = value.strip()
-    if found != image_id:
-        raise ShellImageError("manifest image digest mismatch")
+    validate_generated_manifest(
+        data, image_id=image_id, profile=profile, package_sha256=package_sha256
+    )
     if progress is not None:
         progress("Validating program manifest")
     return (image_id, str(manifest_path))

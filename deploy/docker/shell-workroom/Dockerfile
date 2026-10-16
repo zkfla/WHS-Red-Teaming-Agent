@@ -28,18 +28,29 @@ ARG DEBIAN_FRONTEND=noninteractive
 # --build-arg KALI_MIRROR=<official mirror>/kali.
 ARG KALI_MIRROR=http://mirror.wane.kr/kali
 
-# The install set comes ONLY from packages.txt (single source); the same
-# file generates program-manifest.json after the build. ca-certificates
+# The selected install set comes from one repository-owned profile input;
+# the same exact file generates program-manifest.json after the build.
+# baseline remains the default. kali-default must be selected explicitly:
+#   --build-arg SHELL_IMAGE_PROFILE=kali-default \
+#   --build-arg PACKAGE_INPUT=packages-kali-default.txt
+# ca-certificates
 # is installed FIRST so later stages (and any consumer that switches the
 # image to HTTPS) have a real CA bundle; the big install then proceeds on
 # the same signed HTTP source.
-COPY packages.txt /tmp/shell-workroom-packages.txt
+ARG SHELL_IMAGE_PROFILE=baseline
+ARG PACKAGE_INPUT=packages.txt
+COPY packages*.txt /tmp/shell-workroom-profiles/
 
 # The workroom tree must serve ANY policy uid, not just 65532: the
 # manager runs cap-drop ALL, where even root cannot chmod a path owned
 # by another uid, so the writable+exec modes are baked here at build
 # time (full privilege) rather than fixed up at runtime.
 RUN set -e; \
+    case "$SHELL_IMAGE_PROFILE:$PACKAGE_INPUT" in \
+      baseline:packages.txt|kali-default:packages-kali-default.txt) ;; \
+      *) echo "invalid shell image profile/package input" >&2; exit 1 ;; \
+    esac; \
+    cp "/tmp/shell-workroom-profiles/$PACKAGE_INPUT" /tmp/shell-workroom-packages.txt; \
     if [ -f /etc/apt/sources.list.d/kali.sources ]; then \
       sed -i "s|^URIs: .*|URIs: $KALI_MIRROR|" /etc/apt/sources.list.d/kali.sources; \
       grep -q "^URIs: $KALI_MIRROR" /etc/apt/sources.list.d/kali.sources; \

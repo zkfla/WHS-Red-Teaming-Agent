@@ -69,6 +69,23 @@ class SplitDouble(FakeLLMClient):
             result = response(payload) if callable(response) else response
             if stdlib_inspect.isawaitable(result):
                 result = await result
+            if (
+                not payload.get("candidates")
+                and isinstance(result, dict)
+                and result.get("context_request") is None
+                and not result.get("updates")
+            ):
+                result = {**result, "updates": [{
+                    "expected_revision": None,
+                    "hypothesis": {
+                        "contract_version": 2,
+                        "hypothesis_id": "initial-local",
+                        "description": "A target security premise remains untested",
+                        "target_node_ids": [TARGET],
+                        "reason": "Preserve the first scoped uncertainty for investigation",
+                        "status": "open",
+                    },
+                }]}
             return result
         if "tasks" in props:
             body = messages[-1]["content"].split("\n\nPrevious attempt failed")[0]
@@ -391,6 +408,7 @@ async def test_legacy_single_stage_storage_resume_compat(tmp_path):
     from tests.integration.test_central_completion import OriginalProtocolDouble
     from tests.integration.test_central_development import gateway
     from tests.integration.test_central_parallel import limits
+    from tests.integration.test_hypothesis_planner import candidate as _candidate
     from tests.integration.test_hypothesis_planner import probe as _probe
     original, configured = limits()
     original.metadata["success_criteria"] = ["Assess the original response"]
@@ -399,7 +417,7 @@ async def test_legacy_single_stage_storage_resume_compat(tmp_path):
     config = AppConfig(engagement=EngagementConfig.model_validate(
         original.model_dump(exclude={"engagement_id", "created_at"})))
     root = tmp_path / "run"
-    llm = FakeLLMClient(canned_structured={"tasks": [_probe()],
+    llm = FakeLLMClient(canned_structured={"updates": [_candidate()], "tasks": [_probe()],
                                           "reason": "No candidate yet"})
     tools = OriginalProtocolDouble(gateway())
     options = {"llm": llm, "tool_gateway": tools, "tool_catalog": tools.catalog}
@@ -457,11 +475,12 @@ def _profile_run_config(profile):
     return config, configured
 
 async def test_legacy_bound_run_accepts_same_profile_resume(tmp_path):
+    from tests.integration.test_hypothesis_planner import candidate as _candidate
     from tests.integration.test_hypothesis_planner import probe as _probe
     legacy = PROFILE.with_name("native-probes-legacy.yaml")
     config, configured = _profile_run_config(legacy)
     root = tmp_path / "run"
-    llm = FakeLLMClient(canned_structured={"tasks": [_probe()],
+    llm = FakeLLMClient(canned_structured={"updates": [_candidate()], "tasks": [_probe()],
                                           "reason": "No candidate yet"})
     tools = OriginalProtocolDouble(gateway())
     options = {"llm": llm, "tool_gateway": tools, "tool_catalog": tools.catalog}
@@ -478,12 +497,13 @@ async def test_legacy_bound_run_accepts_same_profile_resume(tmp_path):
         assert len(await session.deps.central_state.list_tasks()) == 1
 
 async def test_legacy_bound_run_refuses_split_profile_resume(tmp_path):
+    from tests.integration.test_hypothesis_planner import candidate as _candidate
     from tests.integration.test_hypothesis_planner import probe as _probe
     legacy = PROFILE.with_name("native-probes-legacy.yaml")
     config, legacy_configured = _profile_run_config(legacy)
     _, split_configured = _profile_run_config(PROFILE)
     root = tmp_path / "run"
-    llm = FakeLLMClient(canned_structured={"tasks": [_probe()],
+    llm = FakeLLMClient(canned_structured={"updates": [_candidate()], "tasks": [_probe()],
                                           "reason": "No candidate yet"})
     tools = OriginalProtocolDouble(gateway())
     options = {"llm": llm, "tool_gateway": tools, "tool_catalog": tools.catalog}

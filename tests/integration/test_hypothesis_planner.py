@@ -87,7 +87,17 @@ class PlannerDouble(FakeLLMClient):
         await self._wait_response("complete_structured", messages)
         self.planner_inputs.append(payload)
         response = self.decisions.pop(0) if self.decisions else held()
-        return response(payload) if callable(response) else response
+        result = response(payload) if callable(response) else response
+        if (
+            not payload.get("candidates")
+            and isinstance(result, dict)
+            and result.get("context_request") is None
+            and not result.get("updates")
+        ):
+            # The runtime contract requires the first final judgment to seed a
+            # tentative candidate. Scripted doubles model that invariant too.
+            result = {**result, "updates": [candidate()]}
+        return result
 
 
 @pytest.mark.parametrize("verdict", ["success", "refuted"])
@@ -163,7 +173,7 @@ async def test_initial_observation_and_same_event_redelivery_are_distinct(tmp_pa
         assert await planner.advance(session.runtime) == []
         assert await SpecialistPlanner(session.deps).advance(session.runtime) == []
         assert len(llm.planner_inputs) == 1
-        assert await AttackGraphService(session.deps.graph_store).list_hypotheses() == []
+        assert len(await AttackGraphService(session.deps.graph_store).list_hypotheses()) == 1
         llm.native_responses_by_task[identity] = [discover(TOOL), turn(inspect("initial"))]
         await drive(session)
         llm.decisions.append(lambda p: {

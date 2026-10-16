@@ -516,6 +516,15 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     # judgment. Free-text messages and inputs never do.
     execution_diagnostic = orchestration_diagnostic
     if execution_diagnostic is None and result.error is not None:
+        from redteam.orchestration.execution_projection import execution_outcome
+
+        selection = None
+        current_execution_id = state.get("current_execution_id")
+        if getattr(deps, "central_state", None) is not None and current_execution_id:
+            current_execution = await deps.central_state.get_execution(current_execution_id)
+            if current_execution is not None:
+                selection = current_execution.selection
+        projected = execution_outcome(result, selection=selection)
         returned_details = result.error.details
         returned_stage = (
             returned_details.get("stage")
@@ -536,6 +545,9 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             kind="execution",
             summary=f"Tool execution failed: {result.error.code}"[:500],
             retryable=bool(result.error.retryable),
+            cause_scope=projected.cause_scope,
+            owner="orchestration.execution_projection",
+            repair_condition=projected.resume_condition,
             error_type=returned_exception_type[:100] if returned_exception_type else "",
         )
 

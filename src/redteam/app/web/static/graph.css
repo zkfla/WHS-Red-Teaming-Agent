@@ -19,11 +19,13 @@
 .graph-edge { fill: none; stroke: rgba(244,245,235,.45); stroke-width: 1.7; }
 .graph-edge.wakes { stroke: var(--tn); stroke-dasharray: 7 6; opacity: .7; }
 .graph-edge.returned { stroke-dasharray: 4 5; opacity: .6; }
+.graph-edge.model_exchange { stroke: var(--or); stroke-dasharray: 3 5; }
 .graph-edge.stored { stroke: var(--tn); }
 .graph-edge.highlighted { stroke-width: 2.8; stroke: var(--tn); opacity: 1; }
 .graph-edge.dim { opacity: .13; }
 .graph-arrow { fill: var(--on-dark); }
 .graph-arrow.stored, .graph-arrow.wakes { fill: var(--tn); }
+.graph-arrow.model_exchange { fill: var(--or); }
 .gnode { position: absolute; display: grid; grid-template-columns: 28px minmax(0,1fr); grid-template-rows: 1fr auto; column-gap: 9px; row-gap: 8px; width: 238px; height: 112px; padding: 13px 14px; border: 1px solid rgba(244,245,235,.3); border-radius: 14px; background: var(--dg); color: var(--bg); text-align: left; box-shadow: 0 7px 20px rgba(40,54,24,.35); }
 .gnode:hover { border-color: var(--tn); background: var(--ol); }
 .gnode.on, .gnode.search-match { border: 2px solid var(--tn); box-shadow: 0 0 0 4px rgba(221,161,94,.12), 0 6px 16px rgba(40,54,24,.3); }
@@ -33,6 +35,8 @@
 .gnode.failed { border-color: var(--or); background: rgba(188,108,37,.13); }
 .gnode.done { border-style: solid; }
 .gnode.on { border-color: var(--tn); }
+.gnode.llm { border-color: var(--or); }
+.gnode.llm .gnode-icon { color: var(--or); }
 .gnode-icon { display: grid; place-items: center; align-self: start; width: 28px; height: 28px; border-radius: 9px; background: var(--on-dark-soft); color: var(--tn); }
 .gnode-icon .ui-icon { width: 17px; height: 17px; }
 .gnode-copy { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
@@ -47,7 +51,20 @@
 .graph-legend > span { display: flex; align-items: center; gap: 6px; }
 .legend-line { display: inline-block; width: 17px; border-top: 2px solid var(--on-dark); }
 .legend-line.stored { border-color: var(--tn); }
+.legend-line.model-exchange { border-color: var(--or); border-top-style: dotted; }
 .legend-line.wakes { border-color: var(--tn); border-top-style: dashed; }
+.gexchange-list { display: grid; gap: 8px; margin-top: 8px; }
+.gexchange { border: 1px solid var(--line); border-radius: 10px; background: var(--bg); overflow: hidden; }
+.gexchange.waiting { border-color: var(--tn); }
+.gexchange.failed, .gexchange.unknown { border-color: var(--or); }
+.gexchange summary { display: flex; justify-content: space-between; gap: 10px; padding: 10px 11px; cursor: pointer; font-size: 11px; }
+.gexchange-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); }
+.gexchange-state { flex: none; color: var(--text-2); }
+.gexchange-body { padding: 0 11px 11px; border-top: 1px solid var(--line); }
+.gexchange-body h5 { margin: 11px 0 5px; font-size: 10px; color: var(--text-2); text-transform: uppercase; letter-spacing: .04em; }
+.gexchange-content { margin-top: 10px; }
+.gexchange-content pre { max-height: 360px; margin: 0; padding: 10px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--dg); color: var(--bg); font: 10px/1.55 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+.gexchange-content .note { margin: 6px 0 0; padding: 0; }
 .graph-zoom { display: flex; align-items: center; gap: 3px; border: 1px solid var(--on-dark-soft); border-radius: 10px; padding: 3px; background: rgba(244,245,235,.04); }
 .graph-zoom button { border: 0; background: transparent; min-width: 28px; height: 28px; border-radius: 6px; padding: 0 6px; font-size: 14px; color: var(--bg); }
 .graph-zoom button:hover:not(:disabled) { background: var(--on-dark-soft); }

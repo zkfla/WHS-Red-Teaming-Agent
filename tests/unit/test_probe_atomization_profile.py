@@ -10,22 +10,22 @@ from tests.integration.test_central_development import PROFILE
 PROBES = PROFILE.with_name("native-probes.yaml")
 LEGACY = PROFILE.with_name("native-probes-legacy.yaml")
 
-# Golden constants for the version-16 single-stage v3 compatibility profile,
-# whose shared Worker prompt now prefers available Kali Bash execution.
+# Golden constants for the version-18 single-stage v3 compatibility profile,
+# whose shared Worker prompt binds restrained execution and v2 promotion guidance.
 # This does not assert compatibility with older prompt/profile versions;
 # integration tests separately require matching selection fingerprints on resume.
 # Runtime fingerprints hash raw prompt bytes, so both LF and CRLF prompt variants
 # are pinned while the YAML checksum is newline-canonicalized.
-LEGACY_YAML_LF_SHA256 = "032f26f475b0b1e3cf362fbd982b70536e2a3b5f87f121c92dd40db2e2b56b89"
-LEGACY_FINGERPRINT_LF = "20a1f2d00c8e315653e38c0b15aae1d8201c9f18f080ea22cbc4587a96ffb041"
-LEGACY_FINGERPRINT_CRLF = "072e1f54336f0f15d15fd0b8d18c9ff4ffe2d28bd8ca3cccb4cb495e38e814cf"
+LEGACY_YAML_LF_SHA256 = "c31b04f283f2d528528484ab3b24db864c9300a01734426e8957f7dbd565dc79"
+LEGACY_FINGERPRINT_LF = "c6bdbda91a944aacb38e6cadbf5bfb6a72245e6c49bb3c0828e0081ac9fc5148"
+LEGACY_FINGERPRINT_CRLF = "8be2502f6e689d34cd520dba7783ab5d7f230d6e40606a146caba8e048f17c5f"
 
 
 def test_legacy_golden_fingerprint_and_bytes():
     canonical = LEGACY.read_bytes().replace(b"\r\n", b"\n")
     assert hashlib.sha256(canonical).hexdigest() == LEGACY_YAML_LF_SHA256
     loaded = load_specialist_profile(LEGACY)
-    assert loaded.profile.version == "16"
+    assert loaded.profile.version == "18"
     assert loaded.fingerprint in {LEGACY_FINGERPRINT_CRLF, LEGACY_FINGERPRINT_LF}
     assert loaded.run_policy().probe_atomization is False
     assert loaded.run_policy().fingerprint == loaded.fingerprint
@@ -36,6 +36,7 @@ def test_legacy_golden_fingerprint_and_bytes():
         "b176b4317993b1483666b9dcfa330d0f413a2ca616435a931b21ca0af0046ffe",
         "92dbea51ba10fd7a019a312a1cfd85dc9db4cba2bcef39dce77ebeb9c3524cf5",
         "b0dfb2534e37b4418138dc0ab54ddd924a6f975b156c51526b58c909b224a2c5",
+        "20a1f2d00c8e315653e38c0b15aae1d8201c9f18f080ea22cbc4587a96ffb041",
     }  # Historical selections must not silently resume with the new contract.
 
 

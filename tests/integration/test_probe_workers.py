@@ -15,7 +15,7 @@ from redteam.core.config import AppConfig, EngagementConfig
 from redteam.core.contracts.completion import CompletionCriterion, criterion_id
 from redteam.core.contracts.execution import ExecutionState
 from redteam.core.enums import ApprovalStatus, TaskStatus, ToolHealthStatus
-from redteam.core.ports.llm import NativeCompletion
+from redteam.core.ports.llm import LLMProviderFailure, NativeCompletion, NativeToolCall
 from redteam.llm.fake import FakeLLMClient
 from redteam.orchestration.agents.tool_access import eligible_role_tool_ids
 from redteam.orchestration.central_runtime import ACTOR_RETURNED, ready_workers
@@ -26,6 +26,7 @@ from redteam.orchestration.graph_recording import GraphRecordingHandler
 from redteam.orchestration.llm_requests import RequestAdmissionError
 from redteam.orchestration.local_tools import LocalToolContext
 from redteam.orchestration.metered_llm import llm_request_scope
+from redteam.orchestration.native_binding import exposed_tool_name
 from redteam.orchestration.probes import context_for_probe
 from redteam.orchestration.specialist_tasks import HypothesisProbeProposal, register_probe_tasks
 from redteam.orchestration.worker_session import WorkerSession
@@ -69,7 +70,10 @@ async def selection(tmp_path, *, tools=None, llm=None, jobs=None, profile=PROFIL
         yield session, llm, tools
 
 
-async def register(session, key, *, actions=1, requests=8, hypotheses=None, updates=()):
+async def register(
+    session, key, *, actions=1, requests=8, hypotheses=None, updates=(),
+    objective="Observe one response",
+):
     state = session.deps.central_state
     service = AttackGraphService(session.deps.graph_store)
     mission = await state.get_mission(session.runtime.mission_id)
@@ -78,7 +82,7 @@ async def register(session, key, *, actions=1, requests=8, hypotheses=None, upda
                     for update in updates if update.get("expected_revision") is not None)
     read = {ref: content_hash(await service.get_node(ref)) for ref in subjects}
     proposal = HypothesisProbeProposal.model_validate({"updates": list(updates), "tasks": [{
-        "task_key": key, "title": "Short response probe", "objective": "Observe one response",
+        "task_key": key, "title": "Short response probe", "objective": objective,
         "role_id": "probe-worker", "target_node_ids": [TARGET],
         "completion_criteria": [{"kind": "observation", "description": "Inspect the response"}],
         "hypothesis_revisions": hypotheses or {},
@@ -166,6 +170,7 @@ async def test_common_pool_stops_extra_calls_and_isolates_worker_context(tmp_pat
                 lambda tx, identity=identity: tx.probe_usage(identity), write=False,
             )
             assert usage["actions"] == 1 and usage["model_requests"] == 2
+            assert usage["external_tool_decisions"] == 1
         assert len(llm.requests) == 4
         payloads = [worker_input(item["messages"]) for item in llm.requests]
         assert all(len(payload["investigation_tasks"]) == 1 for payload in payloads)
@@ -174,6 +179,119 @@ async def test_common_pool_stops_extra_calls_and_isolates_worker_context(tmp_pat
         }
         assert all(payload["probe"]["candidates"] == {} for payload in payloads)
         assert await AttackGraphService(session.deps.graph_store).list_findings() == []
+
+
+async def test_provider_failure_circuit_survives_new_worker_and_same_purpose_task(tmp_path):
+    class FailingThenTextModel(FakeLLMClient):
+        def __init__(self):
+            super().__init__()
+            self.native_calls = 0
+
+        async def complete_native(self, *args, **kwargs):
+            self.native_calls += 1
+            if self.native_calls <= 2:
+                raise LLMProviderFailure(kind="server", http_status=503, retryable=True)
+            return NativeCompletion(text="provider recovered")
+
+    llm = FailingThenTextModel()
+    async with selection(tmp_path, llm=llm) as (session, llm, tools):
+        first = await register(session, "provider-failures")
+        first_result, = await drive(session)
+        assert first_result.runtime.planning_diagnostic.code == (
+            "probe_provider_failure_circuit_open"
+        )
+        assert llm.native_calls == 2
+        first_usage = await session.deps.central_state.transaction(
+            lambda tx: tx.probe_usage(first), write=False,
+        )
+        assert first_usage["provider_failures"] == 2
+        assert first_usage["transport_retries"] == 1
+        assert first_usage["actions"] == 0
+
+        # Limits remain part of resume/completion binding, but changing only a
+        # limit must not create a fresh provider-failure circuit.
+        clone = await register(session, "same-purpose-clone", requests=7)
+        clone_result, = await drive(session)
+        assert clone_result.runtime.planning_diagnostic.code == (
+            "probe_provider_failure_circuit_open"
+        )
+        assert llm.native_calls == 2
+        assert (await session.deps.central_state.transaction(
+            lambda tx: tx.probe_usage(clone), write=False,
+        ))["model_requests"] == 0
+
+        different = await register(
+            session, "different-purpose", objective="Observe a different response property",
+        )
+        different_result, = await drive(session)
+        assert different_result.runtime.termination_reason == "investigation_held"
+        assert llm.native_calls == 3
+        assert (await session.deps.central_state.transaction(
+            lambda tx: tx.probe_usage(different), write=False,
+        ))["text_only_held"] == 1
+
+
+async def test_task_repair_cap_is_shared_with_total_request_ledger(tmp_path):
+    async with selection(tmp_path) as (session, llm, tools):
+        identity = await register(session, "repair-cap")
+        worker, = await ready_workers(session.deps, session.runtime)
+        ledger = session.deps.central_state.request_ledger()
+        for index in range(2):
+            request = await ledger.reserve(
+                str(worker.run_id), owner=worker.work_owner, kind="complete_native",
+                task_id=identity, stage="native_action", purpose="worker_decision",
+                attempt_kind="format_repair",
+            )
+            await ledger.dispatch(str(worker.run_id), request)
+            await ledger.settle_provider_outcome(
+                str(worker.run_id), request, total_tokens=index + 1,
+            )
+            await ledger.classify_decision(
+                str(worker.run_id), request, outcome="format_rejected", valid=False,
+                made_progress=False,
+            )
+        with pytest.raises(RequestAdmissionError) as caught:
+            await ledger.reserve(
+                str(worker.run_id), owner=worker.work_owner, kind="complete_native",
+                task_id=identity, stage="native_action", purpose="worker_decision",
+                attempt_kind="format_repair",
+            )
+        assert caught.value.reason_code == "probe_repair_request_limit_exhausted"
+        usage = await session.deps.central_state.transaction(
+            lambda tx: tx.probe_usage(identity), write=False,
+        )
+        assert usage["model_requests"] == usage["repairs"] == 2
+        assert usage["request_outcomes"]["format_rejected"] == 2
+
+
+async def test_invalid_arguments_unknown_tool_and_settlement_are_distinct_outcomes(tmp_path):
+    async with selection(tmp_path) as (session, llm, tools):
+        identity = await register(session, "native-outcomes")
+        llm.native_responses_by_task[identity] = [
+            turn(NativeToolCall(
+                call_id="invalid-arguments",
+                name=exposed_tool_name(TOOL),
+                arguments={},
+                argument_error="arguments did not match the advertised schema",
+            )),
+            turn(call("unknown", "unregistered.tool", {})),
+            turn(call("settle", "task.settle", {
+                "outcome": "inconclusive",
+                "reason": "No valid external action was selected",
+                "evidence_ids": [],
+            })),
+        ]
+
+        outcome, = await drive(session)
+        assert outcome.kind == "completed", outcome.error
+        usage = await session.deps.central_state.transaction(
+            lambda tx: tx.probe_usage(identity), write=False,
+        )
+        assert usage["request_outcomes"]["invalid_tool_arguments"] == 1
+        assert usage["request_outcomes"]["unknown_tool"] == 1
+        assert usage["request_outcomes"]["accepted"] == 1
+        assert usage["settlements"] == 1
+        assert usage["external_tool_decisions"] == usage["actions"] == 0
 
 
 async def test_model_boundary_returns_without_another_request_and_budget_never_resets(tmp_path):

@@ -45,6 +45,12 @@ canonical `capture_snapshot`, related reads, exact source/result·후보 revisio
 의미대로 처리한다. atomizer는 기존의 관련 handoff, issued IDs, coverage 검증을 유지하며
 전체 Planner 자료·모델 원장을 다시 받지 않는다.
 
+Planner가 깨어난 시점의 canonical 후보 inventory가 비어 있으면 최종 judgment는 등록된
+target에 연결된 검증 전 후보를 최소 하나 제안해야 한다. 후보에는 아직 확인하지 않은 전제를
+명시하고 `open`/`inconclusive`/`held` 상태를 사용한다. 코드 validator가 이 조건을 검사하며,
+lookup-only 응답은 조회 후의 최종 judgment가 아니므로 예외다. 이 규칙은 Finding 확정 조건을
+낮추지 않으며 후보 생성 자체를 취약점 확인으로 취급하지 않는다.
+
 ## provider 전달과 한계
 
 Chat은 첫 system 메시지와 별도 `response_format`을, Responses는 `instructions`와
@@ -64,10 +70,10 @@ HTTP JSON 필드 순서는 모델이 해석하는 prompt 순서와 같은 개념
 
 ## version과 resume
 
-10b 도입 당시 profile은 16/13이었다. 현재 `native-probes`는 profile 19 / strategy prompt 9,
-single-stage 호환 profile은 16 / planner prompt 5다. Worker prompt는 11이며 atomizer는 4다.
+10b 도입 당시 profile은 16/13이었다. 현재 `native-probes`는 profile 22 / strategy prompt 9,
+single-stage 호환 profile은 19 / planner prompt 5다. Worker prompt는 14이며 atomizer는 4다.
 기존 prompt SHA와 profile fingerprint가 달라지며, `specialist_planning_inputs`에도
-`planner_request_contract_version=1`을 포함한다. 따라서 prompt bytes가 그대로인 custom
+`planner_request_contract_version=3`을 포함한다. 따라서 prompt bytes가 그대로인 custom
 profile도 기존 코드 계약의 Run으로 조용히 재개되지 않는다. 기존 planning binding 검사에서
 다른 입력으로 거부하고 새 Run을 사용한다. 과거 DB/보고서/checkpoint를 수정하거나 backfill하지 않는다.
 

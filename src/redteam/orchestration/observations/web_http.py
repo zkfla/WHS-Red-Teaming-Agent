@@ -532,6 +532,11 @@ def map_web_http_request(
     if port is not None:
         facts["port"] = port
     observation = http_observation(arguments, result)
+    if "http_receipt" in output and observation is None:
+        # The canonical provider declared a receipt but it failed its
+        # producer/consumer consistency checks.  Do not downgrade it to a
+        # legacy summary and do not create graph evidence from it.
+        return GraphMutation()
     if isinstance(observation, dict):
         observation["body_sha256"] = f"sha256:{digest.lower()}"
         for metadata_key in ("redirect_metadata", "auth_challenge", "cookie_metadata"):

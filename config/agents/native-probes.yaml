@@ -5,9 +5,13 @@
 # old Runs/tests lives in native-probes-legacy.yaml (compat only, not a feature).
 schema_version: '3'
 profile_id: native-probes
-version: '19'
+version: '22'
 common: {path: prompts/common.md, version: '2', contract_version: '1'}
-probe_limits: {max_actions: 4, max_model_requests: 16}
+probe_limits:
+  max_actions: 4
+  max_model_requests: 8
+  max_repair_requests: 2
+  max_consecutive_provider_failures: 2
 max_instances: 2
 max_activations: 8
 max_tasks_per_strategy: 8
@@ -51,7 +55,7 @@ roles:
       capabilities: [web, api, recon, mobile, analysis]
       tool_selection: {capability_tags: [web, api, recon, mobile, analysis]}
       context_profile: {profile_id: probe_execution}
-    prompt: {path: prompts/worker.md, version: '11'}
+    prompt: {path: prompts/worker.md, version: '14'}
   - definition:
       agent_id: research-evidence
       role: research_evidence

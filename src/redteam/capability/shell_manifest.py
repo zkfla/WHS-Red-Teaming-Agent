@@ -51,8 +51,46 @@ def _script_max_chars(policy: ShellWorkroomPolicy | None) -> int:
     return int(ShellWorkroomPolicy.model_fields["max_script_bytes"].default)
 
 
+def program_input_property(
+    policy: ShellWorkroomPolicy | None = None, *, max_chars: int | None = None
+) -> dict:
+    """Versioned structured-program input owned by the shell capability.
+
+    ``argv`` contains arguments after argv[0]; the provider prepends the
+    discovered absolute executable.  There is intentionally no environment,
+    host path, Docker option, workroom identity, or route selector here.
+    """
+    stdin_max = _script_max_chars(policy) if max_chars is None else int(max_chars)
+    return {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "minLength": 1, "maxLength": 256},
+            "executable": {
+                "type": "string", "minLength": 2, "maxLength": 4096,
+                "pattern": "^/",
+                "description": "Exact absolute path returned by program discovery.",
+            },
+            "owner_scope": {"type": "string", "enum": ["image", "instance"]},
+            "argv": {
+                "type": "array", "maxItems": 128,
+                "items": {"type": "string", "maxLength": 4096},
+                "description": "Arguments after argv[0]; no shell parsing is performed.",
+            },
+            "stdin": {
+                "type": "string", "maxLength": stdin_max,
+                "description": (
+                    "Optional bytes supplied to the program stdin. The runtime also "
+                    f"enforces a {stdin_max}-byte UTF-8 limit."
+                ),
+            },
+        },
+        "required": ["name", "executable", "owner_scope", "argv"],
+        "additionalProperties": False,
+    }
+
+
 def _run_input_schema(policy: ShellWorkroomPolicy | None) -> dict:
-    """Script-execution input schema with policy-derived bounds.
+    """Script-or-discovered-program input schema with policy-derived bounds.
 
     ``maxLength`` counts JSON characters while the runtime enforces UTF-8
     bytes; the description says so because the schema language cannot
@@ -99,8 +137,15 @@ def _run_input_schema(policy: ShellWorkroomPolicy | None) -> dict:
                     "timed_out with a null exit_code."
                 ),
             },
+            "program": program_input_property(policy),
         },
-        "required": ["language", "script"],
+        "oneOf": [
+            {"required": ["language", "script"], "not": {"required": ["program"]}},
+            {
+                "required": ["program"],
+                "not": {"anyOf": [{"required": ["language"]}, {"required": ["script"]}]},
+            },
+        ],
         "additionalProperties": False,
     }
 
@@ -145,6 +190,10 @@ RUN_OUTPUT_SCHEMA = {
         "truncated": {"type": "boolean"},
         "duration_ms": {"type": "integer", "minimum": 0},
         "script_sha256": {"type": "string"},
+        "execution_kind": {"type": "string", "enum": ["script", "program"]},
+        "program_sha256": {"type": "string"},
+        "program_executable": {"type": "string"},
+        "program_argv": {"type": "array", "items": {"type": "string"}},
         "workroom_key": {"type": "string"},
     },
     "required": [
@@ -203,7 +252,9 @@ class ShellToolSpec:
 
 
 _RUN_DESCRIPTION = (
-    "Stateful shell workroom (shell_run). Network closed. Output streams are " +
+    "Stateful workroom execution (shell_run). Network closed. Runs either an "
+    "opaque Bash/Python script or an exact executable/argv identity returned by "
+    "program discovery. Output streams are " +
     "capped at the policy max_output_bytes during collection " +
     "(truncated marks a reached cap); the gateway applies its own " +
     "per-server serialized-output cut afterwards."
@@ -288,7 +339,10 @@ def _descriptor_for(spec: ShellToolSpec, input_schema: dict) -> ToolDescriptor:
         outbound_text_fields=[],
         target_binding=ToolTargetBinding(binds_target_arguments=False),
         requires_target=False,
-        command_fields=list(spec.command_fields),
+        command_fields=[
+            field for field in spec.command_fields
+            if field in input_schema.get("properties", {})
+        ],
         availability_impact=False,
     )
 
@@ -301,10 +355,14 @@ def build_shell_descriptors(policy: ShellWorkroomPolicy | None = None) -> list:
     policy model defaults.
     """
     run_schema = _run_input_schema(policy)
+    job_start_schema = _run_input_schema(policy)
+    job_start_schema["properties"].pop("program", None)
+    job_start_schema.pop("oneOf", None)
+    job_start_schema["required"] = ["language", "script"]
     job_schema = _job_input_schema()
     schemas = {
         RUN_TOOL_NAME: run_schema,
-        JOB_START_TOOL_NAME: run_schema,
+        JOB_START_TOOL_NAME: job_start_schema,
         JOB_STATUS_TOOL_NAME: job_schema,
         JOB_CANCEL_TOOL_NAME: job_schema,
     }

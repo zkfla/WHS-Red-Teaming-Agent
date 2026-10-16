@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, Field
 
@@ -84,6 +84,9 @@ class LocalToolDescriptor:
     bootstrap: bool = False
     # Read/return contracts needed without discovery; distinct from navigators.
     initial_exposure: bool = False
+    # Declared by the tool owner so the Worker loop classifies validated calls
+    # without branching on physical tool IDs.
+    decision_kind: Literal["local_read", "settlement", "local_action"] = "local_action"
 
 
 @dataclass(frozen=True)
@@ -189,6 +192,10 @@ class LocalToolRegistry:
     def get(self, tool_id: str) -> LocalToolHandler | None:
         entry = self._entries.get(str(tool_id).strip())
         return entry[1] if entry is not None else None
+
+    def descriptor(self, tool_id: str) -> LocalToolDescriptor | None:
+        entry = self._entries.get(str(tool_id).strip())
+        return entry[0] if entry is not None else None
 
     def descriptors(self) -> tuple[LocalToolDescriptor, ...]:
         """Local-only listing, apart from the remote target catalog."""

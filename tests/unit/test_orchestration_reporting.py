@@ -91,6 +91,36 @@ async def test_candidate_projection_is_not_a_finding_or_mission_verdict() -> Non
     assert "separate from Task completion" in markdown
 
 
+async def test_markdown_projects_safe_provider_cooldown_state() -> None:
+    from redteam.app.cli.commands.report import _render_markdown
+
+    projection = await ReportingAgent().project(
+        RuntimeState(
+            run_id=RunId("run"), engagement_id=EngagementId("eng"),
+            phase=AgentPhase.FAILED, termination_reason="planning_error",
+        ),
+        graph=AttackGraphService(InMemoryAttackGraphStore()),
+        evidence_store=FakeEvidenceStore(), work_store=InMemoryWorkStore(),
+    )
+    projection.llm_request_accounting = {
+        "policy": {"mode": "bounded", "max_requests": 10},
+        "spent": 1, "reserved": 0, "known_tokens": 0, "unknown_usage": 1,
+        "by_stage": {}, "usage": {},
+        "provider_cooldown": {
+            "version": 2, "state": "cooldown", "generation": 1,
+            "consecutive": 1, "until": 123.0, "recovery_request_id": None,
+            "last_failure": {
+                "kind": "rate_limited", "provider_status": 429,
+                "provider_code": "rate_limit", "retryable": True, "retry_after": 2.5,
+            },
+        },
+    }
+
+    markdown = _render_markdown(projection)
+    assert "Provider cooldown: state=cooldown; consecutive=1; retry_at=123.0" in markdown
+    assert "kind=rate_limited; status=429; code=rate_limit" in markdown
+
+
 async def test_reporting_preserves_operational_diagnostic_in_json_and_markdown() -> None:
     from redteam.app.cli.commands.report import _render_markdown
     from redteam.orchestration.diagnostics import operational_exception_diagnostic

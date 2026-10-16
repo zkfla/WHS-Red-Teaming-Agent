@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 import pytest
 
 from redteam.app.central_run import open_central_run
+from redteam.app.web.graph_read import read_graph
+from redteam.attack_graph.service import AttackGraphService
 from redteam.capability.catalog import MCPToolCatalog
 from redteam.capability.gateway import MCPToolGateway
 from redteam.capability.registry import MCPToolRegistry
@@ -28,6 +30,7 @@ from redteam.orchestration.engine import InvestigationEngine
 from redteam.orchestration.native_binding import exposed_tool_name
 from redteam.orchestration.nodes import react
 from redteam.orchestration.operator_intents.models import IntentRecord
+from redteam.orchestration.reporting import ReportingAgent
 from redteam.orchestration.worker_session import WorkerSession
 from tests.integration.test_central_development import call, turn
 from tests.integration.test_central_parallel import limits
@@ -47,11 +50,12 @@ class SuccessfulWorkroom(ScriptedWorkroom):
 
 
 class ConversationModel(FakeLLMClient):
-    def __init__(self, *, executions, reads, opaque=True):
+    def __init__(self, *, executions, reads, opaque=True, repeat_reads=False):
         super().__init__()
         self.envelopes = []
         self.executions, self.reads = executions, reads
         self.opaque = opaque
+        self.repeat_reads = repeat_reads
         self.on_second_request: Callable[[], Awaitable[None]] | None = None
 
     async def complete_native(self, messages, tools, system=None, **kwargs):
@@ -72,7 +76,9 @@ class ConversationModel(FakeLLMClient):
             }))
         elif index <= 1 + self.reads:
             response = turn(call(f"read-{index}", "evidence.read", {
-                "evidence_id": evidence[0], "offset": index - 1, "limit": 500,
+                "evidence_id": evidence[0],
+                "offset": 0 if self.repeat_reads else index - 1,
+                "limit": 500,
             }))
         else:
             response = turn(call("return", "task.settle", {
@@ -155,9 +161,12 @@ async def test_worker_receives_invalid_shell_context_and_repairs_without_restart
         assert llm.envelopes[1][:len(llm.envelopes[0])] == llm.envelopes[0]
 
 
-@pytest.mark.parametrize("executions,reads", [(3, 1), (1, 13)])
+@pytest.mark.parametrize(
+    "executions,reads,repeat_reads",
+    [(3, 1, False), (1, 5, False), (1, 2, True)],
+)
 async def test_worker_executes_bash_and_keeps_every_display_byte_identical(
-    tmp_path, monkeypatch, executions, reads,
+    tmp_path, monkeypatch, executions, reads, repeat_reads,
 ):
     calls = Counter()
     original_context = InvestigationEngine.context
@@ -184,12 +193,14 @@ async def test_worker_executes_bash_and_keeps_every_display_byte_identical(
     catalog = MCPToolCatalog(registry)
     adapter = BuiltinShellAdapter(manager.policy, workroom=manager)
     gateway = MCPToolGateway(registry, {SHELL_SERVER_ID: adapter}, health_refresh_enabled=False)
-    llm = ConversationModel(executions=executions, reads=reads)
+    llm = ConversationModel(
+        executions=executions, reads=reads, repeat_reads=repeat_reads,
+    )
     async with open_central_run(
         config, directory=tmp_path / "run", settings=settings, llm=llm,
         tool_gateway=gateway, tool_catalog=catalog, shell_programs=manager,
     ) as session:
-        identity = await register(session, "append-only", actions=4, requests=16)
+        identity = await register(session, "append-only", actions=4, requests=8)
         if executions == 3:
             async def guidance() -> None:
                 await session.deps.central_state.append(IntentRecord(
@@ -211,6 +222,15 @@ async def test_worker_executes_bash_and_keeps_every_display_byte_identical(
         assert len(llm.envelopes) == executions + reads + 1
         assert calls[identity] == 1  # No complete DB/context reconstruction on subsequent turns.
         initial = llm.envelopes[0]
+        initial_context = json.loads(initial["messages"][0]["content"])
+        assert initial_context["program_execution_environment"]["routes"][0]["status"] == (
+            "local_only"
+        )
+        assert initial_context["probe"]["remaining"] == {
+            "actions": 4,
+            "model_requests": 8,
+            "repairs": 2,
+        }
         for previous, current in zip(llm.envelopes, llm.envelopes[1:], strict=False):
             count = len(previous["messages"])
             assert current["messages"][:count] == previous["messages"]
@@ -231,11 +251,26 @@ async def test_worker_executes_bash_and_keeps_every_display_byte_identical(
         assert all(view["program_output"]["stderr"] == "fixture warning" for view in windows)
         assert all(view["execution"]["accounting"]["exit_code"] == 0 for view in windows)
         assert all(view["provenance"]["invocation_id"] for view in windows)
+        stored_executions = await session.deps.central_state.list_executions(task_id=identity)
+        assert len(stored_executions) == executions
+        assert all(item.selection.route == "local" for item in stored_executions)
+        assert all(item.selection.route_status == "local_only" for item in stored_executions)
+        assert all(item.outcome.result_kind == "generic_program_output"
+                   for item in stored_executions)
+        assert all(item.outcome.success is True for item in stored_executions)
+        web = await read_graph(session.deps.central_state.path, str(session.runtime.run_id))
+        projected = [item for item in web["executions"] if item["task_id"] == identity]
+        assert len(projected) == executions
+        assert all(item["route"] == "local" for item in projected)
+        assert all(item["result_kind"] == "generic_program_output" for item in projected)
         delivered_reads = [message for message in final if message["role"] == "tool"
                            and json.loads(message["content"]).get("evidence_read_request")]
         assert len(delivered_reads) == reads
         assert all(json.loads(message["content"])["payload"]["limit"] == 500
                    for message in delivered_reads)
+        if repeat_reads:
+            payloads = [json.loads(item["content"])["payload"] for item in delivered_reads]
+            assert payloads == [payloads[0], payloads[0]]
         runner = session.driver.runner_for(outcome.runtime)
         snapshot = await runner._graph.aget_state(runner.config())
         saved = WorkerSession.model_validate_json(json.dumps(snapshot.values["worker_session"]))
@@ -248,6 +283,35 @@ async def test_worker_executes_bash_and_keeps_every_display_byte_identical(
             str(session.runtime.run_id),
         )
         assert requests["spent"] == executions + reads + 1
+        task_usage = requests["by_task"][identity]
+        assert task_usage["local_reads"] == reads
+        assert task_usage["no_progress"] == (1 if repeat_reads else 0)
+        if repeat_reads:
+            report = await ReportingAgent().project(
+                outcome.runtime,
+                graph=AttackGraphService(session.deps.graph_store),
+                evidence_store=session.deps.evidence_store,
+                work_store=None,
+                central_state=session.deps.central_state,
+            )
+            effectiveness, = [
+                item for item in report.task_request_effectiveness
+                if item["task_id"] == identity
+            ]
+            assert effectiveness == {
+                "task_id": identity,
+                "model_requests": 4,
+                "known_tokens": 40,
+                "unknown_usage": 0,
+                "external_actions": 1,
+                "local_reads": 2,
+                "repairs": 0,
+                "transport_retries": 0,
+                "provider_failures": 0,
+                "settlements": 1,
+                "text_only_held": 0,
+                "external_actions_per_model_request": 0.25,
+            }
         sizes = [len(json.dumps(envelope, ensure_ascii=False, separators=(",", ":")).encode())
                  for envelope in llm.envelopes]
         comparisons = [_compare_requests(envelope, llm.envelopes[index - 1] if index else None)

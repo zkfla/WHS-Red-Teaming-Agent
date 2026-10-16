@@ -7,7 +7,7 @@ export function drawEdges(svg, edges, layout, related) {
   svg.setAttribute('height', String(layout.height));
   const ns = svg.namespaceURI;
   const defs = document.createElementNS(ns, 'defs');
-  for (const kind of ['registered', 'held_by', 'returned', 'stored', 'wakes']) {
+  for (const kind of ['registered', 'held_by', 'returned', 'stored', 'model_exchange', 'wakes']) {
     const marker = document.createElementNS(ns, 'marker');
     for (const [key, value] of Object.entries({id:`graph-arrow-${kind}`, viewBox:'0 0 10 10', refX:'9', refY:'5', markerWidth:'6', markerHeight:'6', orient:'auto-start-reverse'})) marker.setAttribute(key, value);
     const arrow = document.createElementNS(ns, 'path');
@@ -39,6 +39,7 @@ export function drawEdges(svg, edges, layout, related) {
     line.setAttribute('d', d);
     line.setAttribute('class', `graph-edge ${edge.kind}${active ? ' highlighted' : related ? ' dim' : ''}`);
     line.setAttribute('marker-end', `url(#graph-arrow-${edge.kind})`);
+    if (edge.kind === 'model_exchange') line.setAttribute('marker-start', `url(#graph-arrow-${edge.kind})`);
     line.setAttribute('data-from', edge.from);
     line.setAttribute('data-to', edge.to);
     svg.append(line);
