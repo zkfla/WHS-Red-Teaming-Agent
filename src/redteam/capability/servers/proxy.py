@@ -7,15 +7,18 @@ import base64
 import binascii
 import hashlib
 import json
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlsplit
 
+import httpx
 from mcp.server import MCPServer
 
 from redteam.capability.servers.config import ServerPolicy
 from redteam.capability.servers.network import CapturedResponse, ToolInputError, request
+from redteam.core.contracts.tool import PROVIDER_METADATA_RESOURCE_BINDINGS
 
 _READ_METHODS = {"GET", "HEAD", "OPTIONS"}
 MAX_CAPTURE_BYTES = 4 * 1024 * 1024
@@ -220,18 +223,67 @@ def _require_session_for_write(flow: ProxyFlow, session_ref: str | None) -> None
         raise ToolInputError("write replay requires a configured session_ref")
 
 
+def _proxy_resource_key(policy: ServerPolicy, flow: ProxyFlow) -> tuple[str, str, int, str]:
+    """Identify the physical target path, collapsing aliases in operator policy."""
+    try:
+        # Use the same URL parser as the network path for IDNA and default ports.
+        origin = httpx.URL(policy.targets[flow.target_ref].origin)
+        host = origin.raw_host.decode("ascii").rstrip(".")
+        port = origin.port
+        if port is None:
+            port = 443 if origin.scheme == "https" else 80
+        return origin.scheme, host, port, flow.path
+    except httpx.InvalidURL:
+        # An operator origin that HTTPX cannot normalize cannot be replayed;
+        # retain a deterministic lock key so the input still fails at request validation.
+        parts = urlsplit(policy.targets[flow.target_ref].origin)
+        host = (parts.hostname or "").lower()
+        port = parts.port
+        if port is None:
+            port = 443 if parts.scheme == "https" else 80
+        return parts.scheme.lower(), host, port, flow.path
+
+
+def _proxy_resource_identity(policy: ServerPolicy, flow: ProxyFlow) -> str:
+    encoded = json.dumps(_proxy_resource_key(policy, flow), separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _proxy_resource_bindings(
+    policy: ServerPolicy, backend: ProxyCaptureBackend,
+) -> list[dict[str, Any]]:
+    return [{
+        "namespace": "proxy.replay-path",
+        "argument": "flow_ref",
+        "value_map": {
+            flow.flow_ref: _proxy_resource_identity(policy, flow)
+            for flow in backend.list_flows()
+        },
+    }]
+
+
 def create_server(policy: ServerPolicy, capture_path: str) -> MCPServer:
     backend: ProxyCaptureBackend = HarCaptureBackend.load(capture_path, policy)
     server = MCPServer("web-proxy", log_level="WARNING")
-    execution_lock = asyncio.Lock()
+    backend_lock = threading.Lock()
+    execution_slots = asyncio.BoundedSemaphore(policy.max_concurrency)
+    resource_locks: dict[tuple[str, str, int, str], asyncio.Lock] = {}
+
+    def capture_backend() -> ProxyCaptureBackend:
+        with backend_lock:
+            return backend
+
+    def resource_lock(key: tuple[str, str, int, str]) -> asyncio.Lock:
+        return resource_locks.setdefault(key, asyncio.Lock())
 
     @server.tool()
     def proxy_status() -> dict[str, Any]:
         """Report capture provider and operator replay switch; no target traffic."""
+        current = capture_backend()
         return {
-            "provider": backend.provider,
-            "flow_count": len(backend.list_flows()),
-            "ignored_out_of_scope_flows": backend.ignored_flow_count,
+            "provider": current.provider,
+            "flow_count": len(current.list_flows()),
+            "ignored_out_of_scope_flows": current.ignored_flow_count,
             "replay_enabled": policy.proxy_replay_enabled,
         }
 
@@ -242,7 +294,7 @@ def create_server(policy: ServerPolicy, capture_path: str) -> MCPServer:
             raise ToolInputError("unknown target_ref")
         if limit < 1 or limit > 100:
             raise ToolInputError("limit must be between 1 and 100")
-        flows = backend.list_flows(target_ref)
+        flows = capture_backend().list_flows(target_ref)
         return {
             "flows": [flow.summary() for flow in flows[:limit]],
             "may_be_truncated": len(flows) > limit,
@@ -251,44 +303,50 @@ def create_server(policy: ServerPolicy, capture_path: str) -> MCPServer:
     @server.tool()
     def proxy_get_flow(flow_ref: str) -> dict[str, Any]:
         """Return one redacted capture summary. Header values and bodies remain omitted."""
-        return backend.get_flow(flow_ref).summary()
+        return capture_backend().get_flow(flow_ref).summary()
 
     @server.tool()
     async def proxy_reload_capture() -> dict[str, Any]:
         """Atomically reload the operator-owned capture file; never contacts a target."""
         nonlocal backend
         replacement = HarCaptureBackend.load(capture_path, policy)
-        async with execution_lock:
+        with backend_lock:
             backend = replacement
         return {
-            "provider": backend.provider,
-            "flow_count": len(backend.list_flows()),
-            "ignored_out_of_scope_flows": backend.ignored_flow_count,
+            "provider": replacement.provider,
+            "flow_count": len(replacement.list_flows()),
+            "ignored_out_of_scope_flows": replacement.ignored_flow_count,
             "reloaded": True,
         }
 
-    @server.tool()
+    # Discovery metadata remains static for this MCP process. After reload,
+    # a newly introduced flow_ref is unmapped in the durable ledger and fails
+    # closed until this provider is restarted and its tools are rediscovered.
+    resource_bindings = _proxy_resource_bindings(policy, backend)
+
+    @server.tool(meta={PROVIDER_METADATA_RESOURCE_BINDINGS: resource_bindings})
     async def proxy_replay_flow(flow_ref: str, session_ref: str | None = None) -> dict[str, Any]:
         """Replay one operator-approved flow with a configured test session, never captured auth.
 
         The response summary carries the actual-use receipt actual_session_ref
         (None means this replay actually ran anonymous). No secret recorded.
         """
-        flow = backend.get_flow(flow_ref)
+        flow = capture_backend().get_flow(flow_ref)
         _require_replay(policy, flow)
         _require_session_for_write(flow, session_ref)
-        async with execution_lock:
-            response = await request(
-                policy,
-                flow.target_ref,
-                flow.path,
-                method=flow.method,
-                session_ref=session_ref,
-                json_body=flow.request_json,
-            )
+        async with resource_lock(_proxy_resource_key(policy, flow)):
+            async with execution_slots:
+                response = await request(
+                    policy,
+                    flow.target_ref,
+                    flow.path,
+                    method=flow.method,
+                    session_ref=session_ref,
+                    json_body=flow.request_json,
+                )
         return {"flow_ref": flow_ref, "target_ref": flow.target_ref, **response.summary()}
 
-    @server.tool()
+    @server.tool(meta={PROVIDER_METADATA_RESOURCE_BINDINGS: resource_bindings})
     async def proxy_mutate_json(
         flow_ref: str,
         mutations: dict[str, Any],
@@ -299,7 +357,7 @@ def create_server(policy: ServerPolicy, capture_path: str) -> MCPServer:
         The response summary carries the actual-use receipt actual_session_ref
         (None means this replay actually ran anonymous). No secret recorded.
         """
-        flow = backend.get_flow(flow_ref)
+        flow = capture_backend().get_flow(flow_ref)
         _require_replay(policy, flow)
         _require_session_for_write(flow, session_ref)
         if flow.request_json is None:
@@ -308,15 +366,16 @@ def create_server(policy: ServerPolicy, capture_path: str) -> MCPServer:
         if not mutations or set(mutations) - allowed_fields:
             raise ToolInputError("JSON mutation field is not enabled for this path")
         body = {**flow.request_json, **mutations}
-        async with execution_lock:
-            response = await request(
-                policy,
-                flow.target_ref,
-                flow.path,
-                method=flow.method,
-                session_ref=session_ref,
-                json_body=body,
-            )
+        async with resource_lock(_proxy_resource_key(policy, flow)):
+            async with execution_slots:
+                response = await request(
+                    policy,
+                    flow.target_ref,
+                    flow.path,
+                    method=flow.method,
+                    session_ref=session_ref,
+                    json_body=body,
+                )
         return {
             "flow_ref": flow_ref,
             "target_ref": flow.target_ref,
@@ -324,7 +383,7 @@ def create_server(policy: ServerPolicy, capture_path: str) -> MCPServer:
             **response.summary(),
         }
 
-    @server.tool()
+    @server.tool(meta={PROVIDER_METADATA_RESOURCE_BINDINGS: resource_bindings})
     async def proxy_compare_sessions(
         flow_ref: str,
         first_session_ref: str,
@@ -335,7 +394,7 @@ def create_server(policy: ServerPolicy, capture_path: str) -> MCPServer:
         Each side's summary carries its own actual_session_ref receipt so the
         two actual replays stay distinguished. No secret material recorded.
         """
-        flow = backend.get_flow(flow_ref)
+        flow = capture_backend().get_flow(flow_ref)
         _require_replay(policy, flow)
         if flow.method not in _READ_METHODS or flow.request_json is not None:
             raise ToolInputError("session comparison requires a bodyless read request")
@@ -349,9 +408,14 @@ def create_server(policy: ServerPolicy, capture_path: str) -> MCPServer:
             or first.principal_ref == second.principal_ref
         ):
             raise ToolInputError("two distinct principals bound to this target are required")
-        async with execution_lock:
-            a = await request(policy, flow.target_ref, flow.path, session_ref=first_session_ref)
-            b = await request(policy, flow.target_ref, flow.path, session_ref=second_session_ref)
+        async with resource_lock(_proxy_resource_key(policy, flow)):
+            async with execution_slots:
+                a = await request(
+                    policy, flow.target_ref, flow.path, session_ref=first_session_ref,
+                )
+                b = await request(
+                    policy, flow.target_ref, flow.path, session_ref=second_session_ref,
+                )
         return {
             "flow_ref": flow_ref,
             "first": {"principal_ref": first.principal_ref, **a.summary()},
