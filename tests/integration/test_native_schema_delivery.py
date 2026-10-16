@@ -24,10 +24,11 @@ from tests.integration.test_probe_workers import drive, register, selection
 class SchemaSensitiveProbe(FakeLLMClient):
     """Chooses discovery only when its intended operation's schema is absent."""
 
-    def __init__(self, *, read_extra=False):
+    def __init__(self, *, read_extra=False, raw_detail_name=False):
         super().__init__()
         self.envelopes = []
         self.read_extra = read_extra
+        self.raw_detail_name = raw_detail_name
         self.read_issued = False
 
     async def complete_native(self, messages, tools, system=None, **kwargs):
@@ -59,7 +60,10 @@ class SchemaSensitiveProbe(FakeLLMClient):
         elif exposed_tool_name(TOOL) in names:
             response = turn(inspect("observe"))
         else:
-            response = turn(call("detail", "tool.get_detail", {"tool_id": TOOL}))
+            detail = call("detail", "tool.get_detail", {"tool_id": TOOL})
+            if self.raw_detail_name:
+                detail = replace(detail, name="tool.get_detail")
+            response = turn(detail)
         self.native_responses = [response]
         return await super().complete_native(messages, tools, system=system, **kwargs)
 
@@ -130,6 +134,33 @@ async def test_size_based_whole_catalog_or_lazy_schema_reaches_review_and_measur
                "total_requests": ledger["spent"], "known_tokens": ledger["known_tokens"],
                "unknown_usage": ledger["unknown_usage"],
                "native_input_bytes": [NATIVE_INPUT_LIMIT.size(**x) for x in llm.envelopes]})
+
+
+async def test_raw_exact_detail_name_resolves_then_advertises_only_selected_schema(tmp_path):
+    async with selection(
+        tmp_path, tools=provider(large=True),
+        llm=SchemaSensitiveProbe(raw_detail_name=True),
+    ) as (session, llm, tools):
+        identity = await register(session, "raw-detail-name", actions=2)
+        outcome, = await drive(session)
+
+        task = await session.deps.central_state.get_task(identity)
+        assert outcome.kind == "completed", outcome.error
+        assert task.status is TaskStatus.COMPLETED and task.result.outcome == "confirmed"
+        assert len(tools.inner.invocations) == 1
+
+        first_names = {item.name for item in llm.envelopes[0]["tools"]}
+        second_names = {item.name for item in llm.envelopes[1]["tools"]}
+        assert exposed_tool_name("tool.get_detail") in first_names
+        assert exposed_tool_name(TOOL) not in first_names
+        assert exposed_tool_name(TOOL) in second_names
+        assert exposed_tool_name("cloud.hidden") not in second_names
+        assert exposed_tool_name("web.unhealthy") not in second_names
+
+        ledger = await session.deps.central_state.request_ledger().snapshot(
+            session.runtime.run_id,
+        )
+        assert ledger["outcomes"]["unknown_tool"] == 0
 
 
 async def test_initial_schema_does_not_bypass_approval_or_replay_success(tmp_path):

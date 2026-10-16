@@ -13,6 +13,8 @@ import json
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from redteam.core.contracts.tool import ToolDescriptor
 from redteam.core.enums import ToolHealthStatus
 from redteam.core.ids import ToolId
@@ -419,8 +421,65 @@ def test_bindings_cover_every_eligible_name():
         local_tool_ids=[TOOL_LIST_CARDS_ID],
     )
     assert bindings[exposed_tool_name(INVENTORY_TOOL)] == INVENTORY_TOOL
+    assert bindings[INVENTORY_TOOL] == INVENTORY_TOOL
     assert bindings[exposed_tool_name("web.other")] == "web.other"
     assert bindings[exposed_tool_name(TOOL_LIST_CARDS_ID)] == TOOL_LIST_CARDS_ID
+    assert bindings[TOOL_LIST_CARDS_ID] == TOOL_LIST_CARDS_ID
+    assert "unselected.tool" not in bindings
+
+
+def test_native_binding_alias_collisions_fail_closed(monkeypatch):
+    monkeypatch.setattr(
+        "redteam.orchestration.tool_discovery.exposed_tool_name",
+        lambda _identity: "shared_alias",
+    )
+    with pytest.raises(ValueError, match="^native_tool_binding_collision$"):
+        build_native_bindings(
+            catalog_tool_ids=["catalog.one", "catalog.two"], local_tool_ids=[],
+        )
+
+
+def test_native_binding_alias_cannot_shadow_another_canonical_id(monkeypatch):
+    monkeypatch.setattr(
+        "redteam.orchestration.tool_discovery.exposed_tool_name",
+        lambda identity: "catalog.two" if identity == "catalog.one" else "alias_two",
+    )
+    with pytest.raises(ValueError, match="^native_tool_binding_collision$"):
+        build_native_bindings(
+            catalog_tool_ids=["catalog.one", "catalog.two"], local_tool_ids=[],
+        )
+
+
+def test_raw_detail_call_is_resolved_and_only_eligible_tool_is_advertised():
+    bindings = {
+        exposed_tool_name(INVENTORY_TOOL): INVENTORY_TOOL,
+        exposed_tool_name("catalog.unselected"): "catalog.unselected",
+        exposed_tool_name(TOOL_GET_DETAIL_ID): TOOL_GET_DETAIL_ID,
+    }
+    messages: list[dict[str, Any]] = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "raw-detail",
+                "type": "function",
+                "function": {
+                    "name": TOOL_GET_DETAIL_ID,
+                    "arguments": json.dumps({"tool_id": INVENTORY_TOOL}),
+                },
+            }],
+        },
+        {"role": "tool", "tool_call_id": "raw-detail", "content": json.dumps({"ok": True})},
+    ]
+
+    fetched = detail_fetched_tool_ids(messages, bindings=bindings)
+    assert fetched == [INVENTORY_TOOL]
+    assert select_advertised_tool_ids(
+        eligible_ids=[INVENTORY_TOOL], fetched_ids=fetched,
+    ) == [INVENTORY_TOOL]
+    assert select_advertised_tool_ids(
+        eligible_ids=["catalog.unselected"], fetched_ids=fetched,
+    ) == []
 
 
 def test_detail_fetched_tracks_successful_lookups_only():

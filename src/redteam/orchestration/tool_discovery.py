@@ -1092,12 +1092,17 @@ def build_native_bindings(
     catalog_tool_ids: Collection[str],
     local_tool_ids: Collection[str],
 ) -> dict[str, str]:
-    seen: dict[str, str] = {}
-    for identity in catalog_tool_ids:
-        seen[exposed_tool_name(str(identity))] = str(identity)
-    for identity in local_tool_ids:
-        seen[exposed_tool_name(str(identity))] = str(identity)
-    return seen
+    identities = sorted({
+        str(identity) for identity in (*catalog_tool_ids, *local_tool_ids)
+    })
+    bindings: dict[str, str] = {}
+    for identity in identities:
+        for name in (exposed_tool_name(identity), identity):
+            previous = bindings.get(name)
+            if previous is not None and previous != identity:
+                raise ValueError("native_tool_binding_collision")
+            bindings[name] = identity
+    return bindings
 
 
 def detail_fetched_tool_ids(
@@ -1106,7 +1111,9 @@ def detail_fetched_tool_ids(
     bindings: Mapping[str, str],
     detail_tool_ids: Collection[str] = DETAIL_TOOL_IDS,
 ) -> list[str]:
+    bound_detail_ids = {identity for identity in bindings.values() if identity in detail_tool_ids}
     wanted_names = {name for name, identity in bindings.items() if identity in detail_tool_ids}
+    wanted_names.update(bound_detail_ids)
     ok_by_call: dict[str, bool] = {}
     for message in messages or []:
         if message.get("role") != "tool":
