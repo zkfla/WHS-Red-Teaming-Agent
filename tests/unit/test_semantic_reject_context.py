@@ -1,4 +1,6 @@
-"""Semantic rejections keep attempt metrics and a count-only judgment shape; raw values stay out."""
+"""Semantic traces stay count-only; the ephemeral correction request retains public data."""
+
+import json
 
 import pytest
 
@@ -73,7 +75,10 @@ async def test_semantic_reject_keeps_attempt_metrics_and_judgment_shape():
     assert result["termination"] == "held"
     assert len(llm.prompts) == 2
     assert "Use a question that names a captured subject." in llm.prompts[1]
-    assert SENTINEL not in llm.prompts[1]
+    diagnostic, marker, replay = llm.prompts[1].partition("\n\nRejected proposal data:\n")
+    assert marker
+    assert SENTINEL not in diagnostic
+    assert json.loads(replay) == {"previous_proposal": rejected, "omitted": False}
 
 
 async def test_semantic_reject_trace_has_metrics_shape_and_no_raw_values():

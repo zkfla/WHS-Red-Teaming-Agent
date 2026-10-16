@@ -154,7 +154,12 @@ async def test_wrong_task_receipt_is_repaired_before_atomizer_or_writes(
         feedback = llm.plan_feedback[2]
         assert "candidate_review_receipt_invalid" in feedback
         assert "$.updates[0].review_evidence_id" in feedback
-        assert completion_id not in feedback
+        diagnostic, marker, replay = feedback.partition("\n\nRejected proposal data:\n")
+        assert marker
+        assert completion_id not in diagnostic
+        assert json.loads(replay)["previous_proposal"]["updates"][0]["review_evidence_id"] == (
+            completion_id
+        )
         # One wrong and one corrected or held judgment, both on the shared finite budget.
         assert (await session.status())["usage"]["spent"] - spent_before == 2
 

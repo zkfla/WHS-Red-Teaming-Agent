@@ -1,5 +1,7 @@
 """Split stage-1 repair feedback: code-owned guidance, then a valid retry commits."""
 
+import json
+
 from redteam.orchestration.diagnostics import DecisionDiagnostic, safe_feedback
 from redteam.orchestration.hypothesis_planner import _REPAIR_GUIDANCE
 from redteam.orchestration.specialist_planner import SpecialistPlanner
@@ -13,14 +15,15 @@ class FeedbackRecordingDouble(SplitDouble):
     def __init__(self, plans, atoms):
         super().__init__(plans, atoms)
         self.plan_feedback = []
+        self.plan_replays = []
 
     async def complete_structured(self, *, messages, response_schema, **kwargs):
         if "questions" in response_schema.get("properties", {}):
             content = messages[-1]["content"]
-            self.plan_feedback.append(
-                content.split("Previous attempt failed", 1)[1]
-                if "Previous attempt failed" in content else ""
-            )
+            feedback = content.partition("Previous attempt failed")[2]
+            diagnostic, _, replay = feedback.partition("\n\nRejected proposal data:\n")
+            self.plan_feedback.append(diagnostic)
+            self.plan_replays.append(json.loads(replay) if replay else None)
         return await super().complete_structured(
             messages=messages, response_schema=response_schema, **kwargs,
         )
@@ -63,6 +66,9 @@ async def test_held_without_resume_condition_gets_resume_guidance_then_commits(t
     assert "$.resume_conditions" in llm.plan_feedback[1]
     assert "resume_condition" in llm.plan_feedback[1]
     assert "RAW-REASON-MARKER-7d1e" not in llm.plan_feedback[1]
+    assert llm.plan_replays[1] == {
+        "previous_proposal": _held_without_resume_conditions(), "omitted": False,
+    }
 
 
 def test_repair_guidance_fits_diagnostic_limit_and_validates_on_construction():

@@ -134,7 +134,9 @@ async def test_scope_mismatch_repairs_once_then_atomizes_once(tmp_path):
         feedback = llm.plan_feedback[1]
         assert SUBJECT_CODE in feedback
         assert "$.questions[0].target_node_ids" in feedback
-        assert extra not in feedback
+        diagnostic, _, replay = feedback.partition("\n\nRejected proposal data:\n")
+        assert extra not in diagnostic
+        assert extra in replay
         assert llm.plan_feedback[0] == ""
 
         assert (await session.status())["usage"]["spent"] == 3

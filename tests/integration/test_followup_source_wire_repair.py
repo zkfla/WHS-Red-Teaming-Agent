@@ -1,5 +1,7 @@
 """Stage-1 follow-up source repair through the real split planner loop."""
 
+import json
+
 from redteam.attack_graph.service import AttackGraphService
 from redteam.core.contracts.mission import InvestigationResult
 from redteam.core.enums import TaskStatus
@@ -112,8 +114,13 @@ async def test_explicit_null_followup_source_repairs_then_atomizes_once(tmp_path
         assert "$.questions[0].source_result_id" in feedback
         assert "omit" in feedback.lower()
         assert "null" in feedback.lower()
-        assert SOURCE_TASK_ID not in feedback
-        assert SOURCE_RESULT_ID not in feedback
+        diagnostic, marker, replay = feedback.partition("\n\nRejected proposal data:\n")
+        assert marker
+        assert SOURCE_TASK_ID not in diagnostic
+        assert SOURCE_RESULT_ID not in diagnostic
+        assert json.loads(replay) == {
+            "previous_proposal": _plan(explicit_null=True), "omitted": False,
+        }
 
         task_saved = await state.get_task(identities[0])
         assert str(task_saved.source_task_id) == SOURCE_TASK_ID

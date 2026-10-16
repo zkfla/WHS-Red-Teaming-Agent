@@ -139,3 +139,4 @@ async def test_old_revision_map_on_wire_repair_then_valid_plan_commits(tmp_path)
     feedback = llm.plan_feedback[1]
     assert "schema_additionalProperties at $.questions[0]" in feedback
     assert IDENTIFIER_MARKER not in feedback
+    assert llm.plan_replays[1] is None
