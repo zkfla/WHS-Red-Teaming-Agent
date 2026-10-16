@@ -838,7 +838,7 @@ async def _finalize_hypothesis_pass(deps, snapshot, budget, *, identity, proposa
     return identities
 
 
-PLANNER_REQUEST_CONTRACT_VERSION = 6
+PLANNER_REQUEST_CONTRACT_VERSION = 7
 
 
 FEEDBACK_SYSTEM = (
@@ -989,6 +989,15 @@ _SPLIT_PLAN_SYSTEM = FEEDBACK_SYSTEM + (
     "그렇지 않으면 이유와 함께 held, exhausted 또는 replan을 선택하세요. context lookup은 빈 "
     "updates와 questions, "
     "termination continue 및 context_request를 보냅니다."
+    "여러 Task에 걸친 반복을 판단할 때는 보이는 investigations, execution_history와 "
+    "original_observations에서 질문의 목적·범위와 원본 결과를 비교하세요. 같은 질문에 답하는 "
+    "변경 없는 inventory 결과가 이미 보이면 그 정확한 evidence를 재사용하고, inventory를 다시 "
+    "만드는 것만을 이유로 새 question을 제안하지 마세요. 실제 상태나 입력이 바뀌었거나 freshness가 "
+    "목적상 중요하거나 새 question이 다른 불확실성을 줄일 때는 새 관측을 제안할 수 있습니다. "
+    "목록이나 발견한 식별자는 항목의 존재 또는 가용성만 보입니다. 그것만으로 실제 사용이나 "
+    "인증 성공을 입증하지 않습니다. 사용·인증 주장은 해당 행동에 연결된 원본 execution evidence를 "
+    "필요로 합니다. 관련 기록이 보이지 않으면 제한된 context lookup으로 확인하고 생략된 기록이 "
+    "없다고 가정하지 마세요. 이 지침은 admission gate나 자동 중복 금지를 추가하지 않습니다."
 )
 
 
