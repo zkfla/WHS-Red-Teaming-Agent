@@ -4,9 +4,11 @@ Questions remain result items. An unresolved investigation can finish without
 claiming positive criteria or a Finding. The owned planner settles the goal.
 """
 
+from copy import deepcopy
 from types import SimpleNamespace
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from redteam.core.contracts.events import EventType
 from redteam.core.contracts.mission import InvestigationResult, ResultQuestion
@@ -31,9 +33,44 @@ from redteam.orchestration.local_tools import LocalToolDescriptor, LocalToolResu
 RESULT_UPDATED = "InvestigationResultUpdated"
 
 
+class PublicationResultInput(InvestigationResult):
+    """Model-facing publication input; fresh inputs default to the v2 contract.
+
+    ``InvestigationResult`` remains the historical storage/read model with its v1
+    default. Explicit v1 stays available for legacy Tasks; omitted wire versions
+    use the current v2 result contract.
+    """
+
+    contract_version: Literal[1, 2] = Field(
+        default=2,
+        description="Defaults to 2; explicitly use 1 only for a legacy Task result.",
+    )
+
+
 class ResultPublication(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    result: InvestigationResult
+    result: PublicationResultInput
+
+
+def probe_result_wire_schema() -> dict[str, Any]:
+    """Expose the publication input schema with the probe's current v2 contract pinned.
+
+    The detached schema preserves every result field and outcome while making the
+    probe-purpose meaning of version 2 explicit to the model.
+    """
+    schema = deepcopy(PublicationResultInput.model_json_schema())
+    properties = schema.get("properties")
+    version = properties.get("contract_version") if isinstance(properties, dict) else None
+    if not isinstance(version, dict):
+        raise ValueError("publication_result_version_schema_missing")
+    version.pop("enum", None)
+    version["const"] = 2
+    version["default"] = 2
+    version["description"] = (
+        "Version 2: the outcome describes this probe purpose, never "
+        "the related candidate's verdict."
+    )
+    return schema
 
 
 class OriginTaskChangedConflict(StateConflict):
@@ -205,9 +242,10 @@ def register_result_tool(registry):
         LocalToolDescriptor(
             tool_id="task.publish_result",
             contribution_id="central-investigation-result",
-            version="3", initial_exposure=True,
+            version="4", initial_exposure=True,
             description="Publish an intermediate investigation result and its follow-up questions "
-            "while retaining the task. Cite preserved originals. Confirmed results require "
+            "while retaining the task. The result contract defaults to v2; explicitly use v1 "
+            "only for a legacy Task. Cite preserved originals. Confirmed results require "
             "task.settle review. Probe contract v2 refutations also require review; outcomes "
             "describe this probe purpose, never the candidate verdict. Probe follow-ups may "
             "refer to the source task/result without a question; legacy follow-ups use the triple.",

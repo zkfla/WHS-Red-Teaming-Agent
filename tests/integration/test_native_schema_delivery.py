@@ -9,11 +9,16 @@ from redteam.capability.development import DevelopmentToolGateway
 from redteam.core.contracts.completion import CompletionCriterion, criterion_id
 from redteam.core.enums import ApprovalStatus, TaskStatus, ToolHealthStatus
 from redteam.llm.fake import FakeLLMClient
+from redteam.orchestration.local_tools import LocalToolContext
 from redteam.orchestration.native_binding import exposed_tool_name
 from redteam.orchestration.nodes.react import model_node
 from redteam.orchestration.specialist_planner import SpecialistPlanner
 from redteam.orchestration.state import initial_graph_state
-from redteam.orchestration.tool_discovery import NATIVE_INPUT_LIMIT, NativeInputLimit
+from redteam.orchestration.tool_discovery import (
+    NATIVE_INPUT_LIMIT,
+    NativeInputLimit,
+    tool_get_detail_handler,
+)
 from redteam.orchestration.worker_session import WorkerSession
 from tests.fakes.worker_input import worker_input
 from tests.integration.test_central_completion import OriginalProtocolDouble
@@ -111,6 +116,20 @@ async def test_size_based_whole_catalog_or_lazy_schema_reaches_review_and_measur
         first_names = {spec.name for spec in llm.envelopes[0]["tools"]}
         assert {exposed_tool_name(item) for item in ["evidence.read", "task.settle",
                 "task.publish_result", "tool.list_cards", "tool.get_detail"]} <= first_names
+        publication_name = exposed_tool_name("task.publish_result")
+        publication_spec = next(
+            spec for spec in llm.envelopes[0]["tools"] if spec.name == publication_name
+        )
+        publication_input = publication_spec.input_schema
+        publication_result = publication_input["$defs"]["PublicationResultInput"]
+        assert publication_result["properties"]["contract_version"]["enum"] == [1, 2]
+        assert publication_result["properties"]["contract_version"]["default"] == 2
+        detail = await tool_get_detail_handler(
+            {"tool_id": "task.publish_result"},
+            LocalToolContext(session.deps, session.runtime),
+        )
+        assert detail.ok, detail.error
+        assert detail.payload["input_schema"] == publication_input
         assert exposed_tool_name("goal.settle") not in first_names
         assert exposed_tool_name("cloud.hidden") not in first_names
         assert exposed_tool_name("web.unhealthy") not in first_names

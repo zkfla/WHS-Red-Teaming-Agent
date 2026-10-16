@@ -390,10 +390,10 @@ Already-supplied execution schemas need no discovery round. No per-program
 wrappers, title-based tool switch, extra registry or model approval polling is
 introduced; the native input bound and shared model-request ledger remain.
 
-`native-probes` is version 22 (worker prompt 14, strategy prompt 9, atomizer prompt 4).
-The explicit single-stage compatibility profile is version 19 (planner prompt 5,
-shared worker prompt 14). The code contracts additionally bind
-`planner_request_contract_version=4` and `worker_conversation_version=3`, including
+`native-probes` is version 27 (worker prompt 13, strategy prompt 15, atomizer prompt 8).
+The explicit single-stage compatibility profile is version 20 (planner prompt 7,
+shared worker prompt 13). The code contracts additionally bind
+`planner_request_contract_version=4` and `worker_conversation_version=4`, including
 for custom profiles. Worker checkpoints use session version 2; see
 [Worker lifecycle](worker-conversation.md) and
 [Planner request and resume semantics](planner-request.md).

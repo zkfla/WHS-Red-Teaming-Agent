@@ -37,8 +37,13 @@ and admitted candidate revisions, so old receipts cannot prove a different probe
 Result contract v2 adds structured `observations` and `limitations`; its outcome
 concerns the current probe purpose. Confirming an observation does not confirm
 the vulnerability candidate. Existing settlement/claim/original proof gates still
-apply to confirmed and refuted v2 results. The result tool descriptor is version 2,
-with legacy v1 result input still supported. Intermediate results retain their ID and prior original
+apply to confirmed and refuted v2 results. The result tool descriptor is version 4.
+New publication inputs default to v2 when `result.contract_version` is omitted;
+explicit v1 remains supported for legacy Tasks. The stored `InvestigationResult`
+model retains its v1 default and serialization, so reading old records does not
+reinterpret them as v2. Probe context advertises version 2 with the same result
+fields and outcomes. Task-version matching, review and original-proof checks
+still apply. Intermediate results retain their ID and prior original
 references and observation items. A v2 blocked probe can publish partial feedback
 without completing the Task or releasing unresolved executions. Direct follow-ups
 may cite source Task/result without inventing a result question; when a question

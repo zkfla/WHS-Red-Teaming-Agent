@@ -18,6 +18,7 @@ from redteam.core.enums import ApprovalStatus, TaskStatus, ToolHealthStatus
 from redteam.core.ports.llm import LLMProviderFailure, NativeCompletion, NativeToolCall
 from redteam.llm.fake import FakeLLMClient
 from redteam.orchestration.agents.tool_access import eligible_role_tool_ids
+from redteam.orchestration.central_results import publish_result_handler
 from redteam.orchestration.central_runtime import ACTOR_RETURNED, ready_workers
 from redteam.orchestration.coordination import StateConflict, content_hash
 from redteam.orchestration.development_jobs import DevelopmentJobs
@@ -513,6 +514,27 @@ async def test_probe_keeps_admitted_candidate_snapshot_after_planner_update(tmp_
         context["knowledge"]["provided"]["claims"].append({"node_id": "host:unrelated"})
         context["knowledge"]["historical"] = {"facts": [{"node_id": "host:other-run"}]}
         payload = await context_for_probe(session.deps, worker, context)
+        result_schema = payload["probe"]["result_schema"]
+        assert result_schema["properties"]["contract_version"]["const"] == 2
+        assert result_schema["properties"]["contract_version"]["default"] == 2
+        assert set(result_schema["properties"]) >= {
+            "outcome", "finding_node_ids", "completion_receipt_id", "observations", "limitations",
+        }
+        assert result_schema["properties"]["outcome"]["enum"]
+        mismatch = await publish_result_handler({"result": {
+            "result_id": "legacy-version", "contract_version": 1,
+            "outcome": "inconclusive", "summary": "Version mismatch",
+        }}, LocalToolContext(session.deps, worker))
+        assert not mismatch.ok
+        assert mismatch.error == "result contract does not match the current task"
+        unreviewed_refutation = await publish_result_handler({"result": {
+            "result_id": "unreviewed-refutation", "contract_version": 2,
+            "outcome": "refuted", "summary": "Review remains required",
+        }}, LocalToolContext(session.deps, worker))
+        assert not unreviewed_refutation.ok
+        assert unreviewed_refutation.error == (
+            "reviewed probe outcomes require the existing settlement review"
+        )
         assert payload["probe"]["candidates"]["candidate"]["revision"] == 1
         assert payload["probe"]["candidates"]["candidate"]["description"] == "Initial premise"
         assert "hypotheses" not in payload["knowledge"]
@@ -530,6 +552,18 @@ async def test_probe_keeps_admitted_candidate_snapshot_after_planner_update(tmp_
         assert not refused.ok
         assert refused.payload["diagnostic"]["code"] == "probe_candidate_change_requires_planner"
         assert len(await AttackGraphService(session.deps.graph_store).list_hypotheses()) == 1
+        accepted = await publish_result_handler({"result": {
+            "result_id": "v2-default-with-extensions",
+            "outcome": "inconclusive",
+            "summary": "Preserve the probe observation",
+            "observations": ["A probe-purpose observation"],
+            "limitations": ["The probe does not settle the related candidate"],
+        }}, LocalToolContext(session.deps, worker))
+        assert accepted.ok, accepted.error
+        assert accepted.payload["result"]["observations"] == ["A probe-purpose observation"]
+        assert accepted.payload["result"]["limitations"] == [
+            "The probe does not settle the related candidate"
+        ]
 
 
 async def test_probe_resource_wait_automatically_resumes_original_at_boundary(tmp_path):

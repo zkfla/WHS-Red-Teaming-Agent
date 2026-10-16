@@ -1,24 +1,26 @@
 """Pure session/checkpoint contracts; live consumer tests are integration tests."""
 
 import json
+from types import SimpleNamespace
 
 import pytest
 from langgraph.checkpoint.base import empty_checkpoint
 from langgraph.checkpoint.sqlite import SqliteSaver
 
 from redteam.orchestration.state import RuntimeState
+from redteam.orchestration.worker_conversation import WORKER_CONVERSATION_VERSION, provider_binding
 from redteam.orchestration.worker_session import FrozenMessage, SessionBinding, WorkerSession
 from tests.unit.test_central_state import ENG, MISSION, RUN, task
 
 
-def binding(*, task_id="task-a", instance="instance-a", **changes):
+def binding(*, task_id="task-a", instance="instance-a", provider=None, **changes):
     runtime = RuntimeState(
         run_id=RUN, engagement_id=ENG, mission_id=MISSION,
         active_task_id=task_id, instance_id=instance,
     )
     return SessionBinding.capture(
         runtime.model_copy(update=changes), task(task_id), system="Stable system",
-        tools=[], provider_binding={"config_fingerprint": "selected-provider"},
+        tools=[], provider_binding=provider or {"config_fingerprint": "selected-provider"},
     )
 
 
@@ -35,6 +37,18 @@ def test_session_identity_is_separate_from_shared_prefix():
     }), first.model_copy(update={"tools_hash": "a" * 64})):
         with pytest.raises(ValueError, match="binding mismatch"):
             WorkerSession.restore(checkpoint, expected=wrong)
+
+
+def test_worker_conversation_version_invalidates_old_session_binding():
+    current_provider = provider_binding(SimpleNamespace(component_binding=None))
+    assert current_provider["worker_conversation_version"] == WORKER_CONVERSATION_VERSION == 4
+    old_provider = {**current_provider, "worker_conversation_version": 3}
+    old_binding = binding(provider=old_provider)
+    current_binding = binding(provider=current_provider)
+    checkpoint = WorkerSession(binding=old_binding).checkpoint()
+
+    with pytest.raises(ValueError, match="binding mismatch"):
+        WorkerSession.restore(checkpoint, expected=current_binding)
 
 
 def test_capture_rejects_unbound_task_and_changed_candidate_revision():

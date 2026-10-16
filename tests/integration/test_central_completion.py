@@ -75,7 +75,8 @@ async def finish_inconclusive(session, llm, *, questions=()):
         published = await publish_result_handler({"result": {
             "result_id": "result-" + str(original.active_task_id),
             "outcome": "inconclusive", "summary": "Original response inspected",
-            "evidence_ids": originals, "questions": list(questions),
+            "contract_version": 1, "evidence_ids": originals,
+            "questions": list(questions),
         }}, LocalToolContext(
             session.deps, original.model_copy(update={"phase": AgentPhase.OBSERVE}),
         ))

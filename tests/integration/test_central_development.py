@@ -217,6 +217,7 @@ async def test_planner_worker_intermediate_followup_and_atomic_originals():
                                     "result_id": "result-first",
                                     "outcome": "inconclusive",
                                     "summary": "Investigate another account independently",
+                                    "contract_version": 1,
                                     "evidence_ids": [evidence_id],
                                     "questions": [
                                         {
@@ -285,6 +286,7 @@ async def test_planner_worker_intermediate_followup_and_atomic_originals():
         assert final.actions_executed == 2 and final.remaining_budget == 4
         current = [task for task in await state.list_tasks() if task.result is not None][0]
         assert current.status is TaskStatus.COMPLETED and current.result.outcome == "inconclusive"
+        assert current.result.contract_version == 1
         assert published == [str(current.task_id)]
         followup = [
             task for task in await state.list_tasks() if task.source_task_id == current.task_id

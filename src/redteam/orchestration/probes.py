@@ -3,10 +3,13 @@
 from typing import Literal
 
 from redteam.core.contracts.graph import Hypothesis
-from redteam.core.contracts.mission import InvestigationResult
 from redteam.core.enums import MissionStatus, TaskStatus
 from redteam.orchestration.central_completion import unsafe
-from redteam.orchestration.central_results import commit_result, result_for
+from redteam.orchestration.central_results import (
+    commit_result,
+    probe_result_wire_schema,
+    result_for,
+)
 from redteam.orchestration.central_runtime import runtime_token
 from redteam.orchestration.completion_proposal import CompletionProposal, record_unresolved
 from redteam.orchestration.diagnostics import DecisionDiagnostic
@@ -232,7 +235,7 @@ async def context_for_probe(deps, runtime, context):
         },
         "purpose": task.objective,
         "return_conditions": [item.model_dump(mode="json") for item in task.completion_criteria],
-        "result_schema": InvestigationResult.model_json_schema(),
+        "result_schema": probe_result_wire_schema(),
     }
     return filtered
 

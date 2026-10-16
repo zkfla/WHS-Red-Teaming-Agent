@@ -524,6 +524,7 @@ async def test_planner_and_peer_read_intermediate_result_before_source_finishes(
                             "task.publish_result",
                             {
                                 "result": {
+                                        "contract_version": 1,
                                     "result_id": "intermediate",
                                     "outcome": "inconclusive",
                                     "summary": "Independent follow-up",

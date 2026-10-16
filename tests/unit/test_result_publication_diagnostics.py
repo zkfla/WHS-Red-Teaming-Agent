@@ -5,8 +5,13 @@ from pydantic import ValidationError
 from pydantic_core import InitErrorDetails, PydanticCustomError
 
 from redteam.core.contracts.mission import InvestigationResult
-from redteam.orchestration.central_results import ResultPublication
+from redteam.orchestration.central_results import (
+    PublicationResultInput,
+    ResultPublication,
+    probe_result_wire_schema,
+)
 from redteam.orchestration.diagnostics import diagnostic_for_exception
+from tests.unit.test_central_state import task as stored_task
 
 
 def _publication(**result_changes):
@@ -117,16 +122,30 @@ def test_diagnostic_discards_untrusted_location_labels_for_owner_codes():
 
 def test_result_publication_schema_fields_and_v1_serialization_stay_compatible():
     schema = ResultPublication.model_json_schema()
-    result_schema = schema["$defs"]["InvestigationResult"]
+    result_schema = schema["$defs"]["PublicationResultInput"]
+    stored_schema = InvestigationResult.model_json_schema()
     valid_v1 = InvestigationResult.model_validate(
         _publication()["result"]
     )
+    wire_v2 = ResultPublication.model_validate(_publication(
+        observations=["A direct observation"], limitations=["A stated limitation"],
+    )).result
+    explicit_legacy = ResultPublication.model_validate(_publication(
+        contract_version=1,
+    )).result
 
     assert set(result_schema["properties"]) == {
         "result_id", "outcome", "summary", "evidence_ids", "hypothesis_ids",
         "finding_node_ids", "completion_receipt_id", "questions", "contract_version",
         "observations", "limitations",
     }
+    assert result_schema["properties"]["contract_version"]["enum"] == [1, 2]
+    assert result_schema["properties"]["contract_version"]["default"] == 2
+    assert stored_schema["properties"]["contract_version"]["default"] == 1
+    assert wire_v2.contract_version == 2
+    assert wire_v2.observations == ["A direct observation"]
+    assert wire_v2.limitations == ["A stated limitation"]
+    assert explicit_legacy.contract_version == 1
     assert valid_v1.model_dump() == {
         "result_id": "result-a",
         "outcome": "inconclusive",
@@ -137,4 +156,36 @@ def test_result_publication_schema_fields_and_v1_serialization_stay_compatible()
         "completion_receipt_id": None,
         "questions": [],
     }
+
+    task_with_stored_result = stored_task("legacy-result-task").model_copy(
+        update={"result": valid_v1},
+    )
+    serialized = task_with_stored_result.model_dump(mode="json")
+    assert serialized["result"] == valid_v1.model_dump(mode="json")
+    assert not {"contract_version", "observations", "limitations"} & set(
+        serialized["result"]
+    )
+    restored = type(task_with_stored_result).model_validate(serialized)
+    assert restored.result.contract_version == 1
+    assert restored.model_dump(mode="json") == serialized
+
+
+def test_probe_wire_schema_pins_v2_without_dropping_publication_fields():
+    publication_schema = PublicationResultInput.model_json_schema()
+    probe_schema = probe_result_wire_schema()
+
+    assert probe_schema["properties"]["contract_version"]["const"] == 2
+    assert probe_schema["properties"]["contract_version"]["default"] == 2
+    assert "probe purpose" in probe_schema["properties"]["contract_version"]["description"]
+    assert probe_schema["properties"] == publication_schema["properties"] | {
+        "contract_version": probe_schema["properties"]["contract_version"],
+    }
+    assert probe_schema["properties"]["outcome"] == publication_schema["properties"]["outcome"]
+    assert probe_schema["properties"]["finding_node_ids"] == (
+        publication_schema["properties"]["finding_node_ids"]
+    )
+    assert probe_schema["properties"]["completion_receipt_id"] == (
+        publication_schema["properties"]["completion_receipt_id"]
+    )
+    assert "enum" not in probe_schema["properties"]["contract_version"]
 
