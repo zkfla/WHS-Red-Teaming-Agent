@@ -3,7 +3,7 @@
 # selection contract; they never grant scope or execution permission.
 schema_version: '3'
 profile_id: native-probes
-version: '18'
+version: '19'
 common: {path: prompts/common.md, version: '3', contract_version: '1'}
 probe_limits: {max_actions: 4, max_model_requests: 8}
 max_instances: 2
@@ -30,7 +30,7 @@ roles:
       capabilities: []
       tool_selection: {}
       context_profile: {profile_id: hypothesis_planning}
-    prompt: {path: prompts/hypothesis-planner.md, version: '6'}
+    prompt: {path: prompts/hypothesis-planner.md, version: '7'}
   - definition:
       agent_id: probe-worker
       role: probe_execution
@@ -39,7 +39,7 @@ roles:
       capabilities: [web, api, recon, mobile, analysis]
       tool_selection: {capability_tags: [web, api, recon, mobile, analysis]}
       context_profile: {profile_id: probe_execution}
-    prompt: {path: prompts/worker.md, version: '12'}
+    prompt: {path: prompts/worker.md, version: '13'}
   - definition:
       agent_id: research-evidence
       role: research_evidence
@@ -49,7 +49,7 @@ roles:
       capabilities: []
       tool_selection: {}
       context_profile: {profile_id: research_evidence}
-    prompt: {path: prompts/evidence.md, version: '4'}
+    prompt: {path: prompts/evidence.md, version: '5'}
   - definition:
       agent_id: code-author
       role: code_artifact

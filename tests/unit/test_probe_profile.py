@@ -32,7 +32,7 @@ def test_probe_profile_uses_one_common_executor_and_split_atomizer():
     assert len(executors) == 1
     assert loaded.run_policy().probe_limits == ProbeLimits(max_actions=4, max_model_requests=16)
 
-    assert loaded.profile.version == "25"
+    assert loaded.profile.version == "26"
     atomizer_id = loaded.profile.stages.get("task_atomization")
     assert atomizer_id == "probe-atomizer"
     assert atomizer_id != loaded.profile.stages["hypothesis_planning"]
@@ -60,7 +60,7 @@ def test_probe_profile_uses_one_common_executor_and_split_atomizer():
 
 def test_legacy_single_stage_profile_has_no_atomizer():
     loaded = load_specialist_profile(LEGACY)
-    assert loaded.profile.version == "18"
+    assert loaded.profile.version == "19"
     assert "task_atomization" not in loaded.profile.stages
     assert loaded.run_policy().probe_atomization is False
     assert "probe_atomization" not in loaded.run_policy().model_dump()
@@ -110,6 +110,51 @@ def test_split_policy_serialization_keeps_legacy_fingerprints_stable():
     assert default.run_policy().model_dump()["probe_atomization"] is True
     assert "probe_atomization" not in legacy.run_policy().model_dump()
     assert "probe_atomization" not in legacy.profile.model_dump()
+
+
+def test_active_prompt_composition_carries_depth_dispatch_and_review_rules():
+    loaded = load_specialist_profile(PROBES)
+    strategy = loaded.prompts.compose("hypothesis_planning", "runtime contract")
+    atomizer = loaded.prompts.compose("task_atomization", "runtime contract")
+    worker = loaded.prompts.compose("native_action", "runtime contract")
+    reviewer = loaded.prompts.compose("analysis_verify", "runtime contract")
+
+    assert "깊이가 커버리지보다 우선한다" in strategy
+    assert "2~3개 가설 경로" in strategy
+    assert "가장 강한 고가치 증거 경로" in strategy
+    assert "앞 단계의 실제 출력" in strategy
+    assert "캡처된 후보 결속 사후 검토 기록" in strategy
+    assert (
+        "증거와 범위에 맞는 유용한 경로를 평가했고 "
+        "지금 이어갈 승인된 조사가 남지 않은 판단"
+    ) in strategy
+    assert "미래에 어떤 새 증거나 조건 변화가 생기면 재평가할지" in strategy
+    assert "미래 결과를 전제로 한 의존성 DAG" in atomizer
+    assert "앞 task의 실제 출력" in atomizer
+    assert "도구 호출 수가 아니라 저장된" in worker
+    assert "호출 수·재시도 수·검색량만으로" in worker
+    assert "일치하는 공개 검토 receipt는 독립 판단 기록" in reviewer
+    assert "Finding 또는 Mission 완료를 자동 확정하지 않는다" in reviewer
+
+
+def test_alternate_specialist_profiles_compose_the_same_methodology():
+    for filename in ("native-specialists.yaml", "native-specialists-web.yaml"):
+        loaded = load_specialist_profile(PROBES.with_name(filename))
+        strategy_stage = "attack_path_proposal"
+        strategy = loaded.prompts.compose(strategy_stage, "runtime contract")
+        atomizer = loaded.prompts.compose("task_atomization", "runtime contract")
+        executor = loaded.prompts.compose("native_action", "runtime contract")
+        reviewer = loaded.prompts.compose("analysis_verify", "runtime contract")
+
+        assert "깊이가 coverage보다 우선한다" in strategy
+        assert "2~3개 경로" in strategy
+        assert "실제 출력" in strategy
+        assert "외부 선행 조건에 막혀 있으면" in strategy
+        assert "모두 평가해 현재 진행할 유용한 조사가 남지 않았다면" in strategy
+        assert "입력에 없는 의존성 DAG" in atomizer
+        assert "호출 수는 진전이 아니다" in executor
+        assert "일치하는 공개 검토 receipt는 독립 판단 기록" in reviewer
+        assert "Finding 또는 Mission 완료를 자동 확정하지 않는다" in reviewer
 
 
 def _split_raw():

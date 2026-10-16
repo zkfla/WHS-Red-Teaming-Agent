@@ -2,7 +2,7 @@
 # Reuses the same MD contracts/loader. A changed fingerprint needs a new Run.
 schema_version: '2'
 profile_id: native-specialists-web
-version: '2'
+version: '3'
 common: {path: prompts/common.md, version: '3', contract_version: '1'}
 max_instances: 2
 max_activations: 8
@@ -28,7 +28,7 @@ roles:
       capabilities: []
       tool_selection: {}
       context_profile: {profile_id: strategy}
-    prompt: {path: prompts/planner.md, version: '2'}
+    prompt: {path: prompts/planner.md, version: '3'}
   - definition:
       agent_id: atomizer
       role: atomization
@@ -38,7 +38,7 @@ roles:
       capabilities: []
       tool_selection: {}
       context_profile: {profile_id: atomization}
-    prompt: {path: prompts/atomizer.md, version: '2'}
+    prompt: {path: prompts/atomizer.md, version: '3'}
   - definition:
       agent_id: web-executor
       role: web_execution
@@ -47,7 +47,7 @@ roles:
       capabilities: [web, api, recon]
       tool_selection: {capability_tags: [web, api, recon]}
       context_profile: {profile_id: web_execution}
-    prompt: {path: prompts/web.md, version: '2'}
+    prompt: {path: prompts/web.md, version: '3'}
   - definition:
       agent_id: research-evidence
       role: research_evidence
@@ -57,7 +57,7 @@ roles:
       capabilities: []
       tool_selection: {}
       context_profile: {profile_id: research_evidence}
-    prompt: {path: prompts/evidence.md, version: '4'}
+    prompt: {path: prompts/evidence.md, version: '5'}
   - definition:
       agent_id: code-author
       role: code_artifact
