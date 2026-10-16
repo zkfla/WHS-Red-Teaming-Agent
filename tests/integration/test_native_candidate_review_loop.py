@@ -44,8 +44,12 @@ def _active_task(messages):
         try:
             context = json.loads(message.get("content") or "{}")
         except (TypeError, ValueError):
-            return None
-        return (context.get("active_task") or {}).get("task_id")
+            continue
+        if not isinstance(context, dict):
+            continue
+        task = context.get("active_task")
+        if isinstance(task, dict) and task.get("task_id"):
+            return task["task_id"]
     return None
 
 
@@ -208,6 +212,8 @@ async def test_native_worker_discovers_graph_record_and_planner_consumes_its_rec
                     current=saved.model_dump(mode="json"), status="confirmed",
                     evidence=[str(source.evidence_id)], review=receipt_id,
                 ))
+            assert await service.list_findings() == []
+            assert await session.deps.central_state.candidate_finding_promotions() == []
             return
 
         judged = candidate(current=current.model_dump(mode="json"), status="confirmed",
@@ -221,4 +227,16 @@ async def test_native_worker_discovers_graph_record_and_planner_consumes_its_rec
         assert matches[0]["metadata"]["hypothesis_outcome"] == "success"
         saved = await service.get_hypothesis(current.hypothesis_id)
         assert saved.status == "confirmed" and saved.revision == 2
-        assert await service.list_findings() == []
+        findings = await service.list_findings()
+        assert len(findings) == 1
+        finding, = findings
+        assert finding.verified is True
+        assert set(finding.evidence_ids) == {str(source.evidence_id), receipt_id}
+        assert finding.metadata["hypothesis_id"] == current.hypothesis_id
+        assert finding.metadata["review_receipt_id"] == receipt_id
+        assert finding.metadata["candidate_pre_verdict_revision"] == 1
+        assert finding.metadata["candidate_revision"] == 2
+        promotions = await session.deps.central_state.candidate_finding_promotions()
+        assert len(promotions) == 1
+        assert promotions[0]["status"] == "promoted"
+        assert promotions[0]["finding_id"] == finding.finding_id
