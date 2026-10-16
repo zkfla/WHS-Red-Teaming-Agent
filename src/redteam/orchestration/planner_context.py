@@ -32,6 +32,72 @@ from redteam.orchestration.investigation_context import (
 )
 
 
+def _planner_context_batch_item_schema(schema: dict[str, Any]) -> None:
+    """Expose the batch item's existing exactly-one-query parser rule to JSON Schema."""
+    properties = schema["properties"]
+    context_ref = properties["context"]["anyOf"][0]
+    evidence_ref = properties["evidence"]["anyOf"][0]
+    # These alternatives are disjoint: each rules out a non-null opposite query.
+    schema["anyOf"] = [
+        {
+            "required": ["context"],
+            "properties": {"context": context_ref, "evidence": {"type": "null"}},
+        },
+        {
+            "required": ["evidence"],
+            "properties": {"context": {"type": "null"}, "evidence": evidence_ref},
+        },
+    ]
+
+
+def _planner_context_request_schema(schema: dict[str, Any]) -> None:
+    """Publish the versioned query rules enforced by PlannerContextRequest."""
+    properties = schema["properties"]
+    context_ref = properties["context"]["anyOf"][0]
+    evidence_ref = properties["evidence"]["anyOf"][0]
+    batch_item_ref = properties["queries"]["anyOf"][0]["items"]
+    schema["description"] = (
+        "Optional read-only lookup. Omit context_request or set it to null when no lookup is "
+        "needed. Version 1 takes exactly one context or evidence query; version 2 takes one "
+        "to four independent queries, each with exactly one query."
+    )
+    # Keep the branches disjoint while using the existing anyOf JSON Schema dialect.
+    schema["anyOf"] = [
+        {
+            "properties": {
+                "version": {"enum": [1]},
+                "context": context_ref,
+                "evidence": {"type": "null"},
+                "queries": {"type": "null"},
+            },
+            "required": ["context"],
+        },
+        {
+            "properties": {
+                "version": {"enum": [1]},
+                "context": {"type": "null"},
+                "evidence": evidence_ref,
+                "queries": {"type": "null"},
+            },
+            "required": ["evidence"],
+        },
+        {
+            "properties": {
+                "version": {"enum": [2]},
+                "context": {"type": "null"},
+                "evidence": {"type": "null"},
+                "queries": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 4,
+                    "items": batch_item_ref,
+                },
+            },
+            "required": ["version", "queries"],
+        },
+    ]
+
+
 class PlannerEvidenceQuery(BaseModel):
     """Search captured public records, then read a window through EvidenceReader."""
 
@@ -68,7 +134,10 @@ class PlannerEvidenceQuery(BaseModel):
 
 
 class PlannerContextRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+    model_config = ConfigDict(
+        extra="forbid", hide_input_in_errors=True,
+        json_schema_extra=_planner_context_request_schema,
+    )
     version: Literal[1, 2] = 1
     context: ContextQuery | None = None
     evidence: PlannerEvidenceQuery | None = None
@@ -93,7 +162,10 @@ class PlannerContextRequest(BaseModel):
 class PlannerContextBatchItem(BaseModel):
     """One independently bounded read in a version-2 lookup batch."""
 
-    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+    model_config = ConfigDict(
+        extra="forbid", hide_input_in_errors=True,
+        json_schema_extra=_planner_context_batch_item_schema,
+    )
     context: ContextQuery | None = None
     evidence: PlannerEvidenceQuery | None = None
 

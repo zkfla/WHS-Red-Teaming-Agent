@@ -34,7 +34,7 @@ def _explicit_held():
 def test_schema_requires_questions_and_termination_but_not_updates():
     assert {"reason", "questions", "termination"} <= set(STAGE_ONE_SCHEMA["required"])
     assert "updates" not in STAGE_ONE_SCHEMA["required"]
-    assert "lookup" in STAGE_ONE_SCHEMA["properties"]["termination"]["description"]
+    assert "context_request" in STAGE_ONE_SCHEMA["properties"]["termination"]["description"]
 
 
 def test_persisted_draft_defaults_are_unchanged():

@@ -5,6 +5,7 @@ import json
 import pytest
 from pydantic import ValidationError
 
+from redteam.orchestration.cognition import _REJECTED_PROPOSAL_MARKER
 from redteam.orchestration.planner_context import (
     PlannerContextRequest,
     PlannerEvidenceQuery,
@@ -60,8 +61,18 @@ async def test_invalid_lookup_then_valid_lookup_then_held_uses_finite_budget(
         assert await SpecialistPlanner(session.deps).advance(session.runtime) == []
         assert len(llm.plan_inputs) == 3 and not llm.atom_inputs
         feedback = json.dumps(llm.requests)
-        assert code in feedback and "value_error" not in feedback
-        assert MARK not in feedback
+        # Empty/mixed shapes now fail the published JSON Schema before the
+        # Pydantic owner callback; the typed callback is checked separately above.
+        assert ("schema_" if code == EXACTLY_ONE else code) in feedback
+        assert location in feedback
+        assert "value_error" not in feedback
+        # The existing bounded proposal replay may retain a public rejected ID.
+        # Code-owned diagnostic feedback must still exclude the proposed value.
+        diagnostic_feedback = "\n".join(
+            message["content"].split(_REJECTED_PROPOSAL_MARKER, 1)[0]
+            for request in llm.requests for message in request.get("messages", [])
+        )
+        assert MARK not in diagnostic_feedback
         state = session.deps.central_state
         ledger = await state.request_ledger().snapshot(state.run_id)
         assert ledger["spent"] == 3
