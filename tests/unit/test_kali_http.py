@@ -314,6 +314,62 @@ async def test_public_identity_is_preserved_and_only_registered_provider_emits_r
     for item in descriptors:
         assert item.input_schema == legacy[item.tool_name].input_schema
         assert item.output_schema == legacy[item.tool_name].output_schema
+    path_description = request.input_schema["properties"]["path"]["description"]
+    query_description = request.input_schema["properties"]["query"]["description"]
+    assert "exact-path allowlists require an exact configured path" in path_description
+    assert "whole-origin paths must be explicitly enabled" in path_description
+    assert "separately in query" in path_description
+    assert "configured per-path or global query policy" in query_description
+    assert "explicit allow-all setting" in query_description
+    assert "do not encode them into path" in query_description
+
+
+@pytest.mark.parametrize("path", ["/account?user=alice", "/account#section"])
+async def test_query_or_fragment_in_path_is_rejected_before_route_or_workroom(monkeypatch, path):
+    workroom, route = FakeWorkroom(envelope()), FakeRoute()
+    adapter = BuiltinKaliHttpAdapter(workroom, route, provider(), policy(monkeypatch))
+    call = invocation().model_copy(update={"arguments": {"target_ref": "target_lab", "path": path}})
+
+    result = await adapter.invoke_contextual(call)
+
+    assert not result.success
+    assert result.error is not None
+    assert result.error.code == "path outside configured allowlist"
+    assert route.calls == []
+    assert workroom.calls == []
+
+
+async def test_configured_query_is_passed_separately_from_literal_path(monkeypatch):
+    configured_policy = ServerPolicy(
+        targets={
+            "target_lab": TargetProfile(
+                origin="http://lab",
+                allowed_paths=["/account"],
+                allowed_query_keys={"/account": ["user"]},
+                response_body_max_chars=64,
+            )
+        },
+        allowed_networks=["127.0.0.1/32"],
+    )
+    workroom, route = FakeWorkroom(envelope()), FakeRoute()
+    adapter = BuiltinKaliHttpAdapter(workroom, route, provider(), configured_policy)
+    call = invocation().model_copy(
+        update={
+            "arguments": {
+                "target_ref": "target_lab",
+                "path": "/account",
+                "query": {"user": "alice"},
+            }
+        }
+    )
+
+    result = await adapter.invoke_contextual(call)
+
+    assert result.success
+    assert route.calls[0][1:] == ("lab", 80)
+    request = json.loads(workroom.calls[0][0][3])
+    assert request["path"] == "/account"
+    assert request["request_target"] == "/account?user=alice"
 
 
 async def test_anonymous_receipt_is_bound_to_kali_route_and_consumed(monkeypatch):
