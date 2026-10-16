@@ -56,3 +56,7 @@ Sol6.1 High의 최종 독립 소스 리뷰는 추가 P1/P2가 없고 이전 두 
 단계 커밋: `2e4b453f` 이름/상세 schema 연결, `d53e168e` 동일 주소 host anchor 선택, `e47d7e4f` helper schema 진단, `a7b15b77` 대상 없는 session inventory 선언, `e94734c5` durable session/v2 승격 시나리오 정합화. 푸시 직전 `origin/dev`를 fetch해 추가 원격 커밋이 없음을 확인했다. 푸시·실제 재실행 결과는 별도로 확인한다.
 
 새 내부 경로 fixture의 Docker/config 및 credential-reference preflight는 root도 통과했다. 별도의 호스트 연결 preflight에서 Windows → 내부 은행 IP의 `/health` GET은 ConnectTimeout이었다. 이는 Run 원본 증거나 Finding에 포함하지 않는다. 따라서 다음 실행에서 기존 호스트 측 recon 도구의 접근 실패와 Kali 제공자의 실제 결과를 구분해야 한다. 동일 은행이라도 host-published 주소와 내부 bridge 주소의 도달성을 같다고 취급하지 않는다.
+
+## 세션 종료 전 실제 상태 정정
+
+구현과 기록은 `0f30a3dc`로 dev에 푸시했고 원격 해시를 확인했다. 17:55 KST에 후속 fixture 시작을 시도했지만 빈 `stdin.txt` 준비 누락으로 CLI 프로세스 생성 전에 실패했다. 모델 호출·Run DB·Run ID는 생성되지 않았다. 먼저 시작된 전용 monitor의 정확한 부모/명령/fixture와 DB 부재를 확인해 종료했고 launcher도 종료됐다. start.ps1에 프로세스 시작 전 입력 파일 검사를 추가하고 빈 파일을 준비했다. 실패 lock과 stderr는 보존하고 현재 launch.lock은 없다. 새 세션에서 재확인 후 시작하며 이번 세션에서는 다시 실행하지 않았다. 현재 source freeze는 해제 상태다. [핸드오프](HANDOFF-20261016-tool-repair-live.md)에 전체 목표·수정·검사·다음 실행 순서를 남겼다.
