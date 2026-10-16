@@ -33,6 +33,7 @@ import asyncio
 import inspect
 import json
 import math
+import re
 import time
 from collections.abc import Callable
 from typing import Any, Literal
@@ -69,6 +70,8 @@ DECISION_KINDS = ("transport", "format", "budget", "unknown")
 
 _MAX_FEEDBACK_CHARS = 500
 _MAX_REJECTED_PROPOSAL_BYTES = 16 * 1024
+_DIAGNOSTIC_PATH = re.compile(r"\$(?:\.[A-Za-z0-9_-]+|\[[0-9]+\])*\Z")
+_DECODER_LOCATION = re.compile(r"decoder input line [0-9]+, column [0-9]+\Z")
 _EMPTY_OBJECT_TEXT = "{}"
 _REJECTED_PROPOSAL_MARKER = "\n\nRejected proposal data:\n"
 _REJECTED_PROPOSAL_INSTRUCTION = (
@@ -112,6 +115,43 @@ def _capture_completed_request(
         request_id = take_completed_request(scope.run_id)
         if request_id is not None:
             budget.last_request_id = request_id
+
+
+def _diagnostic_identifier(value: Any, fallback: str) -> str:
+    if (not isinstance(value, str) or not value or len(value) > 100
+            or not value.isascii()
+            or not all(char.isalnum() or char in "_-" for char in value)):
+        return fallback
+    return value
+
+
+def _diagnostic_location(value: Any) -> str:
+    if not isinstance(value, str) or len(value) > 200:
+        return ""
+    if (not value or _DIAGNOSTIC_PATH.fullmatch(value) is not None
+            or _DECODER_LOCATION.fullmatch(value) is not None):
+        return value
+    return ""
+
+
+def _request_diagnostic(diagnostic: DecisionDiagnostic) -> dict[str, Any]:
+    """Project only stable code labels and allowlisted field locations."""
+    rules = []
+    for issue in diagnostic.validation_issues[:10]:
+        if not isinstance(issue, dict):
+            continue
+        rule = _diagnostic_identifier(issue.get("rule"), "")
+        if rule:
+            rules.append({
+                "rule": rule,
+                "location": _diagnostic_location(issue.get("location", "")),
+            })
+    return {
+        "code": _diagnostic_identifier(diagnostic.code, "invalid_decision"),
+        "stage": _diagnostic_identifier(diagnostic.stage, "decision"),
+        "location": _diagnostic_location(diagnostic.location),
+        "rules": rules,
+    }
 
 
 class DecisionFailure(Exception):
@@ -230,6 +270,8 @@ class DecisionBudget:
         self.failure_counts: dict[str, int] = {}
         # Request identity only; prompts/responses stay outside the budget trace.
         self.last_request_id: str | None = None
+        self.previous_rejection_request_id: str | None = None
+        self._attempt_previous_rejection_request_id: str | None = None
 
     def diagnostic_details(self) -> dict[str, Any]:
         return {
@@ -746,16 +788,28 @@ class StructuredDecisionClient:
         outcome: str,
         valid: bool,
         made_progress: bool | None = None,
+        diagnostic: DecisionDiagnostic | None = None,
     ) -> None:
         """Finalize a metered row when the caller knows protocol semantics."""
         request_id = budget.last_request_id
         classify = getattr(self._llm, "classify_request", None)
         if request_id is None or not callable(classify):
             return
+        decision_diagnostic = (
+            _request_diagnostic(diagnostic)
+            if diagnostic is not None and outcome in {"semantic_rejected", "format_rejected"}
+            else None
+        )
         await classify(
             request_id, purpose=purpose, outcome=outcome, valid=valid,
             made_progress=made_progress,
+            decision_diagnostic=decision_diagnostic,
+            previous_rejection_request_id=budget._attempt_previous_rejection_request_id,
         )
+        if outcome in {"semantic_rejected", "format_rejected"}:
+            budget.previous_rejection_request_id = request_id
+        elif outcome == "accepted":
+            budget.previous_rejection_request_id = None
 
     async def ask(
         self,
@@ -776,6 +830,8 @@ class StructuredDecisionClient:
             )
         elif not isinstance(budget, DecisionBudget):
             raise TypeError("budget must be a DecisionBudget or None")
+        budget.previous_rejection_request_id = None
+        budget._attempt_previous_rejection_request_id = None
         working = dict(payload)
         extra = await self._resolve_extra_context(stage, payload)
         for key, value in extra.items():
@@ -996,7 +1052,8 @@ class StructuredDecisionClient:
         repair: bool = False,
         transport: bool = False,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        # Clear the prior attempt identity before any preflight callback can fail.
+        # Snapshot the rejection that prompted this attempt, then clear its identity.
+        budget._attempt_previous_rejection_request_id = budget.previous_rejection_request_id
         budget.last_request_id = None
         current = dict(working)
         try:
@@ -1321,17 +1378,16 @@ class StructuredDecisionClient:
                         )
                         return result
                     except _RetryableDecisionError as exc:
+                        outcome = (
+                            "semantic_rejected"
+                            if exc.diagnostic.kind == "validation"
+                            else "format_rejected"
+                            if exc.diagnostic.kind != "transport"
+                            else "transport_failure"
+                        )
                         await self.classify_last_request(
-                            budget,
-                            outcome=(
-                                "semantic_rejected"
-                                if exc.diagnostic.kind == "validation"
-                                else "format_rejected"
-                                if exc.diagnostic.kind != "transport"
-                                else "transport_failure"
-                            ),
-                            valid=False,
-                            made_progress=False,
+                            budget, outcome=outcome, valid=False, made_progress=False,
+                            diagnostic=exc.diagnostic,
                         )
                         budget.record_failure(exc.diagnostic.code)
                         budget.last_failure = exc.diagnostic.model_copy(

@@ -269,6 +269,8 @@ class RunMeteredLLM:
         outcome: str,
         valid: bool,
         made_progress: bool | None = None,
+        decision_diagnostic: dict[str, Any] | None = None,
+        previous_rejection_request_id: str | None = None,
     ) -> None:
         scope = current_request_scope()
         if scope is None:
@@ -276,6 +278,8 @@ class RunMeteredLLM:
         await self.ledger.classify_decision(
             scope.run_id, request_id, purpose=purpose, outcome=outcome,
             valid=valid, made_progress=made_progress,
+            decision_diagnostic=decision_diagnostic,
+            previous_rejection_request_id=previous_rejection_request_id,
         )
 
     async def complete(self, *, messages, system=None, **kwargs) -> str:

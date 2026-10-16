@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import re
 import time
 from collections.abc import Awaitable, Callable, Coroutine, MutableMapping
 from dataclasses import asdict
@@ -109,12 +110,67 @@ _DECISION_OUTCOMES = (
     "protocol_rejected", "invalid_tool_arguments", "unknown_tool", "invalid_tool_call",
     "text_only_held", "transport_failure",
 )
+_REJECTION_OUTCOMES = frozenset({"format_rejected", "semantic_rejected"})
+_REQUEST_ID_PREFIX = "llm_request_"
+_DIAGNOSTIC_LABEL_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+)
+_DIAGNOSTIC_PATH = re.compile(r"\$(?:\.[A-Za-z0-9_-]+|\[[0-9]+\])*\Z")
+_DECODER_LOCATION = re.compile(r"decoder input line [0-9]+, column [0-9]+\Z")
 
 # Large enough to inspect the real planner/worker exchange while keeping one
 # Run's durable request ledger bounded. These are display records, not replay
 # inputs; truncation is explicit and never changes provider execution.
 LLM_REQUEST_CONTENT_LIMIT = 65_536
 LLM_RESPONSE_CONTENT_LIMIT = 32_768
+
+
+def _diagnostic_label(value: Any, *, maximum: int = 100) -> bool:
+    return (
+        isinstance(value, str) and 0 < len(value) <= maximum
+        and all(char in _DIAGNOSTIC_LABEL_CHARS for char in value)
+    )
+
+
+def _diagnostic_location(value: Any) -> bool:
+    """Only retain code-shaped paths or the fixed JSON decoder location form."""
+    return (
+        isinstance(value, str) and len(value) <= 200
+        and (not value or _DIAGNOSTIC_PATH.fullmatch(value) is not None
+             or _DECODER_LOCATION.fullmatch(value) is not None)
+    )
+
+def _checked_decision_diagnostic(value: Any) -> dict[str, Any] | None:
+    """Check the small code-owned summary persisted beside a rejected request."""
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {"code", "stage", "location", "rules"}:
+        raise RequestAdmissionError("llm_request_classification_invalid")
+    code, stage, location, rules = (
+        value["code"], value["stage"], value["location"], value["rules"],
+    )
+    if (not _diagnostic_label(code) or not _diagnostic_label(stage)
+            or not _diagnostic_location(location)
+            or not isinstance(rules, list) or len(rules) > 10):
+        raise RequestAdmissionError("llm_request_classification_invalid")
+    checked_rules: list[dict[str, str]] = []
+    for item in rules:
+        if (not isinstance(item, dict) or set(item) != {"rule", "location"}
+                or not _diagnostic_label(item["rule"])
+                or not _diagnostic_location(item["location"])):
+            raise RequestAdmissionError("llm_request_classification_invalid")
+        checked_rules.append({"rule": item["rule"], "location": item["location"]})
+    return {
+        "code": code, "stage": stage, "location": location, "rules": checked_rules,
+    }
+
+
+def _canonical_request_id(value: Any) -> bool:
+    return (
+        isinstance(value, str) and value.startswith(_REQUEST_ID_PREFIX)
+        and len(value) == len(_REQUEST_ID_PREFIX) + 12
+        and all(char in "0123456789abcdef" for char in value[len(_REQUEST_ID_PREFIX):])
+    )
 
 
 def _exchange_preview(value: Any, *, limit: int) -> tuple[str, bool]:
@@ -670,6 +726,21 @@ class RunRequestLedger:
         for field in ("decision_valid", "made_progress"):
             if row.get(field) is not None and not isinstance(row[field], bool):
                 raise RequestAdmissionError("llm_request_record_invalid")
+        if "decision_diagnostic" in row:
+            try:
+                diagnostic = _checked_decision_diagnostic(row["decision_diagnostic"])
+            except RequestAdmissionError as exc:
+                raise RequestAdmissionError("llm_request_record_invalid") from exc
+            if (diagnostic is None or decision_outcome not in _REJECTION_OUTCOMES
+                    or row.get("decision_valid") is not False):
+                raise RequestAdmissionError("llm_request_record_invalid")
+        previous_rejection = row.get("previous_rejection_request_id")
+        if previous_rejection is not None and (
+            not _canonical_request_id(previous_rejection)
+            or attempt_kind not in {"semantic_repair", "format_repair", "transport_retry"}
+            or not isinstance(row.get("stage"), str) or not row["stage"].strip()
+        ):
+            raise RequestAdmissionError("llm_request_record_invalid")
         for prefix, limit in (
             ("request", LLM_REQUEST_CONTENT_LIMIT),
             ("response", LLM_RESPONSE_CONTENT_LIMIT),
@@ -826,6 +897,8 @@ class RunRequestLedger:
         outcome: str,
         valid: bool,
         made_progress: bool | None = None,
+        decision_diagnostic: dict[str, Any] | None = None,
+        previous_rejection_request_id: str | None = None,
     ) -> None:
         """Finalize code-known semantics for one settled response.
 
@@ -836,16 +909,41 @@ class RunRequestLedger:
             raise RequestAdmissionError("llm_request_classification_invalid")
         if outcome not in _DECISION_OUTCOMES:
             raise RequestAdmissionError("llm_request_classification_invalid")
+        diagnostic = _checked_decision_diagnostic(decision_diagnostic)
+        if diagnostic is not None and (outcome not in _REJECTION_OUTCOMES or valid):
+            raise RequestAdmissionError("llm_request_classification_invalid")
+        if (previous_rejection_request_id is not None
+                and not _canonical_request_id(previous_rejection_request_id)):
+            raise RequestAdmissionError("llm_request_classification_invalid")
 
         async def change(tx: RequestSession) -> None:
             row = self._get(tx, run_id, request_id)
             if row["state"] not in {"settled", "unknown"}:
                 raise RequestAdmissionError("llm_request_classification_before_settlement")
+            if previous_rejection_request_id is not None:
+                if row.get("attempt_kind") not in {
+                    "semantic_repair", "format_repair", "transport_retry",
+                }:
+                    raise RequestAdmissionError("llm_request_classification_invalid")
+                predecessor = self._get(tx, run_id, previous_rejection_request_id)
+                if (predecessor.get("decision_outcome") not in _REJECTION_OUTCOMES
+                        or predecessor.get("stage") != row.get("stage")
+                        or predecessor.get("owner") != row.get("owner")
+                        or predecessor.get("task_id") != row.get("task_id")
+                        or previous_rejection_request_id == request_id):
+                    raise RequestAdmissionError("llm_request_classification_invalid")
+                earlier = predecessor.get("request_sequence")
+                current = row.get("request_sequence")
+                if (earlier is not None and current is not None and earlier >= current):
+                    raise RequestAdmissionError("llm_request_classification_invalid")
             proposed = {
                 "decision_outcome": outcome,
                 "decision_valid": valid,
                 **({"purpose": purpose} if purpose is not None else {}),
                 **({"made_progress": made_progress} if made_progress is not None else {}),
+                **({"decision_diagnostic": diagnostic} if diagnostic is not None else {}),
+                **({"previous_rejection_request_id": previous_rejection_request_id}
+                   if previous_rejection_request_id is not None else {}),
             }
             for name, value in proposed.items():
                 previous = row.get(name)

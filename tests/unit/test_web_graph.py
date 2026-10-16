@@ -426,7 +426,12 @@ def test_candidate_planner_input_carries_operator_guidance_without_view_guessing
     import inspect
 
     from redteam.app.web.graph_model import build_graph  # noqa: F401
-    from redteam.orchestration.hypothesis_planner import advance_hypotheses
+    from redteam.orchestration.hypothesis_planner import (
+        _advance_hypotheses,
+        advance_hypotheses,
+    )
 
-    source = inspect.getsource(advance_hypotheses)
-    assert "operator_instructions" in source
+    wrapper_source = inspect.getsource(advance_hypotheses)
+    planner_source = inspect.getsource(_advance_hypotheses)
+    assert "return await _advance_hypotheses(planner, runtime, schema)" in wrapper_source
+    assert '"operator_instructions": context["operator_instructions"]' in planner_source
